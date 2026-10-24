@@ -415,10 +415,22 @@ namespace GbDualBoot
                     N.PutGuid(b, o + 32, p.Type);
                     N.PutGuid(b, o + 48, p.Id);
                     Marshal.WriteInt64(b, o + 64, (long)p.Attributes);
-                    var name = new byte[72];
-                    byte[] nb = Encoding.Unicode.GetBytes(p.Name);
-                    Array.Copy(nb, name, Math.Min(nb.Length, 72));
-                    Marshal.Copy(name, 0, b + o + 72, 72);
+                    // name: an existing entry keeps its 72 name bytes exactly as GET returned them (including any
+                    // bytes after the terminating NUL); only new or renamed entries get a freshly encoded name
+                    bool keepName = false;
+                    if (p.Raw != null)
+                    {
+                        string rn = Encoding.Unicode.GetString(p.Raw, 72, 72);
+                        int z = rn.IndexOf('\0');
+                        keepName = (z >= 0 ? rn.Substring(0, z) : rn) == p.Name;
+                    }
+                    if (!keepName)
+                    {
+                        var name = new byte[72];
+                        byte[] nb = Encoding.Unicode.GetBytes(p.Name);
+                        Array.Copy(nb, name, Math.Min(nb.Length, 72));
+                        Marshal.Copy(name, 0, b + o + 72, 72);
+                    }
                 }
                 int ret;
                 if (!N.DeviceIoControl(h, N.IOCTL_DISK_SET_DRIVE_LAYOUT_EX, b, sz, IntPtr.Zero, 0, out ret, IntPtr.Zero))
@@ -530,9 +542,13 @@ namespace GbDualBoot
         readonly string path;
         public ImageDisk(string p, Access acc)
         {
+            // never a device (\\.\PhysicalDriveN, \\?\GLOBALROOT\...) or network path: --image is for test files only
+            if (p.StartsWith(@"\\") || p.StartsWith("//")) throw new GbError("--image must be a regular file on a local drive, not a device or network path: " + p);
             path = Path.GetFullPath(p);
+            if (path.StartsWith(@"\\")) throw new GbError("--image must be a regular file on a local drive: " + path);
             writable = acc == Access.Write;   // Query and Read both open the file read-only
             if (!File.Exists(path)) throw new GbError("image not found: " + path);
+            if ((File.GetAttributes(path) & (FileAttributes.Directory | FileAttributes.Device)) != 0) throw new GbError("--image is not a regular file: " + path);
             fs = new FileStream(path, FileMode.Open, writable ? FileAccess.ReadWrite : FileAccess.Read,
                                 writable ? FileShare.Read : FileShare.ReadWrite, 1 << 16, FileOptions.None);
             if (fs.Length % 512 != 0 || fs.Length < 4 * K.MiB) throw new GbError("image size must be a multiple of 512 and >= 4 MiB");
@@ -926,13 +942,14 @@ namespace GbDualBoot
             Console.Error.WriteLine(@"gbdisk <command> (--disk N | --image FILE) [options]      nothing is written without --apply
   layout       [--json]                                      print the GPT layout (no admin needed for --disk)
   backup       --out DIR --tag T                             save LBA 0-33, the last 33 LBAs and the layout JSON
-  plan         --manifest M --anchor NUM [--anchor-new-length B] [--reserve B] [--userdata B]
+  plan         --manifest M --anchor NUM [--anchor-id GUID] [--anchor-new-length B] [--reserve B] [--userdata B]
                [--min-userdata B] [--allow-truncated] [--existing] [--layout-json F|-] --out F|-
   create       --plan P [--apply]                            add the planned partitions (names, GUIDs, attributes)
   write        --plan P --source-dir D [--only a,b] [--zero-full-userdata] [--apply]
   verify       --plan P --source-dir D [--only a,b] [--layout-only]
   checksrc     (--manifest M | --plan P) --source-dir D      sha256 of the source images (no disk access)
-  remove       [--plan P] [--protect LAYOUT.json] [--force] [--apply]   delete the Googlebook partitions
+  remove       [--plan P] [--protect LAYOUT.json] [--anchor-id GUID] [--force] [--apply]
+                                                             delete the Googlebook partitions after the anchor (D:)
   resize-image --number N --length B [--apply]               image only: stands in for Resize-Partition
   voldev       --id GUID                                     disk only: \Device\HarddiskVolumeN of a partition
   restore-gpt  --from DIR --tag T [--apply]                  write a 'backup' GPT copy back");
@@ -973,6 +990,9 @@ namespace GbDualBoot
                 d.Read(0, prim, prim.Length);
                 var bak = new byte[33 * ss];
                 d.Read((last - 32) * ss, bak, bak.Length);
+                // the two files must really hold the whole GPT (standard geometry: entries at LBA 2 and at last-32),
+                // otherwise restore-gpt / dd from them would not bring the table back: refuse before anything changes
+                CheckGptCopies(prim, bak, ss, last, "disk");
                 string pf = Path.Combine(dir, "gpt_" + tag + "_primary.bin"), bf = Path.Combine(dir, "gpt_" + tag + "_backup.bin");
                 File.WriteAllBytes(pf, prim);
                 File.WriteAllBytes(bf, bak);
@@ -993,6 +1013,28 @@ namespace GbDualBoot
                 Console.WriteLine("backup '{0}' of {1}: {2}, {3}, {4}", tag, d.Describe, pf, bf, lf);
             }
             return 0;
+        }
+
+        // prim = LBA 0..33, bak = LBA last-32..last. Both headers valid (CRC, MyLBA), entry arrays at LBA 2 and at
+        // last-32 inside the copies, both entry-array CRCs correct, primary <-> backup consistent.
+        static void CheckGptCopies(byte[] prim, byte[] bak, int ss, long last, string what)
+        {
+            if (prim.Length != 34 * ss || bak.Length != 33 * ss) throw new GbError(what + ": GPT copies have the wrong size");
+            var h1 = new byte[ss]; Array.Copy(prim, ss, h1, 0, ss);
+            GptHeader g1 = GptHeader.Parse(h1, 1);
+            var h2 = new byte[ss]; Array.Copy(bak, 32 * ss, h2, 0, ss);
+            GptHeader g2 = GptHeader.Parse(h2, last);
+            if (!g1.Valid || !g2.Valid) throw new GbError(what + ": GPT headers not valid (primary: " + (g1.Valid ? "ok" : g1.Problem) + "; backup: " + (g2.Valid ? "ok" : g2.Problem) + ")");
+            long ent = (long)g1.EntryCount * g1.EntrySize;
+            if (g1.EntriesLba != 2 || 2L * ss + ent > prim.Length)
+                throw new GbError(what + ": primary entry array not inside LBA 2-33 (EntriesLBA " + g1.EntriesLba + ", " + ent + " B): a 34-LBA copy would be incomplete");
+            if (g1.AltLba != last || g2.AltLba != 1) throw new GbError(what + ": AlternateLBA fields do not match the disk size");
+            if (g2.EntriesLba < last - 32 || (g2.EntriesLba - (last - 32)) * ss + ent > 32L * ss)
+                throw new GbError(what + ": backup entry array (EntriesLBA " + g2.EntriesLba + ") not inside the last 33 LBAs");
+            if (g2.EntryCount != g1.EntryCount || g2.EntrySize != g1.EntrySize || g2.DiskId != g1.DiskId || g2.FirstLba != g1.FirstLba || g2.LastLba != g1.LastLba)
+                throw new GbError(what + ": primary and backup GPT headers disagree");
+            if (U.Crc32(prim, 2 * ss, (int)ent) != g1.EntriesCrc) throw new GbError(what + ": primary entry array CRC mismatch");
+            if (U.Crc32(bak, (int)((g2.EntriesLba - (last - 32)) * ss), (int)ent) != g2.EntriesCrc) throw new GbError(what + ": backup entry array CRC mismatch");
         }
 
         // ---------------------------------------------------------------- plan
@@ -1020,6 +1062,9 @@ namespace GbDualBoot
             Layout l = cur.Clone();
             Part an = l.ByNumber(anchorNum);
             if (an == null) throw new GbError("no partition #" + anchorNum);
+            if (Opt("anchor-id") != null && an.Id != new Guid(Opt("anchor-id")))
+                throw new GbError("partition #" + anchorNum + " is " + an.Id + ", not the expected anchor " + Opt("anchor-id") + " - refusing");
+            if (Array.IndexOf(K.GbNames, an.Name) >= 0) throw new GbError("the anchor partition #" + anchorNum + " is a Googlebook partition");
             if (Opt("anchor-new-length") != null)
             {
                 long nl = long.Parse(Opt("anchor-new-length"), CultureInfo.InvariantCulture);
@@ -1205,6 +1250,21 @@ namespace GbDualBoot
                 CheckDisk(d, cur, plan);
                 var todo = plan.Parts.Where(x => only == null || only.Contains(x.P.Name)).ToList();
                 if (only != null && todo.Count != only.Count) throw new GbError("--only names not all in the plan");
+                // only Googlebook partitions are ever written: a plan (it is a JSON file) that names anything else -
+                // a Windows type, a partition that existed before the install, or one outside the freed region - is refused
+                foreach (PlannedPart pp in todo)
+                {
+                    if (Array.IndexOf(K.GbNames, pp.P.Name) < 0) throw new GbError("refusing: plan partition '" + pp.P.Name + "' is not a Googlebook partition");
+                    if (K.WindowsTypes.Contains(pp.P.Type)) throw new GbError("refusing: plan partition '" + pp.P.Name + "' has a Windows type " + pp.P.Type);
+                    if (!plan.Existing)
+                    {
+                        if (plan.Base.Any(b => b.Id == pp.P.Id)) throw new GbError("refusing: plan partition '" + pp.P.Name + "' " + pp.P.Id + " existed before the install");
+                        if (pp.P.Offset < plan.RegionStart || pp.P.End > plan.RegionEnd)
+                            throw new GbError("refusing: plan partition '" + pp.P.Name + "' lies outside the planned region " + plan.RegionStart + " .. " + plan.RegionEnd);
+                        foreach (Part b in plan.Base)
+                            if (pp.P.Offset < b.End && b.Offset < pp.P.End) throw new GbError("refusing: plan partition '" + pp.P.Name + "' overlaps pre-existing #" + b.Number + " '" + b.Name + "'");
+                    }
+                }
                 // pre-existing partitions must be exactly as planned (fresh layout read)
                 foreach (Part b in plan.Base)
                     if (plan.Parts.All(x => x.P.Id != b.Id) && !b.SameAs(cur.ById(b.Id)))
@@ -1332,32 +1392,57 @@ namespace GbDualBoot
             Layout protect = Opt("protect") != null ? Layout.FromJson(U.LoadJson(Opt("protect"))) : null;
             if (plan == null && protect == null && !Flag("force"))
                 throw new GbError("no --plan/--protect from the install: refusing to guess (use --force to remove by name and type only)");
+            if (plan != null && plan.Existing) throw new GbError("--plan is an update plan (--existing), not the install plan");
+            // the partition the Googlebook set was placed after (D:): from the install plan, or --anchor-id
+            Guid anchorId = plan != null ? plan.AnchorId : Guid.Empty;
+            if (Opt("anchor-id") != null)
+            {
+                Guid a = new Guid(Opt("anchor-id"));
+                if (anchorId != Guid.Empty && a != anchorId) throw new GbError("--anchor-id " + a + " is not the install plan's anchor " + anchorId);
+                anchorId = a;
+            }
+            if (anchorId == Guid.Empty) throw new GbError("the partition the Googlebook set follows (D:) is not known: give --plan or --anchor-id");
             using (IDisk d = OpenTarget(Access.Write))
             {
                 Layout cur = d.GetLayout();
                 if (protect != null && protect.DiskId != cur.DiskId) throw new GbError("--protect layout is from another disk");
                 if (plan != null && plan.DiskId != cur.DiskId) throw new GbError("--plan is from another disk");
+                Part anchor = cur.ById(anchorId);
+                if (anchor == null) throw new GbError("anchor partition " + anchorId + " is not on " + d.Describe);
+                if (Array.IndexOf(K.GbNames, anchor.Name) >= 0) throw new GbError("anchor partition " + anchorId + " has a Googlebook name - refusing");
                 var gbTypes = new HashSet<Guid> { K.EspType, K.LinuxType };
                 if (plan != null) foreach (PlannedPart pp in plan.Parts) gbTypes.Add(pp.P.Type);
                 else gbTypes.Add(new Guid("88434509-d9d1-487d-b82c-15ef964cbd4b"));   // lapis vbmeta type
+                foreach (Guid t in K.WindowsTypes) gbTypes.Remove(t);
                 var victims = new List<Part>();
                 foreach (Part p in cur.Sorted())
                 {
                     bool named = Array.IndexOf(K.GbNames, p.Name) >= 0;
                     if (!named) continue;
                     string why = null;
-                    if (!gbTypes.Contains(p.Type) || K.WindowsTypes.Contains(p.Type)) why = "type " + p.Type + " is not a Googlebook type";
+                    PlannedPart planned = plan != null ? plan.Parts.FirstOrDefault(x => x.P.Id == p.Id) : null;
+                    if (!gbTypes.Contains(p.Type)) why = "type " + p.Type + " is not a Googlebook type";
                     else if (protect != null && protect.ById(p.Id) != null) why = "it existed before the install (protected)";
-                    else if (plan != null && plan.Parts.All(x => x.P.Id != p.Id)) why = "its GUID is not in the install plan";
+                    else if (plan != null && planned == null) why = "its GUID is not in the install plan";
+                    else if (p.Offset < anchor.End) why = "it lies before the end of #" + anchor.Number + " '" + anchor.Name + "' (not in the freed region)";
                     if (why != null) { Console.WriteLine("  keep   " + p + "   <- " + why); continue; }
+                    if (planned != null)
+                    {
+                        // one of ours by GUID: it must be exactly where the install put it, inside the region it freed
+                        if (planned.P.Offset != p.Offset || planned.P.Length != p.Length || planned.P.Type != p.Type || planned.P.Name != p.Name)
+                            throw new GbError("refusing: '" + p.Name + "' " + p.Id + " is not where the install plan put it (" + planned.P.Diff(p) + ")");
+                        if (p.Offset < plan.RegionStart || p.End > plan.RegionEnd)
+                            throw new GbError("refusing: '" + p.Name + "' lies outside the install region " + plan.RegionStart + " .. " + plan.RegionEnd);
+                    }
                     victims.Add(p);
                 }
                 if (victims.Count == 0) { Console.WriteLine("no Googlebook partitions found on " + d.Describe); return 0; }
-                // the victims must be one contiguous run: nothing else between the first and the last
+                // the victims must be one run right after the anchor: no other partition between the anchor's end and
+                // the last victim (so nothing outside the shrunk region, and nothing foreign in between, is touched)
                 long lo = victims.Min(v => v.Offset), hi = victims.Max(v => v.End);
                 foreach (Part p in cur.Parts)
-                    if (!victims.Contains(p) && p.Offset < hi && p.End > lo)
-                        throw new GbError("partition #" + p.Number + " '" + p.Name + "' lies between Googlebook partitions - refusing");
+                    if (!victims.Contains(p) && p != anchor && p.Offset < hi && p.End > anchor.End)
+                        throw new GbError("partition #" + p.Number + " '" + p.Name + "' lies between #" + anchor.Number + " and the Googlebook partitions - refusing");
                 if (plan != null)
                     foreach (PlannedPart pp in plan.Parts)
                         if (victims.All(v => v.Id != pp.P.Id)) Console.WriteLine("  note: planned partition " + pp.P.Name + " " + pp.P.Id + " not on disk");
@@ -1449,11 +1534,8 @@ namespace GbDualBoot
                 if (prim.Length != 34 * ss || bak.Length != 33 * ss) throw new GbError("backup files have the wrong size");
                 var h1 = new byte[ss]; Array.Copy(prim, ss, h1, 0, ss);
                 GptHeader g1 = GptHeader.Parse(h1, 1);
-                var h2 = new byte[ss]; Array.Copy(bak, 32 * ss, h2, 0, ss);
-                GptHeader g2 = GptHeader.Parse(h2, last);
-                if (!g1.Valid || !g2.Valid) throw new GbError("backup headers invalid for this disk size (" + g1.Problem + "; " + g2.Problem + ")");
-                if (g1.AltLba != last) throw new GbError("backup was taken on a disk of another size");
-                if (U.Crc32(prim, 2 * ss, (int)(g1.EntryCount * 128)) != g1.EntriesCrc) throw new GbError("primary entries CRC mismatch in the backup");
+                if (g1.Valid && g1.AltLba != last) throw new GbError("backup was taken on a disk of another size");
+                CheckGptCopies(prim, bak, ss, last, "backup files");   // headers, both entry arrays and their CRCs
                 Layout cur = null;
                 try { cur = d.GetLayout(); } catch (GbError) { }
                 if (cur != null && cur.DiskId != g1.DiskId && !Flag("force")) throw new GbError("backup disk GUID " + g1.DiskId + " != current " + cur.DiskId);

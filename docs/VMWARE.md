@@ -39,7 +39,7 @@ Open `lapis-boot.vmx` in VMware Workstation (File > Open). Settings that matter:
 | `svga.graphicsMemoryKB = "2097152"`, `mks.enable3d = "TRUE"`, `svga.guestBackedPrimaryAware` | 3D acceleration (2 GB of graphics memory) |
 | `mouse.vusb.enable = "FALSE"`, `mouse.vusb.useBasicMouse = "FALSE"` | absolute pointer for `gb_absmouse`, together with vmmouse in psmouse |
 | `ethernet0.virtualDev = "vmxnet3"`, NAT | network (the guest's eth0 is DHCP'd by Android's EthernetTracker) |
-| `sound.virtualDev = "hdaudio"` | sound |
+| `sound.present = "TRUE"`, `sound.virtualDev = "hdaudio"`, `sound.minProgressUsec = "2000"`, `sound.maxPeriodSizeMS = "10"`, `sound.bufferIdealMS = "60"` | sound through lapis's HDA drivers (`gb_vmaudio.sh`); the last three shrink VMware's host audio buffering for lower latency |
 | `chipset.useAcpiBattery = "TRUE"` | host battery/AC as ACPI devices (only the first battery; see the battery bridge) |
 | `serial0` -> `serial0.log` | kernel + Android log (the diagnostics write to kmsg) |
 | `serial1` -> named pipe `\\.\pipe\lapis_con` (server) | root shell for `gbsh.py` |
@@ -80,13 +80,21 @@ follows it automatically (it reads the slot state from lapis.bin, see [OTA.md](O
 ## 6. Host helpers
 
 * **Battery**: build `host/gb_hostbatt.exe` (`csc -nologo -target:winexe -out:gb_hostbatt.exe gb_hostbatt.cs`) and
-  run it at logon (Task Scheduler, "At log on", your user, `gb_hostbatt.exe <workspace>\lapis-boot.vmx`). It writes
-  Windows' combined battery level to the VM every 10 s; without it the guest shows only the clipboard battery.
+  run it at logon (Task Scheduler, "At log on", your user, `gb_hostbatt.exe <workspace>\lapis-boot.vmx`). It reads
+  Windows' combined battery level, AC and charging state every 10 s and writes it to the VM (on change and every
+  2 min); `gb_vmtools` mirrors it into the guest's battery, so the status bar follows the laptop live. Without it
+  the guest shows only the clipboard battery.
 * **Console**: `python -I gbsh.py "getprop sys.boot_completed"`, `gbsh.py -f script.sh`, `gbsh.py push|pull`;
   `gbnet.py push|pull` is the fast path over the VM network. `gbsh.py --reset` sends ^C.
-* **scrcpy (optional)**: put your ADB public key in `inject/adb/adb_keys`, rebuild; after boot the guest listens for
-  ADB on its NAT address (`gb_adb.sh`), and `host\Googlebook-scrcpy.cmd` opens it with audio (unpack scrcpy 5.0.1
-  for Windows next to it).
+* **scrcpy (optional)**: put your ADB public key (`%USERPROFILE%\.android\adbkey.pub`) in `inject/adb/adb_keys`
+  (never commit it), rebuild; after boot the guest listens for ADB on its NAT address (`gb_adb.sh`), and
+  `host\Googlebook-scrcpy.cmd` opens it with screen, keyboard/mouse, clipboard and audio (unpack scrcpy 5.0.1 for
+  Windows as `host\scrcpy-win64-v5.0.1`). While scrcpy runs, the guest's sound plays in it instead of through
+  VMware's sound card. `Googlebook-scrcpy.cmd hid` / `hidall` use a virtual HID keyboard (and mouse) inside Android.
+  The script uses the guest address `192.168.115.133`: change `IP` in it to your VM's NAT address.
+* **Network watchdog**: built together with network ADB, `gb_netwatch.sh` checks eth0 every 10 s and cycles the link
+  when it has carrier but no IPv4 address for 30 s (Android's Ethernet stack sometimes stops re-provisioning it after
+  a VMware NAT hiccup; the guest then keeps sending unanswered DHCP requests). It logs `gb_netwatch:` to kmsg.
 * **Frame pacing**: `tools/frametime.cs` measures the VM window's on-screen update cadence (DXGI desktop duplication).
 
 ## Limitations in the VM
@@ -102,6 +110,6 @@ follows it automatically (it reads the slot state from lapis.bin, see [OTA.md](O
 ## Troubleshooting
 
 * `serial0.log` has everything; useful markers: `GB_MODULES`, `GB_EDID`, `GB_UI`, `GB_P<n>` (boot progress loop),
-  `gb_slotsync:`, `gb_vmaudio:`.
+  `gb_slotsync:`, `gb_vmaudio:`, `gb_netwatch:`.
 * `wipe_data.py --yes` (VM off) zeroes the start of userdata; the next boot formats a fresh /data.
 * `cycle.ps1` is the quick reboot-and-grep loop used during bring-up.

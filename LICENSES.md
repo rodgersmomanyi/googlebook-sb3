@@ -17,8 +17,10 @@ modifies. **Proposed** licensing (to be confirmed by the copyright holder before
 | `native/audio/src/tinymix-setall.patch` | BSD-3-Clause (tinyalsa) | change to tinyalsa |
 | `native/nvk-android/` build scripts and probe | Apache-2.0 (ours); builds Mesa NVK (MIT) | `native/nvk-android/patches/` are Mesa changes: MIT |
 | `native/hw-gap-audit/kernel/` (`hid-surface` patch and source) | GPL-2.0-or-later | based on linux-surface's hid-surface patch, as marked in the file |
+| `native/power/uapi/linux/surface_aggregator/dtx.h` | GPL-2.0+ WITH Linux-syscall-note | copy of the Linux uAPI header (Surface DTX, by Maximilian Luz), SPDX line and copyright kept |
 | `kernel/manifest_16302624.xml` | AOSP repo manifest (pins public AOSP kernel projects) | as published by AOSP for build 16302624 |
 | `inject/fstab.android-desktop`, `inject/se_manifest.xml` | Apache-2.0 | edited versions of the AOSP-format lapis fstab and system_ext VINTF manifest |
+| `native/hw-gap-audit/tree/etc/excluded-input-devices.xml` | Apache-2.0 | our overlay of the AOSP-format input exclusion list; keeps lapis's one entry ("Power Button") |
 | `inject/odm_sepolicy.cil` | Apache-2.0 | generated: one `typepermissive` statement per SELinux type name in lapis's policy |
 
 ## What is deliberately not here
@@ -28,7 +30,10 @@ modifies. **Proposed** licensing (to be confirmed by the copyright holder before
   copies of them (patched minigbm: we ship the patcher instead).
 * Android emulator / AOSP binaries (the software KeyMint graft), SwiftShader/Mesa/iptsd/tinyalsa build outputs, our
   kernel and module builds.
-* Firmware (Intel graphics, Wi-Fi, Bluetooth, SOF audio, IPU4, NVIDIA), ACPI table dumps and Windows driver INF files.
+* Firmware (Intel graphics, Wi-Fi, Bluetooth, SOF audio, the proprietary IPU4P camera firmware, Realtek USB
+  Ethernet, NVIDIA), ACPI table dumps and Windows driver INF files.
+* Keys and personal data: the ADB key used for scrcpy, the builder's SSH key, the sensors overlay's signing key,
+  build and test logs.
 * Third-party documentation copied for research (e.g. the Surface Pro 7 IPU4P camera notes): see their sources.
 
 Redistributing Google's images or vendor binaries is not permitted by this repository's licenses and must not be done

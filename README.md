@@ -15,30 +15,32 @@ them. You have to get the lapis image yourself (see [Requirements](#requirements
 ## Status
 
 Build tested: lapis **CL3B.260622.271.R1** (installed from the recovery image) updated in the VM by OTA to
-**CL3B.260622.276.R4**; our GKI kernel **android17-6.18 (6.18.21)**, built with Kleaf.
+**CL3B.260622.276.R4**; our GKI kernel **android17-6.18 (6.18.21)**, built with Kleaf (build #13).
 
 | Area | VMware VM | Native Surface Book 3 |
 |---|---|---|
-| Boot to the desktop, user sign-in | **works** (first boot is slow: dexopt) | untested on hardware |
+| Boot to the desktop, user sign-in | **works** (first boot is slow: dexopt) | untested on hardware (the native tree's module loading and services were boot-tested in VMware) |
 | Display | **works**: vmwgfx (patched), 2560x1600 @ 320 dpi | untested: i915 (Gen11 Iris Plus 8086:8A52) + DMC firmware, stock lapis composer |
 | GPU / 3D | **works**: VMware SVGA3D through Mesa gallium `svga` 26.3 (patched) as the system GLES driver, SkiaGL; Vulkan is SwiftShader (CPU) | untested: lapis's own Mesa ANV (Vulkan) + ANGLE on i915 |
-| Pointer / keyboard | **works**: seamless absolute mouse (`gb_absmouse` + vmmouse + mini VMware Tools `gb_vmtools`), wheel, VMware keyboard | untested: SAM base keyboard + touchpad (`surface_hid`) |
-| Touchscreen + pen | n/a | untested: IPTS (linux-surface driver, MEI 8086:34E4) + `iptsd` 3.1.1 for Android (end-to-end tested on the builder with a fake HID device) |
-| Batteries | **works**: Windows' combined level (both packs) via `gb_hostbatt` -> guestinfo -> `gb_vmtools` -> `test_power` | untested: `gb_power` sums clipboard + base battery into one Android battery (unit-tested) |
-| Charger / AC | **works** (host AC state) | untested: `surface_charger` mirrored by `gb_power` |
+| Pointer / keyboard | **works**: seamless absolute mouse (`gb_absmouse` + vmmouse + mini VMware Tools `gb_vmtools`), wheel, VMware keyboard | untested: SAM base keyboard + touchpad (`surface_hid`, `hid-surface` drops the Fn "gamepad" button), IDC files |
+| Touchscreen + pen | n/a | untested: IPTS (linux-surface driver, MEI 8086:34E4) + `iptsd` 3.1.1 for Android (end-to-end tested on the builder with a fake HID device); pen top button key layouts |
+| Batteries | **works**: Windows' combined level (both packs), updated live, via `gb_hostbatt` -> guestinfo -> `gb_vmtools` -> `test_power` | untested: `gb_power` sums clipboard + base battery into one Android battery (unit-tested) |
+| Charger / AC | **works** (host AC state, live) | untested: `surface_charger` mirrored by `gb_power` |
 | Detach (DTX) | n/a | untested: `gb_power` handles detach requests like `surface-dtx-daemon`; tablet mode from `surface_dtx` |
-| NVIDIA GTX 1650 Max-Q (TU117, in the base) | not visible to the guest; VMware uses it on the host to render the VM | untested: no Android driver; kept unbound and runtime-suspended (D3cold) by `gb_power`. Opt-in nouveau/NVK experiments in `native/` |
-| Audio | **works**: VMware HD Audio through lapis's HDA drivers | untested: SOF (Ice Lake DSP 8086:34C8) + ALC274 with lapis's vendor modules and our card configs |
-| Wi-Fi / Bluetooth | VM networking via vmxnet3 (NAT); Bluetooth disabled | untested: AX201 (iwlwifi, firmware -77) and Intel BT (8087:0026) with our signed GKI modules |
-| Sensors | n/a | untested: ISH accelerometer/gyro and APDS-9960 light sensor exposed in the form lapis's sensors HAL accepts (QEMU-tested; not yet in the default build) |
-| Cameras (IPU4, 8086:8A19) | n/a | **not supported**: Linux has no IPU4 driver. An out-of-tree experiment lives in `native/camera-*` (compiles, never run) |
+| NVIDIA GTX 1650 Max-Q (TU117, in the base) | not visible to the guest; VMware uses it on the host to render the VM | untested: by default no driver, kept unbound and runtime-suspended (D3cold) by `gb_power`. **nouveau is opt-in** (`persist.vendor.gb.nouveau=1`; built and staged, `gb_power` keeps it bound). **NVK is shipped but inactive**: lapis's Vulkan loader loads only the `ro.hardware.vulkan=intel` driver (ANV), so NVK is reachable only from a test probe |
+| Audio | **works**: VMware HD Audio through lapis's HDA drivers (low-latency `sound.*` VMX settings); or the guest's sound in the scrcpy window | untested: SOF (Ice Lake DSP 8086:34C8) + ALC274 with lapis's vendor modules and our card configs |
+| Wi-Fi / Bluetooth / network | VM networking via vmxnet3 (NAT) with a link watchdog (`gb_netwatch`); Bluetooth disabled | untested: AX201 (iwlwifi, firmware -77) and Intel BT (8087:0026) with our signed GKI modules; USB / SurfaceDock Ethernet (r8152) |
+| Remote window | **works** (optional): network ADB + `host\Googlebook-scrcpy.cmd` (screen, keyboard/mouse, clipboard, audio) | n/a |
+| Sensors | n/a | untested: ISH accelerometer/gyro and APDS-9960 light sensor presented as ChromeOS EC (`cros-ec-*`) IIO devices, the only kind lapis's sensors HAL accepts; auto-rotate overlay (QEMU-tested) |
+| Cameras (IPU4P, 8086:8A19) | n/a | untested: our IPU4P port of the Linux ipu6 driver + OV5693 (front), OV8865 + DW9719 (rear), and libcamera's simple pipeline with the software ISP as the Android camera HAL (tested against vimc only). Needs Intel's IPU4P firmware from your own Windows driver package ([INPUTS.md](docs/INPUTS.md#firmware-native-only)) |
 | Power / volume buttons, lid | VMware power button = clean shutdown | untested: `soc_button_array` (MSHW0040), `surface_gpe` |
-| Platform profile | n/a | untested: `surface_platform_profile`, set by `gb_power` (`persist.vendor.gb.perf_profile`) |
+| Platform profile, CPU power limits | n/a | untested: `surface_platform_profile`, set by `gb_power` (`persist.vendor.gb.perf_profile`); `gb_hw.sh` restores the Surface firmware's PL1/PL2 |
 | OTA system updates | **works** (one update so far, .271 -> .276): the A/B update installs and the VM boots the new slot; `gb_slotsync` switches the boot entry (see [OTA.md](docs/OTA.md) for what was observed) | same mechanism; untested on hardware |
 | Screen lock PIN / hardware-backed keys | **no**: software KeyMint, no Gatekeeper/Weaver (no Trusty/GSC) | same |
 
 Details per device, with the kernel config, firmware and userspace pieces behind each line:
-[docs/DRIVERS.md](docs/DRIVERS.md).
+[docs/DRIVERS.md](docs/DRIVERS.md); every Surface Book 3 device from the hardware audit, with its status and a
+first-boot checklist: [docs/DEVICE-STATUS.md](docs/DEVICE-STATUS.md).
 
 ## How it works (short)
 
@@ -55,7 +57,8 @@ system, vendor and product partitions are used unmodified. [docs/ARCHITECTURE.md
   `android-desktop_signed_recovery_image.bin` (build CL3B.260622.271.R1 here). This repository does not distribute
   it, links to no copy of it, and contains no file from it: no binaries, libraries, modules or verbatim configs.
   The only lapis-derived text is small and listed in [LICENSES.md](LICENSES.md): our edited fstab and VINTF
-  manifest (`inject/`) and the generated list of SELinux type names in `inject/odm_sepolicy.cil`.
+  manifest (`inject/`), the generated list of SELinux type names in `inject/odm_sepolicy.cil`, and the one lapis
+  entry kept in our input exclusion list (`native/hw-gap-audit/tree/etc/excluded-input-devices.xml`).
 * A few further inputs you build or fetch yourself (busybox, systemd-boot, the AOSP software KeyMint from an Android
   emulator image, linux-firmware files, Mesa, SwiftShader, lapis's own minigbm patched by our script ...):
   [docs/INPUTS.md](docs/INPUTS.md) lists every one, where it comes from and its checksum.
@@ -64,7 +67,8 @@ system, vendor and product partitions are used unmodified. [docs/ARCHITECTURE.md
 * A **Linux x86_64 builder** (we use an Ubuntu 24.04 VM with ~120 GB of disk) for the kernel (Kleaf/Bazel), the
   Android NDK r27c builds and image work: [builder/README.md](builder/README.md).
 * Native: a Surface Book 3 13.5" with **Secure Boot disabled** (our loader and kernel are unsigned), a USB stick of
-  32 GB or more, and for dual boot free space on the internal disk.
+  32 GB or more, and for dual boot free space on the internal disk. For the cameras, the IPU4P firmware file from
+  the laptop's own Intel camera driver (Windows).
 
 ## Getting started
 
@@ -72,6 +76,8 @@ system, vendor and product partitions are used unmodified. [docs/ARCHITECTURE.md
 |---|---|
 | Run it in VMware on Windows | [docs/VMWARE.md](docs/VMWARE.md) |
 | Boot the Surface Book 3 natively from USB (`build_usb.py`) | [docs/NATIVE.md](docs/NATIVE.md) |
+| Check, flash and boot the USB stick image (`verify_image.py`, Rufus) | [docs/FLASHING.md](docs/FLASHING.md) |
+| What each Surface Book 3 device needs, and what to test first | [docs/DEVICE-STATUS.md](docs/DEVICE-STATUS.md) |
 | Install next to Windows on the internal NVMe | [native/dualboot/README_DUALBOOT.md](native/dualboot/README_DUALBOOT.md) |
 | System updates (OTA) and the A/B slot follower | [docs/OTA.md](docs/OTA.md) |
 | Build the kernel | [kernel/README.md](kernel/README.md) |
@@ -85,6 +91,7 @@ firmware, keys, logs) is excluded by [.gitignore](.gitignore).
 ```
 build_esp.py         ESP + initrd builder (VM and native trees); writes the ESP into lapis.bin
 build_usb.py         raw GPT image for a USB stick (+ partition export for the dual-boot installer)
+verify_image.py      read-only check of a built stick image before flashing (GPT, slots, boot entry, contents)
 extract_slot.py      A/B slot detection and ramdisk extraction from lapis.bin
 stage_kernel.py      fetch a kernel build from the builder, check module dependencies/vermagic, stage modules
 carve_lp.py          extract dynamic partitions (e.g. vendor_dlkm_b) from super
@@ -101,7 +108,7 @@ native/              Surface Book 3 components: audio, iptsd, power, sensors, hw
 builder/             builder VM cloud-init template and helpers
 tools/               frametime (host-side frame cadence measurement)
 legacy/              the first bring-up ISO builder (historical)
-docs/                architecture, VMware, native, OTA, drivers, inputs
+docs/                architecture, VMware, native, flashing, device status, OTA, drivers, inputs
 ```
 
 ### Environment variables
@@ -114,6 +121,7 @@ docs/                architecture, VMware, native, OTA, drivers, inputs
 | `GB_BUILDER`, `GB_BUILDER_KEY` | `builder@192.168.115.132`, `C:\GB-build\builder_key` | `stage_kernel.py` (ssh to the builder) |
 | `GB_PIPE` | `\\.\pipe\lapis_con` | `gbsh.py` (the VM's serial console pipe) |
 | `GB_SLOT` | read from lapis.bin's GPT | `build_esp.py`: force slot a/b |
+| `GB_NATIVE_TEST` | unset | `build_esp.py`: `1` writes a one-off VM ESP that boots the native tree (module/service test in VMware, [NATIVE.md](docs/NATIVE.md)) |
 | `NDK` | `/build/ndk` | builder-side build scripts |
 
 The original development setup used `C:\GB-x86` as the workspace and `C:\GB-build` for builder-side sources and

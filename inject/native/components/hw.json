@@ -1,0 +1,73 @@
+{
+ "name": "hw",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\gb_hw.sh",
+   "dest": "gb_hw.sh",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\idc\\Microsoft_Surface_045E_09AE_Keyboard.idc",
+   "dest": "vup/usr/idc/Microsoft_Surface_045E_09AE_Keyboard.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\idc\\Microsoft_Surface_045E_09AF_Touchpad.idc",
+   "dest": "vup/usr/idc/Microsoft_Surface_045E_09AF_Touchpad.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\keylayout\\Vendor_045e_Product_0921.kl",
+   "dest": "vup/usr/keylayout/Vendor_045e_Product_0921.kl",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\keylayout\\Surface_Slim_Pen_2_Keyboard.kl",
+   "dest": "vup/usr/keylayout/Surface_Slim_Pen_2_Keyboard.kl",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\etc\\excluded-input-devices.xml",
+   "dest": "vup/etc/excluded-input-devices.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153a-2.fw",
+   "dest": "firmware/rtl_nic/rtl8153a-2.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153a-3.fw",
+   "dest": "firmware/rtl_nic/rtl8153a-3.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153a-4.fw",
+   "dest": "firmware/rtl_nic/rtl8153a-4.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153b-2.fw",
+   "dest": "firmware/rtl_nic/rtl8153b-2.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153c-1.fw",
+   "dest": "firmware/rtl_nic/rtl8153c-1.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8156a-2.fw",
+   "dest": "firmware/rtl_nic/rtl8156a-2.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8156b-2.fw",
+   "dest": "firmware/rtl_nic/rtl8156b-2.fw",
+   "mode": "0644"
+  }
+ ],
+ "rc_files": [],
+ "rc_text": "service gb_hw_rapl_snap /system/bin/sh /odm/gb_hw.sh rapl-snapshot\n    user root\n    group root\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\nservice gb_hw_boot /system/bin/sh /odm/gb_hw.sh boot\n    user root\n    group root system\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\nservice gb_hw_diag /system/bin/sh /odm/gb_hw.sh diag\n    user root\n    group root system log readproc\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\non early-init\n    exec_start gb_hw_rapl_snap\n\non boot\n    start gb_hw_boot\n\non property:sys.boot_completed=1\n    start gb_hw_diag\n\non property:persist.vendor.gb.rapl.mode=*\n    start gb_hw_boot\n",
+ "build_prop": []
+}

@@ -118,8 +118,12 @@ function Add-GooglebookBootEntry([string]$EspId) {
         Write-Warn2 'firmware boot entries not readable here (bcdedit needs elevation)'
     } else {
         $fwb = $before | Where-Object { $_.Id -eq '{fwbootmgr}' } | Select-Object -First 1
-        $orderBefore = @($fwb.DisplayOrder)
-        Write-Info ("firmware boot order now: " + ($orderBefore -join ' '))
+        if ($fwb) { $orderBefore = @($fwb.DisplayOrder | Where-Object { $_ }) }
+        # without the current boot order the "Windows Boot Manager stays first" check cannot work: stop BEFORE any change
+        if ($orderBefore.Count -eq 0) {
+            if ($script:GbApply) { throw 'the firmware boot order ({fwbootmgr} displayorder) could not be read - not touching the boot configuration' }
+            Write-Warn2 'the firmware boot order could not be read'
+        } else { Write-Info ("firmware boot order now: " + ($orderBefore -join ' ')) }
     }
     $script:EspDev = $null; $script:EspVol = $null; $script:NewId = $null
     Invoke-Change 'look up the Windows device of the new ESP' "gbdisk voldev --disk $DiskNumber --id $EspId" {
@@ -132,11 +136,13 @@ function Add-GooglebookBootEntry([string]$EspId) {
     }
     Invoke-Change "copy the Windows Boot Manager firmware entry as '$EntryName'" "bcdedit /copy {bootmgr} /d `"$EntryName`"" {
         $o = Invoke-Native 'bcdedit.exe' @('/copy', '{bootmgr}', '/d', $EntryName)
-        $script:NewId = Get-GuidFromText $o
-        if (-not $script:NewId) { throw 'bcdedit /copy printed no GUID' }
+        $id = Get-GuidFromText $o
+        Assert-SafeEntryId $id                 # a real new GUID, never empty: '/set' without an id would edit {current}
+        $script:NewId = $id
     }
     try {
         Invoke-Change 'point the entry at the Googlebook ESP' 'bcdedit /set {NEW} device partition=\Device\HarddiskVolumeN' {
+            Assert-SafeEntryId $script:NewId
             try { Invoke-Native 'bcdedit.exe' @('/set', $script:NewId, 'device', "partition=$script:EspDev") | Out-Null }
             catch {
                 # fallback: give the ESP a temporary drive letter, reference it, remove the letter again
@@ -149,24 +155,34 @@ function Add-GooglebookBootEntry([string]$EspId) {
             }
         }
         Invoke-Change 'set the loader path (systemd-boot)' 'bcdedit /set {NEW} path \EFI\BOOT\BOOTX64.EFI' {
+            Assert-SafeEntryId $script:NewId
             Invoke-Native 'bcdedit.exe' @('/set', $script:NewId, 'path', '\EFI\BOOT\BOOTX64.EFI') | Out-Null
         }
         Invoke-Change 'append it to the firmware boot order (Windows Boot Manager stays first = default)' 'bcdedit /set {fwbootmgr} displayorder {NEW} /addlast' {
+            Assert-SafeEntryId $script:NewId
             Invoke-Native 'bcdedit.exe' @('/set', '{fwbootmgr}', 'displayorder', $script:NewId, '/addlast') | Out-Null
         }
         Invoke-Change 'verify the firmware boot entries' 'bcdedit /enum firmware /v' {
             $after = Get-FirmwareEntries
+            if ($after -eq $null) { throw 'bcdedit /enum firmware failed after the change' }
             $e = $after | Where-Object { $_.Id -eq $script:NewId } | Select-Object -First 1
             $fwa = $after | Where-Object { $_.Id -eq '{fwbootmgr}' } | Select-Object -First 1
             if (-not $e) { throw "new entry $script:NewId not listed" }
+            if (-not $fwa) { throw 'firmware boot manager ({fwbootmgr}) not listed' }
             if ($e.Path -ne '\EFI\BOOT\BOOTX64.EFI') { throw "entry path is '$($e.Path)'" }
-            if ($fwa.DisplayOrder[0] -ne $orderBefore[0]) { throw "first boot entry changed: $($fwa.DisplayOrder[0]) (was $($orderBefore[0]))" }
-            if (@($fwa.DisplayOrder) -notcontains $script:NewId) { throw 'new entry not in the firmware boot order' }
-            Write-Ok "entry $script:NewId '$($e.Description)' device $($e.Device) path $($e.Path); first in boot order still $($fwa.DisplayOrder[0])"
+            $orderAfter = @($fwa.DisplayOrder | Where-Object { $_ })
+            if ($orderAfter.Count -eq 0 -or $orderAfter[0] -ne $orderBefore[0]) { throw "first boot entry changed: $($orderAfter[0]) (was $($orderBefore[0]))" }
+            if ($orderAfter -notcontains $script:NewId) { throw 'new entry not in the firmware boot order' }
+            if ($orderAfter[-1] -ne $script:NewId) { throw 'new entry is not last in the firmware boot order' }
+            Write-Ok "entry $script:NewId '$($e.Description)' device $($e.Device) path $($e.Path); first in boot order still $($orderAfter[0])"
         }
     } catch {
-        if ($script:NewId -and $script:GbApply) { Write-Warn2 "rolling back: bcdedit /delete $script:NewId"; & bcdedit.exe /delete $script:NewId | Out-Null }
-        throw
+        $err = $_
+        if ($script:NewId -and $script:GbApply) {
+            try { Assert-SafeEntryId $script:NewId; Write-Warn2 "rolling back: bcdedit /delete $script:NewId"; & bcdedit.exe /delete $script:NewId | Out-Null }
+            catch { Write-Warn2 "no rollback: $($_.Exception.Message)" }
+        }
+        throw $err
     }
     return $script:NewId
 }
@@ -175,6 +191,7 @@ if ($UpdateEspOnly -or $RepairBootEntry) {
     $state = Get-InstallState
     if (-not $state) { Write-Bad "no install state at $pointer"; exit 2 }
     Write-Info "installed set: $($state.run_dir) (phase $($state.phase))"
+    if ($state.disk_id -and $state.disk_id -ne $layout.disk_id) { Write-Bad "the install state is for disk $($state.disk_id), the target is $($layout.disk_id)"; exit 2 }
     if ($UpdateEspOnly) {
         if (-not $ImageMode -and $Apply -and -not (Test-Admin)) { Write-Bad 'run from an elevated PowerShell'; exit 2 }
         if ($espM.guid -ne $state.esp_id -or $superM.guid -ne $state.super_id) {
@@ -258,12 +275,20 @@ if ($ImageMode) {
     else { Write-Bad 'Secure Boot state unknown' }
     $ac = Get-ACPower
     if ($ac -eq $true) { Write-Ok 'on AC power' } elseif ($Apply) { Write-Bad 'not on AC power (plug in the charger)' } else { Write-Warn2 'not on AC power' }
+    $fs = Get-FastStartupState
+    if ($fs -eq 'off') { Write-Ok 'Fast Startup off' }
+    else { Write-Warn2 "Fast Startup is $($fs) - after 'Shut down' Windows is hibernated with the disk layout cached. Boot Googlebook only via Restart-ToGooglebook.ps1 (a restart), or turn Fast Startup off (README)" }
     if ($isAdmin -and -not $SkipBootEntry) {
         $fw = Get-FirmwareEntries
         if ($fw -eq $null) { Write-Bad 'bcdedit /enum firmware failed' }
         else {
             $dupe = $fw | Where-Object { $_.Description -eq $EntryName }
             if ($dupe) { Write-Bad "a firmware boot entry '$EntryName' already exists ($($dupe.Id))" } else { Write-Ok "$(@($fw).Count) firmware boot entries, none named '$EntryName'" }
+            $fwb0 = $fw | Where-Object { $_.Id -eq '{fwbootmgr}' } | Select-Object -First 1
+            $first = if ($fwb0) { @($fwb0.DisplayOrder | Where-Object { $_ })[0] } else { $null }
+            if (-not $first) { Write-Bad 'the firmware boot order ({fwbootmgr} displayorder) could not be read' }
+            elseif ($first -ne '{bootmgr}') { Write-Warn2 "the first firmware boot entry is $first, not Windows Boot Manager; the installer leaves the first entry as it is" }
+            else { Write-Ok 'Windows Boot Manager is first in the firmware boot order (it stays first)' }
         }
     }
 }
@@ -277,7 +302,7 @@ $next = $layout.partitions | Where-Object { [int64]$_.offset -gt [int64]$anchor.
 if ($next) { Write-Info "next partition after it: #$($next.number) '$($next.name)' type $($next.type) at $($next.offset) (stays in place)" }
 
 Write-Step ("Plan: shrink #{0} by {1} GiB to {2}, Googlebook partitions after it, {3} MiB kept free before the next partition" -f $anchor.number, $ShrinkGB, (Format-MiB $newLen), $ReserveMiB)
-$planArgs = @('plan', '--manifest', $manifestPath, '--anchor', "$($anchor.number)", '--anchor-new-length', "$newLen",
+$planArgs = @('plan', '--manifest', $manifestPath, '--anchor', "$($anchor.number)", '--anchor-id', "$($anchor.id)", '--anchor-new-length', "$newLen",
               '--reserve', "$([int64]$ReserveMiB * $MiB)") + $target
 if ($UserdataGB -gt 0) { $planArgs += @('--userdata', "$([int64]$UserdataGB * 1GB)") }
 if ($ImageMode) { $planArgs += '--allow-truncated'; if ($ImageMinUserdataMiB -gt 0) { $planArgs += @('--min-userdata', "$([int64]$ImageMinUserdataMiB * $MiB)") } }
@@ -312,7 +337,8 @@ trap {
 $stateFile = Join-Path $runDir 'install_state.json'
 $state = [ordered]@{
     format = 'gb-dualboot-state/1'; mode = $(if ($ImageMode) { 'image' } else { 'disk' }); target = ($target -join ' ')
-    disk_number = $DiskNumber; disk_id = $layout.disk_id; run_dir = $runDir; export_dir = (Resolve-Path $ExportDir).Path
+    disk_number = $DiskNumber; disk_id = $layout.disk_id; disk_serial = $(if ($ImageMode) { $null } else { [string]$disk.SerialNumber })
+    run_dir = $runDir; export_dir = (Resolve-Path $ExportDir).Path
     manifest = (Resolve-Path $manifestPath).Path; phase = 'start'; time = (Get-Date).ToString('o')
     anchor = [ordered]@{ number = $anchor.number; id = $anchor.id; offset = [int64]$anchor.offset; original_length = [int64]$anchor.length; new_length = $newLen }
     plan = (Join-Path $runDir 'plan.json'); pre_shrink_layout = (Join-Path $runDir 'layout_pre_shrink.json')
@@ -377,6 +403,17 @@ if ($ImageMode) {
     }
 } else {
     Invoke-Change "shrink $($ShrinkDriveLetter): (NTFS + partition)" "Resize-Partition -DiskNumber $DiskNumber -PartitionNumber $($sp.PartitionNumber) -Size $newLen" {
+        # identity re-check right before the first change to the disk: same disk (GUID + serial) and the same D:
+        $d2 = Get-Disk -Number $DiskNumber
+        if ($d2.Guid -ne $disk.Guid -or [string]$d2.SerialNumber -ne [string]$disk.SerialNumber -or [int64]$d2.Size -ne [int64]$disk.Size) {
+            throw "disk $DiskNumber is no longer $($disk.Guid) / serial $($disk.SerialNumber) - not shrinking"
+        }
+        $p2 = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $sp.PartitionNumber
+        if ($p2.Guid -ne ('{' + $anchor.id + '}') -or [int64]$p2.Offset -ne [int64]$anchor.offset -or [int64]$p2.Size -ne [int64]$anchor.length -or [string]$p2.DriveLetter -ne $ShrinkDriveLetter.TrimEnd(':')) {
+            throw "partition $($sp.PartitionNumber) is no longer $($ShrinkDriveLetter): $($anchor.id) at $($anchor.offset) - not shrinking"
+        }
+        $l2 = Get-GbLayout $target
+        if ($l2.disk_id -ne $layout.disk_id) { throw 'IOCTL disk GUID changed - not shrinking' }
         Resize-Partition -DiskNumber $DiskNumber -PartitionNumber $sp.PartitionNumber -Size $newLen
         $now = [int64](Get-Partition -DiskNumber $DiskNumber -PartitionNumber $sp.PartitionNumber).Size
         if ($now -gt $newLen) { throw "partition size is $now after the shrink, expected at most $newLen" }
@@ -392,7 +429,7 @@ Invoke-Change 'GPT backup after the shrink' "gbdisk backup ... --tag post_shrink
 
 Write-Step '4. Create the Googlebook partitions'
 $planFile = Join-Path $runDir 'plan.json'
-$realPlanArgs = @('plan', '--manifest', $manifestPath, '--anchor', "$($anchor.number)", '--reserve', "$([int64]$ReserveMiB * $MiB)", '--out', $planFile) + $target
+$realPlanArgs = @('plan', '--manifest', $manifestPath, '--anchor', "$($anchor.number)", '--anchor-id', "$($anchor.id)", '--reserve', "$([int64]$ReserveMiB * $MiB)", '--out', $planFile) + $target
 if ($UserdataGB -gt 0) { $realPlanArgs += @('--userdata', "$([int64]$UserdataGB * 1GB)") }
 if ($ImageMode) { $realPlanArgs += '--allow-truncated'; if ($ImageMinUserdataMiB -gt 0) { $realPlanArgs += @('--min-userdata', "$([int64]$ImageMinUserdataMiB * $MiB)") } }
 Invoke-Change 'plan on the shrunk layout (same placement as the preview)' ("gbdisk " + ($realPlanArgs -join ' ')) {

@@ -6,9 +6,11 @@
 .DESCRIPTION
   Only partitions that (a) carry a Googlebook GPT name, (b) have a Googlebook type GUID (ESP / Linux data / the
   vbmeta type), (c) are not in the pre-install layout backup and (d) - when the install state is available - have
-  one of the installed GUIDs are deleted, and only if they form one contiguous run. Every other partition entry
-  must come out of the layout change unchanged (gbdisk verifies). D: is then extended back to its original size.
-  Without an install state (lost C:\GB-backup) it refuses unless -Force (name + type + contiguity only).
+  one of the installed GUIDs, exactly at the offset/length the install plan gave them, are deleted - and only if
+  they lie after D: (the shrunk region) with no other partition between D: and them. Every other partition entry
+  must come out of the layout change unchanged (gbdisk verifies). D: is then extended back to its original size
+  (also when the install stopped after the shrink and no Googlebook partition exists).
+  Without an install state (lost C:\GB-backup) it refuses unless -Force (name + type + "after D:" + contiguity only).
 
 .EXAMPLE
   .\uninstall_dualboot.ps1                 # dry run
@@ -72,8 +74,21 @@ if (-not $ImageMode) {
     if ($ac -eq $true) { Write-Ok 'on AC power' } elseif ($Apply) { Write-Bad 'not on AC power' } else { Write-Warn2 'not on AC power' }
 } else { Write-Info 'image mode: elevation, AC power and bcdedit do not apply' }
 
+# the partition the Googlebook set follows (D:): it bounds what may be removed, and it is extended back afterwards
+$anchor = $null
+if ($state) { $anchor = $layout.partitions | Where-Object { $_.id -eq $state.anchor.id } | Select-Object -First 1 }
+elseif (-not $ImageMode) {
+    $p = Get-Partition -DriveLetter $ExtendDriveLetter
+    if ($p.DiskNumber -ne $DiskNumber) { Write-Bad "$($ExtendDriveLetter): is on disk $($p.DiskNumber), not $DiskNumber"; exit 2 }
+    $anchor = $layout.partitions | Where-Object { [int64]$_.offset -eq [int64]$p.Offset -and [int64]$_.length -eq [int64]$p.Size } | Select-Object -First 1
+}
+if (-not $anchor) { Write-Bad 'cannot identify the partition the Googlebook set follows (D:) - nothing is removed without it'; exit 2 }
+Write-Ok "anchor: #$($anchor.number) '$($anchor.name)' $($anchor.id), $(Format-MiB $anchor.length); only partitions after it are candidates"
+$targetLen = $null
+if ($state) { $targetLen = [int64]$state.anchor.original_length }
+
 # which partitions (gbdisk decides; dry run here)
-$removeArgs = @('remove') + $target
+$removeArgs = @('remove') + $target + @('--anchor-id', "$($anchor.id)")
 if ($state) {
     if (Test-Path $state.plan) { $removeArgs += @('--plan', $state.plan) } else { Write-Warn2 "plan $($state.plan) missing" }
     if (Test-Path $state.pre_shrink_layout) { $removeArgs += @('--protect', $state.pre_shrink_layout) } else { Write-Warn2 "pre-install layout $($state.pre_shrink_layout) missing" }
@@ -81,15 +96,10 @@ if ($state) {
 if ($Force) { $removeArgs += '--force' }
 Write-Step 'Partitions to remove (gbdisk remove, dry run)'
 Invoke-GbDisk -Arguments $removeArgs | Out-Null
-$gbLeft = @($layout.partitions | Where-Object { $script:GbNames -contains $_.name })
-
-# the partition to extend back
-$anchor = $null
-if ($state) { $anchor = $layout.partitions | Where-Object { $_.id -eq $state.anchor.id } | Select-Object -First 1 }
-elseif (-not $ImageMode) { $p = Get-Partition -DriveLetter $ExtendDriveLetter; $anchor = $layout.partitions | Where-Object { [int64]$_.offset -eq [int64]$p.Offset } | Select-Object -First 1 }
-if (-not $anchor -and -not $NoExtend) { Write-Bad 'cannot identify the partition to extend (D:)' }
-$targetLen = $null
-if ($anchor -and $state) { $targetLen = [int64]$state.anchor.original_length }
+$gbLeft = @($layout.partitions | Where-Object { $script:GbNames -contains $_.name -and [int64]$_.offset -ge ([int64]$anchor.offset + [int64]$anchor.length) })
+# D: still smaller than before the install (e.g. the install stopped after the shrink): extend it even if no
+# Googlebook partitions are left
+$stillShrunk = [bool]($targetLen -and [int64]$anchor.length -lt $targetLen)
 
 $entry = $null
 if (-not $ImageMode -and -not $KeepBootEntry -and (Test-Admin)) {
@@ -127,6 +137,9 @@ elseif ($KeepBootEntry) { Write-Info 'kept (-KeepBootEntry)' }
 else {
     $eid = if ($entry) { $entry.Id } elseif ($state -and $state.entry_id) { $state.entry_id } else { $null }
     if ($eid) {
+        # never Windows Boot Manager / the firmware boot manager / anything that starts Windows
+        Assert-SafeEntryId $eid
+        if ($entry -and ($entry.Description -eq 'Windows Boot Manager' -or $entry.Path -match '\\EFI\\Microsoft\\')) { Write-Bad "entry $eid looks like Windows Boot Manager ($($entry.Description), $($entry.Path)) - not deleting it"; exit 1 }
         Invoke-Change "delete the firmware boot entry $eid" "bcdedit /delete $eid" {
             Invoke-Native 'bcdedit.exe' @('/delete', $eid) | Out-Null
             if (Find-GooglebookEntry $EntryName $eid) { throw "entry $eid still present" }
@@ -135,7 +148,7 @@ else {
     } else { Write-Info 'none to delete' }
 }
 
-if ($gbLeft.Count -eq 0) {
+if ($gbLeft.Count -eq 0 -and -not $stillShrunk) {
     Write-Step '3-5. Partitions'
     Write-Ok 'no Googlebook partitions on the target: the partition table and D: are left alone'
     if ($Apply) { Write-Ok 'done'; Stop-Transcript | Out-Null } else { Write-Host 'DRY RUN complete: nothing was changed.' -ForegroundColor White }
@@ -143,8 +156,11 @@ if ($gbLeft.Count -eq 0) {
 }
 
 Write-Step '3. Delete the Googlebook partitions'
-Invoke-Change 'remove them from the GPT (one SET_DRIVE_LAYOUT_EX, every other entry verbatim)' ("gbdisk " + (($removeArgs + '--apply') -join ' ')) {
-    Invoke-GbDisk -Arguments ($removeArgs + '--apply') | Out-Null
+if ($gbLeft.Count -eq 0) { Write-Info "none left; $($ExtendDriveLetter): is still $(Format-MiB $anchor.length) of $(Format-MiB $targetLen): giving the space back" }
+else {
+    Invoke-Change 'remove them from the GPT (one SET_DRIVE_LAYOUT_EX, every other entry verbatim)' ("gbdisk " + (($removeArgs + '--apply') -join ' ')) {
+        Invoke-GbDisk -Arguments ($removeArgs + '--apply') | Out-Null
+    }
 }
 
 Write-Step '4. Give the space back'
@@ -169,7 +185,7 @@ elseif ($ImageMode) {
 Write-Step '5. Verify against the pre-install layout'
 Invoke-Change 'compare every pre-install partition entry with the disk now' '' {
     $now = Get-GbLayout $target
-    $left = @($now.partitions | Where-Object { $script:GbNames -contains $_.name })
+    $left = @($now.partitions | Where-Object { $script:GbNames -contains $_.name -and [int64]$_.offset -gt [int64]$anchor.offset })
     if ($left.Count) { Write-Bad ('Googlebook partitions still present: ' + (($left | ForEach-Object { $_.name }) -join ', ')) } else { Write-Ok 'no Googlebook partitions left' }
     if ($state -and (Test-Path $state.pre_shrink_layout)) {
         $pre = Read-Json $state.pre_shrink_layout

@@ -1,11 +1,12 @@
 --- a/meson.build
 +++ b/meson.build
-@@ -2152,7 +2152,8 @@
+@@ -2152,7 +2152,9 @@
  elif with_gallium_radeonsi and with_gfx_compute
    error('Gallium driver radeonsi requires libelf')
  elif with_nouveau_vk
 -  error('NVK requires libelf')
-+  # libelf is only used by the NVK cubin (VK_NVX_binary_import) entrypoints, which NVK does not advertise.
++  # libelf is only used by the NVK cubin (VK_NVX_binary_import) entrypoints. Without it nvk_cubin.c is not built
++  # and src/nouveau/vulkan/meson.build defines NVK_NO_CUBIN so the extension is never advertised.
 +  warning('libelf not found: building NVK without the cubin (VK_NVX_binary_import) entrypoints')
  endif
  
@@ -54,3 +55,28 @@
  
  nvk_include_directories = [
    fs.relative_to(meson.project_build_root(), meson.current_source_dir()),
+@@ -267,6 +269,11 @@
+ 
+ nvk_flags = []
+ 
++# Built without libelf (nvk_cubin.c left out): VK_NVX_binary_import must not be advertised.
++if not dep_elf.found()
++  nvk_flags += '-DNVK_NO_CUBIN=1'
++endif
++
+ nvk_build_id = get_option('nvk-build-id')
+ if nvk_build_id != ''
+   nvk_flags += '-DNVK_BUILD_ID_OVERRIDE="' + nvk_build_id + '"'
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -336,8 +336,10 @@
+       .NV_shader_atomic_float16_vector = info->cls_eng3d >= TURING_A,
+       .NV_shader_sm_builtins = true,
+       .NVX_image_view_handle = info->cls_eng3d >= MAXWELL_A, /* needs true bindless descriptors */
++#ifndef NVK_NO_CUBIN
+       .NVX_binary_import = info->cls_eng3d >= MAXWELL_A &&
+          instance->experimental_flags & NVK_EXPERIMENTAL_DLSS,
++#endif
+       .VALVE_mutable_descriptor_type = true,
+    };
+ }

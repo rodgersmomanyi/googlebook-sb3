@@ -34,6 +34,8 @@ if (-not $EntryId) {
 $e = Find-GooglebookEntry $EntryName $EntryId
 if (-not $e) { Write-Host "No firmware boot entry '$EntryName' found - run install_dualboot.ps1 -RepairBootEntry -Apply" -ForegroundColor Red; exit 1 }
 Write-Host "Googlebook boot entry: $($e.Id) '$($e.Description)' $($e.Device) $($e.Path)"
+Assert-SafeEntryId $e.Id      # a plain GUID, never {bootmgr}/{fwbootmgr}
+if ($e.Path -ne '\EFI\BOOT\BOOTX64.EFI') { Write-Host "entry path is '$($e.Path)', not \EFI\BOOT\BOOTX64.EFI - run install_dualboot.ps1 -RepairBootEntry" -ForegroundColor Red; exit 1 }
 if ($WhatIf) {
     Write-Host "would run: bcdedit /set {fwbootmgr} bootsequence $($e.Id)"
     if (-not $NoRestart) { Write-Host 'would run: shutdown /r /t 0' }

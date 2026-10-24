@@ -4,8 +4,8 @@
 #   setprop persist.vendor.gb.nouveau 1   -> load nouveau (runpm=1 modeset=2) now / at every boot after boot_completed
 #   setprop persist.vendor.gb.nouveau 0   -> unbind + unload it again
 #   persist.vendor.gb.nouveau.args        -> extra nouveau args, e.g. "config=NvGspRm=0" (non-GSP firmware path)
-# REQUIRES gb_power with coordination/gb_power-nouveau-optin.patch: unpatched gb_power unbinds ANY driver from the dGPU
-# within 0.5 s of its "bind" uevent (by design), so nouveau would be torn down right after probing.
+# gb_power (native/power, merged + reviewed opt-in support) keeps a nouveau-bound dGPU bound while
+# persist.vendor.gb.nouveau=1, unbinds it before any base detach is confirmed, and cancels the detach if it cannot.
 # Files: /odm/vup/bin/gb_nouveau.sh (-> /vendor/bin/gb_nouveau.sh, 0755); /odm/lib/modules/{drm_exec,drm_gpuvm,
 # gpu-sched,drm_ttm_helper,nouveau}.ko (NOT in modules.load / modules.load.late); /odm/firmware/nvidia/tu117.
 service gb_nouveau /system/bin/sh /vendor/bin/gb_nouveau.sh

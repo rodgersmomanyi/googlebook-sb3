@@ -1266,6 +1266,10 @@ for _mf in sorted(_glob.glob(os.path.join(NATIVE_DIR, "components", "*.json"))):
         _COMP_FILES.append((_e["dest"], open(os.path.expandvars(_e["src"]), "rb").read(), _mode if _mode > 0o7777 else 0o100000 | _mode))
     for _r in _m.get("rc_files", []):
         _COMP_RC += b"\n# ---- component " + _m["name"].encode() + b" ----\n" + open(os.path.expandvars(_r), "rb").read()
+    if _m.get("rc_text"):
+        _COMP_RC += b"\n# ---- component " + _m["name"].encode() + b" ----\n" + _m["rc_text"].encode() + b"\n"
+    for _l in _m.get("build_prop", []):           # native /odm/etc/build.prop additions
+        ODM_BUILD_PROP_NATIVE += _l.encode() + b"\n"
     NATIVE_COMPONENTS.append(_m["name"])
 print(f"native components: {', '.join(NATIVE_COMPONENTS) or 'none'} ({len(_COMP_FILES)} files)", flush=True)
 
@@ -1514,10 +1518,13 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
         # a normal rebuild drops this entry.
         ntest = (f"{CMDLINE} gb.hw=native androidboot.boot_devices={VM_BOOT_DEVICES} "
                  f"firmware_class.path=/odm/firmware,/vendor/firmware snd_intel_dspcfg.dsp_driver=3")
-        FILES["loader/entries/gb-ntest.conf"] = (f"title   Googlebook native tree (VM test)\nlinux   /vmlinuz\n"
-                                                 f"initrd  /initrd-ntest.img\noptions {ntest}\n").encode()
-        FILES["initrd-ntest.img"] = make_initrd(INJECT_CPIO_NATIVE, SLOT)
-        FILES["loader/loader.conf"] = FILES["loader/loader.conf"].replace(f"default gb-{SLOT}".encode(), b"default gb-ntest")
+        # the native initrd (Surface firmware, camera stack, nouveau) no longer fits next to the VM entry in the
+        # 192 MiB VM ESP: this one-off ESP holds only the test entry (the next normal build restores the VM entry)
+        FILES = {"EFI/BOOT/BOOTX64.EFI": SDBOOT, "vmlinuz": KERNEL,
+                 "loader/loader.conf": b"default gb-ntest\ntimeout 3\nconsole-mode max\neditor yes\n",
+                 "loader/entries/gb-ntest.conf": (f"title   Googlebook native tree (VM test)\nlinux   /vmlinuz\n"
+                                                  f"initrd  /initrd-ntest.img\noptions {ntest}\n").encode(),
+                 "initrd-ntest.img": make_initrd(INJECT_CPIO_NATIVE, SLOT)}
         print("NATIVE TEST entry is the default for this build", flush=True)
     ESP = make_esp(FILES)
     print("CMDLINE:", CMDLINE_VM, flush=True)

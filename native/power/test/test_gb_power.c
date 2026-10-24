@@ -213,6 +213,12 @@ static void test_combine(void) {
   n = mk(ps, n, bat(b1, "BAT1", "Charging", 8750000, 17500000, 10000000, 8300000, 7600000, NULL), "surface_battery");
   combine(ps, n, &c);
   CHECK(c.ac == 1 && c.status == S_CHARGING, "11 inferred ac");
+  /* 11b. no charger supply, unplugged: the base charges the clipboard -> not AC */
+  n = 0;
+  n = mk(ps, n, bat(b1, "BAT1", "Charging", 10000000, 17500000, 5000000, 8200000, 7600000, NULL), "surface_battery");
+  n = mk(ps, n, bat(b2, "BAT2", "Discharging", 40000000, 58000000, 15000000, 11800000, 11400000, NULL), "surface_battery");
+  combine(ps, n, &c);
+  CHECK(c.ac == 0 && c.status == S_DISCHARGING && c.i_ua < 0, "11b inferred battery power: ac %d %s", c.ac, status_name(c.status));
 
   /* 12. rounding: 57.96 % -> 58, 57.94 % -> 57 (HAL: floor(x + 0.05)) */
   n = 0;
@@ -431,7 +437,7 @@ static int mock_ioctl(int fd, unsigned long req, void *arg) {
   const char *n = req == SDTX_IOCTL_EVENTS_ENABLE ? "EV" : req == SDTX_IOCTL_LATCH_CONFIRM ? "CONFIRM" :
                   req == SDTX_IOCTL_LATCH_HEARTBEAT ? "HB" : req == SDTX_IOCTL_LATCH_CANCEL ? "CANCEL" :
                   req == SDTX_IOCTL_LATCH_REQUEST ? "REQ" : NULL;
-  if (req == SDTX_IOCTL_GET_BASE_INFO) { struct gb_sdtx_base_info *b = arg; b->state = ec.base; b->base_id = ec.base == 1 ? 0x205 : 0; return 0; }
+  if (req == SDTX_IOCTL_GET_BASE_INFO) { struct sdtx_base_info *b = arg; b->state = ec.base; b->base_id = ec.base == 1 ? 0x205 : 0; return 0; }
   if (req == SDTX_IOCTL_GET_LATCH_STATUS) { *(uint16_t *)arg = ec.latch; return 0; }
   if (req == SDTX_IOCTL_GET_DEVICE_MODE) { *(uint16_t *)arg = ec.mode; return 0; }
   if (n) { strcat(ec.log, n); strcat(ec.log, " "); return 0; }
@@ -489,7 +495,7 @@ static void fake_pci(void) {
 static void test_dgpu(void) {
   set_root("tree_pci");
   fake_pci();
-  int bound = dgpu_scan("test", 1);
+  int bound = dgpu_scan("test", 1, 1);
   CHECK(bound == 0, "unbind ok, bound %d", bound);
   CHECK(!strcmp(get("/sys/bus/pci/drivers/nouveau/unbind"), "0000:02:00.0"), "unbind written: %s", get("/sys/bus/pci/drivers/nouveau/unbind"));
   CHECK(!strcmp(get("/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.0/power/control"), "auto"), "dGPU rpm auto");
@@ -502,12 +508,12 @@ static void test_dgpu(void) {
   char p[PATH_MAX];
   chmod(rpath(p, sizeof p, "/sys/bus/pci/drivers/nouveau/unbind"), 0444);
   if (access(p, W_OK)) {
-    CHECK(dgpu_scan("test", 0) == 1, "busy driver counted");
+    CHECK(dgpu_scan("test", 0, 1) == 1, "busy driver counted");
   }
   /* no dGPU (base detached) */
   set_root("tree_nopci");
   put("/sys/bus/pci/devices/.keep", "");
-  CHECK(dgpu_scan("test", 1) == 0 && g_dgpu_seen == 0, "no dGPU");
+  CHECK(dgpu_scan("test", 1, 1) == 0 && g_dgpu_seen == 0, "no dGPU");
 }
 
 static void test_dtx(void) {
@@ -516,6 +522,7 @@ static void test_dtx(void) {
   fake_pci();
   put("/dev/surface/dtx", "");
   dtx_ioctl = mock_ioctl;
+  g_race_wait_ms = 20;
   memset(&ec, 0, sizeof ec);
   ec.base = SDTX_BASE_ATTACHED; ec.latch = SDTX_LATCH_CLOSED; ec.mode = MODE_LAPTOP;
   g_dtx.fd = -1;
@@ -546,11 +553,57 @@ static void test_dtx(void) {
   ev(SDTX_EVENT_BASE_CONNECTION, SDTX_BASE_ATTACHED);
   CHECK(g_dtx.base == SDTX_BASE_ATTACHED && g_dgpu_due > 0, "attach schedules dGPU scan");
 
-  /* B. user aborts (presses the button again before the latch opened) */
+  /* B. user aborts (presses the button again before the latch opened; the latch stays closed) */
   ec.log[0] = 0;
   ev(SDTX_EVENT_REQUEST, 0);
   ev(SDTX_EVENT_REQUEST, 0);
   CHECK(!strcmp(ec.log, "HB CONFIRM ") && g_dtx.ec == EC_READY, "abort: '%s' ec %d", ec.log, g_dtx.ec);
+
+  /* B2. confirm/abort race where the latch did open: stays confirmed (no second HB/CONFIRM on the next press) until
+   * the latch closes */
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  ec.latch = SDTX_LATCH_OPENED;                   /* EC executed the confirm before the abort */
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(g_dtx.ec == EC_CONFIRMED && g_dtx.latch == SDTX_LATCH_OPENED && !strcmp(prop("vendor.gb.dtx.latch"), "opened"),
+        "race, latch open: ec %d latch %d", g_dtx.ec, g_dtx.latch);
+  ev(SDTX_EVENT_REQUEST, 0);                      /* press while open: EC closes the latch, we send nothing */
+  CHECK(!strcmp(ec.log, "HB CONFIRM ") && g_dtx.ec == EC_CONFIRMED, "press while open: '%s'", ec.log);
+  ec.latch = SDTX_LATCH_CLOSED;
+  ev(SDTX_EVENT_LATCH_STATUS, SDTX_LATCH_CLOSED);
+  CHECK(g_dtx.ec == EC_READY && g_dtx.latch == SDTX_LATCH_CLOSED, "race resolved by latch close");
+
+  /* B3. unknown EC values are ignored (base state, latch status, mode): a detach still gets confirmed */
+  ec.log[0] = 0;
+  ec.base = 0xf005;                               /* SDTX_UNKNOWN(5) */
+  ev(SDTX_EVENT_BASE_CONNECTION, 0xf005);
+  CHECK(g_dtx.base == SDTX_BASE_ATTACHED, "unknown base state ignored: 0x%x", g_dtx.base);
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB CONFIRM ") && g_dtx.ec == EC_CONFIRMED, "unknown base state does not cancel: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(g_dtx.ec == EC_READY, "B3 abort");
+  ec.base = SDTX_BASE_ATTACHED;
+  ev(SDTX_EVENT_LATCH_STATUS, 0xf007);
+  CHECK(g_dtx.latch == SDTX_LATCH_CLOSED, "unknown latch status ignored");
+  ev(SDTX_EVENT_DEVICE_MODE, 7);
+  CHECK(g_dtx.mode == MODE_LAPTOP, "unknown mode ignored");
+  ec.latch = SDTX_ERR_FAILED_TO_CLOSE;            /* hw error: re-read says still failed -> inferred open */
+  ev(SDTX_EVENT_LATCH_STATUS, SDTX_ERR_FAILED_TO_CLOSE);
+  CHECK(g_dtx.latch == SDTX_LATCH_OPENED, "failed-to-close -> open");
+  ec.latch = SDTX_LATCH_CLOSED;
+  ev(SDTX_EVENT_LATCH_STATUS, SDTX_ERR_FAILED_TO_REMAIN_OPEN);   /* re-read wins: closed */
+  CHECK(g_dtx.latch == SDTX_LATCH_CLOSED && g_dtx.ec == EC_READY, "failed-to-remain-open -> re-read closed");
+
+  /* B4. dGPU handling off (gb.dgpu=keep / -G): a detach still unbinds before confirming, runtime PM untouched */
+  g_dgpu_on = 0;
+  put("/sys/bus/pci/drivers/nouveau/unbind", "");
+  put("/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.0/power/control", "on\n");
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB CONFIRM ") && !strcmp(get("/sys/bus/pci/drivers/nouveau/unbind"), "0000:02:00.0") &&
+        !strcmp(get("/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.0/power/control"), "on"), "keep mode detach: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);
+  g_dgpu_on = 1;
 
   /* C. low clipboard battery: refuse with LATCH_CANCEL, EC echoes a request */
   ec.log[0] = 0;
@@ -611,6 +664,224 @@ static void test_dtx(void) {
   dtx_ioctl = sys_ioctl;
 }
 
+/* ---- nouveau opt-in ---- */
+/* Kernel emulation of <dev>/driver/unbind (the fake tree's attribute is a plain file): logs the write into ec.log, so
+ * its order against the DTX ioctls is checked, and drops the driver link like device_driver_detach().
+ * unbind_mode 0: ok; 1: refused (-EBUSY, link stays); 2: write "succeeds" but the function stays bound. */
+static int unbind_mode;
+static int mock_unbind(const char *path, const char *bdf) {
+  static const char *const tag[] = {"UNBIND", "UNBIND-EBUSY", "UNBIND-STUCK"};
+  strcat(ec.log, tag[unbind_mode]); strcat(ec.log, ":"); strcat(ec.log, bdf); strcat(ec.log, " ");
+  if (unbind_mode == 1) return -EBUSY;
+  int r = write_text(path, bdf);
+  if (r || unbind_mode == 2) return r;
+  char l[PATH_MAX];
+  snprintf(l, sizeof l, "%s", path);
+  *strrchr(l, '/') = 0;                           /* <dev>/driver */
+  return unlink(l) ? -errno : 0;
+}
+static int dgpu_linked(const char *bdf) {         /* driver link present? */
+  char p[PATH_MAX], t[64];
+  rpath(p, sizeof p, "/sys/bus/pci/devices/%s/driver", bdf);
+  return readlink(p, t, sizeof t) > 0;
+}
+#define FN0 "/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.0"
+#define FN1 "/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.1"
+static void bind_nouveau(void) { lnk("../../../../bus/pci/drivers/nouveau", FN0 "/driver"); put("/sys/bus/pci/drivers/nouveau/unbind", ""); }
+static void bind_hda(void) {                      /* another driver on the HDMI audio function */
+  put("/sys/bus/pci/drivers/snd_hda_intel/unbind", "");
+  lnk("../../../../bus/pci/drivers/snd_hda_intel", FN1 "/driver");
+}
+/* LATCH_CONFIRM while any dGPU function still has a driver -> "BOUND!" in the log (the unsafe case).
+ * rebind_on_hb: on the heartbeat that follows an unbind (i.e. after the dGPU pass, before the confirm), a driver binds
+ * 02:00.1 (a probe that raced the slow nouveau teardown). */
+static int rebind_on_hb;
+static int mock_ioctl_chk(int fd, unsigned long req, void *arg) {
+  if (req == SDTX_IOCTL_LATCH_HEARTBEAT && rebind_on_hb && strstr(ec.log, "UNBIND")) { rebind_on_hb = 0; bind_hda(); }
+  if (req == SDTX_IOCTL_LATCH_CONFIRM && (dgpu_linked("0000:02:00.0") || dgpu_linked("0000:02:00.1"))) strcat(ec.log, "BOUND! ");
+  return mock_ioctl(fd, req, arg);
+}
+static void optin_tree(const char *name) {
+  set_root(name);
+  fake_pci();                                     /* 02:00.0 bound to nouveau, 02:00.1 driverless */
+  bind_hda();
+  ec.log[0] = 0;
+}
+
+static void test_dgpu_optin(void) {
+  dgpu_unbind_write = mock_unbind;
+  unbind_mode = 0;
+  g_keep_cli = 0; g_keep_drv[0] = 0;
+
+  /* 1. opt-in off (property unset): any bound driver is unbound, runtime PM auto, as before */
+  optin_tree("tree_optin_off");
+  CHECK(dgpu_scan("hot-plug", 1, 1) == 0 && g_keep_drv[0] == 0 && g_dgpu_kept == 0, "off: scan");
+  CHECK(strstr(ec.log, "UNBIND:0000:02:00.0 ") && strstr(ec.log, "UNBIND:0000:02:00.1 "), "off: both unbound: '%s'", ec.log);
+  CHECK(!dgpu_linked("0000:02:00.0") && !dgpu_linked("0000:02:00.1"), "off: driver links gone");
+  CHECK(!strcmp(get("/sys/bus/pci/drivers/nouveau/unbind"), "0000:02:00.0") &&
+        !strcmp(get("/sys/bus/pci/drivers/snd_hda_intel/unbind"), "0000:02:00.1"), "off: unbind attributes written");
+  CHECK(!strcmp(get(FN0 "/power/control"), "auto") && !strcmp(get(FN1 "/power/control"), "auto") &&
+        !strcmp(get("/sys/devices/pci0000:00/0000:00:1d.4/power/control"), "auto"), "off: rpm auto");
+  /* property 0 is the same as unset */
+  prop_set("persist.vendor.gb.nouveau", "0");
+  optin_tree("tree_optin_zero");
+  CHECK(dgpu_scan("hot-plug", 0, 1) == 0 && g_keep_drv[0] == 0 && !dgpu_linked("0000:02:00.0") &&
+        !dgpu_linked("0000:02:00.1") && !strcmp(get(FN0 "/power/control"), "auto"), "property 0: unbound: '%s'", ec.log);
+
+  /* 2. opt-in on: the nouveau function stays bound with power/control untouched; other drivers are still unbound */
+  prop_set("persist.vendor.gb.nouveau", "1");
+  optin_tree("tree_optin_on");
+  put(FN0 "/d3cold_allowed", "0\n");
+  CHECK(dgpu_scan("hot-plug", 0, 1) == 0, "on: kept driver not counted as bound");
+  CHECK(!strcmp(g_keep_drv, "nouveau") && g_dgpu_kept == 1, "on: keep '%s' kept %d", g_keep_drv, g_dgpu_kept);
+  CHECK(!strstr(ec.log, "0000:02:00.0") && dgpu_linked("0000:02:00.0") && !strcmp(get("/sys/bus/pci/drivers/nouveau/unbind"), ""),
+        "on: nouveau left bound: '%s'", ec.log);
+  CHECK(!strcmp(get(FN0 "/power/control"), "on"), "on: kept function's power/control untouched");
+  CHECK(!strcmp(get(FN0 "/d3cold_allowed"), "1"), "on: d3cold still allowed on the kept function");
+  CHECK(strstr(ec.log, "UNBIND:0000:02:00.1 ") && !dgpu_linked("0000:02:00.1") && !strcmp(get(FN1 "/power/control"), "auto"),
+        "on: other driver (snd_hda_intel) unbound: '%s'", ec.log);
+  CHECK(!strcmp(get("/sys/devices/pci0000:00/0000:00:1d.4/power/control"), "auto"), "on: root port rpm auto");
+  ec.log[0] = 0;
+  CHECK(dgpu_scan("report", 1, 1) == 0 && dgpu_linked("0000:02:00.0") && ec.log[0] == 0, "on: report pass keeps it too");
+  /* a bind uevent (nouveau loaded at runtime) schedules the pass that leaves it bound */
+  struct uev u = {.action = "bind", .subsystem = "pci", .devpath = "/devices/pci0000:00/0000:00:1d.4/0000:02:00.0",
+                  .pci_id = "10DE:1F91"};
+  g_dgpu_due = -1;
+  uev_handle(&u);
+  CHECK(g_dgpu_due > 0, "on: bind uevent schedules a pass");
+
+  /* 3. opt-in on, detach request with nouveau bound: unbound and verified gone BEFORE LATCH_CONFIRM, extra heartbeat */
+  put("/dev/surface/dtx", "");
+  dtx_ioctl = mock_ioctl_chk;
+  g_race_wait_ms = 20;
+  memset(&ec, 0, sizeof ec);
+  ec.base = SDTX_BASE_ATTACHED; ec.latch = SDTX_LATCH_CLOSED; ec.mode = MODE_LAPTOP;
+  g_dtx.fd = -1;
+  CHECK(dtx_open() == 0 && g_dtx.fd >= 0, "on: dtx open");
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND:0000:02:00.0 HB CONFIRM "), "on: detach unbinds nouveau, then confirms: '%s'", ec.log);
+  CHECK(g_dtx.ec == EC_CONFIRMED && !dgpu_linked("0000:02:00.0") &&
+        !strcmp(get("/sys/bus/pci/drivers/nouveau/unbind"), "0000:02:00.0"), "on: confirmed with the driver gone");
+  CHECK(!strcmp(get(FN0 "/power/control"), "auto"), "on: driverless after the detach pass -> rpm auto");
+  ev(SDTX_EVENT_REQUEST, 0);                      /* user aborts; the latch never opened */
+  CHECK(g_dtx.ec == EC_READY, "on: abort -> ready");
+
+  /* 3b. opt-in on, nouveau not bound (not loaded yet): plain detach, no extra heartbeat */
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB CONFIRM "), "on, nothing bound: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);
+
+  /* 3c. nouveau binds while a detach is under way (gb_nouveau.sh's insmod or a re-probe racing the button): the
+   * bind-triggered pass (and any other pass) unbinds it again instead of leaving it bound while the base can be pulled;
+   * once the latch is closed again (detach over) it is kept as usual */
+  bind_nouveau();
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND:0000:02:00.0 HB CONFIRM ") && g_dtx.ec == EC_CONFIRMED, "3c confirmed: '%s'", ec.log);
+  bind_nouveau();                                 /* probe done after the confirm, latch still opening */
+  put(FN0 "/power/control", "on\n");              /* as nouveau's teardown leaves it (pm_runtime_forbid) */
+  ec.log[0] = 0;
+  CHECK(dgpu_scan("hot-plug", 0, 1) == 0 && !dgpu_linked("0000:02:00.0") && !strcmp(ec.log, "UNBIND:0000:02:00.0 "),
+        "on, confirmed: late bind unbound: '%s'", ec.log);
+  CHECK(!strcmp(get(FN0 "/power/control"), "auto"), "on, confirmed: late-bound function back to rpm auto");
+  ec.latch = SDTX_LATCH_OPENED;
+  ev(SDTX_EVENT_LATCH_STATUS, SDTX_LATCH_OPENED);
+  bind_nouveau();
+  ec.log[0] = 0;
+  CHECK(dgpu_scan("report", 1, 1) == 0 && !dgpu_linked("0000:02:00.0") && !strcmp(ec.log, "UNBIND:0000:02:00.0 "),
+        "on, latch open: late bind unbound: '%s'", ec.log);
+  ec.latch = SDTX_LATCH_CLOSED;                   /* clipboard not pulled: the EC closes the latch again */
+  ev(SDTX_EVENT_LATCH_STATUS, SDTX_LATCH_CLOSED);
+  bind_nouveau();
+  ec.log[0] = 0;
+  CHECK(g_dtx.ec == EC_READY && dgpu_scan("hot-plug", 0, 1) == 0 && dgpu_linked("0000:02:00.0") && ec.log[0] == 0,
+        "on, detach over: nouveau kept again: '%s'", ec.log);
+
+  /* 3d. a driver binds between the (slow) unbind pass and the confirm: the last look before LATCH_CONFIRM cancels */
+  rebind_on_hb = 1;
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND:0000:02:00.0 HB CANCEL ") && g_dtx.ec == EC_IN_PROGRESS && dgpu_linked("0000:02:00.1"),
+        "on, rebound before the confirm -> cancel: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);                      /* EC echoes the cancel */
+  CHECK(g_dtx.ec == EC_READY && !strstr(ec.log, "CONFIRM"), "3d: ready, never confirmed");
+  ec.log[0] = 0;
+  CHECK(dgpu_scan("hot-plug", 0, 1) == 0 && !dgpu_linked("0000:02:00.1") && !strcmp(ec.log, "UNBIND:0000:02:00.1 "),
+        "3d: snd_hda_intel unbound by the next pass: '%s'", ec.log);
+
+  /* 4. opt-in on, nouveau refuses the unbind: detach canceled, no confirm */
+  bind_nouveau();
+  unbind_mode = 1;
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND-EBUSY:0000:02:00.0 CANCEL ") && g_dtx.ec == EC_IN_PROGRESS && dgpu_linked("0000:02:00.0"),
+        "on: unbind refused -> cancel: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);                      /* EC echoes the cancel as a request event */
+  CHECK(g_dtx.ec == EC_READY && !strstr(ec.log, "CONFIRM"), "on: refused -> ready, never confirmed");
+
+  /* 5. opt-in on, the unbind write returns success but the driver link stays: the check catches it -> cancel */
+  unbind_mode = 2;
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND-STUCK:0000:02:00.0 CANCEL ") && dgpu_linked("0000:02:00.0"),
+        "on: driver still bound after unbind -> cancel: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(g_dtx.ec == EC_READY, "on: stuck -> ready");
+  unbind_mode = 0;
+
+  /* 6. opt-in on with -G / gb.dgpu=keep: the detach still unbinds (and verifies), runtime PM left alone */
+  g_dgpu_on = 0;
+  put(FN0 "/power/control", "on\n");
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND:0000:02:00.0 HB CONFIRM ") && !dgpu_linked("0000:02:00.0") &&
+        !strcmp(get(FN0 "/power/control"), "on"), "on + -G: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);
+  g_dgpu_on = 1;
+
+  /* 7. runtime opt-out (setprop persist.vendor.gb.nouveau 0): the next pass unbinds nouveau again; a detach is the
+   * plain reviewed sequence (one heartbeat, no extra one) */
+  bind_nouveau();
+  bind_hda();
+  prop_set("persist.vendor.gb.nouveau", "0");
+  ec.log[0] = 0;
+  CHECK(dgpu_scan("hot-plug", 0, 1) == 0 && g_keep_drv[0] == 0 && !dgpu_linked("0000:02:00.0") && !dgpu_linked("0000:02:00.1"),
+        "opt-out: unbound again: '%s'", ec.log);
+  bind_nouveau();
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND:0000:02:00.0 CONFIRM ") && g_dtx.ec == EC_CONFIRMED, "off: detach as before: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);
+  bind_nouveau();
+  unbind_mode = 1;
+  ec.log[0] = 0;
+  ev(SDTX_EVENT_REQUEST, 0);
+  CHECK(!strcmp(ec.log, "HB UNBIND-EBUSY:0000:02:00.0 CANCEL "), "off: refused unbind still cancels: '%s'", ec.log);
+  ev(SDTX_EVENT_REQUEST, 0);
+  unbind_mode = 0;
+  dtx_close();
+  dtx_ioctl = sys_ioctl;
+
+  /* 8. -K <driver> on the command line wins over the property; only that driver is kept */
+  optin_tree("tree_optin_cli");
+  char root[PATH_MAX];
+  snprintf(root, sizeof root, "%s", g_root);
+  char *argv[] = {"gb_power", "-o", "-r", root, "-K", "nouveau", NULL};
+  optind = 1;
+  CHECK(gb_power_main(6, argv) == 0 && g_keep_cli && !strcmp(g_keep_drv, "nouveau"), "-K parsed");
+  prop_set("persist.vendor.gb.nouveau", "0");
+  CHECK(dgpu_scan("hot-plug", 0, 1) == 0 && dgpu_linked("0000:02:00.0") && !dgpu_linked("0000:02:00.1"), "-K nouveau beats property 0");
+  snprintf(g_keep_drv, sizeof g_keep_drv, "snd_hda_intel");
+  bind_hda();
+  prop_set("persist.vendor.gb.nouveau", "1");
+  CHECK(dgpu_scan("hot-plug", 0, 1) == 0 && !dgpu_linked("0000:02:00.0") && dgpu_linked("0000:02:00.1"), "-K other driver: nouveau unbound");
+  g_keep_cli = 0; g_keep_drv[0] = 0;
+  prop_set("persist.vendor.gb.nouveau", "");
+  dgpu_unbind_write = write_text;
+}
+
 static void test_profile(void) {
   set_root("tree_prof");
   CHECK(profile_apply("balanced") == -1, "no interface");
@@ -654,6 +925,7 @@ int main(int argc, char **argv) {
   test_uevent();
   test_dgpu();
   test_dtx();
+  test_dgpu_optin();
   test_profile();
   test_main_once();
   printf("\n%d checks, %d failures\n", checks, fails);

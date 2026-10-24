@@ -1,0 +1,20 @@
+{
+ "name": "nouveau",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_nouveau.sh",
+   "dest": "vup/bin/gb_nouveau.sh",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_dgpu_check.sh",
+   "dest": "vup/bin/gb_dgpu_check.sh",
+   "mode": "0755"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_nouveau.rc"
+ ],
+ "rc_text": "",
+ "build_prop": []
+}

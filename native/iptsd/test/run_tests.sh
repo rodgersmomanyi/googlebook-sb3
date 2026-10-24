@@ -6,6 +6,8 @@
 #  3. End to end: gb_iptsd.sh under mksh (Android's /system/bin/sh) finds a fake "IPTS 045E:09B2" uhid device, writes
 #     the IDCs, runs the Android iptsd in a chroot holding the /odm/etc/iptsd tree at its compiled-in path;
 #     uhid_e2e.py checks the uinput touchscreen/stylus output, a fake resume and a device re-creation.
+#  4. ipts.ko reload after repeated immediate iptsd failures. 5. persist.gb.iptsd.disable: bounded wait for the
+#     persist properties, then idle (init would restart an exited service every 5 s).
 set -u
 T=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-/build/native/iptsd/out}
@@ -47,16 +49,20 @@ mount --bind /dev "$CH/dev"
 printf '#!/bin/sh\nexec chroot %s /vendor/bin/iptsd "$@"\n' "$CH" > "$W/iptsd-chroot"; chmod +x "$W/iptsd-chroot"
 # iptsd-check-device builds the full iptsd application, so it also needs the presets (screen size) -> chroot too
 printf '#!/bin/sh\nexec chroot %s /vendor/bin/iptsd-check-device "$@"\n' "$CH" > "$W/check-chroot"; chmod +x "$W/check-chroot"
-mkdir -p "$W/stubs" "$W/static_idc" "$W/idc"
-printf '#!/bin/sh\nexit 0\n' > "$W/stubs/getprop"
+# The runtime IDC dir mimics /odm/usr/idc: NOT pre-created, and the launcher runs with init's service umask (077), so
+# the test checks that system_server could search it (0755) and read the files (0644).
+IDCD=$W/odm/usr/idc
+mkdir -p "$W/stubs" "$W/static_idc" "$W/odm"
+# getprop stub: persist properties are "loaded"; everything else is unset
+printf '#!/bin/sh\n[ "$1" = ro.persistent_properties.ready ] && echo true\nexit 0\n' > "$W/stubs/getprop"
 printf '#!/bin/sh\necho "stub $(basename $0) $*"\n' > "$W/stubs/rmmod"; cp "$W/stubs/rmmod" "$W/stubs/insmod"
 chmod +x "$W/stubs/"*
 cp "$OUT/idc/"*.idc "$W/static_idc/"
 echo 0 > "$W/suspend_success"
-env GB_IPTSD_BIN="$W/iptsd-chroot" GB_IPTSD_CHECK="$W/check-chroot" GB_IPTSD_IDC="$W/idc" \
+( umask 077; exec env GB_IPTSD_BIN="$W/iptsd-chroot" GB_IPTSD_CHECK="$W/check-chroot" GB_IPTSD_IDC="$IDCD" \
 	GB_IPTSD_STATIC_IDC="$W/static_idc" GB_IPTSD_KO=/nonexistent/ipts.ko GB_IPTSD_USERCONF="$W/none.conf" \
 	GB_IPTSD_SUSPEND_STATS="$W/suspend_success" GB_IPTSD_POLL=1 PATH="$W/stubs:$PATH" \
-	setsid mksh "$OUT/gb_iptsd.sh" > "$W/launcher.log" 2>&1 &
+	setsid mksh "$OUT/gb_iptsd.sh" ) > "$W/launcher.log" 2>&1 &
 LPID=$!
 sleep 1
 python3 "$T/uhid_e2e.py" --desc-h "$DESC_H" --suspend "$W/suspend_success" --recreate 2>&1 | tee "$W/e2e_eds1.txt"
@@ -75,10 +81,13 @@ grep -q "reloading the ipts driver" "$W/launcher.log" && grep -q "stub rmmod ipt
 	&& grep -q "stub insmod /nonexistent/ipts.ko" "$W/launcher.log" && echo "ok module reload attempted" \
 	|| { echo "FAIL no module reload"; rc=1; }
 kill -TERM -$LPID 2> /dev/null; sleep 1; kill -KILL -$LPID 2> /dev/null
+m=$(stat -c %a "$W/odm/usr" "$IDCD" | tr '\n' ' '); f=$(stat -c %a "$IDCD"/*.idc | sort -u | tr '\n' ' ')
+[ "$m" = "755 755 " ] && [ "$f" = "644 " ] && echo "ok runtime IDC dir modes under umask 077 (dirs $m files $f)" \
+	|| { echo "FAIL runtime IDC modes: dirs $m files $f (system_server could not read them)"; rc=1; }
 
 echo "=== 4. iptsd failing immediately on a present device -> ipts.ko reload after 5 failures"
 printf '#!/bin/sh\necho "fake iptsd failing on $1"\nexit 1\n' > "$W/iptsd-fail"; chmod +x "$W/iptsd-fail"
-env GB_IPTSD_BIN="$W/iptsd-fail" GB_IPTSD_CHECK="$W/check-chroot" GB_IPTSD_IDC="$W/idc" \
+env GB_IPTSD_BIN="$W/iptsd-fail" GB_IPTSD_CHECK="$W/check-chroot" GB_IPTSD_IDC="$IDCD" \
 	GB_IPTSD_STATIC_IDC="$W/static_idc" GB_IPTSD_KO=/nonexistent/ipts.ko GB_IPTSD_USERCONF="$W/none.conf" \
 	GB_IPTSD_SUSPEND_STATS="$W/no_such_file" GB_IPTSD_POLL=1 PATH="$W/stubs:$PATH" \
 	setsid mksh "$OUT/gb_iptsd.sh" > "$W/launcher_fail.log" 2>&1 &
@@ -97,8 +106,22 @@ cat "$W/launcher_fail.log"
 grep -q "iptsd failed 5 times in a row" "$W/launcher_fail.log" && grep -q "stub rmmod ipts" "$W/launcher_fail.log" \
 	&& grep -q "no $W/no_such_file: no restart after resume" "$W/launcher_fail.log" \
 	&& echo "ok reload after repeated failures" || { echo "FAIL no reload after repeated failures"; rc=1; }
+
+echo "=== 5. persist.gb.iptsd.disable=1 with persist properties never 'ready': bounded wait, then idle (no exit)"
+mkdir -p "$W/stubs2"; cp "$W/stubs/rmmod" "$W/stubs/insmod" "$W/stubs2/"
+printf '#!/bin/sh\n[ "$1" = persist.gb.iptsd.disable ] && echo 1\nexit 0\n' > "$W/stubs2/getprop"; chmod +x "$W/stubs2/"*
+env GB_IPTSD_BIN="$W/iptsd-fail" GB_IPTSD_IDC="$IDCD" GB_IPTSD_PROPWAIT=5 GB_IPTSD_SUSPEND_STATS="$W/no_such_file" \
+	PATH="$W/stubs2:$PATH" setsid mksh "$OUT/gb_iptsd.sh" > "$W/launcher_disabled.log" 2>&1 &
+LPID=$!
+sleep 5
+alive=0; kill -0 $LPID 2> /dev/null && alive=1
+kill -TERM -$LPID 2> /dev/null; sleep 1; kill -KILL -$LPID 2> /dev/null
+cat "$W/launcher_disabled.log"
+[ $alive = 1 ] && [ "$(grep -c 'disabled (persist.gb.iptsd.disable=1)' "$W/launcher_disabled.log")" = 1 ] \
+	&& ! grep -q "fake iptsd" "$W/launcher_disabled.log" && echo "ok disabled: idles, logged once, iptsd not run" \
+	|| { echo "FAIL disabled handling (alive=$alive)"; rc=1; }
 umount "$CH/dev"
 echo "--- launcher log"; cat "$W/launcher.log"
-echo "--- runtime IDCs"; for f in "$W/idc/"*; do echo "## $f"; cat "$f"; done
+echo "--- runtime IDCs"; for f in "$IDCD/"*; do echo "## $f"; cat "$f"; done
 echo "=== RESULT: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc

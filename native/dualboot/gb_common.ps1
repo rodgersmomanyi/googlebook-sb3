@@ -63,6 +63,18 @@ function Get-SecureBootState {
     return 'unknown'
 }
 
+# Windows Fast Startup (hybrid shutdown: "Shut down" hibernates the kernel with the disks' state cached). Readable
+# without elevation. 'on' / 'off' / 'unknown'.
+function Get-FastStartupState {
+    try {
+        $hb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction Stop).HiberbootEnabled
+        $he = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -ErrorAction SilentlyContinue).HibernateEnabled
+        if ($hb -eq 0 -or $he -eq 0) { return 'off' }
+        if ($hb -eq 1) { return 'on' }
+    } catch { }
+    return 'unknown'
+}
+
 # $true on AC, $false on battery, $null unknown
 function Get-ACPower {
     try {
@@ -90,34 +102,58 @@ function Get-BitLockerState([string]$Letter) {
         $sh = New-Object -ComObject Shell.Application
         $val = $sh.NameSpace($mp + '\').Self.ExtendedProperty('System.Volume.BitLockerProtection')
         if ($val -eq 2) { return @('off', 'shell property: protection off') }
-        if ($val -eq $null -or $val -eq 0) { return @('off', 'shell property: not BitLocker capable/none') }
+        # no value (or 0) does NOT prove the volume is unencrypted: report unknown (fails the check with -Apply)
+        if ($val -eq $null -or $val -eq 0) { return @('unknown', "shell property empty ($val)") }
         return @('on', "shell property value $val")
     } catch { }
     return @('unknown', 'no BitLocker query worked')
 }
 
-# bcdedit /enum firmware parsed into objects (Id, Description, Device, Path, Raw). Requires elevation.
+# bcdedit /v prints well-known objects by GUID, not by alias; mapped back so callers can compare with '{fwbootmgr}'
+# and '{bootmgr}' (Windows Boot Manager).
+$script:BcdWellKnown = @{ '{a5a30fa2-3d06-4e9f-b5f4-a01df9d1fcba}' = '{fwbootmgr}'; '{9dea862c-5cdd-4e70-acc1-f32b344d4795}' = '{bootmgr}' }
+function ConvertTo-BcdAlias([string]$Id) {
+    $k = $Id.Trim().ToLowerInvariant()
+    if ($script:BcdWellKnown.ContainsKey($k)) { return $script:BcdWellKnown[$k] }
+    return $Id.Trim()
+}
+
+# A BCD id that bcdedit /set or /delete may be given for the Googlebook entry: a plain GUID, never empty (bcdedit
+# /set without an id changes {current}, the running Windows loader) and never a well-known Windows object.
+function Assert-SafeEntryId([string]$Id) {
+    if (-not $Id -or $Id -notmatch '^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$') { throw "refusing: '$Id' is not a BCD entry GUID" }
+    if ((ConvertTo-BcdAlias $Id) -ne $Id.Trim()) { throw "refusing: $Id is a well-known Windows boot object" }
+}
+
+# bcdedit /enum firmware /v parsed into objects (Id, Description, Device, Path, DisplayOrder). Requires elevation.
+# The ids of the firmware boot manager and Windows Boot Manager come back as '{fwbootmgr}' / '{bootmgr}'.
 function Get-FirmwareEntries {
     $ErrorActionPreference = 'Continue'      # PS 5.1: redirected native stderr must not become a terminating error
     $out = & bcdedit.exe /enum firmware /v 2>&1
     if ($LASTEXITCODE -ne 0) { return $null }
-    $entries = @(); $cur = $null
-    foreach ($line in $out) {
+    return (ConvertFrom-BcdEnum $out)
+}
+
+# Parser for bcdedit /enum output (separate from the bcdedit call so it can be tested offline).
+function ConvertFrom-BcdEnum([object[]]$Lines) {
+    $entries = @(); $cur = $null; $lastKey = ''
+    foreach ($line in $Lines) {
         $l = [string]$line
-        if ($l -match '^\s*$') { if ($cur) { $entries += $cur; $cur = $null }; continue }
+        if ($l -match '^\s*$') { if ($cur) { $entries += $cur; $cur = $null }; $lastKey = ''; continue }
         if ($l -match '^-+$') { continue }
-        if ($l -match '^(identifier|description|device|path|displayorder|default)\s+(.*)$') {
+        if ($l -cmatch '^([a-z]+)\s+(.*)$') {          # element lines (lower-case names); headers start upper-case
             if (-not $cur) { $cur = [pscustomobject]@{ Id = ''; Description = ''; Device = ''; Path = ''; DisplayOrder = @() } }
-            $k = $Matches[1]; $v = $Matches[2].Trim()
+            $k = $Matches[1]; $v = $Matches[2].Trim(); $lastKey = $k
             switch ($k) {
-                'identifier' { $cur.Id = $v }
+                'identifier' { $cur.Id = ConvertTo-BcdAlias $v }
                 'description' { $cur.Description = $v }
                 'device' { $cur.Device = $v }
                 'path' { $cur.Path = $v }
-                'displayorder' { $cur.DisplayOrder = @($v) }
+                'displayorder' { $cur.DisplayOrder = @(ConvertTo-BcdAlias $v) }
             }
         } elseif ($cur -and $l -match '^\s+(\{[0-9a-fA-F-]{36}\})\s*$') {
-            $cur.DisplayOrder += $Matches[1]
+            # continuation line of a list element: only displayorder is collected
+            if ($lastKey -eq 'displayorder') { $cur.DisplayOrder += (ConvertTo-BcdAlias $Matches[1]) }
         } elseif (-not $cur -and $l -notmatch '^\s') {
             $cur = [pscustomobject]@{ Id = ''; Description = ''; Device = ''; Path = ''; DisplayOrder = @() }
         }

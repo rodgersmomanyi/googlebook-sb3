@@ -94,15 +94,17 @@ an older kernel); forced EDID through debugfs `edid_override`; `gb_layout` (2560
 the system EGL (`ro.hardware.egl=mesa`, SkiaGL) with patched minigbm; SwiftShader as the Vulkan HAL; hwcomposer and
 SurfaceFlinger tuning for a VM; `gb_vmtools`, `gb_absmouse`, the AT keyboard IDC marked external, touchpad-inhibitor
 stubbed; VMware HD Audio; Bluetooth features marked unavailable; `gb_console` root shell on COM2; stay-awake and
-diagnostics; optional network ADB for scrcpy.
+diagnostics; optional network ADB for scrcpy, together with the eth0 watchdog `gb_netwatch`.
 
 ### Native tree only (`/gbnative`)
 
 Our module set (two passes: `gbinit` before Android, `gb_modules.sh` at early-init for modules that must link against
-lapis's first-stage `mfd-core`/`platform_profile`), the Surface Book 3 firmware, the native `build.prop`
+lapis's first-stage `mfd-core`/`platform_profile`; nouveau staged for on-demand loading only; never a copy of a
+module lapis loads in its first stage, see [NATIVE.md](NATIVE.md)), the Surface Book 3 firmware, the native `build.prop`
 (320 dpi, no colour pipeline in the composer for i915), refusing stubs for every firmware/EC/SPI flashing tool and
 the disk installer, `gb_bootlog` (writes `gblog\bootN-tSECONDS.txt` to the boot partition at 40/90/180/420 s, since
-there is no serial console), and the components from `inject/native/components/*.json` (audio, iptsd, power, ...).
+there is no serial console), and the components from `inject/native/components/*.json` (audio, iptsd, power, hw,
+sensors, camera, nouveau, nvk; manifests may add rc text and native `build.prop` lines, e.g. `ro.hardware.camera=sb3`).
 Nothing VMware-specific; `gb_console` is left out because the LPSS UART carries the Surface Aggregator.
 
 ## Kernel command lines

@@ -10,6 +10,14 @@ bin/vulkan.nouveau.so      NVK ICD as an Android hwvulkan HAL module (exports HM
                            SONAME vulkan.nouveau.so, stripped. Install: /vendor/lib64/hw/vulkan.nouveau.so (tree
                            path vup/lib64/hw/). Inert there: libvulkan only loads vulkan.<ro.hardware.vulkan>.so and
                            lapis sets ro.hardware.vulkan=intel (vendor build.prop).
+                           sha256 f7e9154f2e049cdfbb8fc3c1d92815eb96a4b22b5105a04f625eeb41fadf0723 (verification
+                           rebuild with the corrected patch 0002, see section 7). The first delivery (f727a064...,
+                           moved to superseded/) advertised VK_NVX_binary_import under NVK_EXPERIMENTAL=dlss although
+                           its entrypoints were compiled out.
+                           Note: NVK's meson does not apply Mesa's Android version script, so the .so exports 3157
+                           dynamic symbols (Rust std/crates, static libc++, static libdrm, nak_*/nil_*), not only
+                           HMI + vk_icd*. With RTLD_LOCAL loading and -Bsymbolic (DT_SYMBOLIC) nothing is
+                           interposed; it only costs ~0.3 MB of dynsym/dynstr.
 bin/nvk_probe              NDK test binary (/vendor/bin/nvk_probe, tree vup/bin/). dlopens the ICD directly.
 bin/nvk_probe_host         same source built for Linux/glibc (validation only; not for the device).
 patches/0001-*.patch       NVK: a gralloc buffer with a foreign DRM modifier (e.g. Intel Y-tiled from minigbm) now
@@ -17,8 +25,13 @@ patches/0001-*.patch       NVK: a gralloc buffer with a foreign DRM modifier (e.
                            BlockLinearModifier::try_from(mod).unwrap() in nil/image.rs (new_tiled) -> Rust panic ->
                            the whole process aborts.
 patches/0002-*.patch       Build NVK without libelf (no libelf in the NDK). libelf is used only by nvk_cubin.c
-                           (VK_NVX_binary_import cubin entrypoints); NVK 26.3 does not advertise that extension
-                           (no NVX in nvk_physical_device.c), so nothing user-visible is lost.
+                           (VK_NVX_binary_import cubin entrypoints). CORRECTED: NVK 26.3 does advertise
+                           VK_NVX_binary_import when NVK_EXPERIMENTAL=dlss is set (nvk_physical_device.c:339; on
+                           Android also `setprop debug.mesa.nvk.experimental dlss`, see util/os_misc.c). The first
+                           version of this patch only dropped nvk_cubin.c, so with that opt-in the extension was
+                           listed while vkCreateCuModuleNVX & co. returned NULL (reproduced with drm-shim:
+                           logs/verify/chroot_shim_orig.log). The patch now also defines NVK_NO_CUBIN and stops
+                           advertising the extension (logs/verify/chroot_fixed.log). Default behaviour is unchanged.
 scripts/                   00_env.sh, 10_build_host_clc.sh (host mesa_clc/vtn_bindgen2, needed because NVK
                            compiles its OpenCL-C meta kernels at build time), 20_build_nvk_android.sh,
                            30_build_probe.sh, 35_build_drm_shim_test.sh + 40_bionic_chroot_test.sh (builder-only
@@ -40,8 +53,11 @@ logs/                      build, host-validation and bionic-chroot test logs.
 - Module ORDER MATTERS: i915 must register its DRM device BEFORE nouveau, i.e. i915 = card0/renderD128.
   lapis' minigbm (libminigbm_gralloc.so, allocator-service.minigbm, libgbm.so) has a "nouveau" (dumb) backend
   (strings: backend_nouveau) and opens the first render node it can drive. If nouveau ever becomes renderD128,
-  gralloc and HWC would try to use the NVIDIA GPU -> no display. Load nouveau late (modules.load.late or gb_power
-  opt-in) and check `ls -l /sys/class/drm/renderD128/device/driver` -> i915.
+  gralloc and HWC would try to use the NVIDIA GPU -> no display. CORRECTED: nouveau must NOT go into modules.load or
+  modules.load.late (that would load it, and power the dGPU, at every boot, against the "dGPU off" default). It is
+  loaded only on demand by the nouveau-kernel component's gb_nouveau service (native/gb_nouveau.rc:
+  sys.boot_completed=1 && persist.vendor.gb.nouveau=1), long after i915 has registered renderD128. Check
+  `ls -l /sys/class/drm/renderD128/device/driver` -> i915.
 - Runtime PM / detach: gb_power keeps the dGPU unbound by default; persist.vendor.gb.nouveau=1 leaves it on nouveau
   (runpm=1) and unbinds it before a confirmed detach. Any process holding NVK at that moment gets
   VK_ERROR_DEVICE_LOST (or dies). Acceptable for test binaries, NOT for SurfaceFlinger (see 4b).
@@ -105,7 +121,8 @@ B4-B6 make it a poor trade on this machine. Do not add an "NVIDIA" boot entry.
 
 5. What nvk_probe measures (run natively; results decide whether any of this is worth pursuing)
 -----------------------------------------------------------------------------------------------
-  setprop persist.vendor.gb.nouveau 1   (gb_power keeps nouveau bound; reboot or re-attach so nouveau loads)
+  setprop persist.vendor.gb.nouveau 1   (after boot_completed, gb_nouveau.rc loads nouveau immediately and at every
+                                         later boot; gb_power needs the nouveau opt-in patch so it stays bound)
   /vendor/bin/nvk_probe -n 200 -o /data/local/tmp/nvk.ppm      (as root; or: setprop vendor.gb.nvk_probe 1 and
                                                                read /data/vendor/nvk/probe.txt)
   test offscreen     : instance/device on the GTX 1650, NAK pipeline compile, render+copy, pixel check, timing.
@@ -120,6 +137,8 @@ B4-B6 make it a poor trade on this machine. Do not add an "NVIDIA" boot entry.
 6. Validation actually performed (builder VM: VMware vmwgfx GPU only, no NVIDIA hardware)
 -----------------------------------------------------------------------------------------
 - Build: Mesa NVK for Android x86_64 builds cleanly (logs/nvk_build.log); host mesa_clc built (logs/host_clc.log).
+  Note: logs/nvk_build.log is from the earlier patchelf variant (16549321 bytes); the shipped binary's build log is
+  logs/verify/fixed_build.log (see section 7).
 - nvk_probe logic (host build): lavapipe -> offscreen PASS (correct clear/triangle pixels, 31.75 % coverage);
   host NVK (Ubuntu Mesa 25.2.8) -> NO_DEVICE exit 3 (logs/host_validation.log).
 - Android binaries on bionic: scripts/40_bionic_chroot_test.sh runs OUR bionic nvk_probe + vulkan.nouveau.so in a
@@ -136,3 +155,41 @@ B4-B6 make it a poor trade on this machine. Do not add an "NVIDIA" boot entry.
   "CrOS Gralloc" (gralloc.minigbm.so) backend like ANV does - nvk_probe's anb tests print which one.
 - NOT tested (needs the real machine): anything executing on the GTX 1650, GSP boot, nouveau runtime PM, gralloc
   buffer import, performance.
+
+7. Independent verification (adversarial re-check, 2026-10-24; builder work dir /build/native/nvk-verify)
+--------------------------------------------------------------------------------------------------------
+Source provenance: the Mesa tree used is upstream mesa-26.3.0-rc2 (tag object e54926ad, commit b34c71d9, matches
+  `git ls-remote https://gitlab.freedesktop.org/mesa/mesa.git`). `diff -r` against `git archive mesa-26.3.0-rc2`
+  shows only the 4 files changed by patches 0001/0002 (+ __pycache__/subprojects); every *.orig equals pristine.
+Reproducibility: the delivered scripts + patches rebuilt the first delivery BIT-IDENTICALLY (f727a064..., also the
+  unstripped 9fa5dddd...) in another directory (logs/verify/repro_build.log), so the shipped binary really is what
+  the scripts produce. After correcting patch 0002 (NVK_NO_CUBIN) the rebuild gives f7e9154f... (now in bin/;
+  logs/verify/fixed_build.log). Import list identical (292 symbols), NEEDED/SONAME/segments unchanged.
+ELF (logs/verify/elf_checks_fixed.log): ELF64 x86-64 DYN, .note.android.ident = NDK r27c / API 35, NEEDED only
+  libhardware, liblog, libnativewindow, libsync, libm, libdl, libc; symbol versions only LIBC/LIBC_N/P/Q/R/U (bionic),
+  zero GLIBC references. HMI is a 248-byte object in writable .data (libvulkan writes hmi->dso): tag 'HWMT',
+  module_api_version 0x0001, hal_api_version 0x0100, id "vulkan", name "Mesa 3D Vulkan HAL".
+  liblog/libnativewindow/libsync are LLNDK in lapis (system/etc/llndk.libraries.txt), libhardware.so is in
+  /vendor/lib64; every import (AHardwareBuffer_* @LIBNATIVEWINDOW, __android_log_write @LIBLOG, sync_merge,
+  hw_get_module) is exported there, and dlopen(RTLD_NOW) succeeding on lapis bionic proves all 292 resolve.
+libvulkan-equivalent loader check: verify/hmi_check.c re-implements what lapis libvulkan does (its strings confirm the
+  same flow: ro.vulkan.apex / ro.hardware.vulkan / ro.board.platform -> vulkan.<x>.so via android_load_sphal_library,
+  "HAL id '%s' != '%s'", "invalid dispatchable object magic"): dlsym HMI, id check, write hmi->dso, open("vk0"),
+  device tag/version/module, CreateInstance, HWVULKAN_DISPATCH_MAGIC 0x01CDC0DE on VkInstance/VkPhysicalDevice/
+  VkDevice/VkQueue. All checks PASS in the lapis bionic chroot, identical to lapis' own vulkan.intel.so
+  (logs/verify/chroot_fixed.log). With the drm-shim TU117: device with +VK_ANDROID_native_buffer (spec 8),
+  vkGetSwapchainGrallocUsage(2)ANDROID / vkAcquireImageANDROID / vkQueueSignalReleaseImageANDROID present,
+  GrallocUsage3/4 absent (libvulkan falls back to Usage2), no AHB extension (B1 confirmed in the binary).
+  hmi_check can also be run natively: /path/hmi_check /vendor/lib64/hw/vulkan.nouveau.so (not in the tree manifest).
+Integration facts re-checked on the lapis images: vendor build.prop ro.hardware.vulkan=intel, ro.board.platform empty,
+  no ro.vulkan.apex in the vendor, system or system_ext props -> NVK is never loaded by libvulkan; ro.hardware.gralloc=minigbm and gralloc.minigbm.so
+  ("CrOS Gralloc") exists; lapis ANV links no IMapper/libui either, so ANV and NVK use the same u_gralloc CrOS
+  backend; surfaceflinger and libhwui both reference VK_ANDROID_external_memory_android_hardware_buffer;
+  debug.renderengine.vulkan=true, ro.hwui.use_vulkan=true, ro.hardware.egl=angle. libminigbm_gralloc.so and
+  libgbm.so contain backend_nouveau and "%s/renderD%d" (render-node ordering risk is real). 6.18 tu102.c:
+  nvkm_boolopt("NvGspRm", true) and TU117 booter 570.144/535.113.01 - matches the staged firmware.
+Corrections made: patch 0002 + scripts/apply_patches.py + bin/vulkan.nouveau(.unstripped).so (old ones in
+  superseded/); section 1/2/5 texts above. Builder note: /build/native/nvk-android still holds the OLD
+  apply_patches.py; copy scripts/apply_patches.py from here before rebuilding there.
+Still NOT verified (needs the Surface Book 3): everything that executes on the GTX 1650 - GSP boot, rendering,
+  gralloc/PRIME import, runtime PM, detach.

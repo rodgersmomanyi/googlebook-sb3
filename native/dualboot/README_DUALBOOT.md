@@ -63,6 +63,18 @@ new partition carries them. The only attribute bits written are the vbmeta slot 
 4. **Secure Boot off**: Surface UEFI → Security → Secure Boot → *None/Disabled*. Our systemd-boot and kernel are
    not signed. The red bar at the Surface boot screen is normal with Secure Boot off.
 5. Stay **on AC power** for the whole install. The installer refuses to run on battery.
+5a. **Fast Startup off** (Control Panel → Power Options → *Choose what the power buttons do* → untick *Turn on fast
+   startup*). With it on, "Shut down" hibernates the Windows kernel with the disk layout cached, and Googlebook
+   rewrites the GPT (vbmeta slot bits) and its own ESP while Windows sleeps. A restart is never a hybrid shutdown,
+   so `Restart-ToGooglebook.ps1` is safe either way; the installer warns while Fast Startup is on.
+5b. **Rehearse on a VHDX first (recommended).** The live-disk paths (IOCTL_DISK_SET_DRIVE_LAYOUT_EX through
+   partmgr, volume lock/dismount, raw writes) have only run against image files. In an elevated prompt, create and
+   attach a ~40 GB dynamic VHDX in Disk Management, initialise it GPT, make an NTFS volume (e.g. `V:`, 30 GB),
+   then run the real code path against that disk with its own backup root and no boot entry:
+   `.\install_dualboot.ps1 -DiskNumber <vhd disk#> -ShrinkDriveLetter V -ShrinkGB 22 -BackupRoot C:\GB-backup-vhd -ExportDir C:\gb-export -SkipBootEntry -Apply`,
+   then `gbdisk verify --disk <vhd disk#> --plan C:\GB-backup-vhd\<ts>\plan.json --source-dir C:\gb-export`, then
+   `.\uninstall_dualboot.ps1 -DiskNumber <vhd disk#> -ExtendDriveLetter V -BackupRoot C:\GB-backup-vhd -KeepBootEntry -Apply`.
+   Detach and delete the VHDX afterwards.
 6. Build the kernel and the native tree (`<workspace>\inject\native`) first. The export's ESP holds the kernel
    and initrd that are current at export time. Later kernels can be pushed with `-UpdateEspOnly` (see below).
 
@@ -126,8 +138,11 @@ What `-Apply` does, in order (the dry run prints the exact commands):
    4. `bcdedit /set {fwbootmgr} displayorder {id} /addlast`
    5. A check that the first boot-order entry (Windows Boot Manager) is unchanged
 
-   If any of these steps fails, the new entry is deleted again. systemd-boot ignores the Windows-style load options
-   that a copied `{bootmgr}` entry carries.
+   If any of these steps fails, the new entry is deleted again. Before any of them runs, the current firmware boot
+   order must be readable (`bcdedit /v` prints `{fwbootmgr}`/`{bootmgr}` as their GUIDs; gb_common maps them back),
+   and every `/set` is given an explicit, non-well-known GUID: `bcdedit /set` without an id would edit `{current}`,
+   the running Windows loader. systemd-boot ignores the Windows-style load options that a copied `{bootmgr}` entry
+   carries (checked in its source: it only sets LoadOptions for the images it starts).
 
 The state of the run (phase, GUIDs, original D: size, plan, boot entry id) goes to
 `C:\GB-backup\<timestamp>\install_state.json`. The pointer to it is `C:\GB-backup\googlebook_install.json`.
@@ -202,14 +217,17 @@ The steps:
    * it has a Googlebook name;
    * it has a Googlebook type;
    * it is not in the pre-install layout;
-   * its GUID is in the install plan;
-   * it lies in one contiguous run with the others.
+   * its GUID is in the install plan, and it is still exactly at the offset and length the plan gave it, inside
+     the region the install freed (otherwise the whole removal is refused);
+   * it lies after D: (the shrunk region), and no other partition lies between D: and the Googlebook run.
 
    Every other entry must come through the change unchanged.
-4. `Resize-Partition` D: back to its **original size**.
+4. `Resize-Partition` D: back to its **original size**. This also runs when no Googlebook partition is left but D:
+   is still smaller than before (an install that stopped after the shrink).
 5. Compare every partition with `layout_pre_shrink.json`.
 
-If the state is lost, `-Force` removes by name + type + contiguity only, and D: is extended to its maximum.
+If the state is lost, `-Force` removes by name + type + "after D:" + contiguity only, and D: is extended to its
+maximum. A Googlebook-named partition anywhere before D: (another Linux/Android install, say) is never a candidate.
 Manual alternative: Disk Management cannot delete these partition types. Use `diskpart` → `select disk 0` →
 `list partition`. Check offsets and sizes against `layout_pre_shrink.json`, never touch partitions 1-5, run
 `select partition N` → `delete partition override` for each one, and then **Extend Volume** on D:.
@@ -218,7 +236,8 @@ Manual alternative: Disk Management cannot delete these partition types. Use `di
 
 | situation | what to do |
 |---|---|
-| The install stops part-way | The phase is in `install_state.json` and the error names the step. Nothing after the failed step ran. If the failure came before "created", D: is only smaller: extend it back (Disk Management → Extend Volume, or `Resize-Partition -DriveLetter D -Size <original_length>`). If it came after, `uninstall_dualboot.ps1 -Apply` removes what was created and extends D:. |
+| The install stops part-way | The phase is in `install_state.json` and the error names the step. Nothing after the failed step ran. `uninstall_dualboot.ps1 -Apply` removes whatever was created and extends D: back to `original_length`, also when the failure came right after the shrink and no partition was created. By hand: Disk Management → Extend Volume, or `Resize-Partition -DriveLetter D -Size <original_length>`. |
+| Surface starts Googlebook (or the Surface logo loops) instead of Windows | Hold Power 10 s. Hold Volume Up + Power → Surface UEFI → Boot configuration: put Windows Boot Manager first, or swipe it to boot once. If Windows Boot Manager is missing there (firmware entries reset), the "Internal Storage" fallback may start our ESP's `\EFI\BOOT\BOOTX64.EFI`, and systemd-boot on that ESP has no Windows entry: boot the Surface recovery drive → Troubleshoot → Command Prompt → `bcdboot C:\Windows /f UEFI` (check the Windows drive letter with `dir` first) to recreate the Windows Boot Manager entry. |
 | Googlebook does not start / hangs after the systemd-boot menu | Hold Power for 10 s to switch off. The next boot is Windows, because BootNext is used up. See the NX_COMPAT note below. |
 | Windows Boot Manager is no longer first | Surface UEFI → Boot configuration: drag Windows Boot Manager to the top. Or, elevated: `bcdedit /set {fwbootmgr} displayorder {bootmgr} /addfirst`. |
 | The Googlebook boot entry vanished (e.g. after a Windows feature update) | `.\install_dualboot.ps1 -RepairBootEntry -Apply` |
@@ -278,6 +297,21 @@ python -I -B build_internal.py --out D:\gb-test\export_small --test-super-mib 64
 .\test\run_image_tests.ps1 -Image D:\gb-test\cycle_full.img -ExportDir D:\gb-export -CMiB 1024 -DMiB 40960 -ShrinkGB 28 -Tag full -DeleteImage
 ```
 
+The image is created sparse, but it ends up allocated at its full logical size on NTFS (42 GiB for the full run),
+and the space comes back only when it is deleted. Both test scripts refuse to start unless the image's volume has
+the image size + 10 GiB free (`run_edge_tests.ps1`: 22 GiB; it deletes each ~9 GiB image right after its case).
+`-DeleteImage` removes the cycle image at the end. Never run them on a nearly full C:.
+
+More tests:
+* `test\run_edge_tests.ps1 [-WorkDir DIR] [-ExportDir D:\gb-test\export_small]`: refusals and edge shapes, each
+  followed by a byte-identity check of the image: not enough space, shrink larger than D:, too much userdata,
+  D: not the last data partition (E: after it: install + uninstall), a foreign Googlebook-named partition before
+  D: (install refused, forced remove leaves it alone), image too small / no GPT / D: too small, a truncated and a
+  corrupted export image, tampered plans for write and remove, an install that stopped after the shrink (uninstall
+  gives the space back), a forced remove anchored at the wrong partition, device paths given as `--image`.
+* `test\test_bcd_parse.ps1`: offline test of the `bcdedit /enum firmware /v` parser (well-known GUIDs mapped to
+  `{fwbootmgr}`/`{bootmgr}`) and of the guard that refuses an empty or well-known id for `bcdedit /set` / `/delete`.
+
 The cycle runs these steps:
 1. `gpt_validate.py mkimage` builds a sparse image shaped like disk 0. It has the same names, types, GUIDs and
    attributes, including Recovery's `0x8000000000000001` and the 1 MiB gap before Recovery, plus random data
@@ -297,3 +331,22 @@ The cycle runs these steps:
 7. Uninstall dry run (image unchanged), then `-Apply`. The GPT must be **byte-identical to before the install**.
 8. A plan that does not fit is refused.
 9. Re-install, then `gbdisk restore-gpt --tag pre_shrink`. The GPT must be byte-identical again.
+
+**Results (2026-10-24; image files and read-only dry runs only, the logs are not part of the repository):**
+* Small cycle: 25/25 steps pass. Validator: 88/88 checks after install, the GPT is byte-identical after uninstall
+  and after `restore-gpt`, and 8187 MiB units compared.
+* Full-size cycle: a real export (12 GiB super) in a 42 GiB image with D: shrunk 40 → 12 GiB. 25/25 steps pass,
+  88/88 checks, 43003 MiB units compared.
+* Real-disk dry runs: install/uninstall dry runs against disk 0 without elevation. The layout is unchanged
+  afterwards and no backup folder was created. A `-ShrinkGB` larger than D:'s free space is refused; a smaller one
+  that leaves userdata at least 8 GiB is accepted.
+
+**Safety review (2026-10-25):** small cycle 25/25, edge cases 56/56, BCD parser 19/19, real-disk dry runs
+read-only (layout byte-identical before/after, no backup folders created). Fixed in that review: the firmware
+boot-order check could never pass on a real system (`/v` prints GUIDs, the code compared with `{fwbootmgr}`); a
+forced uninstall could delete any Linux-typed partition with a Googlebook name anywhere on the disk; the
+BitLocker check treated an unreadable state as "off"; `gbdisk backup` did not prove that its two files hold the
+whole GPT; `gbdisk write` did not itself refuse non-Googlebook or pre-existing partitions in a plan; no identity
+re-check right before the shrink; the uninstaller did not give the space back after an install that stopped
+after the shrink. The full-size cycle was not re-run in the review (disk space); the changed code is
+size-independent.

@@ -1,0 +1,75 @@
+{
+ "name": "camera",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\lib64\\hw\\camera.sb3.so",
+   "dest": "lib64/hw/camera.sb3.so",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\lib64\\libcamera.so",
+   "dest": "lib64/libcamera.so",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\lib64\\libcamera-base.so",
+   "dest": "lib64/libcamera-base.so",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\lib64\\libc++_lcam.so",
+   "dest": "lib64/libc++_lcam.so",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\lib64\\libcamera\\ipa\\ipa_soft_simple.so",
+   "dest": "lib64/libcamera/ipa/ipa_soft_simple.so",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\lib64\\libcamera\\ipa\\ipa_soft_simple.so.sign",
+   "dest": "lib64/libcamera/ipa/ipa_soft_simple.so.sign",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\bin\\libcamera\\soft_ipa_proxy",
+   "dest": "bin/libcamera/soft_ipa_proxy",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\bin\\lcam-probe",
+   "dest": "bin/lcam-probe",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\etc\\libcamera\\camera_hal.yaml",
+   "dest": "etc/libcamera/camera_hal.yaml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\etc\\libcamera\\configuration.yaml",
+   "dest": "etc/libcamera/configuration.yaml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\etc\\libcamera\\ipa\\simple\\ov5693.yaml",
+   "dest": "etc/libcamera/ipa/simple/ov5693.yaml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\etc\\libcamera\\ipa\\simple\\ov8865.yaml",
+   "dest": "etc/libcamera/ipa/simple/ov8865.yaml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\odm\\etc\\libcamera\\ipa\\simple\\uncalibrated.yaml",
+   "dest": "etc/libcamera/ipa/simple/uncalibrated.yaml",
+   "mode": "0644"
+  }
+ ],
+ "rc_files": [],
+ "rc_text": "",
+ "build_prop": [
+  "ro.hardware.camera=sb3"
+ ]
+}

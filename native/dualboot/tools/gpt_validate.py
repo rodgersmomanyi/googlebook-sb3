@@ -143,16 +143,28 @@ def gpt_header(my, alt, first, last, disk, elba, ecrc):
 
 
 def cmd_mkimage(a):
+    host = list(HOST)
     sizes = [100 * MiB, 16 * MiB, a.c_mib * MiB, a.d_mib * MiB, 900 * MiB]
+    gaps = [0, 0, 0, 0, MiB]                                   # host: 1 MiB unallocated between D: and Recovery
+    # edge-case shapes (review tests): a foreign Linux-type partition with a Googlebook name between C: and D:, and/or
+    # another data partition (E:) between D: and Recovery
+    if a.foreign_before_d:
+        name, mib = a.foreign_before_d.split(":")
+        host.insert(3, (name, "0fc63daf-8483-4772-8e79-3d69d8477de4", "f0f0f0f0-1111-4222-8333-444455556666", 0))
+        sizes.insert(3, int(mib) * MiB); gaps.insert(3, 0)
+    if a.extra_after_d_mib:
+        i = len(host) - 1                                      # before Recovery
+        host.insert(i, ("Basic data partition", BASIC, "e0e0e0e0-1111-4222-8333-444455556666", 0))
+        sizes.insert(i, a.extra_after_d_mib * MiB); gaps.insert(i, 0)
     offs, o = [], MiB
-    for i, s in enumerate(sizes):
-        if i == 4: o += MiB                                    # host: 1 MiB unallocated between D: and Recovery
+    for s, g in zip(sizes, gaps):
+        o += g
         offs.append(o); o += s
     usable_end = o + 335360                                    # host: 0.32 MiB free after Recovery
     size = usable_end + 33 * SECTOR
     last_lba = size // SECTOR - 1
     ents = b"".join(gpt_entry(t, i, off // SECTOR, (off + s) // SECTOR - 1, at, n)
-                    for (n, t, i, at), off, s in zip(HOST, offs, sizes)).ljust(128 * 128, b"\0")
+                    for (n, t, i, at), off, s in zip(host, offs, sizes)).ljust(128 * 128, b"\0")
     ecrc = zlib.crc32(ents)
     mbr = bytearray(SECTOR)
     mbr[446:462] = struct.pack("<BBBBBBBBII", 0, 0, 2, 0, 0xEE, 0xFF, 0xFF, 0xFF, 1, min(last_lba, 0xFFFFFFFF))
@@ -173,9 +185,9 @@ def cmd_mkimage(a):
             for x, n in spots:
                 f.seek(x); f.write(rnd.randbytes(n)); written += n
         # the 1 MiB gap before Recovery: stale bytes too (must stay untouched)
-        f.seek(offs[4] - MiB); f.write(rnd.randbytes(64 << 10)); written += 64 << 10
+        f.seek(offs[-1] - MiB); f.write(rnd.randbytes(64 << 10)); written += 64 << 10
     print(f"wrote {a.out}: {size} bytes ({size / 2**30:.2f} GiB), sparse={sparse}, {written / MiB:.0f} MiB of pattern data")
-    for (n, t, i, at), off, s in zip(HOST, offs, sizes):
+    for (n, t, i, at), off, s in zip(host, offs, sizes):
         print(f"  {n:<30} offset {off:>12} length {s:>12} type {t} id {i} attr {at:#018x}")
 
 
@@ -364,6 +376,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     m = sub.add_parser("mkimage"); m.add_argument("out"); m.add_argument("--c-mib", type=int, default=1024)
     m.add_argument("--d-mib", type=int, default=6144); m.add_argument("--seed", type=int, default=20261024)
+    m.add_argument("--foreign-before-d", help="NAME:MIB - Linux-type partition with that GPT name between C: and D:")
+    m.add_argument("--extra-after-d-mib", type=int, default=0, help="another basic data partition between D: and Recovery")
     s = sub.add_parser("snapshot"); s.add_argument("image"); s.add_argument("out")
     v = sub.add_parser("validate"); v.add_argument("image"); v.add_argument("--snapshot", required=True)
     v.add_argument("--expect", choices=("clean", "installed", "uninstalled"), required=True)

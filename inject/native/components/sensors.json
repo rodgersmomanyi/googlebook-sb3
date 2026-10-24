@@ -1,0 +1,28 @@
+{
+ "name": "sensors",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\sensors\\gb_sensors.sh",
+   "dest": "gb_sensors.sh",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\sensors\\gb_sb3_sensors.xml",
+   "dest": "vup/etc/permissions/gb_sb3_sensors.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\sensors\\overlay\\GbSb3SensorsOverlay.apk",
+   "dest": "vup/overlay/GbSb3SensorsOverlay.apk",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\sensors\\bin\\gb_hal_probe",
+   "dest": "gb_hal_probe",
+   "mode": "0755"
+  }
+ ],
+ "rc_files": [],
+ "rc_text": "service gb_sensors_wait /system/bin/sh /odm/gb_sensors.sh wait\n    user root\n    group root\n    seclabel u:r:shell:s0\n    oneshot\n    disabled\n\nservice gb_sensors_diag /system/bin/sh /odm/gb_sensors.sh diag\n    user root\n    group root system shell\n    seclabel u:r:shell:s0\n    oneshot\n    disabled\n\non early-boot\n    exec_start gb_sensors_wait\n\non property:sys.boot_completed=1\n    start gb_sensors_diag\n",
+ "build_prop": []
+}

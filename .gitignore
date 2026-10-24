@@ -97,8 +97,17 @@ native/sensors/overlay/key/
 native/*/b-*/
 native/*/run/
 native/*/src/mesa/
+native/nvk-android/verify/hmi_check
+native/*/superseded/
 host/gb_hostbatt
 tools/frametime
+# working copies kept next to sources (stage_kernel.py's *.pre-<tag>, merge leftovers)
+*.pre-k[0-9]*
+*.pre-nouveau
+*.pre-merge
+*.merged
+*.orig
+*.orig-*
 !native/*/tree/firmware/*.sha256
 native/*/logs/
 native/*/kernel/logs/

@@ -8,8 +8,10 @@ network ADB) switch their feature off when missing (`build_esp.py` prints `... o
 present, or `build_esp.py` stops with a missing-file error. That covers the OS image, kernel and modules, busybox,
 systemd-boot and the KeyMint graft. It also covers `tinymix` and `volume_curves.xml` for VM sound (on as soon as
 `inject/vmaudio/gb_vmaudio.sh` exists, and it is in the repository). Finally it covers every file listed in
-`inject/native/components/*.json`: native component binaries, the test tone, `volume_curves.xml` and the SOF
-firmware. Those manifests are read for every build, VM builds included.
+`inject/native/components/*.json`: native component binaries (iptsd, gb_power, tinyalsa, the camera HAL tree, the
+sensors overlay and probe, NVK and its probe), the test tone, `volume_curves.xml`, the SOF firmware and the Realtek
+USB Ethernet firmware. Those manifests are read for every build, VM builds included: to build without a component
+(for example a VM-only workspace), move its manifest out of `inject/native/components/`.
 
 ## The OS image (required, obtain it yourself)
 
@@ -29,7 +31,10 @@ firmware. Those manifests are read for every build, VM builds included.
 | `inject/vulkan.pastel.so` (SwiftShader Vulkan HAL for the VM) | [graphics/swiftshader/](../graphics/swiftshader/) (notes + patchers) |
 | `inject/vmaudio/tinymix`, native `tree/vup/bin/tiny*` | `native/audio/src/build_tinyalsa.sh` (tinyalsa v2.0.0 + our patch, static) |
 | `native/audio/tree/gb_test_tone.wav` | `native/audio/tools/gen_test_tone.py` (bit-identical to ours) |
-| native component binaries (`native/iptsd/bin/iptsd*`, `native/power/bin/gb_power`, `native/sensors/...`) | each component's build script, see [native/README.md](../native/README.md) |
+| native component binaries: `native/iptsd/bin/iptsd*`, `native/power/bin/gb_power` (static) | each component's build script, see [native/README.md](../native/README.md) |
+| `native/camera-userspace/odm/` (`lib64/hw/camera.sb3.so`, libcamera, the soft IPA + its signature, `lcam-probe`, `etc/libcamera/*.yaml`) | `native/camera-userspace/build-scripts/` (deps, configure, patches, `stage.sh`) on the builder |
+| `native/sensors/overlay/GbSb3SensorsOverlay.apk`, `native/sensors/bin/gb_hal_probe` | `native/sensors/overlay/build_overlay.sh` (signs with a key it generates locally), a static build of `native/sensors/test/hal_probe.c` |
+| `native/nvk-android/bin/vulkan.nouveau.so`, `nvk_probe` | `native/nvk-android/scripts/` (Mesa 26.3.0-rc2 + our patches, NDK r27c) |
 | `host/gb_hostbatt.exe` | `csc -nologo -target:winexe -out:gb_hostbatt.exe gb_hostbatt.cs` (in-box .NET Framework compiler) |
 
 ## Third-party binaries you fetch
@@ -65,4 +70,10 @@ Staged uncompressed under `inject/native/firmware/` (-> `/odm/firmware`). From
 | `iwlwifi-Qu-b0-hr-b0-77.ucode`, `iwlwifi-Qu-c0-hr-b0-77.ucode`, `iwlwifi-QuZ-a0-hr-b0-77.ucode` | AX201 Wi-Fi |
 | `intel/ibt-19-*.sfi` / `.ddc` (0-0, 0-1, 0-3, 0-4, 16-4, 240-1, 240-4, 32-0, 32-1, 32-4) | Intel Bluetooth 8087:0026 |
 | `intel/sof/sof-icl.ri` (+ `intel-signed/sof-icl.ri`, `sof-icl.ldc`), `intel/sof-tplg/sof-hda-generic*.tplg` | SOF audio DSP (from [sof-bin](https://github.com/thesofproject/sof-bin)) |
-| `nvidia/tu117/...` (30 files) | only for the opt-in nouveau experiment: `native/nouveau-kernel/firmware/fetch_tu117_firmware.sh` |
+| `intel/ipu/ipu4p_fw.bin` | IPU4P camera ISP. **Intel's proprietary firmware, not in linux-firmware and not distributable here.** Take it from the laptop's own Windows camera driver: `cpd_component_signed.bin` in `C:\Windows\System32\DriverStore\FileRepository\iacamera64.inf_amd64_*\`, copied under the new name. Check it with `python -I native\camera-kernel\tools\cpd_check.py <file>`. Without it the cameras do not appear; nothing else depends on it |
+| `nvidia/tu117/...` (30 files) | only for the opt-in nouveau: `native/nouveau-kernel/firmware/fetch_tu117_firmware.sh` |
+
+The Realtek USB Ethernet / SurfaceDock PHY firmware goes to `native/hw-gap-audit/tree/firmware/rtl_nic/` instead
+(the `hw.json` manifest copies it to `/odm/firmware/rtl_nic/`): `rtl8153a-2/-3/-4.fw`, `rtl8153b-2.fw`,
+`rtl8153c-1.fw`, `rtl8156a-2.fw`, `rtl8156b-2.fw` from linux-firmware's `rtl_nic/`, checked with
+`sha256sum -c ../rtl_nic.sha256` inside that folder.

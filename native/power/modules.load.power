@@ -1,18 +1,21 @@
-# gb_power module requirements, in load order (merge into C:\GB-x86\inject\native\modules\modules.load).
-# gb_modules.sh passes words after the file name to insmod as module parameters.
-# test_power first: test_battery/test_ac must exist before the health HAL starts (it scans once).
-test_power.ko
+# gb_power module requirements (reference; already merged into C:\GB-x86\inject\native\modules\modules.load(.late), k12).
+# gbinit / gb_modules.sh pass the words after the file name to insmod as module parameters.
+# modules.load (gbinit, before Android init):
 crc-itu-t.ko
 surface_aggregator.ko
 surface_aggregator_registry.ko
 surface_aggregator_hub.ko
-# scope_device=1 needs kernel patch 0001; an unpatched module ignores it ("unknown parameter ... ignored") and
+# scope_device=1 needs kernel patch 0001 (in k12); an unpatched module ignores it ("unknown parameter ... ignored") and
 # gb_power falls back to hiding BAT1/BAT2 with a bind mount.
 surface_battery.ko scope_device=1
 surface_charger.ko
-platform_profile.ko
-surface_platform_profile.ko
 surface_dtx.ko
-surface_hotplug.ko
 surface_gpe.ko
+surface_hotplug.ko
+# test_power must be loaded before the health HAL scans /sys/class/power_supply ("on boot"); any position in
+# modules.load satisfies that. Patch 0002 (in k12) adds battery_charge_full/_design/battery_temp.
+test_power.ko
+# modules.load.late (gb_modules.sh, early-init, after it modprobes lapis's own platform_profile from /vendor/lib/modules,
+# which also serves lapis's processor_thermal): do NOT ship/load our platform_profile.ko.
+#   surface_platform_profile.ko
 # NOT natively: ac.ko / battery.ko (VM-only ACPI battery) - they would add more Battery/Mains supplies.

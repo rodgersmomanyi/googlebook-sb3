@@ -1,0 +1,14 @@
+<!-- Surface Book 3 native overlay of /vendor/etc/excluded-input-devices.xml (installed as /odm/vup/etc/...).
+     Entry 1 is lapis's own (build 271 vendor file; re-check against the booted vendor build before shipping).
+     Entries 2-3 hide input devices that the kernel creates for vendor-defined HID collections of the Surface
+     Aggregator touchpad (045E:09AF, hid-multitouch exports all applications and names unknown ones "... UNKNOWN") and
+     any un-suffixed application of the SAM keyboard (045E:09AE; its keyboard, system-control and consumer-control
+     inputs always carry a suffix). Such devices only carry BTN_MISC/ABS_MISC codes, which Android's EventHub
+     classifies as a gamepad. Matching is by exact device name. -->
+<devices>
+    <!-- lapis: ignore the ACPI Power Button to prevent duplicated power button events (the SB3 has none anyway). -->
+    <device name="Power Button"/>
+    <device name="Microsoft Surface 045E:09AF UNKNOWN"/>
+    <device name="Microsoft Surface 045E:09AE"/>
+    <device name="Microsoft Surface 045E:09AF"/>
+</devices>

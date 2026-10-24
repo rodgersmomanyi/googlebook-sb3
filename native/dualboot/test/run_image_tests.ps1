@@ -47,6 +47,16 @@ function Step([string]$Name, [scriptblock]$Body, [int]$Expect = 0, [switch]$Crit
 }
 function PS1([string]$Script, [string[]]$Args2) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root $Script) @Args2 }
 
+# free-space guard: the image ends up fully allocated on NTFS despite the sparse flag (writes + zero ranges), so the
+# volume must hold its whole logical size plus a margin, or the test can fill the drive
+$imgBytes = [int64]($CMiB + $DMiB + 1100) * 1MB
+$volLetter = (Split-Path -Qualifier ([IO.Path]::GetFullPath($Image))).TrimEnd(':')
+$freeNow = [int64](Get-Volume -DriveLetter $volLetter).SizeRemaining
+if (Test-Path $Image) { $freeNow += (Get-Item $Image).Length }
+if ($freeNow -lt $imgBytes + 10GB) {
+    Write-Host ("REFUSING: {0}: has {1:N1} GiB free, the {2:N1} GiB test image needs {3:N1} GiB (image + 10 GiB margin)" -f $volLetter, ($freeNow / 1GB), ($imgBytes / 1GB), (($imgBytes + 10GB) / 1GB)) -ForegroundColor Red
+    exit 98
+}
 foreach ($f in @($Image, "$Image.gbstate.json")) { if (Test-Path $f) { Remove-Item -Force $f } }
 if (Test-Path "$Image.gbbackup") { Remove-Item -Recurse -Force "$Image.gbbackup" }
 $snap0 = "$Image.snap0.json"; $snap1 = "$Image.snap1.json"

@@ -24,16 +24,25 @@ NATIVE_EARLY = [
     # signed GKI replacements for lapis system_dlkm (Wi-Fi/BT dependency chain, zram, USB network adapters)
     "libarc4", "pps_core", "ptp", "rfkill", "bluetooth", "btbcm", "hidp", "rfcomm", "zsmalloc", "zram",
     "mii", "usbnet", "cdc_ether", "cdc_ncm", "r8152", "ax88179_178a", "cdc-acm",
+    # NOT ours: mfd-core, pinctrl-intel, intel-lpss(-pci) (lapis first stage loads them, and its pinctrl-intel-platform
+    # is refused - fatally, in first stage - against our copies' protected exports: VM test of k13), nor pinctrl-icelake
+    # / i2c-designware (lapis vendor_dlkm). The camera stack needs only the buses they provide, no symbols.
     # Surface Aggregator: base keyboard/touchpad, batteries, charger, profile, detach, lid/GPE, hot-plug, buttons
     "crc-itu-t", "surface_aggregator", "surface_aggregator_registry", "surface_aggregator_hub",
-    "surface_aggregator_cdev", "surface_hid_core", "surface_hid", "surface_battery", "surface_charger",
+    "surface_aggregator_cdev", "surface_hid_core", "surface_hid", "hid-surface", "surface_battery", "surface_charger",
     "surface_dtx", "surface_gpe", "surface_hotplug",
     "soc_button_array", "test_power",
     # display (Ice Lake Gen11)
     "wmi", "wmi-bmof", "video", "i2c-algo-bit", "drm_buddy", "drm_display_helper", "intel-gtt", "i915",
     # light sensor, thermal, touch
     "kfifo_buf", "industrialio-triggered-buffer", "apds9960", "thermal", "ipts",
+    # cameras (k13): IPU4P on the ipu6 driver + sensors, focus motor, INT3472 power control; before lapis's own
+    # intel-ipu6/int3472/v4l2-cci (no 8A19 support), which then EEXIST
+    "v4l2-cci", "ipu-bridge", "intel_skl_int3472_common", "intel_skl_int3472_discrete",
+    "ov5693", "ov8865", "ov7251", "dw9719", "intel-ipu6", "intel-ipu6-isys",
 ]
+# staged in /odm/lib/modules but in NO load list: nouveau is opt-in (persist.vendor.gb.nouveau=1 -> gb_nouveau.sh)
+NATIVE_OPTIN = ["drm_exec", "drm_gpuvm", "gpu-sched", "drm_ttm_helper", "nouveau"]
 # gb_modules, after lapis's first stage loaded its mfd-core (hid-sensor-hub must link against that one)
 NATIVE_LATE = [
     # after gb_modules modprobes lapis's platform_profile (our copy's export would be protected; lapis's
@@ -42,6 +51,9 @@ NATIVE_LATE = [
     "hid-sensor-hub", "hid-sensor-iio-common", "hid-sensor-trigger", "hid-sensor-accel-3d", "hid-sensor-gyro-3d",
     "hid-sensor-als", "hid-sensor-rotation", "hid-sensor-incl-3d", "hid-sensor-magn-3d",
 ]
+# exactly what lapis's vendor ramdisk modules.load loads in first-stage init
+LAPIS_FIRST_STAGE_LOAD = {"8250_dw", "intel-lpss-pci", "intel-lpss", "intel_iommu_vendor_hooks", "mfd-core",
+                          "pinctrl-intel-platform", "pinctrl-intel"}
 LAPIS_FIRST_STAGE = {"platform_profile", "mfd_core", "intel_lpss", "intel_lpss_pci", "8250_dw", "pinctrl_intel", "pinctrl_intel_platform"}
 # insmod arguments in modules.load (gbinit/gb_modules pass the words after the file name)
 MODULE_ARGS = {
@@ -65,7 +77,7 @@ def ssh(cmd):
 def main():
     tag = sys.argv[1]
     dry = "--dry-run" in sys.argv
-    wanted = sorted(set(VM_MODS + NATIVE_EARLY + NATIVE_LATE))
+    wanted = sorted(set(VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN))
     info = ssh("cd %s && for m in %s; do f=$m.ko; [ -f $f ] || f=$(echo $m | tr - _).ko; "
                "if [ -f $f ]; then echo \"$m|$f|$(modinfo -F depends $f)|$(modinfo -F vermagic $f)\"; "
                "else echo \"$m|MISSING||\"; fi; done; md5sum bzImage" % (DIST, " ".join(wanted)))
@@ -102,8 +114,14 @@ def main():
             seen.add(norm(n))
         return seen
 
+    # lapis's first stage loads these itself; preloading our copies makes its pinctrl-intel-platform fail (protected
+    # exports) and a first-stage module failure stops the boot (k13 VM test)
+    clash = sorted({norm(n) for n in NATIVE_EARLY + NATIVE_LATE} & {norm(n) for n in LAPIS_FIRST_STAGE_LOAD})
+    if clash:
+        problems.append(f"native list preloads lapis first-stage modules {clash} (fatal at boot)")
     early = check(NATIVE_EARLY)
-    check(NATIVE_LATE, extra_ok=early | LAPIS_FIRST_STAGE)
+    late = check(NATIVE_LATE, extra_ok=early | LAPIS_FIRST_STAGE)
+    check(NATIVE_OPTIN, extra_ok=early | late | LAPIS_FIRST_STAGE)
     check(VM_MODS)
     for p in problems:
         print("PROBLEM:", p)
@@ -133,7 +151,7 @@ def main():
             put(os.path.join(vm_dir, n + ".ko"), blobs[mods[n][0]])
     nat = os.path.join(HERE, "inject", "native", "modules")
     os.makedirs(nat, exist_ok=True)
-    for n in NATIVE_EARLY + NATIVE_LATE:
+    for n in NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN:
         if n not in missing:
             put(os.path.join(nat, mods[n][0]), blobs[mods[n][0]])
     hdr = f"# kernel build {tag} (bzImage md5 {bz_md5})\n"

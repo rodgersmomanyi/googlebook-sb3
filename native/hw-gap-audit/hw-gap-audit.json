@@ -28,6 +28,11 @@
    "mode": "0644"
   },
   {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\etc\\excluded-input-devices.xml",
+   "dest": "vup/etc/excluded-input-devices.xml",
+   "mode": "0644"
+  },
+  {
    "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153a-2.fw",
    "dest": "firmware/rtl_nic/rtl8153a-2.fw",
    "mode": "0644"

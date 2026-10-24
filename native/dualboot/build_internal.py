@@ -20,6 +20,7 @@ Usage: python -I build_internal.py --out D:\\gb-export [--esp-mib 512] [--boot-d
 """
 import argparse, datetime, hashlib, importlib.util, json, os, struct, sys, uuid
 
+sys.dont_write_bytecode = True   # never write __pycache__ into the workspace (same as python -B)
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # <repo>/native/dualboot
 HERE = os.environ.get("GB_HOME") or (_REPO if os.path.isfile(os.path.join(_REPO, "build_esp.py")) else r"C:\GB-x86")
 spec = importlib.util.spec_from_file_location("build_usb", os.path.join(HERE, "build_usb.py"))

@@ -19,14 +19,23 @@
  * C. dGPU (NVIDIA TU117 in the base): no Android driver exists, so keep every 10de function unbound with runtime PM
  *    'auto' (power/control) on it and on all its upstream bridges; the root port then runtime-suspends and ACPI _PR3
  *    cuts the dGPU's power (D3cold). Re-applied when the base is re-attached (PCI hot-add uevent).
+ *    Opt-in nouveau (persist.vendor.gb.nouveau=1, loaded by gb_nouveau.rc/.sh; or -K <driver>): a function bound to
+ *    that driver is left bound and its power/control alone (nouveau runpm=1 runtime-suspends it to D3cold itself); a
+ *    detach request still unbinds it, and the detach is confirmed only once its driver link is gone and no NVIDIA
+ *    function has a driver right before LATCH_CONFIRM (else canceled); while a detach is under way (confirmed / latch
+ *    open) any pass unbinds it again (a late bind is never left on a base that can be pulled).
+ *    Property unset/0 and no -K: every driver is unbound, exactly as without the opt-in.
  * D. Platform profile: sets /sys/firmware/acpi/platform_profile at start (persist.vendor.gb.perf_profile if valid,
  *    else balanced). "gb_power -p <profile>" sets one and exits (the rc property trigger runs that).
  *
  * Logs to /dev/kmsg as "gb_power: ...". Needs root (bind mount, sysfs writes). Single-threaded poll loop on the kernel
  * uevent netlink socket + the DTX fd.
- * Build: clang --target=x86_64-linux-android34 -O2 -Wall -Wextra -o gb_power gb_power.c
+ * Build: clang --target=x86_64-linux-android34 -O2 -Wall -Wextra -Werror -static -Iuapi -o gb_power gb_power.c
  * Options: -p <profile> set platform profile and exit | -o one battery pass, print, exit | -r <root> sysfs/dev prefix
- *          (tests) | -H no BATn/type hiding | -D no DTX | -G no dGPU handling | -I no studio-mode input inhibit | -v
+ *          (tests) | -H no BATn/type hiding | -D no DTX | -G no dGPU handling (as gb.dgpu=keep: no unbind/runtime PM at
+ *          start or hot-plug; a detach request still unbinds before confirming) | -I no studio-mode input inhibit | -v
+ *          | -K <driver> leave dGPU functions bound to <driver> except at detach (overrides persist.vendor.gb.nouveau)
+ * Built static (build.sh): it starts at early-init, so it does not depend on the dynamic linker / linkerconfig state.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -57,6 +66,10 @@
 static int g_kmsg = -1, g_verbose;
 static char g_root[256] = "";      /* path prefix for /sys, /dev, /proc (unit tests use a fake tree) */
 static int g_hide = 1, g_dtx_on = 1, g_dgpu_on = 1, g_inhibit_on = 1, g_dgpu_unbind = 1;
+/* dGPU driver left bound outside a detach (nouveau opt-in): "-K <driver>" (g_keep_cli), else "nouveau" while
+ * persist.vendor.gb.nouveau=1 (re-read on every dGPU pass). Empty = default: every driver is unbound. */
+static char g_keep_drv[48] = "";
+static int g_keep_cli;
 
 static void logm(int lvl, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void logm(int lvl, const char *fmt, ...) {
@@ -387,7 +400,9 @@ static void combine(const struct psy *ps, int n, struct combo *c) {
     c->ac = ac < 0 ? 1 : ac;
     return;
   }
-  if (ac < 0) ac = nchg > 0 || (nfull > 0 && ndis == 0);   /* no charger supply registered: infer */
+  /* no charger supply registered: infer. Any discharging pack means battery power (unplugged, the base charges the
+   * clipboard: "Charging" + "Discharging" must not read as AC). */
+  if (ac < 0) ac = ndis == 0 && (nchg > 0 || nfull > 0);
   c->present = 1;
   c->ac = ac;
   c->e_now = en; c->e_full = ef; c->e_design = ed;
@@ -606,13 +621,33 @@ static void pci_state(const char *devdir, char *out, size_t n) {
   snprintf(out, n, "runtime %s, %s", rs, ps);
 }
 
-/* Unbinds drivers from / enables runtime PM on every NVIDIA function and its bridges. Never touches config space
- * (vendor/device/class come from sysfs caches). Returns the number of functions still bound to a driver. */
-static int g_dgpu_seen;
-static int dgpu_scan(const char *why, int report) {
+/* nouveau opt-in state for the next pass: -K wins; else persist.vendor.gb.nouveau=1 -> "nouveau" (the value
+ * gb_nouveau.rc triggers on), anything else -> "" (default). Logs only when it changes, so the default stays silent. */
+static void keep_drv_update(void) {
+  if (g_keep_cli) return;
+  char v[100], want[sizeof g_keep_drv];
+  prop_get("persist.vendor.gb.nouveau", v);
+  snprintf(want, sizeof want, "%s", !strcmp(v, "1") ? "nouveau" : "");
+  if (!strcmp(want, g_keep_drv)) return;
+  if (want[0]) LOGI("dGPU: persist.vendor.gb.nouveau=1: functions bound to %s stay bound (it runs their runtime PM) "
+                    "and are unbound only before a detach is confirmed", want);
+  else LOGI("dGPU: nouveau opt-in off: every driver on the dGPU is unbound again");
+  snprintf(g_keep_drv, sizeof g_keep_drv, "%s", want);
+}
+
+/* Unbinds drivers from every NVIDIA function and (pm) enables runtime PM on it and its bridges. Never touches config
+ * space (vendor/device/class/power_state come from sysfs caches). Returns the number of functions still bound.
+ * Opt-in (g_keep_drv set): a function bound to g_keep_drv is left bound with its power/control untouched, except in
+ * a detach pass (the request's own, or any pass while a detach is under way: dgpu_scan), which unbinds every driver
+ * and then counts a function as bound until its driver link is gone. */
+static int g_dgpu_seen, g_dgpu_kept;              /* last pass: NVIDIA functions seen / found bound to g_keep_drv */
+static int (*dgpu_unbind_write)(const char *path, const char *bdf) = write_text;   /* unit tests emulate the kernel */
+static int dgpu_pass(const char *why, int report, int pm, int detach) {
   char dir[PATH_MAX], dev[PATH_MAX + 32], p[PATH_MAX + 64], v[32], cls[16], did[16], drv[48], real[PATH_MAX];
+  keep_drv_update();
+  g_dgpu_kept = 0;
   DIR *d = opendir(rpath(dir, sizeof dir, "/sys/bus/pci/devices"));
-  int found = 0, bound = 0;
+  int found = 0, bound = 0, kept = 0;
   if (!d) return 0;
   struct dirent *e;
   while ((e = readdir(d))) {
@@ -627,20 +662,43 @@ static int dgpu_scan(const char *why, int report) {
     if (read_text(p, did, sizeof did) < 0) strcpy(did, "?");
     snprintf(p, sizeof p, "%s/driver", dev);
     link_base(p, drv, sizeof drv);
-    if (drv[0]) {
+    int keep = drv[0] && g_keep_drv[0] && !strcmp(drv, g_keep_drv);   /* always 0 without the opt-in */
+    int left = keep && !detach;                   /* stays bound after this pass */
+    kept += keep;
+    if (left) {
+      if (report) LOGI("dGPU %s (10de:%s class %s): left bound to %s (opt-in; unbound before a detach)", e->d_name,
+                       hex4(did), cls, drv);
+    } else if (drv[0]) {
       int r = -EPERM;
+      char still[48] = "";
       if (g_dgpu_unbind) {
         snprintf(p, sizeof p, "%s/driver/unbind", dev);
-        r = write_text(p, e->d_name);
+        r = dgpu_unbind_write(p, e->d_name);
+        if (!r && detach && g_keep_drv[0]) {      /* opt-in: the base is never pulled while a driver holds the dGPU */
+          snprintf(p, sizeof p, "%s/driver", dev);
+          link_base(p, still, sizeof still);
+        }
       }
-      if (!r) LOGI("dGPU %s (10de:%s class %s): unbound from %s (no Android user of the NVIDIA GPU)", e->d_name,
-                   hex4(did), cls, drv);
-      else { bound++; LOGW("dGPU %s: still bound to %s (%s)", e->d_name, drv, g_dgpu_unbind ? strerror(-r) : "unbind off"); }
+      if (still[0]) {
+        bound++;
+        LOGE("dGPU %s: unbind from %s returned, but the function is still bound to %s", e->d_name, drv, still);
+      } else if (!r && keep) {
+        LOGI("dGPU %s (10de:%s class %s): unbound from %s before the detach (opt-in driver)", e->d_name, hex4(did), cls,
+             drv);
+      } else if (!r) {
+        LOGI("dGPU %s (10de:%s class %s): unbound from %s (no Android user of the NVIDIA GPU)", e->d_name, hex4(did),
+             cls, drv);
+      } else {
+        bound++;
+        LOGW("dGPU %s: still bound to %s (%s)", e->d_name, drv, g_dgpu_unbind ? strerror(-r) : "unbind off");
+      }
     }
-    snprintf(p, sizeof p, "%s/d3cold_allowed", dev);
-    if (read_text(p, v, sizeof v) >= 0 && !strcmp(v, "0")) write_text(p, "1");
-    snprintf(p, sizeof p, "dGPU %s", e->d_name);
-    rpm_auto(dev, p);
+    if (pm) {
+      snprintf(p, sizeof p, "%s/d3cold_allowed", dev);
+      if (read_text(p, v, sizeof v) >= 0 && !strcmp(v, "0")) write_text(p, "1");
+      snprintf(p, sizeof p, "dGPU %s", e->d_name);
+      if (!left) rpm_auto(dev, p);                /* a kept driver owns power/control (nouveau runpm: pm_runtime_allow) */
+    }
     /* every upstream PCI bridge (the root port 00:1d.4 on the SB3): runtime PM auto, so it can drop to D3cold */
     char top[PATH_MAX] = "";
     if (realpath(dev, real)) {
@@ -650,7 +708,7 @@ static int dgpu_scan(const char *why, int report) {
         const char *b = strrchr(real, '/');
         if (!b || !is_bdf(b + 1)) break;
         snprintf(p, sizeof p, "bridge %s (above dGPU)", b + 1);
-        rpm_auto(real, p);
+        if (pm) rpm_auto(real, p);
         snprintf(top, sizeof top, "%s", real);
       }
     }
@@ -663,13 +721,37 @@ static int dgpu_scan(const char *why, int report) {
       if (strstr(s1, "D0") && !drv[0])
         LOGW("dGPU %s still in D0: root port not runtime-suspended (check its power/control, pcie_port_pm, and that "
              "no other function below it is active)", e->d_name);
+      else if (strstr(s1, "D0") && left)
+        LOGW("dGPU %s still in D0 on %s: check that it was loaded with runpm=1, its power/control is auto, and that "
+             "nothing keeps its render node busy", e->d_name, drv);
     }
   }
   closedir(d);
   if (report && !found) LOGI("no NVIDIA function on PCI (%s): base detached or dGPU off", why);
   else if (found) LOGD("dGPU scan (%s): %d NVIDIA functions, %d still bound", why, found, bound);
   g_dgpu_seen = found;
+  g_dgpu_kept = kept;
   return bound;
+}
+
+/* NVIDIA functions that have a driver right now (read-only): the opt-in detach's last look before LATCH_CONFIRM, as
+ * its unbind pass can block for seconds (nouveau resume + teardown) while another probe binds a function. */
+static int dgpu_bound_now(void) {
+  char dir[PATH_MAX], p[PATH_MAX + 300], v[32], drv[48];
+  DIR *d = opendir(rpath(dir, sizeof dir, "/sys/bus/pci/devices"));
+  int n = 0;
+  if (!d) return 0;
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    if (e->d_name[0] == '.') continue;
+    snprintf(p, sizeof p, "%s/%s/vendor", dir, e->d_name);
+    if (read_text(p, v, sizeof v) < 0 || strcasecmp(v, "0x10de")) continue;
+    snprintf(p, sizeof p, "%s/%s/driver", dir, e->d_name);
+    link_base(p, drv, sizeof drv);
+    if (drv[0]) { n++; LOGE("dGPU %s: bound to %s after the unbind pass", e->d_name, drv); }
+  }
+  closedir(d);
+  return n;
 }
 
 /* ------------------------------------------------------------------------------------------------ D. profile */
@@ -693,34 +775,38 @@ static int profile_apply(const char *want) {
 }
 
 /* ------------------------------------------------------------------------------------------------ B. DTX */
-/* uAPI: include/uapi/linux/surface_aggregator/dtx.h (copied: the NDK sysroot may not carry it) */
-#define SDTX_IOCTL_EVENTS_ENABLE _IO(0xa5, 0x21)
-#define SDTX_IOCTL_LATCH_LOCK _IO(0xa5, 0x23)
-#define SDTX_IOCTL_LATCH_UNLOCK _IO(0xa5, 0x24)
-#define SDTX_IOCTL_LATCH_REQUEST _IO(0xa5, 0x25)
-#define SDTX_IOCTL_LATCH_CONFIRM _IO(0xa5, 0x26)
-#define SDTX_IOCTL_LATCH_HEARTBEAT _IO(0xa5, 0x27)
-#define SDTX_IOCTL_LATCH_CANCEL _IO(0xa5, 0x28)
-struct gb_sdtx_base_info { uint16_t state, base_id; } __attribute__((packed));
-#define SDTX_IOCTL_GET_BASE_INFO _IOR(0xa5, 0x29, struct gb_sdtx_base_info)
-#define SDTX_IOCTL_GET_DEVICE_MODE _IOR(0xa5, 0x2a, uint16_t)
-#define SDTX_IOCTL_GET_LATCH_STATUS _IOR(0xa5, 0x2b, uint16_t)
-enum { SDTX_EVENT_REQUEST = 1, SDTX_EVENT_CANCEL, SDTX_EVENT_BASE_CONNECTION, SDTX_EVENT_LATCH_STATUS,
-       SDTX_EVENT_DEVICE_MODE };
-#define SDTX_CAT(v) ((v) & 0xf000)
-#define SDTX_CAT_RUNTIME 0x1000
-#define SDTX_CAT_HW 0x2000
-#define SDTX_BASE_DETACHED 0x0000
-#define SDTX_BASE_ATTACHED 0x0001
-#define SDTX_DETACH_NOT_FEASIBLE 0x1001
-#define SDTX_DETACH_TIMEDOUT 0x1002
-#define SDTX_LATCH_CLOSED 0x0000
-#define SDTX_LATCH_OPENED 0x0001
-#define SDTX_ERR_FAILED_TO_OPEN 0x2001
-#define SDTX_ERR_FAILED_TO_REMAIN_OPEN 0x2002
-#define SDTX_ERR_FAILED_TO_CLOSE 0x2003
-enum { MODE_TABLET = 0, MODE_LAPTOP = 1, MODE_STUDIO = 2 };
+/* uAPI: include/uapi/linux/surface_aggregator/dtx.h. build.sh compiles against a verbatim copy of the kernel tree's header
+ * (uapi/ next to this file, -Iuapi, ahead of the NDK sysroot's identical copy). The literal values below pin the ABI, so a
+ * header that differs from what surface_dtx.c implements fails the build instead of producing wrong ioctls. */
+#include <linux/surface_aggregator/dtx.h>
+_Static_assert(SDTX_IOCTL_EVENTS_ENABLE == 0xa521 && SDTX_IOCTL_LATCH_CONFIRM == 0xa526 &&
+               SDTX_IOCTL_LATCH_HEARTBEAT == 0xa527 && SDTX_IOCTL_LATCH_CANCEL == 0xa528, "DTX ioctl numbers");
+_Static_assert(SDTX_IOCTL_GET_BASE_INFO == 0x8004a529 && SDTX_IOCTL_GET_DEVICE_MODE == 0x8002a52a &&
+               SDTX_IOCTL_GET_LATCH_STATUS == 0x8002a52b, "DTX read ioctl numbers/sizes");
+_Static_assert(sizeof(struct sdtx_base_info) == 4 && sizeof(struct sdtx_event) == 4, "DTX struct layout");
+_Static_assert(SDTX_EVENT_REQUEST == 1 && SDTX_EVENT_CANCEL == 2 && SDTX_EVENT_BASE_CONNECTION == 3 &&
+               SDTX_EVENT_LATCH_STATUS == 4 && SDTX_EVENT_DEVICE_MODE == 5, "DTX event codes");
+_Static_assert(SDTX_BASE_DETACHED == 0 && SDTX_BASE_ATTACHED == 1 && SDTX_DETACH_NOT_FEASIBLE == 0x1001 &&
+               SDTX_DETACH_TIMEDOUT == 0x1002 && SDTX_LATCH_CLOSED == 0 && SDTX_LATCH_OPENED == 1 &&
+               SDTX_ERR_FAILED_TO_OPEN == 0x2001 && SDTX_ERR_FAILED_TO_REMAIN_OPEN == 0x2002 &&
+               SDTX_ERR_FAILED_TO_CLOSE == 0x2003 && SDTX_CATEGORY_HARDWARE_ERROR == 0x2000, "DTX status codes");
+_Static_assert(SDTX_DEVICE_MODE_TABLET == 0 && SDTX_DEVICE_MODE_LAPTOP == 1 && SDTX_DEVICE_MODE_STUDIO == 2, "modes");
+#define SDTX_CAT(v) SDTX_CATEGORY(v)
+#define SDTX_CAT_HW SDTX_CATEGORY_HARDWARE_ERROR
+enum { MODE_TABLET = SDTX_DEVICE_MODE_TABLET, MODE_LAPTOP = SDTX_DEVICE_MODE_LAPTOP, MODE_STUDIO = SDTX_DEVICE_MODE_STUDIO };
 enum { EC_READY, EC_IN_PROGRESS, EC_CONFIRMED };
+static int g_race_wait_ms = 2000;                 /* confirm/abort race re-check delay (unit tests shorten it) */
+
+/* Latch value -> SDTX_LATCH_CLOSED / SDTX_LATCH_OPENED, inferring the mechanical state from a hardware error the way
+ * surface-dtx-daemon does; -1 for unknown values (ignored, like the daemon). */
+static int latch_state(int v) {
+  switch (v) {
+    case SDTX_LATCH_CLOSED: case SDTX_ERR_FAILED_TO_OPEN: case SDTX_ERR_FAILED_TO_REMAIN_OPEN: return SDTX_LATCH_CLOSED;
+    case SDTX_LATCH_OPENED: case SDTX_ERR_FAILED_TO_CLOSE: return SDTX_LATCH_OPENED;
+    default: return -1;
+  }
+}
+static int base_known(int v) { return v == SDTX_BASE_DETACHED || v == SDTX_BASE_ATTACHED || v == SDTX_DETACH_NOT_FEASIBLE; }
 
 static int sys_ioctl(int fd, unsigned long req, void *arg) { return ioctl(fd, req, arg) < 0 ? -errno : 0; }
 static int (*dtx_ioctl)(int fd, unsigned long req, void *arg) = sys_ioctl;   /* unit tests swap in a mock */
@@ -732,6 +818,13 @@ static struct {
   long long requery_at, retry_at;
 } g_dtx = {.fd = -1, .base = SDTX_BASE_ATTACHED, .mode = MODE_LAPTOP, .inhibited = -1};
 static long long g_dgpu_due = -1, g_dgpu_report_due = -1;
+
+/* Start/hot-plug/report passes. While a detach is under way (requested, confirmed or the latch open) they get detach
+ * semantics: with the opt-in, a function the kept driver binds meanwhile (gb_nouveau.sh's insmod or a re-probe racing
+ * the button) is unbound again instead of being left bound while the base can be pulled. Without the opt-in the flag
+ * changes nothing in dgpu_pass (every driver is unbound anyway). */
+static int dgpu_releasing(void) { return g_dtx.ec != EC_READY || g_dtx.latch == SDTX_LATCH_OPENED; }
+static int dgpu_scan(const char *why, int report, int pm) { return dgpu_pass(why, report, pm, dgpu_releasing()); }
 
 static const char *base_name(int v) {
   switch (v) {
@@ -791,6 +884,7 @@ static void inhibit_base_input(int on) {
 }
 
 static void dtx_set_mode(int mode, const char *src) {
+  if (mode < MODE_TABLET || mode > MODE_STUDIO) { LOGW("device mode: unknown value %d (%s) ignored", mode, src); return; }
   if (mode == g_dtx.mode && g_dtx.inhibited >= 0) return;
   if (mode != g_dtx.mode) LOGI("device mode: %s -> %s (%s); SW_TABLET_MODE=%d", mode_name(g_dtx.mode), mode_name(mode),
                                src, mode != MODE_LAPTOP);
@@ -800,6 +894,9 @@ static void dtx_set_mode(int mode, const char *src) {
 }
 
 static void dtx_set_base(int base, const char *src) {
+  /* unknown (SDTX_UNKNOWN) states keep the last known one, like surface-dtx-daemon: otherwise one odd EC value would
+   * make every detach request look "not attached" and get canceled (detach impossible) */
+  if (!base_known(base)) { LOGW("base: unknown state 0x%04x (%s) ignored", base, src); return; }
   if (base == g_dtx.base) return;
   int old = g_dtx.base;
   g_dtx.base = base;
@@ -827,16 +924,12 @@ static void dtx_set_latch(int latch, const char *src) {
  * while the latch is still closing) and for every base event (v6.18 surface_dtx's resume path emits a
  * BASE_CONNECTION event carrying the latch status, see patch 0003). */
 static int dtx_query(const char *src) {
-  struct gb_sdtx_base_info bi;
+  struct sdtx_base_info bi;
   uint16_t v;
   int r = dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_BASE_INFO, &bi);
   if (r) { LOGE("DTX GET_BASE_INFO failed: %s", strerror(-r)); return r; }
   dtx_set_base(bi.state, src);
-  if (!dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_LATCH_STATUS, &v)) {
-    int l = v;
-    if (SDTX_CAT(l) == SDTX_CAT_HW) l = l == SDTX_ERR_FAILED_TO_CLOSE ? SDTX_LATCH_OPENED : SDTX_LATCH_CLOSED;
-    dtx_set_latch(l, src);
-  }
+  if (!dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_LATCH_STATUS, &v) && latch_state(v) >= 0) dtx_set_latch(latch_state(v), src);
   if (!dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_DEVICE_MODE, &v)) dtx_set_mode(v, src);
   return 0;
 }
@@ -845,15 +938,27 @@ static void dtx_on_request(void) {
   if (g_dtx.ec != EC_READY) {                     /* a second request event = abort (button pressed again / echo) */
     if (g_dtx.latch == SDTX_LATCH_OPENED) {
       LOGI("detach: request while the latch is open -> the EC closes it again (detach canceled)");
-      return;
+      return;                                     /* stays confirmed until the LATCH_CLOSED event */
     }
-    if (g_dtx.ec == EC_CONFIRMED) g_dtx.requery_at = now_ms() + 2000;  /* confirm/abort race: re-read the latch */
+    if (g_dtx.ec == EC_CONFIRMED) {
+      /* Confirm/abort race (as surface-dtx-daemon): either the latch opens momentarily, or the abort was queued before
+       * our confirm and it never opens. Wait 2 s and look; blocking on purpose like the daemon, so later DTX events
+       * (kept in the driver's FIFO) are handled against the settled state. Rare (needs a double press). */
+      struct timespec ts = {g_race_wait_ms / 1000, (g_race_wait_ms % 1000) * 1000000L};
+      while (nanosleep(&ts, &ts) && errno == EINTR) {}
+      uint16_t s;
+      if (!dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_LATCH_STATUS, &s) && latch_state(s) != SDTX_LATCH_CLOSED) {
+        LOGI("detach: abort after confirm, latch not closed (0x%04x): waiting for it to close", s);
+        if (latch_state(s) == SDTX_LATCH_OPENED) dtx_set_latch(SDTX_LATCH_OPENED, "re-check");
+        return;                                   /* stays confirmed; LATCH_CLOSED -> ready */
+      }
+    }
     LOGI("detach: request canceled");
     g_dtx.ec = EC_READY;
     return;
   }
   g_dtx.ec = EC_IN_PROGRESS;
-  struct gb_sdtx_base_info bi;
+  struct sdtx_base_info bi;
   if (!dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_BASE_INFO, &bi)) dtx_set_base(bi.state, "request");
   if (g_dtx.base != SDTX_BASE_ATTACHED) {        /* EC answers LATCH_CANCEL with a REQUEST event -> EC_READY */
     LOGW("detach: refused, %s", g_dtx.base == SDTX_DETACH_NOT_FEASIBLE ? "clipboard battery too low" : "no base attached");
@@ -862,9 +967,22 @@ static void dtx_on_request(void) {
   }
   LOGI("detach: requested (detach button)");
   dtx_cmd(SDTX_IOCTL_LATCH_HEARTBEAT, "LATCH_HEARTBEAT");
-  int busy = g_dgpu_on ? dgpu_scan("detach", 0) : 0;
+  /* Always unbind before confirming, also with -G / gb.dgpu=keep (then without runtime-PM writes) and with the nouveau
+   * opt-in (its functions too, each checked to be driverless afterwards): the dGPU is about to be hot-removed, and a
+   * confirm with a driver still bound is exactly the unsafe case. */
+  int busy = dgpu_pass("detach", 0, g_dgpu_on, 1);
   if (busy) {                                     /* never pull a dGPU out from under a driver */
     LOGE("detach: aborted, %d dGPU function(s) still bound to a driver", busy);
+    dtx_cmd(SDTX_IOCTL_LATCH_CANCEL, "LATCH_CANCEL");
+    return;
+  }
+  /* opt-in driver was bound: its unbind resumed the GPU and tore nouveau/GSP-RM down (can take seconds), so restart
+   * the EC's detach timeout before confirming (never sent without the opt-in: g_dgpu_kept is 0 then) */
+  if (g_dgpu_kept) dtx_cmd(SDTX_IOCTL_LATCH_HEARTBEAT, "LATCH_HEARTBEAT");
+  /* opt-in: the pass above can take seconds, so look once more right before confirming; a driver that bound meanwhile
+   * cancels the detach (the next press unbinds it). Not done without the opt-in (its pass is quick; unchanged path). */
+  if (g_keep_drv[0] && (busy = dgpu_bound_now())) {
+    LOGE("detach: aborted, %d dGPU function(s) bound to a driver again before the confirm", busy);
     dtx_cmd(SDTX_IOCTL_LATCH_CANCEL, "LATCH_CANCEL");
     return;
   }
@@ -890,13 +1008,16 @@ static void dtx_event(int code, const unsigned char *d, int len) {
       if (dtx_query("base event")) dtx_set_base(v, "base event");
       break;
     case SDTX_EVENT_LATCH_STATUS: {
-      int l = v;
-      if (SDTX_CAT(l) == SDTX_CAT_HW) {
+      int l;
+      if (SDTX_CAT(v) == SDTX_CAT_HW) {           /* re-read; if that fails or is unknown, infer from the error */
         uint16_t s;
-        LOGE("latch %s (0x%04x)", latch_name(l), l);
-        if (!dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_LATCH_STATUS, &s) && SDTX_CAT(s) != SDTX_CAT_HW) l = s;
-        else l = l == SDTX_ERR_FAILED_TO_CLOSE ? SDTX_LATCH_OPENED : SDTX_LATCH_CLOSED;
+        LOGE("latch %s (0x%04x)", latch_name(v), v);
+        l = !dtx_ioctl(g_dtx.fd, SDTX_IOCTL_GET_LATCH_STATUS, &s) ? latch_state(s) : -1;
+        if (l < 0) l = latch_state(v);
+      } else {
+        l = latch_state(v);
       }
+      if (l < 0) { LOGW("latch: unknown status 0x%04x ignored", v); break; }
       if (l == SDTX_LATCH_CLOSED) {
         g_dtx.ec = EC_READY;
         g_dtx.requery_at = now_ms() + 1500;
@@ -960,12 +1081,11 @@ static int dtx_open(void) {
   if (r) { LOGE("DTX EVENTS_ENABLE failed: %s", strerror(-r)); dtx_close(); return -1; }
   /* events first, then the state, so nothing is missed (same order as surface-dtx-daemon); taken as-is, no
    * transition handling */
-  struct gb_sdtx_base_info bi;
+  struct sdtx_base_info bi;
   uint16_t v;
-  if (!dtx_ioctl(fd, SDTX_IOCTL_GET_BASE_INFO, &bi)) g_dtx.base = bi.state;
-  if (!dtx_ioctl(fd, SDTX_IOCTL_GET_LATCH_STATUS, &v))
-    g_dtx.latch = SDTX_CAT(v) != SDTX_CAT_HW ? v : v == SDTX_ERR_FAILED_TO_CLOSE ? SDTX_LATCH_OPENED : SDTX_LATCH_CLOSED;
-  if (!dtx_ioctl(fd, SDTX_IOCTL_GET_DEVICE_MODE, &v)) g_dtx.mode = v;
+  if (!dtx_ioctl(fd, SDTX_IOCTL_GET_BASE_INFO, &bi) && base_known(bi.state)) g_dtx.base = bi.state;
+  if (!dtx_ioctl(fd, SDTX_IOCTL_GET_LATCH_STATUS, &v) && latch_state(v) >= 0) g_dtx.latch = latch_state(v);
+  if (!dtx_ioctl(fd, SDTX_IOCTL_GET_DEVICE_MODE, &v) && v <= MODE_STUDIO) g_dtx.mode = v;
   g_dtx.inhibited = -1;
   inhibit_base_input(g_dtx.mode == MODE_STUDIO);
   g_dtx.ec = g_dtx.latch == SDTX_LATCH_OPENED ? EC_CONFIRMED : EC_READY;
@@ -1079,14 +1199,15 @@ static void read_cmdline(void) {
 }
 
 static void usage(void) {
-  fprintf(stderr, "usage: gb_power [-p profile] [-o] [-r root] [-H] [-D] [-G] [-I] [-v]\n");
+  fprintf(stderr, "usage: gb_power [-p profile] [-o] [-r root] [-H] [-D] [-G] [-I] [-K driver] [-v]\n");
 }
 
 int main(int argc, char **argv) {
   const char *profile = NULL;
   int once = 0, opt;
-  while ((opt = getopt(argc, argv, "p:or:HDGIv")) != -1) {
+  while ((opt = getopt(argc, argv, "p:or:HDGIK:v")) != -1) {
     switch (opt) {
+      case 'K': snprintf(g_keep_drv, sizeof g_keep_drv, "%s", optarg); g_keep_cli = 1; break;
       case 'p': profile = optarg; break;
       case 'o': once = 1; break;
       case 'r': snprintf(g_root, sizeof g_root, "%s", optarg); break;
@@ -1123,13 +1244,16 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  LOGI("starting (hide=%d dtx=%d dgpu=%d inhibit=%d)", g_hide, g_dtx_on, g_dgpu_on, g_inhibit_on);
   read_cmdline();
+  LOGI("starting (hide=%d dtx=%d dgpu=%d inhibit=%d)", g_hide, g_dtx_on, g_dgpu_on, g_inhibit_on);
+  if (g_keep_cli)                                 /* (without -K nothing extra is logged: default output unchanged) */
+    LOGI("-K '%s': %s (persist.vendor.gb.nouveau ignored)", g_keep_drv,
+         g_keep_drv[0] ? "dGPU functions bound to it stay bound except at detach" : "every dGPU driver is unbound");
   int ue = uevent_open();                         /* before the first scan, so no change is missed */
   if (ue < 0) LOGW("uevent socket failed (%s): polling only", strerror(errno));
   if (!tp_probe()) LOGW("test_power not loaded yet: battery bridge waits for it");
   battery_update(1);
-  if (g_dgpu_on) { dgpu_scan("start", 0); g_dgpu_report_due = now_ms() + 8000; }
+  if (g_dgpu_on) { dgpu_scan("start", 0, 1); g_dgpu_report_due = now_ms() + 8000; }
   if (g_dtx_on && dtx_open()) g_dtx.retry_at = now_ms() + 1000;
   char want[100];
   prop_get("persist.vendor.gb.perf_profile", want);
@@ -1140,7 +1264,8 @@ int main(int argc, char **argv) {
 
   for (;;) {
     long long t = now_ms();
-    long long periodic = last_bat + (g_tp.ok ? 20000 : 5000);
+    /* backstop poll: 20 s while bridging; without test_power 5 s during boot, then 60 s (its load uevent wakes us) */
+    long long periodic = last_bat + (g_tp.ok ? 20000 : t - start < 120000 ? 5000 : 60000);
     long long due = min_due(min_due(min_due(g_bat_due, periodic), min_due(g_dgpu_due, g_dgpu_report_due)),
                             min_due(min_due(g_dtx.fd >= 0 && g_dtx.requery_at > 0 ? g_dtx.requery_at : -1,
                                             g_dtx.fd < 0 && g_dtx_on && g_dtx.retry_at > 0 ? g_dtx.retry_at : -1),
@@ -1155,6 +1280,7 @@ int main(int argc, char **argv) {
     for (int i = 0; r > 0 && i < np; i++) {
       if (!pf[i].revents) continue;
       if (pf[i].fd == ue) uevent_read(ue);
+      else if (pf[i].fd != g_dtx.fd) continue;    /* closed meanwhile (misc remove uevent) */
       else if (pf[i].revents & (POLLERR | POLLHUP | POLLNVAL)) { LOGW("DTX device hung up"); dtx_close(); g_dtx.retry_at = now_ms() + 2000; }
       else dtx_read();
     }
@@ -1166,8 +1292,8 @@ int main(int argc, char **argv) {
       if (!g_tp.ok) tp_probe();
       battery_update(0);
     }
-    if (g_dgpu_due >= 0 && t >= g_dgpu_due) { g_dgpu_due = -1; if (g_dgpu_on) dgpu_scan("hot-plug", 0); }
-    if (g_dgpu_report_due >= 0 && t >= g_dgpu_report_due) { g_dgpu_report_due = -1; if (g_dgpu_on) dgpu_scan("report", 1); }
+    if (g_dgpu_due >= 0 && t >= g_dgpu_due) { g_dgpu_due = -1; if (g_dgpu_on) dgpu_scan("hot-plug", 0, 1); }
+    if (g_dgpu_report_due >= 0 && t >= g_dgpu_report_due) { g_dgpu_report_due = -1; if (g_dgpu_on) dgpu_scan("report", 1, 1); }
     if (g_dtx.fd >= 0 && g_dtx.requery_at > 0 && t >= g_dtx.requery_at) { g_dtx.requery_at = -1; dtx_query("re-check"); }
     if (g_dtx_on && g_dtx.fd < 0 && g_dtx.retry_at > 0 && t >= g_dtx.retry_at) {
       /* retry while the driver may still be probing; after 2 min only on its uevent */

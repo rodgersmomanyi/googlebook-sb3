@@ -4,8 +4,12 @@ copies + unified diffs. Usage: python3 -I apply_patches.py <mesa_src_dir> <patch
 
 0001: NVK ANB import: reject foreign (non-LINEAR, non-NVIDIA) gralloc modifiers with VK_ERROR_INVALID_EXTERNAL_HANDLE
       instead of letting NIL panic (abort the process) in BlockLinearModifier::try_from().unwrap().
-0002: allow building NVK without libelf (only VK_NVX_binary_import cubin entrypoints use it; NVK 26.3 does not
-      advertise that extension, and libelf is not available for Android in the NDK).
+0002: allow building NVK without libelf (only the VK_NVX_binary_import cubin entrypoints in nvk_cubin.c use it, and
+      libelf is not available for Android in the NDK). NVK 26.3 advertises VK_NVX_binary_import only when
+      NVK_EXPERIMENTAL=dlss is set (on Android also via the property debug.mesa.nvk.experimental /
+      vendor.mesa.nvk.experimental / mesa.nvk.experimental, see util/os_misc.c). A build without nvk_cubin.c must
+      therefore also stop advertising it (-DNVK_NO_CUBIN), otherwise the extension would be listed while
+      vkCreateCuModuleNVX & co. resolve to NULL. (Verification fix, nvk-verify 2026-10-24.)
 """
 import difflib
 import os
@@ -46,7 +50,8 @@ P2 = [("meson.build",
   error('NVK requires libelf')
 endif""",
        """elif with_nouveau_vk
-  # libelf is only used by the NVK cubin (VK_NVX_binary_import) entrypoints, which NVK does not advertise.
+  # libelf is only used by the NVK cubin (VK_NVX_binary_import) entrypoints. Without it nvk_cubin.c is not built
+  # and src/nouveau/vulkan/meson.build defines NVK_NO_CUBIN so the extension is never advertised.
   warning('libelf not found: building NVK without the cubin (VK_NVX_binary_import) entrypoints')
 endif"""),
       ("src/nouveau/meson.build",
@@ -68,7 +73,23 @@ endif"""),
   nvk_deps += idep_nouveau_cubin
 endif
 
-nvk_include_directories = [""")]
+nvk_include_directories = ["""),
+      ("src/nouveau/vulkan/meson.build", """nvk_flags = []
+""", """nvk_flags = []
+
+# Built without libelf (nvk_cubin.c left out): VK_NVX_binary_import must not be advertised.
+if not dep_elf.found()
+  nvk_flags += '-DNVK_NO_CUBIN=1'
+endif
+"""),
+      ("src/nouveau/vulkan/nvk_physical_device.c",
+       """      .NVX_binary_import = info->cls_eng3d >= MAXWELL_A &&
+         instance->experimental_flags & NVK_EXPERIMENTAL_DLSS,
+""", """#ifndef NVK_NO_CUBIN
+      .NVX_binary_import = info->cls_eng3d >= MAXWELL_A &&
+         instance->experimental_flags & NVK_EXPERIMENTAL_DLSS,
+#endif
+""")]
 
 
 def apply(name, edits):
