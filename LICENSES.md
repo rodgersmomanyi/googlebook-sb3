@@ -1,7 +1,8 @@
 # Licenses
 
 This repository mixes our own work with changes to other projects. Each part keeps the license of the project it
-modifies. **Proposed** licensing (to be confirmed by the copyright holder before publishing):
+modifies. Licensing, confirmed by the copyright holder: our own work is Apache-2.0, and everything derived from another
+project keeps that project's license:
 
 | Part | License | Notes |
 |---|---|---|
