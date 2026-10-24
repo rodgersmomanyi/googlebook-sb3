@@ -1,0 +1,129 @@
+{
+ "name": "iptsd",
+ "source": "${GB_BUILD}\\native\\iptsd",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\bin\\iptsd",
+   "dest": "vup/bin/iptsd",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\bin\\iptsd-check-device",
+   "dest": "vup/bin/iptsd-check-device",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\gb_iptsd.sh",
+   "dest": "gb_iptsd.sh",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\iptsd.conf",
+   "dest": "etc/iptsd/iptsd.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-book-1.conf",
+   "dest": "etc/iptsd/presets/surface-book-1.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-book-2-13.conf",
+   "dest": "etc/iptsd/presets/surface-book-2-13.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-book-2-15.conf",
+   "dest": "etc/iptsd/presets/surface-book-2-15.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-book-3-13.conf",
+   "dest": "etc/iptsd/presets/surface-book-3-13.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-book-3-15.conf",
+   "dest": "etc/iptsd/presets/surface-book-3-15.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-laptop-1+2.conf",
+   "dest": "etc/iptsd/presets/surface-laptop-1+2.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-laptop-studio-2.conf",
+   "dest": "etc/iptsd/presets/surface-laptop-studio-2.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-pro-4-a.conf",
+   "dest": "etc/iptsd/presets/surface-pro-4-a.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-pro-4-b.conf",
+   "dest": "etc/iptsd/presets/surface-pro-4-b.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-pro-4-c.conf",
+   "dest": "etc/iptsd/presets/surface-pro-4-c.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-pro-5.conf",
+   "dest": "etc/iptsd/presets/surface-pro-5.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\etc\\iptsd\\presets\\surface-pro-6.conf",
+   "dest": "etc/iptsd/presets/surface-pro-6.conf",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTSD_Virtual_Touchscreen_045E_09B2.idc",
+   "dest": "vup/usr/idc/IPTSD_Virtual_Touchscreen_045E_09B2.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTSD_Virtual_Stylus_045E_09B2.idc",
+   "dest": "vup/usr/idc/IPTSD_Virtual_Stylus_045E_09B2.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTS_045E_09B2_Touchscreen.idc",
+   "dest": "vup/usr/idc/IPTS_045E_09B2_Touchscreen.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTS_045E_09B2_Stylus.idc",
+   "dest": "vup/usr/idc/IPTS_045E_09B2_Stylus.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTSD_Virtual_Touchscreen_045E_09B1.idc",
+   "dest": "vup/usr/idc/IPTSD_Virtual_Touchscreen_045E_09B1.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTSD_Virtual_Stylus_045E_09B1.idc",
+   "dest": "vup/usr/idc/IPTSD_Virtual_Stylus_045E_09B1.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTS_045E_09B1_Touchscreen.idc",
+   "dest": "vup/usr/idc/IPTS_045E_09B1_Touchscreen.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\iptsd\\idc\\IPTS_045E_09B1_Stylus.idc",
+   "dest": "vup/usr/idc/IPTS_045E_09B1_Stylus.idc",
+   "mode": "0644"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\iptsd\\gb_iptsd.rc"
+ ]
+}

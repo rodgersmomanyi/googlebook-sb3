@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OPTIONAL: install as /odm/etc/permissions/sb3-camera-back.xml only after the rear OV8865
+     camera has been seen working natively (lapis features.xml already declares
+     android.hardware.camera.front and android.hardware.camera.any). No autofocus is declared:
+     the libcamera simple pipeline has no AF algorithm. -->
+<permissions>
+    <feature name="android.hardware.camera" />
+</permissions>

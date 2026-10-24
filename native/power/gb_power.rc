@@ -1,0 +1,28 @@
+# gb_power (source native/power/gb_power.c): combined battery via test_power, detach (DTX) handling,
+# dGPU runtime PM, platform profile. Native tree only (gb.hw=native); append to GB_RC_NATIVE (/odm/etc/init/gb.rc).
+# Started from early-init right after "exec_start gb_modules" (same trigger, parsed later, so it runs after the module
+# loads finished): it flags/hides BAT1/BAT2 and fills test_battery before the health HAL (class hal, "on boot") scans
+# /sys/class/power_supply. Not oneshot: init restarts it if it dies. It waits for the supplies/devices itself
+# (uevents + retries), so no ordering on SAM probing is needed.
+service gb_power /vendor/bin/gb_power
+    user root
+    group root system
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    disabled
+
+# Platform profile from a property; gb_power -p validates it against platform_profile_choices (else balanced) and
+# logs to kmsg. Usage: setprop persist.vendor.gb.perf_profile performance|balanced-performance|balanced|low-power
+service gb_power_profile /vendor/bin/gb_power -p ${persist.vendor.gb.perf_profile}
+    user root
+    group root
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+on early-init
+    start gb_power
+
+on property:persist.vendor.gb.perf_profile=*
+    restart gb_power_profile

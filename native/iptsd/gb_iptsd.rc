@@ -1,0 +1,16 @@
+# Surface Book 3 touchscreen + Surface Pen (native mode). gb_iptsd.sh waits for the ipts.ko HID device's hidraw node,
+# makes sure Android has IDC files for it, and runs /vendor/bin/iptsd on it (restarting it on exit, device reset and
+# resume). Loops forever; init restarts it if the shell itself dies. Log: dmesg | grep -i iptsd
+# ipts.ko is insmod-ed by gbinit (modules.load) long before this; post-fs-data is still well before system_server's
+# InputReader opens the input devices, so the IDCs are in place first.
+service gb_iptsd /system/bin/sh /odm/gb_iptsd.sh
+    user root
+    group root input uhid
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    disabled
+
+on post-fs-data
+    # optional user config (/data/vendor/iptsd/iptsd.conf, writable from adb shell); restart: setprop ctl.restart gb_iptsd
+    mkdir /data/vendor/iptsd 0770 root shell
+    start gb_iptsd

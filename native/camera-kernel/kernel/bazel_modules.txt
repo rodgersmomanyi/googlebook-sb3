@@ -1,0 +1,22 @@
+# Add to BOTH module_implicit_outs and modules_superset of common_kernel(name = "kernel_x86_64")
+# in common/BUILD.bazel (same way build #11 added i915 etc.).
+# Camera stack (always built by camera.config):
+drivers/media/v4l2-core/v4l2-cci.ko
+drivers/media/pci/intel/ipu-bridge.ko
+drivers/media/pci/intel/ipu6/intel-ipu6.ko
+drivers/media/pci/intel/ipu6/intel-ipu6-isys.ko
+drivers/platform/x86/intel/int3472/intel_skl_int3472_common.ko
+drivers/platform/x86/intel/int3472/intel_skl_int3472_discrete.ko
+drivers/platform/x86/intel/int3472/intel_skl_int3472_tps68470.ko
+drivers/media/i2c/ov5693.ko
+drivers/media/i2c/ov8865.ko
+drivers/media/i2c/ov7251.ko
+drivers/media/i2c/dw9719.ko
+# Native-platform prerequisites (only if their CONFIG lines were added; skip if already listed):
+drivers/pinctrl/intel/pinctrl-intel.ko
+drivers/pinctrl/intel/pinctrl-icelake.ko
+drivers/mfd/intel-lpss.ko
+drivers/mfd/intel-lpss-pci.ko
+drivers/i2c/busses/i2c-designware-core.ko
+drivers/i2c/busses/i2c-designware-platform.ko
+# (drivers/mfd/mfd-core.ko is a dependency of intel-lpss and int3472_tps68470; already listed since build #11)

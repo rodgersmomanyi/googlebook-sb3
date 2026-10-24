@@ -1,0 +1,63 @@
+iptsd v3.1.1: Android NDK build - configurable preset/config paths (/odm/etc/iptsd), optional libstdc++fs (absent with libc++).
+
+diff --git a/meson.build b/meson.build
+index bac7f77..ad12c99 100644
+--- a/meson.build
++++ b/meson.build
+@@ -24,5 +24,16 @@ presetdir = join_paths(datadir, 'iptsd')
+ configdir = join_paths(sysconfdir, 'iptsd.d')
+ configfile = join_paths(sysconfdir, 'iptsd.conf')
+ 
++# GB (Googlebook/Android) port: explicit config locations, e.g. /odm/etc/iptsd/...
++if get_option('preset_dir') != ''
++	presetdir = get_option('preset_dir')
++endif
++if get_option('config_dir') != ''
++	configdir = get_option('config_dir')
++endif
++if get_option('config_file') != ''
++	configfile = get_option('config_file')
++endif
++
+ subdir('etc')
+ subdir('src')
+diff --git a/meson_options.txt b/meson_options.txt
+index 7d0e65e..35ae194 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -29,3 +29,22 @@ option(
+ 	type: 'boolean',
+ 	value: false,
+ )
++
++# GB (Googlebook/Android) port: override the compiled-in config locations (empty = upstream default).
++option(
++	'preset_dir',
++	type: 'string',
++	value: '',
++)
++
++option(
++	'config_dir',
++	type: 'string',
++	value: '',
++)
++
++option(
++	'config_file',
++	type: 'string',
++	value: '',
++)
+diff --git a/src/meson.build b/src/meson.build
+index 07c92c0..1e28654 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -96,7 +96,7 @@ spdlog = dependency(
+ )
+ 
+ # Find libstdc++fs for older GCC
+-stdcppfs = cpp.find_library('stdc++fs')
++stdcppfs = cpp.find_library('stdc++fs', required: false) # absent in the Android NDK (libc++)
+ 
+ # Default dependencies
+ default_deps = [

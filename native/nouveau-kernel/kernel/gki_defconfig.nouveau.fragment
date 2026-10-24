@@ -1,0 +1,21 @@
+# nouveau (NVIDIA TU117 / GTX 1650 Max-Q) for the android17-6.18 GKI, on top of kernel build #11's gki_defconfig.
+# Append these 3 lines AND delete the existing line "# CONFIG_FW_CACHE is not set" (gki_defconfig line 331):
+# kleaf_add_nouveau.py does both, idempotently.
+CONFIG_DRM_NOUVEAU=m
+# CONFIG_DRM_NOUVEAU_CH7006 is not set
+# CONFIG_DRM_NOUVEAU_SIL164 is not set
+#
+# Verified resulting .config delta vs build #11 (make defconfig of the edited file, out/config.diff):
+#   CONFIG_DRM_NOUVEAU=m  CONFIG_NOUVEAU_DEBUG=5  CONFIG_NOUVEAU_DEBUG_DEFAULT=3  CONFIG_DRM_NOUVEAU_BACKLIGHT=y
+#   CONFIG_DRM_EXEC=m  CONFIG_DRM_GPUVM=m  CONFIG_DRM_SCHED=m  CONFIG_MXM_WMI=m          (new modules)
+#   CONFIG_FW_CACHE=y                                                                    (vmlinux, built-in bool)
+# Everything else nouveau selects is already set by build #11 (i915 & co): DRM=y DRM_KMS_HELPER=y DRM_TTM=y
+#   DRM_TTM_HELPER=m DRM_DISPLAY_HELPER=m (+DP/HDMI helpers=y) DRM_CLIENT_SELECTION=m I2C=y I2C_ALGOBIT=m
+#   ACPI_WMI=m ACPI_VIDEO=m X86_PLATFORM_DEVICES=y BACKLIGHT_CLASS_DEVICE=y POWER_SUPPLY=y THERMAL=y INPUT=y
+#   IOMMU_API=y FW_LOADER=y PM_SLEEP=y.
+# Deliberately not set (not needed for TU117 power management): CONFIG_VGA_SWITCHEROO (bool, vmlinux; only muxed /
+#   v1-DSM laptops need it - the SB3 is muxless and its Optimus _DSM is not recognised by nouveau anyway, so runpm=1
+#   is passed explicitly), CONFIG_HWMON (no GPU temperature sysfs), CONFIG_DRM_NOUVEAU_SVM (needs DEVICE_PRIVATE),
+#   CONFIG_DRM_FBDEV_EMULATION (stays off: nouveau never takes the console).
+# There is no CONFIG_DRM_NOUVEAU_GSP_DEFAULT in 6.18: GSP-RM is the default on Turing (nvkm/subdev/gsp/tu102.c
+#   nvkm_boolopt("NvGspRm", true)); nouveau.config=NvGspRm=0 selects the old non-GSP path at load time.

@@ -1,0 +1,138 @@
+NVK (Mesa Vulkan for NVIDIA via nouveau) on Googlebook "lapis" / Surface Book 3 - integration notes
+=====================================================================================================
+Component: nvk-android. Mesa mesa-26.3.0-rc2 (+2 small local patches), NDK r27c (API 35), x86_64.
+Status: compile-tested and partially run-tested on the builder VM (no NVIDIA GPU there); nothing here has run on the
+real GTX 1650 yet. Every hardware statement below is either "verified in source" or "to be verified natively".
+
+1. What was built
+-----------------
+bin/vulkan.nouveau.so      NVK ICD as an Android hwvulkan HAL module (exports HMI + vk_icdGetInstanceProcAddr),
+                           SONAME vulkan.nouveau.so, stripped. Install: /vendor/lib64/hw/vulkan.nouveau.so (tree
+                           path vup/lib64/hw/). Inert there: libvulkan only loads vulkan.<ro.hardware.vulkan>.so and
+                           lapis sets ro.hardware.vulkan=intel (vendor build.prop).
+bin/nvk_probe              NDK test binary (/vendor/bin/nvk_probe, tree vup/bin/). dlopens the ICD directly.
+bin/nvk_probe_host         same source built for Linux/glibc (validation only; not for the device).
+patches/0001-*.patch       NVK: a gralloc buffer with a foreign DRM modifier (e.g. Intel Y-tiled from minigbm) now
+                           fails vkCreateImage with VK_ERROR_INVALID_EXTERNAL_HANDLE. Upstream 26.3 calls
+                           BlockLinearModifier::try_from(mod).unwrap() in nil/image.rs (new_tiled) -> Rust panic ->
+                           the whole process aborts.
+patches/0002-*.patch       Build NVK without libelf (no libelf in the NDK). libelf is used only by nvk_cubin.c
+                           (VK_NVX_binary_import cubin entrypoints); NVK 26.3 does not advertise that extension
+                           (no NVX in nvk_physical_device.c), so nothing user-visible is lost.
+scripts/                   00_env.sh, 10_build_host_clc.sh (host mesa_clc/vtn_bindgen2, needed because NVK
+                           compiles its OpenCL-C meta kernels at build time), 20_build_nvk_android.sh,
+                           30_build_probe.sh, 35_build_drm_shim_test.sh + 40_bionic_chroot_test.sh (builder-only
+                           tests), apply_patches.py, x86_64-android-nvk.ini (cross file as used). Toolchain: rustup stable 1.99.1 +
+                           x86_64-linux-android target, bindgen-cli 0.73.2, cbindgen 0.29.4, meson 1.12.1,
+                           host LLVM 18 + SPIRV-LLVM-Translator 18 (only for the host mesa_clc).
+src/                       nvk_probe.c, tri.vert/tri.frag (+ generated SPIR-V header).
+nvk-android.json, gb_nvk.rc  native-tree manifest (same format as components/*.json) and an optional on-demand
+                           probe service (setprop vendor.gb.nvk_probe 1). No build.prop lines are needed.
+logs/                      build, host-validation and bionic-chroot test logs.
+
+2. Kernel / firmware prerequisites (owned by the nouveau-kernel and power components, not by this one)
+------------------------------------------------------------------------------------------------------
+- nouveau.ko (CONFIG_DRM_NOUVEAU=m) + drm_exec, drm_gpuvm, gpu-sched, mxm-wmi, drm_ttm_helper, drm_display_helper.
+  NVK needs the VM_BIND/EXEC uAPI (present since 6.6; 6.18.21 is fine). Nothing extra for NVK beyond that.
+- GSP-RM firmware: 6.18 enables GSP on Turing by default (nvkm/subdev/gsp/tu102.c: NvGspRm defaults to true).
+  Staged: firmware/nvidia/tu117/gsp/{booter_load,booter_unload,bootloader,gsp}-570.144.bin (+ the acr/gr/sec2/nvdec
+  files). Without GSP NVK still works on Turing but at boot clocks.
+- Module ORDER MATTERS: i915 must register its DRM device BEFORE nouveau, i.e. i915 = card0/renderD128.
+  lapis' minigbm (libminigbm_gralloc.so, allocator-service.minigbm, libgbm.so) has a "nouveau" (dumb) backend
+  (strings: backend_nouveau) and opens the first render node it can drive. If nouveau ever becomes renderD128,
+  gralloc and HWC would try to use the NVIDIA GPU -> no display. Load nouveau late (modules.load.late or gb_power
+  opt-in) and check `ls -l /sys/class/drm/renderD128/device/driver` -> i915.
+- Runtime PM / detach: gb_power keeps the dGPU unbound by default; persist.vendor.gb.nouveau=1 leaves it on nouveau
+  (runpm=1) and unbinds it before a confirmed detach. Any process holding NVK at that moment gets
+  VK_ERROR_DEVICE_LOST (or dies). Acceptable for test binaries, NOT for SurfaceFlinger (see 4b).
+
+3. Recommended default: option (a)
+----------------------------------
+Keep ANV (vulkan.intel.so) as THE system Vulkan driver (SurfaceFlinger RenderEngine/Skia-Vulkan, HWUI, ANGLE GLES).
+Ship NVK only as /vendor/lib64/hw/vulkan.nouveau.so for explicit users (nvk_probe, benchmarks, compute tools that
+dlopen it themselves). Nothing in the boot path loads it, so it cannot break the UI, and the dGPU stays powered off
+unless persist.vendor.gb.nouveau=1 is set AND a program actually opens it.
+Linker namespaces: /vendor/bin/* binaries run in the vendor namespace, which may dlopen /vendor/lib64/hw/*.
+The ICD's NEEDED list is exactly: libhardware, liblog, libnativewindow, libsync, libm, libdl, libc (libc++ is linked
+statically). Its non-libc imports (AHardwareBuffer_{acquire,allocate,describe,getNativeHandle,release},
+__android_log_write, hw_get_module, sync_merge) were checked against the lapis system image (CL3B.260622.271.R1,
+SDK 37) and vendor libhardware.so: all exported. Full import list: bin/undef.txt.
+Cost of shipping it in the native tree: ~16 MB in the /odm tmpfs (RAM) and a larger initrd. Drop the two files from
+the tree if that matters; nothing else depends on them.
+Apps cannot use it: an app's classloader namespace cannot load /vendor/lib64/hw; and Android's Vulkan loader has no
+multi-ICD support. (Even via the "updatable graphics driver" mechanism, the per-app driver also becomes HWUI's
+driver, so the same blockers as in 4b apply to that app's UI.)
+
+4. Option (b): NVK as the system Vulkan driver (NVIDIA renders, i915 scans out) - assessment
+---------------------------------------------------------------------------------------------
+Mechanism would be easy (e.g. gbinit writes ro.hardware.vulkan=nouveau into /odm/etc/build.prop, which init loads
+after vendor's build.prop and lets override it; ANGLE and Skia then run on NVK). It would NOT boot to a usable UI with
+NVK 26.3:
+
+ B1 (hard, verified in source AND in the built binary) NVK does not implement
+    VK_ANDROID_external_memory_android_hardware_buffer. nvk_physical_device.c has no such entry (ANV, RADV, panvk,
+    v3dv and venus set it), and the drm-shim run of our vulkan.nouveau.so lists it as absent (logs/chroot_test.log). SurfaceFlinger's Skia-Vulkan RenderEngine (lapis: debug.renderengine.vulkan=true) and HWUI
+    (ro.hwui.use_vulkan=true) wrap every layer/window buffer as an AHardwareBuffer-imported VkImage, and ANGLE needs
+    it for EGLImage/EGL_ANDROID_image_native_buffer. Android's CDD requires it for Vulkan >= 1.1. Without it SF
+    cannot composite a single client layer. Fix = port the AHB plumbing (panvk_android.c is the model: deferred
+    image init, vk_android_get_ahb_layout, AHB import/export in AllocateMemory, image format props, external
+    formats/YCbCr) - a few hundred lines in NVK, plus testing.
+ B2 (hard; NVK side verified in source, minigbm side expected - nvk_probe anb-swapchain prints the real modifier)
+    Buffer layouts. All gralloc buffers come from minigbm's i915 backend in system RAM; for GPU render/texture/
+    composer usage upstream minigbm picks Intel X/Y-tiled (or CCS) modifiers, and lapis' libminigbm_gralloc.so
+    contains those (Y_TILED, Y_TILED_CCS, ...). NVIDIA hardware can only address LINEAR or NVIDIA block-linear
+    (nvk_image.c: format features are 0 for any other vendor modifier). Unpatched NVK aborts the process on such a
+    buffer (patch 0001 turns that into an error, which still means "no surface"). Making it work needs every buffer
+    NVK touches to be LINEAR: e.g. NVK's GetSwapchainGrallocUsage adding a SW_READ usage (upstream minigbm i915 only
+    uses tiled layouts when no SW usage is set; not verified for Google's build) - but SF's own client-target/
+    screenshot buffers, camera, video decoder
+    (Y-tiled NV12) and ANGLE-allocated AHBs are not allocated through that path, so in practice minigbm itself
+    would have to be rebuilt to force LINEAR when an NVIDIA renderer is active (costs: no Intel render compression,
+    no FBC for scanout).
+ B3 Present path: nvk_android.c QueueSignalReleaseImageANDROID does QueueWaitIdle() and returns fence -1, so every
+    present stalls the CPU until the dGPU is idle (correct but no CPU/GPU overlap).
+ B4 Copies over PCIe: imported buffers live in Intel system RAM; NVK renders LINEAR targets through a VRAM tiled
+    shadow and copies back each frame (linear_tiled_shadow path in nvk_cmd_draw.c). A 3000x2000 RGBA layer is
+    ~24 MB per frame per surface across the base connector's PCIe link, plus sampling sysmem textures over PCIe.
+    For desktop composition this is likely SLOWER than ANV on the Iris Plus G7; only heavy 3D apps could gain.
+ B5 Power: SF would keep the dGPU awake permanently (no D3cold), several watts more, large battery-life loss.
+ B6 Detach: the GPU is in the detachable base. With SF on NVK, detaching = device lost in SF/system_server = UI
+    crash/reboot. Would require locking the DTX latch whenever NVIDIA mode is active and refusing detach requests.
+ B7 Boot fragility: if nouveau/GSP fails to init (firmware, base not attached, GSP boot timeout), libvulkan has no
+    fallback to ANV -> no RenderEngine -> no UI. The NVIDIA boot entry would need a probe-and-fallback in gbinit.
+Verdict for (b): not viable with NVK 26.3 on lapis; it needs B1 + B2 fixed upstream-quality first, and even then
+B4-B6 make it a poor trade on this machine. Do not add an "NVIDIA" boot entry.
+
+5. What nvk_probe measures (run natively; results decide whether any of this is worth pursuing)
+-----------------------------------------------------------------------------------------------
+  setprop persist.vendor.gb.nouveau 1   (gb_power keeps nouveau bound; reboot or re-attach so nouveau loads)
+  /vendor/bin/nvk_probe -n 200 -o /data/local/tmp/nvk.ppm      (as root; or: setprop vendor.gb.nvk_probe 1 and
+                                                               read /data/vendor/nvk/probe.txt)
+  test offscreen     : instance/device on the GTX 1650, NAK pipeline compile, render+copy, pixel check, timing.
+  test anb-swapchain : AHardwareBuffer with swapchain-like usage (driver usage | HW_COMPOSER) -> prints the minigbm
+                       modifier -> VkNativeBufferANDROID import into NVK. Expected: FAIL with I915_*_TILED and
+                       VK_ERROR_INVALID_EXTERNAL_HANDLE (this is blocker B2, measured).
+  test anb-linear    : same + CPU_READ_OFTEN -> expected LINEAR -> NVK renders into the i915-allocated sysmem
+                       buffer over PCIe; CPU reads it back via AHardwareBuffer_lock and checks the pixels. PASS here
+                       proves cross-device PRIME (nouveau writing i915 GEM memory) works on this hardware.
+  Exit codes: 0 pass, 1 a test failed, 2 ICD/instance error, 3 NO_DEVICE (expected in the VMware VM).
+
+6. Validation actually performed (builder VM: VMware vmwgfx GPU only, no NVIDIA hardware)
+-----------------------------------------------------------------------------------------
+- Build: Mesa NVK for Android x86_64 builds cleanly (logs/nvk_build.log); host mesa_clc built (logs/host_clc.log).
+- nvk_probe logic (host build): lavapipe -> offscreen PASS (correct clear/triangle pixels, 31.75 % coverage);
+  host NVK (Ubuntu Mesa 25.2.8) -> NO_DEVICE exit 3 (logs/host_validation.log).
+- Android binaries on bionic: scripts/40_bionic_chroot_test.sh runs OUR bionic nvk_probe + vulkan.nouveau.so in a
+  read-only chroot of the real lapis system image (CL3B.260622.271.R1, SDK 37, com.android.runtime APEX) + lapis
+  vendor image, on the builder kernel. Both entry paths (vk_icdGetInstanceProcAddr and the hwvulkan HMI path that
+  Android's libvulkan uses) load the ICD, create a Vulkan 1.4.363 instance and enumerate 0 devices -> NO_DEVICE
+  exit 3: exactly what the VMware VM will show (logs/chroot_test.log).
+- With Mesa's nouveau no-op drm-shim (LD_PRELOAD, NOUVEAU_CHIPSET=167 = TU117; test-only build, scripts/35_*):
+  NVK on bionic creates the physical + logical device (driverID 24 MESA_NVK, Vulkan 1.4.363, 166 device extensions,
+  +ANDROID_native_buffer, -ANDROID_external_memory_android_hardware_buffer), compiles the probe pipeline with NAK in
+  ~2-4 ms, records and "submits" (no-op). Pixels are 0 as expected since no GPU executes anything. In that chroot
+  there are no Android properties, so hw_get_module("gralloc") cannot select gralloc.minigbm.so and u_gralloc most
+  likely came up on its fallback backend; on the device (ro.hardware.gralloc=minigbm) it should pick the
+  "CrOS Gralloc" (gralloc.minigbm.so) backend like ANV does - nvk_probe's anb tests print which one.
+- NOT tested (needs the real machine): anything executing on the GTX 1650, GSP boot, nouveau runtime PM, gralloc
+  buffer import, performance.

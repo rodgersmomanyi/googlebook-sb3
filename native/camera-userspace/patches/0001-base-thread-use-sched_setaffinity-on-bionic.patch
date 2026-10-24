@@ -1,0 +1,43 @@
+From 546656f09411349b2a42a58f51ad7196cd3e9bb2 Mon Sep 17 00:00:00 2001
+From: SB3-port <sb3@localhost>
+Date: Sat, 24 Oct 2026 18:34:34 +0000
+Subject: [PATCH 1/7] base: thread: use sched_setaffinity() on bionic
+
+---
+ src/libcamera/base/thread.cpp              | 6 ++++++
+ src/libcamera/software_isp/debayer_cpu.cpp | 1 +
+ 2 files changed, 7 insertions(+)
+
+diff --git a/src/libcamera/base/thread.cpp b/src/libcamera/base/thread.cpp
+index bcb25ba..aa6d438 100644
+--- a/src/libcamera/base/thread.cpp
++++ b/src/libcamera/base/thread.cpp
+@@ -462,7 +462,13 @@ void Thread::setThreadAffinityInternal()
+ 		return;
+ 
+ 	const cpu_set_t &cpuset = data_->cpuset_.value();
++#if defined(__ANDROID__)
++	/* Bionic has no pthread_setaffinity_np(), use the kernel TID instead. */
++	sched_setaffinity(pthread_gettid_np(thread_.native_handle()),
++			  sizeof(cpuset), &cpuset);
++#else
+ 	pthread_setaffinity_np(thread_.native_handle(), sizeof(cpuset), &cpuset);
++#endif
+ }
+ 
+ /**
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 49382b4..b5e68fe 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -19,6 +19,7 @@
+ #include <linux/dma-buf.h>
+ 
+ #include <libcamera/base/thread.h>
++#include <libcamera/base/utils.h>
+ 
+ #include <libcamera/formats.h>
+ 
+-- 
+2.43.0
+

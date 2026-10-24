@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+# Surface Book 3 rear camera, OV8865 (+ DW9719 VCM) - libcamera simple (software ISP) IPA tuning.
+# STARTER FILE, NOT CALIBRATED. libcamera upstream ships no ov8865 tuning file; the sensor helper
+# has no black level, so without this file the soft ISP would assume 16 @ 8 bit (= 64 @ 10 bit).
+# The SB3 rear sensor applies its own BLC; the sb3-ipu4-camera project subtracts only a 6..12
+# (10 bit) pedestal (camera/surface_webcamd.py), so 8 @ 10 bit = 512 (16 bit scale) is used here.
+# No autofocus: the simple pipeline has no AF algorithm (manual focus only via V4L2 on the VCM).
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 512
+  - Awb:
+  - Adjust:
+  - Agc:
+...

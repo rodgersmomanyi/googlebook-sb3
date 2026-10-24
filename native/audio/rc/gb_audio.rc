@@ -1,0 +1,46 @@
+# ---- GB native audio (Surface Book 3). Append to GB_RC_NATIVE in build_esp.py. ----
+# gb_audio: waits for the sof-hda-dsp card, repairs a codec-less SOF probe, sets the HDA codec volume defaults
+# and restarts DRAS if it started before the card was ready. It runs in the background and never blocks init.
+service gb_audio /system/bin/sh /odm/gb_audio.sh
+    user root
+    group root system audio
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+# gb_audiodiag: dumps /proc/asound, tinymix, input devices, dmesg (sound), DRAS logcat and dumpsys into
+# <boot log partition>\gblog\audio-bN-tT.txt. It runs once 60 s after boot_completed, or on demand with:
+#   setprop debug.gb.audiodiag 1      (dump only)
+#   setprop debug.gb.audiodiag test   (dump plus tone playback and mic captures saved as .wav)
+service gb_audiodiag /system/bin/sh /odm/gb_audiodiag.sh auto
+    user root
+    group root system audio log readproc shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_audiodiag_now /system/bin/sh /odm/gb_audiodiag.sh
+    user root
+    group root system audio log readproc shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_audiotest /system/bin/sh /odm/gb_audiodiag.sh test
+    user root
+    group root system audio log readproc shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+on post-fs-data
+    start gb_audio
+
+on property:sys.boot_completed=1
+    start gb_audiodiag
+
+on property:debug.gb.audiodiag=1
+    start gb_audiodiag_now
+
+on property:debug.gb.audiodiag=test
+    start gb_audiotest

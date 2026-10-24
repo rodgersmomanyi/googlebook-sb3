@@ -1,0 +1,68 @@
+From ab322ee1964cbc343f3e3a8cfebe4e8ab9ed8a83 Mon Sep 17 00:00:00 2001
+From: gb <gb@local>
+Date: Sat, 24 Oct 2026 18:09:52 +0000
+Subject: [PATCH 4/6] media: ipu6: IPU4P: write port-2 fixed timing for active
+ lanes only by default (Surface Book 3)
+
+---
+ .../media/pci/intel/ipu6/ipu4p-isys-csi-phy.c | 22 ++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu6/ipu4p-isys-csi-phy.c b/drivers/media/pci/intel/ipu6/ipu4p-isys-csi-phy.c
+index ffa7d80..abfd2fb 100644
+--- a/drivers/media/pci/intel/ipu6/ipu4p-isys-csi-phy.c
++++ b/drivers/media/pci/intel/ipu6/ipu4p-isys-csi-phy.c
+@@ -5,6 +5,7 @@
+ #include <linux/bits.h>
+ #include <linux/errno.h>
+ #include <linux/io.h>
++#include <linux/moduleparam.h>
+ 
+ #include "ipu6.h"
+ #include "ipu6-bus.h"
+@@ -69,16 +70,31 @@ void ipu4p_isys_phy_setup(struct ipu6_isys *isys)
+ 		ipu4p_isys_configure_phy_bb(isp, &ipu4p_phy_bb_configs[i]);
+ }
+ 
++/*
++ * Surface Book 3: writing the Windows delay values for all 8 data-lane slots
++ * reaches past the receiver's lane-3 registers and was observed to take the
++ * whole ISYS down on the SB3 (sb3-ipu4-camera docs/front-camera.md); there the
++ * values are only written for the active lanes. The SP7 was verified with all
++ * 8 slots. Default: active lanes only; set to 1 for the SP7 behaviour.
++ */
++static bool ipu4p_fixed_timing_all_lanes;
++module_param(ipu4p_fixed_timing_all_lanes, bool, 0644);
++MODULE_PARM_DESC(ipu4p_fixed_timing_all_lanes,
++		 "IPU4P front (port 2) fixed timing: program all 8 lane slots (SP7) instead of the active lanes only (SB3)");
++
+ /*
+  * Use fixed timing observed in Windows for the SP7 front camera:
+  * IPU4P CSI-2 port 2, firmware source 7, two-lane D-PHY.
+  */
+-static void ipu4p_isys_apply_fixed_2lane_timing(struct ipu6_isys_csi2 *csi2)
++static void ipu4p_isys_apply_fixed_2lane_timing(struct ipu6_isys_csi2 *csi2,
++						unsigned int nlanes)
+ {
++	unsigned int n = ipu4p_fixed_timing_all_lanes ? 8 : min(nlanes, 4U);
++
+ 	writel(0, csi2->base + IPU4P_CSI2_RX_DLY_CNT_SETTLE_CLANE);
+ 	writel(1155, csi2->base + IPU4P_CSI2_RX_DLY_CNT_TERMEN_DLANE(0));
+ 
+-	for (unsigned int i = 0; i < 8; i++) {
++	for (unsigned int i = 0; i < n; i++) {
+ 		writel(0, csi2->base + IPU4P_CSI2_RX_DLY_CNT_SETTLE_DLANE(i));
+ 		writel(1269,
+ 		       csi2->base + IPU4P_CSI2_RX_DLY_CNT_TERMEN_DLANE(i + 1));
+@@ -170,7 +186,7 @@ int ipu4p_isys_phy_set_power(struct ipu6_isys *isys,
+ 		       csi2->asd.source ==
+ 		       IPU6_FW_ISYS_STREAM_SRC_CSI2_PORT0 + 7;
+ 	if (fixed_timing) {
+-		ipu4p_isys_apply_fixed_2lane_timing(csi2);
++		ipu4p_isys_apply_fixed_2lane_timing(csi2, cfg->nlanes);
+ 		dev_dbg(&isys->adev->auxdev.dev,
+ 			"using fixed SP7 timing for CSI-2 port %u, source 7, two lanes\n",
+ 			csi2->port);
+-- 
+2.43.0
+

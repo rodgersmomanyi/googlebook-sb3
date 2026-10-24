@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Googlebook SB3 native bring-up <gb-sb3@localhost>
+Date: Sat, 24 Oct 2026 19:00:00 +0000
+Subject: [PATCH 2/2] iio: light: apds9960: add a cros-ec-light (lux) companion IIO device for the Android sensors HAL
+
+The Surface Book 3 ambient light sensor (ACPI MSHW0184) is an APDS-9960, whose IIO device only exposes
+raw RGBC counts and is ignored by the lapis sensors sub-HAL. With android=1 (default) the driver also
+registers "cros-ec-light": u16 lux in scan channel 0, CLOCK_BOOTTIME timestamp in the last 8 bytes of a
+16-byte scan, shared "scale" (1) and "sampling_frequency" (+_available 1/2/4/8 Hz), kfifo buffer fed by a
+freezable delayed work while enabled, auto-range over gain/integration time, ams DN40 RGBC lux equation
+with a glass attenuation parameter (android_ga_x100, 0644). A missing IRQ is no longer fatal in this mode
+(only threshold events/gestures need it). The original apds9960 IIO device is unchanged.
+---
+ 1 files changed, 338 insertions(+), 10 deletions(-)
+ drivers/iio/light/apds9960.c
+
+diff --git a/drivers/iio/light/apds9960.c b/drivers/iio/light/apds9960.c
+--- a/drivers/iio/light/apds9960.c
++++ b/drivers/iio/light/apds9960.c
+@@ -24,6 +24,9 @@
+ #include <linux/iio/events.h>
+ #include <linux/iio/kfifo_buf.h>
+ #include <linux/iio/sysfs.h>
++#include <linux/math64.h>
++#include <linux/timekeeping.h>
++#include <linux/workqueue.h>
+ 
+ #define APDS9960_DRV_NAME	"apds9960"
+ 
+@@ -914,6 +917,324 @@
+ 	.predisable = apds9960_buffer_predisable,
+ };
+ 
++/*
++ * Android mode (default): register a second IIO device, "cros-ec-light", that reports illuminance
++ * in lux the way the Android desktop IIO sensors sub-HAL (android.hardware.sensors@2.1-Desktop-
++ * IIO-Subhal.so) decodes ChromeOS EC light sensors: scan channel 0 = u16 lux (value = raw * the
++ * "scale" attribute), the timestamp (CLOCK_BOOTTIME ns) in the last 8 bytes of a 16-byte scan,
++ * "scale" and "sampling_frequency"(+ _available) shared by all channels, kfifo buffer, no trigger.
++ * The chip has no periodic data-ready interrupt the HAL could use, so a delayed work samples the
++ * RGBC channels while the buffer is enabled, with a small auto-range over gain/integration time.
++ * Lux uses the ams/Avago DN40 RGBC equation; the Surface ink window attenuation is not known, so
++ * it is a module parameter (android_ga_x100) to calibrate against a lux meter or Windows.
++ * The original "apds9960" IIO device is unchanged.
++ */
++static bool android = true;
++module_param(android, bool, 0444);
++MODULE_PARM_DESC(android, "Also register a cros-ec-light (lux) IIO device for the Android sensors HAL (default: 1)");
++static unsigned int android_ga_x100 = 100;
++module_param(android_ga_x100, uint, 0644);
++MODULE_PARM_DESC(android_ga_x100, "cros-ec-light: glass attenuation factor x100, multiplies lux (default: 100 = 1.0)");
++
++#define APDS9960_ANDROID_MIN_PERIOD_MS	125
++#define APDS9960_ANDROID_MAX_PERIOD_MS	1000
++#define APDS9960_ANDROID_DEF_PERIOD_MS	250
++#define APDS9960_ANDROID_DEF_LEVEL	2
++#define APDS9960_ANDROID_LUX_MAX	65535
++
++/* auto-range steps, brightest first: ALS integration time (must be in apds9960_int_time) and gain */
++static const struct {
++	int it_us;
++	int gain;
++} apds9960_android_levels[] = {
++	{  28000,  1 },
++	{ 100000,  1 },
++	{ 100000,  4 },
++	{ 100000, 16 },
++	{ 100000, 64 },
++};
++
++static const int apds9960_android_freq_avail[] = {
++	1, 0,
++	2, 0,
++	4, 0,
++	8, 0,
++};
++
++struct apds9960_android {
++	struct apds9960_data *data;
++	struct iio_dev *indio_dev;
++	struct delayed_work work;
++	unsigned int period_ms;
++	int level;
++	bool skip_next;
++	bool first;
++	struct {
++		u16 lux;
++		aligned_s64 timestamp;
++	} scan;
++};
++
++static const struct iio_chan_spec apds9960_android_channels[] = {
++	{
++		.type = IIO_LIGHT,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
++		.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SCALE) |
++					   BIT(IIO_CHAN_INFO_SAMP_FREQ),
++		.info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_SAMP_FREQ),
++		.scan_index = 0,
++		.scan_type = {
++			.sign = 'u',
++			.realbits = 16,
++			.storagebits = 16,
++			.endianness = IIO_CPU,
++		},
++	},
++	IIO_CHAN_SOFT_TIMESTAMP(1),
++};
++
++static const unsigned long apds9960_android_scan_masks[] = { BIT(0), 0 };
++
++static int apds9960_android_set_level(struct apds9960_android *a, int level)
++{
++	int ret;
++
++	ret = apds9960_set_it_time(a->data, apds9960_android_levels[level].it_us);
++	if (!ret)
++		ret = apds9960_set_als_gain(a->data, apds9960_android_levels[level].gain);
++	if (!ret)
++		a->level = level;
++
++	return ret;
++}
++
++/* One RGBC reading converted to lux. With agc, may step the range for the next reading. */
++static int apds9960_android_sample(struct apds9960_android *a, u32 *lux, bool agc)
++{
++	struct apds9960_data *data = a->data;
++	__le16 buf[4];
++	s64 c, r, g, b, ir, gp;
++	u64 den;
++	unsigned int cycles, full;
++	int ret, level;
++
++	if (data->gesture_mode_running)
++		return -EBUSY;
++
++	ret = regmap_bulk_read(data->regmap, APDS9960_REG_ALS_BASE, buf, sizeof(buf));
++	if (ret)
++		return ret;
++
++	c = le16_to_cpu(buf[IDX_ALS_CLEAR]);
++	r = le16_to_cpu(buf[IDX_ALS_RED]);
++	g = le16_to_cpu(buf[IDX_ALS_GREEN]);
++	b = le16_to_cpu(buf[IDX_ALS_BLUE]);
++
++	/* ams DN40: IR = (R + G + B - C) / 2, G'' = 0.136 R' + 1.000 G' - 0.444 B' (x1000 here) */
++	ir = max_t(s64, (r + g + b - c) / 2, 0);
++	gp = max_t(s64, 136 * (r - ir) + 1000 * (g - ir) - 444 * (b - ir), 0);
++	/* lux = G'' * GA * DF / (ATIME_ms * AGAIN), DF = 310 -> gp * ga_x100 * 310 / (100 * it_us * gain) */
++	den = 100ULL * max(data->als_adc_int_us, 1) * apds9960_als_gain_map[data->als_gain];
++	*lux = (u32)min_t(u64, div64_u64((u64)gp * READ_ONCE(android_ga_x100) * 310ULL, den),
++			  APDS9960_ANDROID_LUX_MAX);
++
++	if (!agc)
++		return 0;
++
++	/* keep the clear channel between ~5 % and ~70 % of its full scale (1025 counts per 2.78 ms) */
++	cycles = max(1, DIV_ROUND_CLOSEST(data->als_adc_int_us, 2780));
++	full = min(65535U, cycles * 1025U);
++	level = a->level;
++	if (c >= full * 7 / 10 && level > 0)
++		level--;
++	else if (c < full / 20 && level < (int)ARRAY_SIZE(apds9960_android_levels) - 1)
++		level++;
++	if (level != a->level && !apds9960_android_set_level(a, level))
++		a->skip_next = true;	/* next registers may mix both settings */
++
++	return 0;
++}
++
++static void apds9960_android_push(struct apds9960_android *a, u32 lux)
++{
++	a->scan.lux = lux;
++	iio_push_to_buffers_with_ts(a->indio_dev, &a->scan, sizeof(a->scan),
++				    ktime_get_boottime_ns());
++}
++
++static void apds9960_android_work(struct work_struct *work)
++{
++	struct apds9960_android *a = container_of(to_delayed_work(work),
++						  struct apds9960_android, work);
++	bool skip = a->skip_next;
++	u32 lux;
++
++	a->skip_next = false;
++	if (!apds9960_android_sample(a, &lux, true) && !skip) {
++		/*
++		 * The HAL only forwards a light event when the integer lux differs from the last one it
++		 * forwarded (even across enable cycles), so start every session with lux+1, then lux.
++		 */
++		if (a->first) {
++			apds9960_android_push(a, min_t(u32, lux + 1, APDS9960_ANDROID_LUX_MAX));
++			a->first = false;
++		}
++		apds9960_android_push(a, lux);
++	}
++
++	queue_delayed_work(system_freezable_wq, &a->work,
++			   msecs_to_jiffies(READ_ONCE(a->period_ms)));
++}
++
++static int apds9960_android_postenable(struct iio_dev *indio_dev)
++{
++	struct apds9960_android *a = iio_priv(indio_dev);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(&a->data->client->dev);
++	if (ret < 0)
++		return ret;
++
++	apds9960_android_set_level(a, a->level);
++	a->skip_next = true;
++	a->first = true;
++	queue_delayed_work(system_freezable_wq, &a->work,
++			   msecs_to_jiffies(READ_ONCE(a->period_ms)));
++
++	return 0;
++}
++
++static int apds9960_android_predisable(struct iio_dev *indio_dev)
++{
++	struct apds9960_android *a = iio_priv(indio_dev);
++
++	cancel_delayed_work_sync(&a->work);
++	pm_runtime_put_autosuspend(&a->data->client->dev);
++
++	return 0;
++}
++
++static const struct iio_buffer_setup_ops apds9960_android_buffer_ops = {
++	.postenable = apds9960_android_postenable,
++	.predisable = apds9960_android_predisable,
++};
++
++static int apds9960_android_read_raw(struct iio_dev *indio_dev,
++				     struct iio_chan_spec const *chan,
++				     int *val, int *val2, long mask)
++{
++	struct apds9960_android *a = iio_priv(indio_dev);
++	unsigned int period;
++	u32 lux;
++	int ret;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		apds9960_set_power_state(a->data, true);
++		ret = apds9960_android_sample(a, &lux, false);
++		apds9960_set_power_state(a->data, false);
++		if (ret)
++			return ret;
++		*val = lux;
++		return IIO_VAL_INT;
++	case IIO_CHAN_INFO_SCALE:
++		*val = 1;
++		return IIO_VAL_INT;
++	case IIO_CHAN_INFO_SAMP_FREQ:
++		period = READ_ONCE(a->period_ms);
++		*val = 1000 / period;
++		*val2 = (1000 % period) * 1000000 / period;
++		return IIO_VAL_INT_PLUS_MICRO;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int apds9960_android_write_raw(struct iio_dev *indio_dev,
++				      struct iio_chan_spec const *chan,
++				      int val, int val2, long mask)
++{
++	struct apds9960_android *a = iio_priv(indio_dev);
++	u64 uhz;
++
++	if (mask != IIO_CHAN_INFO_SAMP_FREQ)
++		return -EINVAL;
++	if (val < 0 || val2 < 0)
++		return -EINVAL;
++	/* the Android HAL writes 0 Hz when it stops the sensor: keep the last rate */
++	if (val == 0 && val2 == 0)
++		return 0;
++
++	uhz = (u64)val * 1000000 + val2;
++	WRITE_ONCE(a->period_ms, clamp_t(u64, div64_u64(1000000000ULL + uhz - 1, uhz),
++					 APDS9960_ANDROID_MIN_PERIOD_MS,
++					 APDS9960_ANDROID_MAX_PERIOD_MS));
++
++	return 0;
++}
++
++static int apds9960_android_read_avail(struct iio_dev *indio_dev,
++				       struct iio_chan_spec const *chan,
++				       const int **vals, int *type, int *length,
++				       long mask)
++{
++	if (mask != IIO_CHAN_INFO_SAMP_FREQ)
++		return -EINVAL;
++
++	*vals = apds9960_android_freq_avail;
++	*type = IIO_VAL_INT_PLUS_MICRO;
++	*length = ARRAY_SIZE(apds9960_android_freq_avail);
++	return IIO_AVAIL_LIST;
++}
++
++static const struct iio_info apds9960_android_info = {
++	.read_raw = apds9960_android_read_raw,
++	.write_raw = apds9960_android_write_raw,
++	.read_avail = apds9960_android_read_avail,
++};
++
++static void apds9960_android_register(struct apds9960_data *data)
++{
++	struct device *dev = &data->client->dev;
++	struct apds9960_android *a;
++	struct iio_dev *indio_dev;
++	int ret;
++
++	indio_dev = devm_iio_device_alloc(dev, sizeof(*a));
++	if (!indio_dev) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	a = iio_priv(indio_dev);
++	a->data = data;
++	a->indio_dev = indio_dev;
++	a->period_ms = APDS9960_ANDROID_DEF_PERIOD_MS;
++	a->level = APDS9960_ANDROID_DEF_LEVEL;
++	INIT_DELAYED_WORK(&a->work, apds9960_android_work);
++
++	indio_dev->name = "cros-ec-light";
++	indio_dev->info = &apds9960_android_info;
++	indio_dev->channels = apds9960_android_channels;
++	indio_dev->num_channels = ARRAY_SIZE(apds9960_android_channels);
++	indio_dev->available_scan_masks = apds9960_android_scan_masks;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++
++	ret = devm_iio_kfifo_buffer_setup(dev, indio_dev, &apds9960_android_buffer_ops);
++	if (ret)
++		goto fail;
++
++	ret = devm_iio_device_register(dev, indio_dev);
++	if (ret)
++		goto fail;
++
++	dev_info(dev, "Android mode: cros-ec-light registered (ga_x100=%u)\n", android_ga_x100);
++	return;
++
++fail:
++	dev_warn(dev, "Android mode: cros-ec-light not registered: %d\n", ret);
++}
++
+ static int apds9960_regfield_init(struct apds9960_data *data)
+ {
+ 	struct device *dev = &data->client->dev;
+@@ -1088,25 +1409,32 @@
+ 	if (ret)
+ 		goto error_power_down;
+ 
+-	if (client->irq <= 0) {
++	if (client->irq <= 0 && android) {
++		/* the Android light device polls; only threshold events and gestures need the irq */
++		dev_warn(&client->dev, "no valid irq defined: events and gestures unavailable\n");
++	} else if (client->irq <= 0) {
+ 		dev_err(&client->dev, "no valid irq defined\n");
+ 		ret = -EINVAL;
+ 		goto error_power_down;
+-	}
+-	ret = devm_request_threaded_irq(&client->dev, client->irq,
+-					NULL, apds9960_interrupt_handler,
+-					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+-					"apds9960_event",
+-					indio_dev);
+-	if (ret) {
+-		dev_err(&client->dev, "request irq (%d) failed\n", client->irq);
+-		goto error_power_down;
++	} else {
++		ret = devm_request_threaded_irq(&client->dev, client->irq,
++						NULL, apds9960_interrupt_handler,
++						IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++						"apds9960_event",
++						indio_dev);
++		if (ret) {
++			dev_err(&client->dev, "request irq (%d) failed\n", client->irq);
++			goto error_power_down;
++		}
+ 	}
+ 
+ 	ret = iio_device_register(indio_dev);
+ 	if (ret)
+ 		goto error_power_down;
+ 
++	if (android)
++		apds9960_android_register(data);
++
+ 	apds9960_set_power_state(data, false);
+ 
+ 	return 0;
+-- 
+2.43.0

@@ -1,0 +1,18 @@
+# gb_power module requirements, in load order (merge into C:\GB-x86\inject\native\modules\modules.load).
+# gb_modules.sh passes words after the file name to insmod as module parameters.
+# test_power first: test_battery/test_ac must exist before the health HAL starts (it scans once).
+test_power.ko
+crc-itu-t.ko
+surface_aggregator.ko
+surface_aggregator_registry.ko
+surface_aggregator_hub.ko
+# scope_device=1 needs kernel patch 0001; an unpatched module ignores it ("unknown parameter ... ignored") and
+# gb_power falls back to hiding BAT1/BAT2 with a bind mount.
+surface_battery.ko scope_device=1
+surface_charger.ko
+platform_profile.ko
+surface_platform_profile.ko
+surface_dtx.ko
+surface_hotplug.ko
+surface_gpe.ko
+# NOT natively: ac.ko / battery.ko (VM-only ACPI battery) - they would add more Battery/Mains supplies.

@@ -1,0 +1,6 @@
+# Append to /odm/etc/build.prop on NATIVE Surface Book 3 boots only (gbinit sb3 branch).
+# Loaded before init.fatcat.rc runs "setprop ro.hardware.camera libcamera_hal_base" (on init),
+# so that setprop is refused and the legacy camera provider loads /odm/lib64/hw/camera.sb3.so
+# (patched libcamera: simple pipeline + software ISP) instead of the IPU7-only lapis HAL.
+# Do NOT set this on VMware boots.
+ro.hardware.camera=sb3

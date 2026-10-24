@@ -1,0 +1,168 @@
+--- a/gb_power.c
++++ b/gb_power.c
+@@ -19,6 +19,8 @@
+  * C. dGPU (NVIDIA TU117 in the base): no Android driver exists, so keep every 10de function unbound with runtime PM
+  *    'auto' (power/control) on it and on all its upstream bridges; the root port then runtime-suspends and ACPI _PR3
+  *    cuts the dGPU's power (D3cold). Re-applied when the base is re-attached (PCI hot-add uevent).
++ *    Opt-in nouveau (persist.vendor.gb.nouveau=1, or -K nouveau): a function bound to nouveau is left bound (nouveau
++ *    loaded with runpm=1 runtime-suspends it to D3cold itself) and is only unbound before a detach is confirmed.
+  * D. Platform profile: sets /sys/firmware/acpi/platform_profile at start (persist.vendor.gb.perf_profile if valid,
+  *    else balanced). "gb_power -p <profile>" sets one and exits (the rc property trigger runs that).
+  *
+@@ -27,6 +29,7 @@
+  * Build: clang --target=x86_64-linux-android34 -O2 -Wall -Wextra -o gb_power gb_power.c
+  * Options: -p <profile> set platform profile and exit | -o one battery pass, print, exit | -r <root> sysfs/dev prefix
+  *          (tests) | -H no BATn/type hiding | -D no DTX | -G no dGPU handling | -I no studio-mode input inhibit | -v
++ *          | -K <driver> leave the dGPU bound to <driver> except at detach (overrides persist.vendor.gb.nouveau)
+  */
+ #define _GNU_SOURCE
+ #include <dirent.h>
+@@ -57,6 +60,10 @@
+ static int g_kmsg = -1, g_verbose;
+ static char g_root[256] = "";      /* path prefix for /sys, /dev, /proc (unit tests use a fake tree) */
+ static int g_hide = 1, g_dtx_on = 1, g_dgpu_on = 1, g_inhibit_on = 1, g_dgpu_unbind = 1;
++/* dGPU driver left bound outside a detach (nouveau opt-in): "-K <driver>", or persist.vendor.gb.nouveau=1 -> "nouveau".
++ * That driver then owns the dGPU's runtime PM (nouveau.runpm=1); it is still unbound before a detach is confirmed. */
++static char g_keep_drv[48] = "";
++static int g_keep_cli;
+ 
+ static void logm(int lvl, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+ static void logm(int lvl, const char *fmt, ...) {
+@@ -609,11 +616,18 @@
+ /* Unbinds drivers from / enables runtime PM on every NVIDIA function and its bridges. Never touches config space
+  * (vendor/device/class come from sysfs caches). Returns the number of functions still bound to a driver. */
+ static int g_dgpu_seen;
++static void keep_drv_update(void) {
++  if (g_keep_cli) return;
++  char v[100];
++  prop_get("persist.vendor.gb.nouveau", v);
++  snprintf(g_keep_drv, sizeof g_keep_drv, "%s", !strcmp(v, "1") ? "nouveau" : "");
++}
+ static int dgpu_scan(const char *why, int report) {
+   char dir[PATH_MAX], dev[PATH_MAX + 32], p[PATH_MAX + 64], v[32], cls[16], did[16], drv[48], real[PATH_MAX];
+   DIR *d = opendir(rpath(dir, sizeof dir, "/sys/bus/pci/devices"));
+-  int found = 0, bound = 0;
++  int found = 0, bound = 0, detach = !strcmp(why, "detach");
+   if (!d) return 0;
++  keep_drv_update();
+   struct dirent *e;
+   while ((e = readdir(d))) {
+     if (e->d_name[0] == '.') continue;
+@@ -627,7 +641,11 @@
+     if (read_text(p, did, sizeof did) < 0) strcpy(did, "?");
+     snprintf(p, sizeof p, "%s/driver", dev);
+     link_base(p, drv, sizeof drv);
+-    if (drv[0]) {
++    int keep = drv[0] && g_keep_drv[0] && !strcmp(drv, g_keep_drv) && !detach;
++    if (keep) {
++      if (report) LOGI("dGPU %s (10de:%s class %s): left on %s (opt-in; the driver runs its runtime PM)", e->d_name,
++                       hex4(did), cls, drv);
++    } else if (drv[0]) {
+       int r = -EPERM;
+       if (g_dgpu_unbind) {
+         snprintf(p, sizeof p, "%s/driver/unbind", dev);
+@@ -640,7 +658,7 @@
+     snprintf(p, sizeof p, "%s/d3cold_allowed", dev);
+     if (read_text(p, v, sizeof v) >= 0 && !strcmp(v, "0")) write_text(p, "1");
+     snprintf(p, sizeof p, "dGPU %s", e->d_name);
+-    rpm_auto(dev, p);
++    if (!keep) rpm_auto(dev, p);                  /* a kept driver sets power/control itself (pm_runtime_allow) */
+     /* every upstream PCI bridge (the root port 00:1d.4 on the SB3): runtime PM auto, so it can drop to D3cold */
+     char top[PATH_MAX] = "";
+     if (realpath(dev, real)) {
+@@ -660,7 +678,7 @@
+       if (top[0]) pci_state(top, s2, sizeof s2);
+       LOGI("dGPU %s 10de:%s class %s driver=%s: %s | root port %s: %s", e->d_name, hex4(did), cls,
+            drv[0] ? drv : "none", s1, top[0] ? strrchr(top, '/') + 1 : "-", s2);
+-      if (strstr(s1, "D0") && !drv[0])
++      if (strstr(s1, "D0") && (!drv[0] || keep))
+         LOGW("dGPU %s still in D0: root port not runtime-suspended (check its power/control, pcie_port_pm, and that "
+              "no other function below it is active)", e->d_name);
+     }
+@@ -863,6 +881,8 @@
+   LOGI("detach: requested (detach button)");
+   dtx_cmd(SDTX_IOCTL_LATCH_HEARTBEAT, "LATCH_HEARTBEAT");
+   int busy = g_dgpu_on ? dgpu_scan("detach", 0) : 0;
++  /* unbinding a kept nouveau resumes the GPU and tears down GSP-RM (seconds): restart the EC's timeout */
++  if (g_dgpu_on && g_keep_drv[0]) dtx_cmd(SDTX_IOCTL_LATCH_HEARTBEAT, "LATCH_HEARTBEAT");
+   if (busy) {                                     /* never pull a dGPU out from under a driver */
+     LOGE("detach: aborted, %d dGPU function(s) still bound to a driver", busy);
+     dtx_cmd(SDTX_IOCTL_LATCH_CANCEL, "LATCH_CANCEL");
+@@ -1079,14 +1099,15 @@
+ }
+ 
+ static void usage(void) {
+-  fprintf(stderr, "usage: gb_power [-p profile] [-o] [-r root] [-H] [-D] [-G] [-I] [-v]\n");
++  fprintf(stderr, "usage: gb_power [-p profile] [-o] [-r root] [-H] [-D] [-G] [-I] [-K driver] [-v]\n");
+ }
+ 
+ int main(int argc, char **argv) {
+   const char *profile = NULL;
+   int once = 0, opt;
+-  while ((opt = getopt(argc, argv, "p:or:HDGIv")) != -1) {
++  while ((opt = getopt(argc, argv, "p:or:HDGIvK:")) != -1) {
+     switch (opt) {
++      case 'K': snprintf(g_keep_drv, sizeof g_keep_drv, "%s", optarg); g_keep_cli = 1; break;
+       case 'p': profile = optarg; break;
+       case 'o': once = 1; break;
+       case 'r': snprintf(g_root, sizeof g_root, "%s", optarg); break;
+--- a/test/test_gb_power.c
++++ b/test/test_gb_power.c
+@@ -510,6 +510,49 @@
+   CHECK(dgpu_scan("test", 1) == 0 && g_dgpu_seen == 0, "no dGPU");
+ }
+ 
++/* opt-in nouveau: persist.vendor.gb.nouveau=1 keeps a nouveau-bound dGPU bound (and its power/control untouched)
++ * outside a detach; a detach still unbinds it, with an extra heartbeat; another driver is still unbound. */
++static void test_dgpu_keep(void) {
++  set_root("tree_pci_keep");
++  fake_pci();
++  prop_set("persist.vendor.gb.nouveau", "1");
++  CHECK(dgpu_scan("hot-plug", 1) == 0, "kept driver not counted as busy");
++  CHECK(!strcmp(get("/sys/bus/pci/drivers/nouveau/unbind"), ""), "nouveau left bound: '%s'", get("/sys/bus/pci/drivers/nouveau/unbind"));
++  CHECK(!strcmp(get("/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.0/power/control"), "on"), "kept dGPU power/control untouched");
++  CHECK(!strcmp(get("/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.1/power/control"), "auto"), "unbound function still rpm auto");
++  CHECK(!strcmp(get("/sys/devices/pci0000:00/0000:00:1d.4/power/control"), "auto"), "root port rpm auto (keep)");
++  CHECK(!strcmp(g_keep_drv, "nouveau"), "keep driver from property: '%s'", g_keep_drv);
++  /* a different driver on the dGPU is still unbound */
++  put("/sys/bus/pci/drivers/nvidiafb/unbind", "");
++  lnk("../../../../bus/pci/drivers/nvidiafb", "/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.0/driver");
++  CHECK(dgpu_scan("hot-plug", 0) == 0 && !strcmp(get("/sys/bus/pci/drivers/nvidiafb/unbind"), "0000:02:00.0"), "other driver unbound");
++  lnk("../../../../bus/pci/drivers/nouveau", "/sys/devices/pci0000:00/0000:00:1d.4/0000:02:00.0/driver");
++  /* detach: nouveau is unbound before LATCH_CONFIRM, with a second heartbeat */
++  set_root("tree_dtx_keep");
++  fake_input();
++  fake_pci();
++  put("/dev/surface/dtx", "");
++  dtx_ioctl = mock_ioctl;
++  memset(&ec, 0, sizeof ec);
++  ec.base = SDTX_BASE_ATTACHED; ec.latch = SDTX_LATCH_CLOSED; ec.mode = MODE_LAPTOP;
++  g_dtx.fd = -1;
++  CHECK(dtx_open() == 0 && g_dtx.fd >= 0, "dtx open (keep)");
++  ec.log[0] = 0;
++  ev(SDTX_EVENT_REQUEST, 0);
++  CHECK(!strcmp(ec.log, "HB HB CONFIRM "), "keep: detach confirmed after unbind: '%s'", ec.log);
++  CHECK(!strcmp(get("/sys/bus/pci/drivers/nouveau/unbind"), "0000:02:00.0"), "keep: nouveau unbound before confirm");
++  dtx_close();
++  dtx_ioctl = sys_ioctl;
++  /* -K on the command line wins over the property; property 0 -> default behaviour */
++  prop_set("persist.vendor.gb.nouveau", "0");
++  keep_drv_update();
++  CHECK(g_keep_drv[0] == 0, "property 0 -> no keep");
++  g_keep_cli = 1; snprintf(g_keep_drv, sizeof g_keep_drv, "nouveau");
++  keep_drv_update();
++  CHECK(!strcmp(g_keep_drv, "nouveau"), "-K overrides property");
++  g_keep_cli = 0; g_keep_drv[0] = 0;
++}
++
+ static void test_dtx(void) {
+   set_root("tree_dtx");
+   fake_input();
+@@ -654,6 +697,7 @@
+   test_uevent();
+   test_dgpu();
+   test_dtx();
++  test_dgpu_keep();
+   test_profile();
+   test_main_once();
+   printf("\n%d checks, %d failures\n", checks, fails);

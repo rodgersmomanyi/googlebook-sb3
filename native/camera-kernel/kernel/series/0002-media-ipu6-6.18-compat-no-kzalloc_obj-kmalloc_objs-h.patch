@@ -1,0 +1,114 @@
+From 840ac6c8d8a7da2ba82227112122ef8012084838 Mon Sep 17 00:00:00 2001
+From: gb <gb@local>
+Date: Sat, 24 Oct 2026 18:05:21 +0000
+Subject: [PATCH 2/6] media: ipu6: 6.18 compat: no kzalloc_obj()/kmalloc_objs()
+ helpers
+
+---
+ drivers/media/pci/intel/ipu6/ipu6-bus.c      | 2 +-
+ drivers/media/pci/intel/ipu6/ipu6-buttress.c | 2 +-
+ drivers/media/pci/intel/ipu6/ipu6-dma.c      | 2 +-
+ drivers/media/pci/intel/ipu6/ipu6-fw-com.c   | 2 +-
+ drivers/media/pci/intel/ipu6/ipu6-mmu.c      | 4 ++--
+ drivers/media/pci/intel/ipu6/ipu6.c          | 4 ++--
+ 6 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-bus.c b/drivers/media/pci/intel/ipu6/ipu6-bus.c
+index 1736163..5cee274 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-bus.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-bus.c
+@@ -90,7 +90,7 @@ ipu6_bus_initialize_device(struct pci_dev *pdev, struct device *parent,
+ 	struct ipu6_device *isp = pci_get_drvdata(pdev);
+ 	int ret;
+ 
+-	adev = kzalloc_obj(*adev);
++	adev = kzalloc(sizeof(*adev), GFP_KERNEL);
+ 	if (!adev)
+ 		return ERR_PTR(-ENOMEM);
+ 
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-buttress.c b/drivers/media/pci/intel/ipu6/ipu6-buttress.c
+index ae63a92..2d1ba76 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-buttress.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-buttress.c
+@@ -733,7 +733,7 @@ int ipu6_map_fw_region(struct ipu6_bus_device *sys, const void *data,
+ 
+ 	n_pages = PFN_UP(size);
+ 
+-	pages = kmalloc_objs(*pages, n_pages);
++	pages = kmalloc_array(n_pages, sizeof(*pages), GFP_KERNEL);
+ 	if (!pages)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-dma.c b/drivers/media/pci/intel/ipu6/ipu6-dma.c
+index 90f530a..0b5b9a7 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-dma.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-dma.c
+@@ -164,7 +164,7 @@ void *ipu6_dma_alloc(struct ipu6_bus_device *sys, size_t size,
+ 	unsigned int i;
+ 	int ret;
+ 
+-	info = kzalloc_obj(*info);
++	info = kzalloc(sizeof(*info), GFP_KERNEL);
+ 	if (!info)
+ 		return NULL;
+ 
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-fw-com.c b/drivers/media/pci/intel/ipu6/ipu6-fw-com.c
+index e1bc047..7986f6f 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-fw-com.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-fw-com.c
+@@ -182,7 +182,7 @@ void *ipu6_fw_com_prepare(struct ipu6_fw_com_cfg *cfg,
+ 	if (!cfg || !cfg->cell_start || !cfg->cell_ready)
+ 		return NULL;
+ 
+-	ctx = kzalloc_obj(*ctx);
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+ 		return NULL;
+ 	ctx->dmem_addr = base + cfg->dmem_addr + REGMEM_OFFSET;
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-mmu.c b/drivers/media/pci/intel/ipu6/ipu6-mmu.c
+index 93e3be1..9c916c3 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-mmu.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-mmu.c
+@@ -469,7 +469,7 @@ static struct ipu6_mmu_info *ipu6_mmu_alloc(struct ipu6_device *isp)
+ 	struct ipu6_mmu_info *mmu_info;
+ 	int ret;
+ 
+-	mmu_info = kzalloc_obj(*mmu_info);
++	mmu_info = kzalloc(sizeof(*mmu_info), GFP_KERNEL);
+ 	if (!mmu_info)
+ 		return NULL;
+ 
+@@ -539,7 +539,7 @@ static struct ipu6_dma_mapping *alloc_dma_mapping(struct ipu6_device *isp)
+ 	struct ipu6_dma_mapping *dmap;
+ 	unsigned long base_pfn;
+ 
+-	dmap = kzalloc_obj(*dmap);
++	dmap = kzalloc(sizeof(*dmap), GFP_KERNEL);
+ 	if (!dmap)
+ 		return NULL;
+ 
+diff --git a/drivers/media/pci/intel/ipu6/ipu6.c b/drivers/media/pci/intel/ipu6/ipu6.c
+index 3ebf2ff..0354377 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6.c
++++ b/drivers/media/pci/intel/ipu6/ipu6.c
+@@ -437,7 +437,7 @@ ipu6_isys_init(struct pci_dev *pdev, struct device *parent,
+ 	if (!devm_ctrl)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	pdata = kzalloc_obj(*pdata);
++	pdata = kzalloc(sizeof(*pdata), GFP_KERNEL);
+ 	if (!pdata)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -483,7 +483,7 @@ ipu6_psys_init(struct pci_dev *pdev, struct device *parent,
+ 	if (!devm_ctrl)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	pdata = kzalloc_obj(*pdata);
++	pdata = kzalloc(sizeof(*pdata), GFP_KERNEL);
+ 	if (!pdata)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-- 
+2.43.0
+

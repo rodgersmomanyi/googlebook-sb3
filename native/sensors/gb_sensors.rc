@@ -1,0 +1,23 @@
+# Googlebook SB3 native: sensors (append to GB_RC_NATIVE in build_esp.py; native tree only).
+# The lapis sensors multi-HAL (class hal, started by "on boot") loads the Desktop IIO sub-HAL, which scans
+# /sys/bus/iio/devices exactly once. Block init at early-boot (bounded, 8 s max) until the ISH accelerometer
+# and the APDS-9960 light device exist, so they are not missed when the ISH enumerates late.
+service gb_sensors_wait /system/bin/sh /odm/gb_sensors.sh wait
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_sensors_diag /system/bin/sh /odm/gb_sensors.sh diag
+    user root
+    group root system shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+on early-boot
+    exec_start gb_sensors_wait
+
+on property:sys.boot_completed=1
+    start gb_sensors_diag

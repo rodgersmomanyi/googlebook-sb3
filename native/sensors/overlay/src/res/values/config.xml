@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- lapis vendor RRO sets these to false; the Surface Book 3 has an accelerometer (ISH) and an ALS (APDS-9960) -->
+    <bool name="config_supportAutoRotation">true</bool>
+    <bool name="config_automatic_brightness_available">true</bool>
+</resources>

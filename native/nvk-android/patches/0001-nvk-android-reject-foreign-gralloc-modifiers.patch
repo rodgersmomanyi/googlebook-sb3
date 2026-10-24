@@ -1,0 +1,24 @@
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -918,6 +918,21 @@
+       if (result != VK_SUCCESS)
+          return result;
+ 
++      /* gralloc (e.g. minigbm on an Intel iGPU) may hand us a buffer with a
++       * foreign tiling such as I915_FORMAT_MOD_Y_TILED.  NVIDIA hardware can
++       * only address LINEAR or its own block-linear layouts and NIL would
++       * panic (abort the process) on any other modifier, so fail the import
++       * cleanly instead.
++       */
++      if (eci.drmFormatModifier != DRM_FORMAT_MOD_LINEAR &&
++          eci.drmFormatModifier != DRM_FORMAT_MOD_INVALID &&
++          !fourcc_mod_is_vendor(eci.drmFormatModifier, NVIDIA)) {
++         return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                          "gralloc buffer has DRM modifier 0x%016llx; NVK "
++                          "can only import LINEAR or NVIDIA modifiers",
++                          (unsigned long long)eci.drmFormatModifier);
++      }
++
+       image->vk.drm_format_mod = eci.drmFormatModifier;
+       for (uint8_t plane = 0; plane < eci.drmFormatModifierPlaneCount; plane++) {
+          explicit_row_stride_B[plane] = eci.pPlaneLayouts[plane].rowPitch;

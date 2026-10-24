@@ -1,0 +1,38 @@
+Subject: [PATCH] HID: build the linux-surface IPTS driver (drivers/hid/ipts)
+
+RECORD ONLY - do not apply together with the IPTS driver import below, which already contains these hunks.
+drivers/hid/ipts itself is NOT in this repository: it comes from linux-surface
+(github.com/linux-surface/linux-surface, patches/6.18/0005-ipts.patch, GPL-2.0; md5 of the copy used:
+5af0a1a8bbfb9d7038a43674508e5938) and is applied with
+    git apply --include='drivers/hid/*' 0005-ipts.patch
+(kernel/scripts/kbuild11_native.sh does exactly that; this file shows the Kconfig/Makefile part of the result).
+The patch's MEI hunk is replaced by 0003, its IOMMU quirk by iommu.passthrough=1 on the native command line.
+Native only.
+
+Base: AOSP kernel/common android17-6.18-2026-06 at 3938c8d97142d5cf31543aa96f864a2cf832dda0 (kernel 6.18.21, ab/16302624;
+     the full pin is kernel/manifest_16302624.xml). Apply in common/ with: git apply <this file>
+License: GPL-2.0 (derived from Linux)
+---
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index 03ad8b5c29a4..c639bb1f6733 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -1440,6 +1440,8 @@ source "drivers/hid/surface-hid/Kconfig"
+ 
+ source "drivers/hid/intel-thc-hid/Kconfig"
+ 
++source "drivers/hid/ipts/Kconfig"
++
+ endif # HID
+ 
+ # USB support may be used with HID disabled
+diff --git a/drivers/hid/Makefile b/drivers/hid/Makefile
+index 361a7daedeb8..b73a1bbd3a1d 100644
+--- a/drivers/hid/Makefile
++++ b/drivers/hid/Makefile
+@@ -176,3 +176,5 @@ obj-$(CONFIG_AMD_SFH_HID)       += amd-sfh-hid/
+ obj-$(CONFIG_SURFACE_HID_CORE)  += surface-hid/
+ 
+ obj-$(CONFIG_INTEL_THC_HID)     += intel-thc-hid/
++
++obj-$(CONFIG_HID_IPTS)          += ipts/

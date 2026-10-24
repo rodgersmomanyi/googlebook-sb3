@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# libcamera runtime configuration for the SB3 native camera HAL.
+# Installed as /odm/etc/libcamera/configuration.yaml (LIBCAMERA_SYSCONF_DIR).
+---
+version: 1
+configuration:
+  pipelines_match_list:
+    - simple
+  software_isp:
+    # i7-1065G7: 4 cores / 8 threads. The CPU debayer + NV12 conversion is split across threads.
+    threads: 4
+    # IPU4 ISYS capture buffers may be write-combined: copy lines to cached memory first.
+    copy_input_buffer: true
+    measure:
+      number: 0

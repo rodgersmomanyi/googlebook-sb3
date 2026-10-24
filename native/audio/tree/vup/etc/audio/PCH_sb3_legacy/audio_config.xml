@@ -1,0 +1,35 @@
+<?xml version='1.0' encoding='utf-8'?>
+<audio_config>
+	<!--
+GB native FALLBACK: Surface Book 3 on legacy snd-hda-intel (no DSP, so no internal DMIC).
+Card "HDA Intel PCH", id "PCH". ALC274 analog is PCM 0 (playback + capture). Only one analog PCM is
+guaranteed, so only Speaker is declared on it; the codec's Auto-Mute moves the sound to the headphone jack
+when one is plugged in. The HDMI PCMs follow the usual Intel HDMI codec numbering (3, 7, 8). That numbering
+is INFERRED; check it with /proc/asound/pcm.
+-->
+	<SoundCardName>hw:PCH</SoundCardName>
+	<HiFi>
+		<Speaker>
+			<PlaybackPCM>hw:PCH,0</PlaybackPCM>
+		</Speaker>
+		<Mic>
+			<CapturePCM>hw:PCH,0</CapturePCM>
+			<JackDev>HDA Intel PCH Mic</JackDev>
+		</Mic>
+		<HDMI1>
+			<PlaybackPCM>hw:PCH,3</PlaybackPCM>
+			<JackDev>HDA Intel PCH HDMI/DP,pcm=3</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI1>
+		<HDMI2>
+			<PlaybackPCM>hw:PCH,7</PlaybackPCM>
+			<JackDev>HDA Intel PCH HDMI/DP,pcm=7</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI2>
+		<HDMI3>
+			<PlaybackPCM>hw:PCH,8</PlaybackPCM>
+			<JackDev>HDA Intel PCH HDMI/DP,pcm=8</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI3>
+	</HiFi>
+</audio_config>

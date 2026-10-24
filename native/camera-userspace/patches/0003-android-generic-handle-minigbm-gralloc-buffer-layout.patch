@@ -1,0 +1,290 @@
+From 21383b8d6262458c544a0ffb01af19ad80583b4a Mon Sep 17 00:00:00 2001
+From: SB3-port <sb3@localhost>
+Date: Sat, 24 Oct 2026 18:34:34 +0000
+Subject: [PATCH 3/7] android: generic: handle minigbm gralloc buffer layouts
+
+---
+ src/android/camera_device.cpp                 |  4 +-
+ src/android/camera_stream.cpp                 | 10 ++-
+ src/android/mm/generic_camera_buffer.cpp      | 54 ++++++++++++
+ .../mm/generic_frame_buffer_allocator.cpp     | 31 ++++++-
+ src/android/mm/minigbm_handle.h               | 83 +++++++++++++++++++
+ 5 files changed, 175 insertions(+), 7 deletions(-)
+ create mode 100644 src/android/mm/minigbm_handle.h
+
+diff --git a/src/android/camera_device.cpp b/src/android/camera_device.cpp
+index 80ff248..5234863 100644
+--- a/src/android/camera_device.cpp
++++ b/src/android/camera_device.cpp
+@@ -783,7 +783,9 @@ CameraDevice::createFrameBuffer(const buffer_handle_t camera3buffer,
+ 
+ 	std::vector<FrameBuffer::Plane> planes(buf.numPlanes());
+ 	for (size_t i = 0; i < buf.numPlanes(); ++i) {
+-		SharedFD fd{ camera3buffer->data[i] };
++		/* Single-fd buffers carry all planes in data[0]. */
++		int fdIndex = i < static_cast<size_t>(camera3buffer->numFds) ? i : 0;
++		SharedFD fd{ camera3buffer->data[fdIndex] };
+ 		if (!fd.isValid()) {
+ 			LOG(HAL, Fatal) << "No valid fd";
+ 			return nullptr;
+diff --git a/src/android/camera_stream.cpp b/src/android/camera_stream.cpp
+index 7da01dc..83fcef0 100644
+--- a/src/android/camera_stream.cpp
++++ b/src/android/camera_stream.cpp
+@@ -182,9 +182,15 @@ int CameraStream::process(Camera3RequestDescriptor::StreamBuffer *streamBuffer)
+ 		streamBuffer->fence.reset();
+ 	}
+ 
+-	const StreamConfiguration &output = configuration();
++	/*
++	 * The destination buffer has the format and size of the Android
++	 * stream, not of the libcamera stream it is produced from.
++	 */
++	const PixelFormat dstFormat =
++		cameraDevice_->capabilities()->toPixelFormat(camera3Stream_->format);
++	const Size dstSize(camera3Stream_->width, camera3Stream_->height);
+ 	streamBuffer->dstBuffer = std::make_unique<CameraBuffer>(
+-		*streamBuffer->camera3Buffer, output.pixelFormat, output.size,
++		*streamBuffer->camera3Buffer, dstFormat, dstSize,
+ 		PROT_READ | PROT_WRITE);
+ 	if (!streamBuffer->dstBuffer->isValid()) {
+ 		LOG(HAL, Error) << "Failed to create destination buffer";
+diff --git a/src/android/mm/generic_camera_buffer.cpp b/src/android/mm/generic_camera_buffer.cpp
+index 0ffcb44..0568e51 100644
+--- a/src/android/mm/generic_camera_buffer.cpp
++++ b/src/android/mm/generic_camera_buffer.cpp
+@@ -13,6 +13,10 @@
+ #include <libcamera/base/log.h>
+ 
+ #include "libcamera/internal/formats.h"
++
++#include <sys/stat.h>
++
++#include "minigbm_handle.h"
+ #include "libcamera/internal/mapped_framebuffer.h"
+ 
+ using namespace libcamera;
+@@ -63,6 +67,56 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
+ {
+ 	error_ = 0;
+ 
++	/*
++	 * minigbm handles describe their own layout (strides are aligned by
++	 * the gralloc, planes may use distinct fds of the same dmabuf).
++	 */
++	MinigbmHandleInfo gbm;
++	if (minigbmHandleInfo(camera3Buffer, &gbm)) {
++		fd_ = gbm.fds[0];
++		struct stat st0;
++		if (fstat(fd_, &st0) < 0) {
++			error_ = -errno;
++			LOG(HAL, Error) << "Invalid gralloc fd";
++			return;
++		}
++		for (unsigned int i = 1; i < gbm.numPlanes; i++) {
++			struct stat st;
++			if (gbm.fds[i] == fd_ || gbm.fds[i] < 0)
++				continue;
++			if (fstat(gbm.fds[i], &st) < 0 ||
++			    st.st_ino != st0.st_ino || st.st_dev != st0.st_dev) {
++				error_ = -EINVAL;
++				LOG(HAL, Error) << "Discontiguous gralloc planes are not supported";
++				return;
++			}
++		}
++
++		if (gbm.modifier != 0)
++			LOG(HAL, Warning) << "Non-linear gralloc buffer (modifier "
++					  << utils::hex(gbm.modifier) << ")";
++
++		bufferLength_ = lseek(fd_, 0, SEEK_END);
++		if (bufferLength_ < 0) {
++			error_ = -errno;
++			LOG(HAL, Error) << "Failed to get buffer length";
++			return;
++		}
++
++		planeInfo_.resize(gbm.numPlanes);
++		for (unsigned int i = 0; i < gbm.numPlanes; i++) {
++			planeInfo_[i].stride = gbm.strides[i];
++			planeInfo_[i].offset = gbm.offsets[i];
++			planeInfo_[i].size = gbm.sizes[i];
++			if (static_cast<off_t>(gbm.offsets[i]) + gbm.sizes[i] > bufferLength_) {
++				error_ = -EINVAL;
++				LOG(HAL, Error) << "gralloc plane " << i << " is out of buffer";
++				return;
++			}
++		}
++		return;
++	}
++
+ 	const auto &info = PixelFormatInfo::info(pixelFormat);
+ 	if (!info.isValid()) {
+ 		error_ = -EINVAL;
+diff --git a/src/android/mm/generic_frame_buffer_allocator.cpp b/src/android/mm/generic_frame_buffer_allocator.cpp
+index 25ad6b0..16251c0 100644
+--- a/src/android/mm/generic_frame_buffer_allocator.cpp
++++ b/src/android/mm/generic_frame_buffer_allocator.cpp
+@@ -22,6 +22,7 @@
+ #include "../camera_device.h"
+ #include "../frame_buffer_allocator.h"
+ #include "../hal_framebuffer.h"
++#include "minigbm_handle.h"
+ 
+ using namespace libcamera;
+ 
+@@ -76,8 +77,11 @@ public:
+ 		  hardwareModule_(nullptr),
+ 		  allocDevice_(nullptr)
+ 	{
+-		hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &hardwareModule_);
+-		ASSERT(hardwareModule_);
++		if (hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &hardwareModule_) ||
++		    !hardwareModule_) {
++			hardwareModule_ = nullptr;
++			LOG(HAL, Error) << "gralloc module not available";
++		}
+ 	}
+ 
+ 	~Private() override;
+@@ -95,7 +99,8 @@ PlatformFrameBufferAllocator::Private::~Private()
+ {
+ 	if (allocDevice_)
+ 		gralloc_close(allocDevice_);
+-	dlclose(hardwareModule_->dso);
++	if (hardwareModule_)
++		dlclose(hardwareModule_->dso);
+ }
+ 
+ std::unique_ptr<HALFrameBuffer>
+@@ -103,6 +108,9 @@ PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
+ 						const libcamera::Size &size,
+ 						uint32_t usage)
+ {
++	if (!hardwareModule_)
++		return nullptr;
++
+ 	if (!allocDevice_) {
+ 		int ret = gralloc_open(hardwareModule_, &allocDevice_);
+ 		if (ret) {
+@@ -124,12 +132,27 @@ PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
+ 		return nullptr;
+ 	}
+ 
+-	/* This code assumes the planes are mapped consecutively. */
+ 	const libcamera::PixelFormat pixelFormat =
+ 		cameraDevice_->capabilities()->toPixelFormat(halPixelFormat);
+ 	const auto &info = PixelFormatInfo::info(pixelFormat);
+ 	std::vector<FrameBuffer::Plane> planes(info.numPlanes());
+ 
++	MinigbmHandleInfo gbm;
++	if (minigbmHandleInfo(handle, &gbm) && gbm.numPlanes == planes.size()) {
++		for (auto [i, plane] : utils::enumerate(planes)) {
++			plane.fd = SharedFD(handle->data[i < static_cast<size_t>(handle->numFds) ? i : 0]);
++			plane.offset = gbm.offsets[i];
++			plane.length = gbm.sizes[i];
++		}
++
++		return std::make_unique<HALFrameBuffer>(
++			std::make_unique<GenericFrameBufferData>(
++				allocDevice_, handle, planes),
++			handle);
++	}
++
++	/* This code assumes the planes are mapped consecutively. */
++
+ 	SharedFD fd{ handle->data[0] };
+ 	size_t offset = 0;
+ 	for (auto [i, plane] : utils::enumerate(planes)) {
+diff --git a/src/android/mm/minigbm_handle.h b/src/android/mm/minigbm_handle.h
+new file mode 100644
+index 0000000..9be8221
+--- /dev/null
++++ b/src/android/mm/minigbm_handle.h
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * minigbm (cros_gralloc) buffer handle introspection.
++ *
++ * The camera HAL receives buffer_handle_t objects created by the minigbm
++ * gralloc of the lapis (Android 17 desktop) vendor image. The layout of the
++ * private handle was verified against /vendor/lib64/libminigbm_gralloc.so:
++ * fds[5] @0x0c, strides[4] @0x20, offsets[4] @0x30, sizes[4] @0x40,
++ * width @0x54, height @0x58, format @0x5c, format_modifier @0x64,
++ * magic 0xabcddcba @0x74, num_planes @0x88, total_size @0x94 (0x9c bytes).
++ * Handles that do not match are left to the generic (packed) code path.
++ */
++
++#pragma once
++
++#include <stdint.h>
++#include <string.h>
++
++#include <cutils/native_handle.h>
++
++struct MinigbmHandleInfo {
++	unsigned int numPlanes;
++	int fds[4];
++	uint32_t strides[4];
++	uint32_t offsets[4];
++	uint32_t sizes[4];
++	uint32_t width;
++	uint32_t height;
++	uint32_t drmFormat;
++	uint64_t modifier;
++	uint64_t totalSize;
++};
++
++static inline bool minigbmHandleInfo(const native_handle_t *h,
++				     MinigbmHandleInfo *info)
++{
++	constexpr size_t kMinSize = 0x9c;
++	constexpr uint32_t kMagic = 0xabcddcba;
++
++	if (!h || h->version != static_cast<int>(sizeof(native_handle_t)))
++		return false;
++	if (h->numFds < 1 || h->numInts < 0)
++		return false;
++
++	size_t total = sizeof(native_handle_t) +
++		       static_cast<size_t>(h->numFds + h->numInts) * sizeof(int);
++	if (total < kMinSize)
++		return false;
++
++	const uint8_t *b = reinterpret_cast<const uint8_t *>(h);
++	auto rd32 = [b](size_t off) {
++		uint32_t v;
++		memcpy(&v, b + off, sizeof(v));
++		return v;
++	};
++	auto rd64 = [b](size_t off) {
++		uint64_t v;
++		memcpy(&v, b + off, sizeof(v));
++		return v;
++	};
++
++	if (rd32(0x74) != kMagic)
++		return false;
++
++	unsigned int n = rd32(0x88);
++	if (n < 1 || n > 4 || static_cast<int>(n) > h->numFds)
++		return false;
++
++	info->numPlanes = n;
++	for (unsigned int i = 0; i < 4; i++) {
++		info->fds[i] = static_cast<int>(rd32(0x0c + 4 * i));
++		info->strides[i] = rd32(0x20 + 4 * i);
++		info->offsets[i] = rd32(0x30 + 4 * i);
++		info->sizes[i] = rd32(0x40 + 4 * i);
++	}
++	info->width = rd32(0x54);
++	info->height = rd32(0x58);
++	info->drmFormat = rd32(0x5c);
++	info->modifier = rd64(0x64);
++	info->totalSize = rd64(0x94);
++
++	return true;
++}
+-- 
+2.43.0
+

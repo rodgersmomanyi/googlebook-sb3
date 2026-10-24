@@ -1,0 +1,299 @@
+# Googlebook OS + Windows dual boot on the Surface Book 3 (Boot Camp style)
+
+This puts Googlebook OS ("lapis", Android 17 desktop) on the internal NVMe next to Windows 11. Windows stays the
+default. You boot Googlebook on purpose, one boot at a time, the way Boot Camp's "Restart in macOS" works.
+
+* **Space.** D: is shrunk. The Googlebook partitions go into the freed space between D: and the Windows
+  Recovery partition. C:, the Windows ESP, MSR and Recovery are never moved, resized or written.
+* **Its own ESP.** Googlebook gets a separate EFI system partition, `EFI-SYSTEM` (systemd-boot, our GKI kernel,
+  initrds). It also gets its own UEFI boot entry, "Googlebook OS". The Windows ESP and `\EFI\Microsoft` are left alone.
+* **One-time boot.** `Restart-ToGooglebook.ps1` sets UEFI `BootNext` and restarts. Any later boot, or a power
+  cycle, goes back to Windows Boot Manager.
+
+Everything that changes something is a **dry run unless `-Apply`** is given. Every step was first run against
+image files (see [Test harness](#test-harness)).
+
+---------------------------------------------------------------------------------------------------------------
+
+## Files
+
+| file | what it is |
+|---|---|
+| `build_internal.py` | Exports the partition set for the internal install (`<out>\*.img` + `manifest.json`). Reads the workspace's `lapis.bin` (`GB_HOME`, default: the repository root) and does not write it. Imports `build_esp.py`/`build_usb.py` without changing them. |
+| `install_dualboot.ps1` | The installer: checks, backups, D: shrink, partitions, raw writes, boot entry. It also has two maintenance modes: `-UpdateEspOnly` and `-RepairBootEntry`. |
+| `uninstall_dualboot.ps1` | Removes the boot entry and the Googlebook partitions, then extends D: back to its original size. |
+| `Restart-ToGooglebook.ps1` | One-time boot into Googlebook: `bcdedit /set {fwbootmgr} bootsequence {id}` + `shutdown /r /t 0`. |
+| `gbdisk.cs` / `gbdisk.exe` | C# helper (.NET 4, built by `build_gbdisk.ps1` with the in-box `csc.exe`). Handles the GPT through `IOCTL_DISK_GET/SET_DRIVE_LAYOUT_EX`, raw I/O, volume lock/dismount, and the image backend. |
+| `gb_common.ps1` | Shared PowerShell helpers. Every change goes through `Invoke-Change`, which only acts with `-Apply`. |
+| `tools/gpt_validate.py` | Test tool, independent of gbdisk. It builds synthetic host-shaped disk images, takes snapshots, and does full GPT validation. |
+| `test/run_image_tests.ps1` | Install + uninstall cycle plus negative tests, run on an image file. Logs go to `test/logs/`. |
+
+## What gets created on disk 0
+
+The partitions go after D:, 1 MiB aligned, in this order. 1 GiB is left unallocated before Recovery (`-ReserveMiB`)
+so a later WinRE enlargement can recreate Recovery in place.
+
+| GPT name | size | type GUID | content |
+|---|---|---|---|
+| `EFI-SYSTEM` | 512 MiB | c12a7328-... (ESP) | FAT32 holding systemd-boot `\EFI\BOOT\BOOTX64.EFI`, `vmlinuz`, `initrd-<slot>.img`, the `gb-<slot>` entry (`gb.hw=native gb.boot=internal`). Boot logs go to `\gblog\`. |
+| `boot_a/b`, `init_boot_a/b`, `vendor_boot_a/b`, `pvmfw_a/b` | 64/8/32/4 MiB | 0fc63daf-... (Linux data) | copied from lapis.bin |
+| `vbmeta_a/b` | 4 MiB | 88434509-d9d1-487d-b82c-15ef964cbd4b (as lapis) | copied. **GPT attributes copied too:** the boot_control HAL keeps the A/B slot state in bits 48-51 (priority), 52-55 (tries) and 56 (successful) |
+| `misc`, `metadata`, `frp_persist`, `desktop_security_persist`, `desktop_security_storage` | 4/64/2/16/32 MiB | Linux data | zeroed. The first boot formats metadata. |
+| `super` | 12 GiB | Linux data | copied (system/vendor/product/... dynamic partitions) |
+| `userdata` | the rest of the shrink (minimum 8 GiB) | Linux data | the first and last 64 MiB are zeroed, which removes old D: data. The first boot formats it (`formattable`). Use `-ZeroFullUserdata` to zero all of it. |
+
+Android finds partitions by **GPT name** (`/dev/block/by-name/<name>`), so the names are exact.
+
+Every partition gets a fresh GUID in `build_internal.py`, and the installer creates the partitions with exactly
+those GUIDs. The ESP's boot entry passes `androidboot.boot_part_uuid=<super GUID>`, so only the disk that holds this
+super gets by-name links. This is the same strict selection the USB stick uses, so an inserted Googlebook stick and
+the internal install never mix. `build_internal.py --boot-devices` uses the PCI path
+`androidboot.boot_devices=pci0000:00/0000:00:1d.0` instead.
+
+None of these types is "basic data", so Windows assigns no drive letters. The GPT "no drive letter" bit (63) only
+applies to basic data partitions, so it is not set. Linux tools read bits 60-63 as read-only/hidden/no-auto, so no
+new partition carries them. The only attribute bits written are the vbmeta slot bits.
+
+## Before you start (once)
+
+1. **Back up** C: and D: user data to an external disk or the cloud.
+2. Create a **Surface USB recovery drive** on a separate stick. Microsoft: "Creating and using a USB recovery drive for
+   Surface". It needs the serial number.
+3. **BitLocker / Device Encryption off** on C: and D:. The installer checks it.
+4. **Secure Boot off**: Surface UEFI → Security → Secure Boot → *None/Disabled*. Our systemd-boot and kernel are
+   not signed. The red bar at the Surface boot screen is normal with Secure Boot off.
+5. Stay **on AC power** for the whole install. The installer refuses to run on battery.
+6. Build the kernel and the native tree (`<workspace>\inject\native`) first. The export's ESP holds the kernel
+   and initrd that are current at export time. Later kernels can be pushed with `-UpdateEspOnly` (see below).
+
+## Install
+
+```powershell
+# 1. Export (no admin), from the repository root. Takes ~5 min plus the 12 GiB copy. Use -B: no __pycache__
+#    next to the images.
+python -I -B native\dualboot\build_internal.py --out C:\gb-export
+#    NOTE: keep the export (~12.6 GiB) off D:, because it would use free space that the D: shrink needs
+#    (the script's default --out is D:\gb-export, so pass --out). Use C: or an external disk.
+
+# 2. Dry run (any PowerShell. Elevated shows the shrink limit, BitLocker and firmware entries too)
+cd native\dualboot
+.\install_dualboot.ps1 -ExportDir C:\gb-export -ShrinkGB 40
+
+# 3. Install (elevated PowerShell: Win+X → Terminal (Admin))
+Set-ExecutionPolicy -Scope Process Bypass
+.\install_dualboot.ps1 -ExportDir C:\gb-export -ShrinkGB 40 -Apply
+```
+
+`-ShrinkGB` is in GiB. The value must leave D: above its shrink minimum: `Get-PartitionSupportedSize -DriveLetter D`.
+If the minimum is too high, run `defrag D: /X` first. With 40 GiB, userdata gets 26,795 MiB (about 26.2 GiB). That
+is the result of a real-disk dry run: 0.9 GiB goes to the ESP and the small partitions, 12 GiB to super, and
+1 GiB is kept free before Recovery.
+
+The shrink can never exceed D:'s free space, so keep the export off D:. Below about 22 GiB of shrink, userdata
+would fall under its 8 GiB minimum, and the installer refuses.
+
+What `-Apply` does, in order (the dry run prints the exact commands):
+
+1. **Checks.** The script must be elevated. The firmware must be UEFI and disk 0 must be GPT with 512-byte
+   sectors. The disk GUID from Get-Disk must match the IOCTL value. BitLocker must be off on D: and C:.
+   `Get-PartitionSupportedSize` must allow the shrink. Secure Boot must be known and off. The laptop must be on AC.
+   There must be no Googlebook partitions and no "Googlebook OS" entry yet, and the export images must match the
+   manifest (sha256).
+2. **Backups**, into `C:\GB-backup\<timestamp>\`:
+   - `bcd.bak` (`bcdedit /export`)
+   - `fw_entries.txt` (`bcdedit /enum firmware /v`)
+   - `bcd_all.txt`
+   - `storage.json` (Get-Disk/Get-Partition/Get-Volume)
+   - `gpt_pre_shrink_primary.bin` (LBA 0-33), `gpt_pre_shrink_backup.bin` (last 33 LBAs), and
+     `layout_pre_shrink.json` (names, GUIDs, attributes)
+   - `manifest_installed.json`
+
+   A second copy of the GPT backups goes to `<export>\gpt-backups\<timestamp>\`. **Copy the folder to a USB stick
+   as well.**
+3. **Shrink D:** with `Resize-Partition`, then check the result. The GPT is backed up again (`post_shrink`).
+4. **Create partitions** with one `IOCTL_DISK_SET_DRIVE_LAYOUT_EX`. The five Windows entries are passed back
+   verbatim, and the new entries carry exact names, types, GUIDs and attributes. gbdisk refuses a layout in which
+   any existing entry would change, any partitions overlap, or anything lies outside the usable area or the freed
+   region. Afterwards it re-reads the layout and verifies every entry.
+5. **Write** each image raw through `\\.\PhysicalDrive0`. Each partition is first checked again against a fresh
+   layout read, any volume on it is locked and dismounted, and every write is bounds-checked to that partition.
+   After writing, the sha256 of the source is compared against the read-back and the manifest. Zero ranges are read
+   back too.
+6. **Boot entry**, in this order:
+   1. `bcdedit /copy {bootmgr} /d "Googlebook OS"`
+   2. `bcdedit /set {id} device partition=\Device\HarddiskVolumeN` (falls back to a temporary drive letter)
+   3. `bcdedit /set {id} path \EFI\BOOT\BOOTX64.EFI`
+   4. `bcdedit /set {fwbootmgr} displayorder {id} /addlast`
+   5. A check that the first boot-order entry (Windows Boot Manager) is unchanged
+
+   If any of these steps fails, the new entry is deleted again. systemd-boot ignores the Windows-style load options
+   that a copied `{bootmgr}` entry carries.
+
+The state of the run (phase, GUIDs, original D: size, plan, boot entry id) goes to
+`C:\GB-backup\<timestamp>\install_state.json`. The pointer to it is `C:\GB-backup\googlebook_install.json`.
+
+## Booting Googlebook and returning to Windows
+
+* **From Windows:** in an elevated PowerShell, run `.\Restart-ToGooglebook.ps1`. Use `-NoRestart` to only set it, or
+  `-WhatIf` to preview. This sets UEFI BootNext for one boot. systemd-boot shows its menu for 4 s and starts
+  `Googlebook OS - Surface Book 3 (slot B)`.
+* **From the firmware:** shut down, then hold **Volume Up** and press **Power** to open Surface UEFI. Go to **Boot
+  configuration**. Swiping left on an entry boots it once without changing the order. The page lists Windows Boot
+  Manager, USB Storage, PXE and Internal Storage. Whether it also lists "Googlebook OS" is **not verified** on this
+  firmware (23.101.140). If it does not, use `Restart-ToGooglebook.ps1`.
+* **USB stick:** holding **Volume Down** and pressing **Power** boots the USB stick. This is the stick image, not
+  the internal install. Surface UEFI → Boot configuration → Advanced options must have "Enable boot from USB
+  devices" on.
+* **Back to Windows:** simply restart or shut down from Googlebook. Windows Boot Manager is first in BootOrder and
+  BootNext is consumed by the one boot. Nothing else is needed.
+* **Optional Android-side "restart into Windows" tool (described, not implemented).** It is only useful if
+  Googlebook were ever made the default. From a root shell (SELinux is permissive):
+  1. `mount -t efivarfs none /sys/firmware/efi/efivars`. This needs `CONFIG_EFIVAR_FS`, which is **not set** in
+     the GKI x86 defconfig or the lapis config (checked). Our build would need `CONFIG_EFIVAR_FS=m`.
+  2. Read `BootOrder-8be4df61-93ca-11d2-aa0d-00e098032b8c` and the `Boot####-8be4df61-...` variables. Find the one
+     whose description (UTF-16 after the 4-byte attributes, 4-byte Attributes field and 2-byte FilePathListLength)
+     is "Windows Boot Manager".
+  3. Write `BootNext-8be4df61-...` as the 4-byte attributes `07 00 00 00` (NV|BS|RT) plus the little-endian UINT16
+     boot number, e.g. `printf '\x07\x00\x00\x00\x00\x00' > .../BootNext-...` for Boot0000. Run `chattr -i` on the
+     file first if efivarfs marks it immutable.
+  4. `reboot`. Keep `efi_pstore.pstore_disable=1`, which is already on the native cmdline, so that panics never go
+     to NVRAM.
+
+## First boot, logs, checks
+
+* The first boot formats `metadata` and `userdata`, and dexopt runs, so it is slow.
+* Logs are written to the Googlebook ESP: `EFI-SYSTEM\gblog\bootN-t<seconds>.txt` (gb_bootlog). That ESP has no
+  drive letter. To read it from an elevated prompt:
+  1. `mountvol G: \\?\Volume{<ESP partition GUID>}\` (the GUID is `esp_id` in install_state.json; on GPT the volume
+     GUID equals the partition GUID)
+  2. read `G:\gblog\`
+  3. `mountvol G: /D`
+* Back in Windows, a read-only check is `gbdisk verify --disk 0 --plan C:\GB-backup\<ts>\plan.json --layout-only`.
+  Android's boot_control HAL changes the vbmeta slot bits, and verify reports that as a note.
+  `gbdisk layout --disk 0` works without admin.
+
+## Updating Googlebook's kernel/initrd later (userdata and system untouched)
+
+```powershell
+python -I -B build_internal.py --out C:\gb-export2 --reuse-guids C:\GB-backup\<ts>\manifest_installed.json
+.\install_dualboot.ps1 -ExportDir C:\gb-export2 -UpdateEspOnly          # dry run
+.\install_dualboot.ps1 -ExportDir C:\gb-export2 -UpdateEspOnly -Apply   # rewrites only EFI-SYSTEM, verified
+```
+
+The GUIDs must stay the same, because the boot entry names the installed super. Without `--reuse-guids` the
+installer refuses.
+
+Notes:
+* `super` is not rewritten by `-UpdateEspOnly`. A new system build means uninstall + install, or an OTA inside
+  Googlebook.
+* gb_slotsync handles OTA slot switches on the ESP.
+
+## Uninstall
+
+```powershell
+.\uninstall_dualboot.ps1           # dry run: lists exactly what would be removed
+.\uninstall_dualboot.ps1 -Apply    # elevated
+```
+
+The steps:
+1. Back up the BCD and the GPT (`pre_uninstall`).
+2. `bcdedit /delete {id}` on the Googlebook entry.
+3. Delete the Googlebook partitions. A partition is deleted only if all of these hold:
+   * it has a Googlebook name;
+   * it has a Googlebook type;
+   * it is not in the pre-install layout;
+   * its GUID is in the install plan;
+   * it lies in one contiguous run with the others.
+
+   Every other entry must come through the change unchanged.
+4. `Resize-Partition` D: back to its **original size**.
+5. Compare every partition with `layout_pre_shrink.json`.
+
+If the state is lost, `-Force` removes by name + type + contiguity only, and D: is extended to its maximum.
+Manual alternative: Disk Management cannot delete these partition types. Use `diskpart` → `select disk 0` →
+`list partition`. Check offsets and sizes against `layout_pre_shrink.json`, never touch partitions 1-5, run
+`select partition N` → `delete partition override` for each one, and then **Extend Volume** on D:.
+
+## Recovery
+
+| situation | what to do |
+|---|---|
+| The install stops part-way | The phase is in `install_state.json` and the error names the step. Nothing after the failed step ran. If the failure came before "created", D: is only smaller: extend it back (Disk Management → Extend Volume, or `Resize-Partition -DriveLetter D -Size <original_length>`). If it came after, `uninstall_dualboot.ps1 -Apply` removes what was created and extends D:. |
+| Googlebook does not start / hangs after the systemd-boot menu | Hold Power for 10 s to switch off. The next boot is Windows, because BootNext is used up. See the NX_COMPAT note below. |
+| Windows Boot Manager is no longer first | Surface UEFI → Boot configuration: drag Windows Boot Manager to the top. Or, elevated: `bcdedit /set {fwbootmgr} displayorder {bootmgr} /addfirst`. |
+| The Googlebook boot entry vanished (e.g. after a Windows feature update) | `.\install_dualboot.ps1 -RepairBootEntry -Apply` |
+| BCD damaged | Elevated: `bcdedit /import C:\GB-backup\<ts>\bcd.bak`. Without Windows: Surface recovery drive → Troubleshoot → Command Prompt → `bcdboot C:\Windows`. |
+| GPT damaged, Windows still boots | `gbdisk restore-gpt --disk 0 --from C:\GB-backup\<ts> --tag post_shrink` (dry run), then add `--apply`. It writes back LBA 0-33 and the last 33 LBAs (tags: `pre_shrink`, `post_shrink`, `post_install`, `pre_uninstall`), then re-reads the table. `post_shrink` is the shrunk D: without Googlebook partitions. `pre_shrink` restores D:'s original partition size, but its NTFS stays shrunk: run Extend Volume afterwards. |
+| GPT damaged, Windows does not boot | WinRE and the recovery drive have no .NET, so gbdisk cannot run there. From any Linux live USB (copy the backup folder onto it first), with `D=/dev/nvme0n1`: `dd if=gpt_post_shrink_primary.bin of=$D bs=512 count=34 conv=fsync` and `dd if=gpt_post_shrink_backup.bin of=$D bs=512 seek=$(( $(blockdev --getsz $D) - 33 )) conv=fsync`. The disk size must be unchanged; the backup files were taken from this same disk. |
+| Nothing helps | Surface recovery drive → reinstall Windows (data loss), restore from your backups. |
+
+## Surface Book 3 notes and risks
+
+* **Boot loader choice.** linux-surface reverts the kernel's PE `NX_COMPAT` flag (patch "Revert efi/x86: Set the
+  PE/COFF header's NX compat flag unconditionally"). Their reason is that Surface devices get stuck on boot with NX
+  advertised, a problem seen with GRUB. We do not use GRUB: our loader is systemd-boot 262.1, whose own PE has
+  NX_COMPAT. Our GKI bzImage has `DllCharacteristics = 0x0100` (NX_COMPAT set, verified). **If boot freezes right
+  after the systemd-boot menu**, rebuild with `build_internal.py --clear-nx-compat --reuse-guids ...`, which clears
+  the flag in the ESP's copy of the kernel only, and use `-UpdateEspOnly -Apply`. The USB stick shows the same
+  behaviour, so test on the stick first.
+* **Two ESPs on one disk.** The UAPI Boot Loader Specification expects a single ESP per disk. Windows uses only the
+  ESP its boot manager was started from, and Surface UEFI starts the firmware entry it is given, so this works in
+  practice. It is still the main design risk.
+  * The "Internal Storage" fallback entry in Surface UEFI might pick either ESP's `\EFI\BOOT\BOOTX64.EFI`.
+  * If the firmware misbehaves, the alternative from the boot-design research is systemd-boot on the Windows ESP
+    with an XBOOTLDR partition holding the kernel and initrds. That is not implemented.
+* **Android writes the Windows disk's GPT.** The android-desktop boot_control HAL rewrites the primary and backup GPT
+  of the disk holding `vbmeta_a/b` when it updates the slot bits (`bootctl mark-boot-successful`, OTA). In the VM
+  these writes were CRC-correct and only touched the vbmeta entries. After the first internal boot, run
+  `gbdisk layout --disk 0`, or uninstall's verify logic, to confirm that partitions 1-5 are unchanged.
+* **Never run Googlebook's own "install to disk".** `android-desktop-install` zaps the whole disk; the native tree
+  stubs it out (GB_REFUSE). Also never let Disk Management format the "unknown" partitions.
+* **TPM / SPI flash / NVRAM.** The native cmdline blacklists the TPM, SPI-NOR and gsmi modules and sets
+  `efi_pstore.pstore_disable=1`, so Android never touches the Surface TPM, the BIOS flash or the UEFI NVRAM (except
+  the optional BootNext tool above).
+* **BitLocker.** The install needs BitLocker off. If you enable it later on C: (with Secure Boot off it seals to
+  PCRs 0/2/4/11), keep the recovery key: firmware boot-order changes can trigger recovery.
+* **Clock.** Windows keeps the RTC in local time and Android keeps it in UTC, so the clock is off by your UTC offset
+  after switching until NTP syncs.
+* **Windows updates.** They may move Windows Boot Manager back to first place, which is harmless (it is already
+  first), or drop foreign entries; then run `-RepairBootEntry`. The 1 GiB left before Recovery lets Windows/WinRE
+  servicing recreate a bigger Recovery partition.
+* **Not tested on the real disk.** Everything here was exercised only against image files and in read-only dry runs
+  against disk 0 (see below). The first real run is yours. Do it with the backups above, and do the USB stick bring-up
+  first.
+
+## Test harness
+
+`-TargetImage <file>` runs the same gbdisk partitioning, naming, attribute and raw-write code against a raw disk image
+(no admin):
+* "Shrink D:" is simulated on partition `-ImageShrinkPartition` (default 4) with `gbdisk resize-image`.
+* bcdedit is never run; the commands are printed.
+* Backups and state go to `<image>.gbbackup\` and `<image>.gbstate.json`.
+
+```powershell
+# small: real ESP + real boot images, super truncated to 64 MiB (manifest marked test_truncated, refused on a disk)
+python -I -B build_internal.py --out D:\gb-test\export_small --test-super-mib 64 --test-userdata-min-mib 512
+.\test\run_image_tests.ps1 -Image D:\gb-test\cycle_small.img -ExportDir D:\gb-test\export_small -Tag small
+# full size: the real export, D: 40 GiB in the image, shrink 28 GiB
+.\test\run_image_tests.ps1 -Image D:\gb-test\cycle_full.img -ExportDir D:\gb-export -CMiB 1024 -DMiB 40960 -ShrinkGB 28 -Tag full -DeleteImage
+```
+
+The cycle runs these steps:
+1. `gpt_validate.py mkimage` builds a sparse image shaped like disk 0. It has the same names, types, GUIDs and
+   attributes, including Recovery's `0x8000000000000001` and the 1 MiB gap before Recovery, plus random data
+   blocks.
+2. Take a snapshot: per-MiB digests plus the GPT.
+3. Install dry run: the image must stay byte-identical.
+4. `-Apply`, then validate:
+   - protective MBR, primary and backup headers and the CRC32s, identical entry arrays;
+   - names, types, GUIDs and attributes, 1 MiB alignment, no overlaps;
+   - pre-existing entries byte-identical apart from the shrunk D:;
+   - content sha256 equal to the export files and the blanks zeroed;
+   - **every MiB outside the new partitions byte-identical**.
+5. Negative tests: a second install is refused, a TEST export is refused for a real disk, a mismatched plan is
+   refused, remove without state is refused, and growing D: into Googlebook is refused. The image must still be
+   unchanged afterwards.
+6. `-UpdateEspOnly`.
+7. Uninstall dry run (image unchanged), then `-Apply`. The GPT must be **byte-identical to before the install**.
+8. A plan that does not fit is refused.
+9. Re-install, then `gbdisk restore-gpt --tag pre_shrink`. The GPT must be byte-identical again.

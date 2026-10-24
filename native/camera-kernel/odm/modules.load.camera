@@ -1,0 +1,17 @@
+mfd-core.ko
+pinctrl-intel.ko
+pinctrl-icelake.ko
+intel-lpss.ko
+intel-lpss-pci.ko
+i2c-designware-core.ko
+i2c-designware-platform.ko
+v4l2-cci.ko
+ipu-bridge.ko
+intel_skl_int3472_common.ko
+intel_skl_int3472_discrete.ko
+ov5693.ko
+ov8865.ko
+ov7251.ko
+dw9719.ko
+intel-ipu6.ko
+intel-ipu6-isys.ko

@@ -1,0 +1,11 @@
+# Surface Pen (Bluetooth LE, HID over GATT) top/eraser button, 045E:0921.
+# The pen does not report its button as a stylus button: it pairs as a tiny BLE keyboard and sends
+# Win+F20 (click), Win+F19 (double-click) and Win+F18 (press and hold).
+# This layout replaces Generic.kl for this device only: META (125) is intentionally NOT mapped, so the Windows-key
+# chord does not reach Android, and the F-keys become stylus / system keys.
+# STYLUS_BUTTON_TAIL is the Android 14+ key for "button at the tail end of a stylus"; SystemUI uses it to open the
+# default note-taking app.
+
+key 190   STYLUS_BUTTON_TAIL
+key 189   SYSRQ
+key 188   ASSIST

@@ -1,0 +1,35 @@
+#cloud-config
+# cloud-init seed for the Ubuntu 24.04 builder VM (NoCloud: pack user-data + meta-data into a 'cidata' ISO).
+# Sanitized template: put your own SSH public key in; password login stays disabled.
+hostname: gkibuilder
+manage_etc_hosts: true
+users:
+  - name: builder
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "<YOUR SSH PUBLIC KEY, e.g. ssh-ed25519 AAAA... builder>"
+ssh_pwauth: false
+package_update: true
+package_upgrade: false
+packages:
+  - git
+  - python3
+  - python3-pip
+  - build-essential
+  - bc
+  - bison
+  - flex
+  - libssl-dev
+  - libelf-dev
+  - rsync
+  - cpio
+  - unzip
+  - zip
+  - curl
+  - ccache
+  - kmod
+runcmd:
+  - [ bash, -c, "mkdir -p /build && (mkfs.ext4 -F /dev/nvme0n2 || mkfs.ext4 -F /dev/sdb || true) && (mount /dev/nvme0n2 /build || mount /dev/sdb /build || true) && chown -R builder:builder /build" ]
+  - [ bash, -c, "echo 'builder-ready' > /tmp/cloudinit-done" ]

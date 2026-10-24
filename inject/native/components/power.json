@@ -1,0 +1,14 @@
+{
+ "name": "power",
+ "source": "${GB_BUILD}\\native\\power",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\power\\bin\\gb_power",
+   "dest": "vup/bin/gb_power",
+   "mode": "0o100755"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\power\\gb_power.rc"
+ ]
+}

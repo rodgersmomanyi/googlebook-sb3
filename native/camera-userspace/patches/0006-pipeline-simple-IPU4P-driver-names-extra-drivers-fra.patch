@@ -1,0 +1,129 @@
+From de3dd7a8df86b4969a074d851bd5b860c1dad859 Mon Sep 17 00:00:00 2001
+From: SB3-port <sb3@localhost>
+Date: Sat, 24 Oct 2026 18:34:34 +0000
+Subject: [PATCH 6/7] pipeline: simple: IPU4P driver names, extra drivers,
+ frame duration limits
+
+---
+ src/ipa/simple/soft_simple.cpp           | 26 ++++++++++++
+ src/libcamera/pipeline/simple/simple.cpp | 53 +++++++++++++++++++++++-
+ 2 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 629e1a3..b14f359 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -178,6 +178,32 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 	}
+ 
+ 	ControlInfoMap::Map ctrlMap = context_.ctrlMap;
++
++	/*
++	 * Report the frame duration limits of the sensor configuration the
++	 * camera was created with (the Android HAL requires them).
++	 */
++	if (sensorInfo.pixelRate && sensorInfo.minLineLength &&
++	    sensorInfo.minFrameLength &&
++	    !ctrlMap.count(&controls::FrameDurationLimits)) {
++		const uint64_t lineUs1e6 = static_cast<uint64_t>(sensorInfo.minLineLength) * 1000000;
++		int64_t minUs = lineUs1e6 * sensorInfo.minFrameLength / sensorInfo.pixelRate;
++		int64_t maxUs = lineUs1e6 * std::max(sensorInfo.maxFrameLength,
++						     sensorInfo.minFrameLength) /
++				sensorInfo.pixelRate;
++		ctrlMap[&controls::FrameDurationLimits] =
++			ControlInfo(minUs, maxUs, minUs);
++		LOG(IPASoft, Debug) << "Frame duration limits " << minUs
++				    << "us - " << maxUs << "us";
++	} else if (!ctrlMap.count(&controls::FrameDurationLimits)) {
++		/* No sensor timings: assume 30 fps nominal, 1 fps worst case. */
++		ctrlMap[&controls::FrameDurationLimits] =
++			ControlInfo(static_cast<int64_t>(33333),
++				    static_cast<int64_t>(1000000),
++				    static_cast<int64_t>(33333));
++		LOG(IPASoft, Warning) << "No sensor timings, frame duration limits defaulted";
++	}
++
+ 	*ipaControls = ControlInfoMap(std::move(ctrlMap), controls::controls);
+ 
+ 	/*
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index e26f438..9613685 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -258,6 +258,10 @@ namespace {
+ static const SimplePipelineInfo supportedDevices[] = {
+ 	{ "dcmipp", {}, false },
+ 	{ "imx7-csi", { { "pxp", 1 } }, true },
++	{ "intel-ipu4", {}, true },
++	{ "intel-ipu4p", {}, true },
++	{ "intel_ipu4p_isys", {}, true },
++	{ "intel-ipu4p-isys", {}, true },
+ 	{ "intel-ipu6", {}, true },
+ 	{ "intel-ipu7", {}, true },
+ 	{ "j721e-csi2rx", {}, true },
+@@ -1523,6 +1527,30 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/*
++	 * Report the frame duration limits of the configured sensor mode
++	 * (binned and full resolution modes differ). The Android HAL reads
++	 * them after configure() to build its per-resolution frame rates.
++	 */
++	{
++		IPACameraSensorInfo sensorInfo{};
++		if (!data->sensor_->sensorInfo(&sensorInfo) && sensorInfo.pixelRate &&
++		    sensorInfo.minLineLength && sensorInfo.minFrameLength) {
++			const uint64_t line =
++				static_cast<uint64_t>(sensorInfo.minLineLength) * 1000000;
++			int64_t minUs = line * sensorInfo.minFrameLength / sensorInfo.pixelRate;
++			int64_t maxUs = line * std::max(sensorInfo.maxFrameLength,
++							sensorInfo.minFrameLength) /
++					sensorInfo.pixelRate;
++
++			ControlInfoMap::Map map;
++			for (const auto &[id, info] : data->controlInfo_)
++				map.emplace(id, info);
++			map[&controls::FrameDurationLimits] = ControlInfo(minUs, maxUs, minUs);
++			data->controlInfo_ = ControlInfoMap(std::move(map), controls::controls);
++		}
++	}
++
+ 	/* Configure the video node, taking into account any Bayer pattern change. */
+ 	V4L2PixelFormat videoFormat;
+ 	if (format.code == pipeConfig->code) {
+@@ -2026,7 +2054,30 @@ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
+ {
+ 	std::shared_ptr<MediaDevice> media;
+ 
+-	for (const SimplePipelineInfo &inf : supportedDevices) {
++	/* Extra drivers from the environment, matched with the software ISP. */
++	static std::vector<std::string> extraNames;
++	static std::vector<SimplePipelineInfo> extraDevices;
++	if (extraDevices.empty()) {
++		const char *env = utils::secure_getenv("LIBCAMERA_SIMPLE_EXTRA_DRIVERS");
++		if (env) {
++			for (const auto &name : utils::split(env, ",")) {
++				if (!name.empty())
++					extraNames.emplace_back(name);
++			}
++			extraNames.reserve(extraNames.size());
++			for (const std::string &name : extraNames)
++				extraDevices.push_back({ name.c_str(), {}, true });
++		}
++	}
++
++	std::vector<const SimplePipelineInfo *> devices;
++	for (const SimplePipelineInfo &inf : supportedDevices)
++		devices.push_back(&inf);
++	for (const SimplePipelineInfo &inf : extraDevices)
++		devices.push_back(&inf);
++
++	for (const SimplePipelineInfo *infp : devices) {
++		const SimplePipelineInfo &inf = *infp;
+ 		DeviceMatch dm(inf.driver);
+ 		while ((media = acquireMediaDevice(enumerator, dm))) {
+ 			/*
+-- 
+2.43.0
+

@@ -1,0 +1,28 @@
+From 60d3fdc84a38aefdf48125053bd1104141fdac7e Mon Sep 17 00:00:00 2001
+From: SB3-port <sb3@localhost>
+Date: Sat, 24 Oct 2026 18:34:34 +0000
+Subject: [PATCH 7/7] dma_buf_allocator: open DMA heaps read-only
+
+---
+ src/libcamera/dma_buf_allocator.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/libcamera/dma_buf_allocator.cpp b/src/libcamera/dma_buf_allocator.cpp
+index d8c62dd..b5b2ba0 100644
+--- a/src/libcamera/dma_buf_allocator.cpp
++++ b/src/libcamera/dma_buf_allocator.cpp
+@@ -100,7 +100,10 @@ DmaBufAllocator::DmaBufAllocator(DmaBufAllocatorFlags type)
+ 		if (!(type & info.type))
+ 			continue;
+ 
+-		int ret = ::open(info.deviceNodeName, O_RDWR | O_CLOEXEC, 0);
++		/* DMA heaps only need a read-only fd (Android: 0444 nodes). */
++		const int flags = info.type == DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf
++					  ? O_RDWR : O_RDONLY;
++		int ret = ::open(info.deviceNodeName, flags | O_CLOEXEC, 0);
+ 		if (ret < 0) {
+ 			ret = errno;
+ 			LOG(DmaBufAllocator, Debug)
+-- 
+2.43.0
+

@@ -1,0 +1,34 @@
+# hw-gap-audit: kernel build #12 changes (android17-6.18, v6.18.21). Lead applies; nothing here touched /build/gki/common.
+
+## 1. Patch (apply to /build/gki/common with: patch -p1 < 0001-HID-surface-drop-the-bogus-SAM-Fn-button.patch)
+#    Touches drivers/hid/Kconfig, drivers/hid/Makefile, adds drivers/hid/hid-surface.c.
+#    Tested: patch --dry-run + apply on a hard-link copy of /build/native/ktree (identical to /build/gki/common for
+#    these two files, diff-checked), olddefconfig keeps CONFIG_HID_SURFACE=m, in-tree "make M=drivers/hid modules"
+#    builds drivers/hid/hid-surface.ko (logs/intree_build_drivers_hid.log); external W=1 build clean
+#    (logs/external_module_W1.log). Not loaded on hardware.
+
+## 2. gki_defconfig line (savedefconfig form)
+CONFIG_HID_SURFACE=m
+
+## 3. common/BUILD.bazel, kernel_x86_64: add to BOTH module_implicit_outs and modules_superset
+drivers/hid/hid-surface.ko
+
+## 4. Native modules.load (stage_kernel.py NATIVE_EARLY): right after surface_hid.ko
+hid-surface.ko
+#    No dependencies (modinfo depends: empty). It binds hid:b0019g0001v0000045Ep000009AE / ...09AF. If it is loaded after
+#    hid-generic already took the keyboard, HID core re-probes the device (hid-core.c __hid_bus_reprobe_drivers), so the
+#    order is not critical.
+
+## 5. Recommended removals from the native module set (no kernel rebuild needed)
+#  - thermal.ko (CONFIG_ACPI_THERMAL): useless on the SB3. The only ThermalZone in the firmware is \TPOL
+#    (_HID MSHW0187, "Surface Thermal Policy") and it has no _TMP, so acpi_thermal_add() fails for it
+#    (verified in the dumped DSDT, acpi/DSDT.dsl). Harmless if kept.
+
+## 6. Config deliberately NOT added (evidence in STATUS.md)
+#  UCSI_ACPI (lapis ships ucsi_acpi.ko; the SB3 \_SB.UBTC USBC000 device returns _STA=0 unless NVS USTC=1 and Windows
+#    does not enumerate it), TYPEC_MUX_INTEL_PMC, INTEL_HID_EVENT / INTEL_VBTN (no INT33D5/INT33D6 in the tables),
+#    ACPI_TAD (Android alarms use rtc0 = rtc_cmos, built in), ACPI_PROCESSOR_AGGREGATOR (\_SB.PAGD has a static _PUR and
+#    is never notified), X86_MSR (gb_hw.sh uses lapis's vendor msr.ko), SURFACE_ACPI_NOTIFY (no MSHW0091 on the SB3),
+#    SURFACE_PRO3_BUTTON / SURFACE_KBD (wrong devices), SENSORS_SURFACE_TEMP/FAN (need HWMON, which GKI x86 has off,
+#    and the SB3 SAM node group has no sensor/fan nodes), MISC_RTSX_USB / MMC_REALTEK_USB (only if the base SD reader
+#    turns out to be a Realtek vendor-class 0BDA:0129/0139/0179 device - see STATUS.md, SD card row).

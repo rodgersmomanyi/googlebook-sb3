@@ -1,0 +1,18 @@
+# OPTIONAL, native SB3 bring-up only: re-declare the lapis legacy camera provider with libcamera
+# debug logging (goes to logcat through bionic syslog, tag = process name). Install as
+# /odm/etc/init/gb-camera-debug.rc; /odm init files are parsed after /vendor, "override" replaces
+# the vendor definition. Remove once the cameras work.
+#
+# LIBCAMERA_SIMPLE_EXTRA_DRIVERS: add the media driver name here if the IPU4P ISYS port reports
+# something other than intel-ipu6 / intel-ipu4 / intel-ipu4p / intel_ipu4p_isys / intel-ipu4p-isys
+# (check: cat /sys/class/video4linux/video0/device/../uevent, or lcam-probe -l log output).
+service vendor.camera-provider-2-7-legacy-wrapper /vendor/bin/hw/android.hardware.camera.provider@2.7-service-legacy-wrapper
+    override
+    class hal
+    user system
+    group system
+    capabilities SYS_NICE
+    rlimit rtprio 10 10
+    task_profiles CameraServiceCapacity CameraServicePerformance
+    setenv LIBCAMERA_LOG_LEVELS *:WARN,HAL:INFO,SimplePipeline:INFO,SoftwareIsp:INFO,IPASoft:INFO
+    # setenv LIBCAMERA_SIMPLE_EXTRA_DRIVERS intel-ipu4p-isys

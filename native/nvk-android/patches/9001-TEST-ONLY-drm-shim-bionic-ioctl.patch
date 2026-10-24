@@ -1,0 +1,20 @@
+--- a/src/drm-shim/drm_shim.c
++++ b/src/drm-shim/drm_shim.c
+@@ -1,3 +1,5 @@
++/* test-only (nvk-android bionic chroot run): bionic ioctl() is (int, int, ...) */
++#define BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD 1
+ /*
+  * Copyright © 2018 Broadcom
+  *
+@@ -783,7 +785,11 @@
+  * our DRM fd to drm_shim_ioctl().
+  */
+ PUBLIC int
++#ifdef __BIONIC__
++ioctl(int fd, int request, ...)
++#else
+ ioctl(int fd, unsigned long request, ...)
++#endif
+ {
+    get_function_pointers();
+ 

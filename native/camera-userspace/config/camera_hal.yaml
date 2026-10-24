@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# libcamera Android HAL configuration - Microsoft Surface Book 3 (Intel IPU4P, 8086:8A19).
+# Installed as /odm/etc/libcamera/camera_hal.yaml (LIBCAMERA_HAL_CONFIG overrides the path).
+#
+# libcamera names ACPI sensors by their firmware node path. The paths below were read from the
+# Windows PnP tree of this machine (DEVPKEY_Device_LocationPaths):
+#   INT33BE (OV5693, front)  ACPI(_SB_)#ACPI(PCI0)#ACPI(I2C2)#ACPI(CAMF)
+#   INT347A (OV8865, rear)   ACPI(_SB_)#ACPI(PCI0)#ACPI(I2C3)#ACPI(CAMR)
+#   INT347E (OV7251, IR)     ACPI(_SB_)#ACPI(PCI0)#ACPI(I2C3)#ACPI(CAM3)  - not exposed (mono IR)
+#
+# The patched HAL also accepts cameras without an entry when ipu-bridge reports the location
+# (ACPI _PLD) and rotation (SSDB); firmware values win over the ones below, which are only used
+# when the sensor driver does not report them. Rotation 0 is unverified on SB3 hardware.
+cameras:
+  "\\_SB_.PCI0.I2C2.CAMF":
+    location: front
+    rotation: 0
+  "\\_SB_.PCI0.I2C3.CAMR":
+    location: back
+    rotation: 0

@@ -1,0 +1,55 @@
+power: supply: surface_battery: add scope_device parameter (report BAT1/BAT2 as scope "Device" so the Android health HAL skips them)
+
+With scope_device=1 the batteries report POWER_SUPPLY_PROP_SCOPE = POWER_SUPPLY_SCOPE_DEVICE (else
+SCOPE_SYSTEM, i.e. unchanged semantics). AOSP BatteryMonitor (lapis health HAL included) skips Battery-type
+supplies whose scope reads "Device", so a combined battery published through test_power is the only one
+Android sees. The scope is answered before any EC request so the read can never fail. Writable at runtime (0644).
+---
+--- a/drivers/power/supply/surface_battery.c
++++ b/drivers/power/supply/surface_battery.c
+@@ -143,6 +143,12 @@
+ module_param(cache_time, uint, 0644);
+ MODULE_PARM_DESC(cache_time, "battery state caching time in milliseconds [default: 1000]");
+ 
++static bool scope_device;
++module_param(scope_device, bool, 0644);
++MODULE_PARM_DESC(scope_device, "report the batteries with scope \"Device\" instead of \"System\", so that user space "
++		 "picking the system battery (e.g. the Android health HAL) skips them, for use when a combined battery is "
++		 "provided elsewhere [default: false]");
++
+ 
+ /* -- State management. ----------------------------------------------------- */
+ 
+@@ -428,6 +434,7 @@
+ static const enum power_supply_property spwr_battery_props_chg[] = {
+ 	POWER_SUPPLY_PROP_STATUS,
+ 	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_SCOPE,
+ 	POWER_SUPPLY_PROP_TECHNOLOGY,
+ 	POWER_SUPPLY_PROP_CYCLE_COUNT,
+ 	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
+@@ -446,6 +453,7 @@
+ static const enum power_supply_property spwr_battery_props_eng[] = {
+ 	POWER_SUPPLY_PROP_STATUS,
+ 	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_SCOPE,
+ 	POWER_SUPPLY_PROP_TECHNOLOGY,
+ 	POWER_SUPPLY_PROP_CYCLE_COUNT,
+ 	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
+@@ -547,6 +555,16 @@
+ 	u32 value;
+ 	int status;
+ 
++	/*
++	 * Answer the scope without talking to the EC: it must not fail, user
++	 * space treats an unreadable scope as "System".
++	 */
++	if (psp == POWER_SUPPLY_PROP_SCOPE) {
++		val->intval = READ_ONCE(scope_device) ? POWER_SUPPLY_SCOPE_DEVICE
++						      : POWER_SUPPLY_SCOPE_SYSTEM;
++		return 0;
++	}
++
+ 	mutex_lock(&bat->lock);
+ 
+ 	status = spwr_battery_update_bst_unlocked(bat, true);

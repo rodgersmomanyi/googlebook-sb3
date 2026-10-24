@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Googlebook SB3 native: sensor features (staged as /vendor/etc/permissions/gb_sb3_sensors.xml via /odm/vup).
+     lapis declares none. RotationPolicy.isRotationSupported() needs FEATURE_SENSOR_ACCELEROMETER (plus
+     config_supportAutoRotation, see GbSb3SensorsOverlay.apk) before SystemUI/Settings offer auto-rotate. -->
+<permissions>
+    <feature name="android.hardware.sensor.accelerometer" />
+    <feature name="android.hardware.sensor.gyroscope" />
+    <feature name="android.hardware.sensor.light" />
+</permissions>

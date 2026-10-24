@@ -1,0 +1,108 @@
+SwiftShader -> vulkan.pastel.so  (Android x86_64 hwvulkan HAL)  build notes
+===========================================================================
+Date:        2026-10-21
+Builder:     Ubuntu VM, 3 cores. SwiftShader HEAD cddb5c91b, NDK r27c.
+Toolchain:   /build/ndk/build/cmake/android.toolchain.cmake (clang 18, lld)
+Output:      /build/vulkan.pastel.so            (linked, unstripped, ~31 MB)
+             /build/vulkan.pastel.stripped.so   (llvm-strip --strip-all, ~23 MB)
+Both: x86_64 ELF shared object, SONAME=vulkan.pastel.so, HMI exported.
+
+CONFIGURE / BUILD COMMAND
+-------------------------
+  cmake -S /build/swiftshader -B /build/swiftshader/build-x64 -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=/build/ndk/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=30 \
+    -DSWIFTSHADER_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+  ninja -C /build/swiftshader/build-x64 vk_swiftshader
+  cp build-x64/libvk_swiftshader.so /build/vulkan.pastel.so
+  patchelf --set-soname vulkan.pastel.so /build/vulkan.pastel.so
+       # CMake forces soname=libvk_swiftshader.so and overrides -Wl,-soname,
+       # so the soname is set after linking with patchelf.
+
+CMAKE PATCHES  (.orig backups kept next to each file)
+-----------------------------------------------------
+File: CMakeLists.txt
+ 1. Android system-detect block (~line 36): extend CXX flags + add our sourced
+    header dir. Was:
+        set(CMAKE_CXX_FLAGS "-DANDROID_NDK_BUILD")
+    Now:
+        set(CMAKE_CXX_FLAGS "-DANDROID_NDK_BUILD -DVK_USE_PLATFORM_ANDROID_KHR \
+            -DSWIFTSHADER_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER \
+            -DANDROID_PLATFORM_SDK_VERSION=10000")
+        include_directories(SYSTEM "/build/inc")
+ 2. vk_base WSI platform if/elseif chain: added before the final else()/FATAL:
+        elseif(ANDROID)
+            target_compile_definitions(vk_base INTERFACE "VK_USE_PLATFORM_ANDROID_KHR")
+ 3. macro set_shared_library_export_map: branch "elseif(LINUX OR FUCHSIA)" ->
+    "elseif(LINUX OR FUCHSIA OR ANDROID)", and inside added:
+        elseif ((ANDROID) AND ("${TARGET}" STREQUAL "vk_swiftshader"))
+          set(LINKER_VERSION_SCRIPT "android_vk_swiftshader.lds")
+    This selects the Android version script that exports ONLY the loader/ICD
+    entry points plus HMI (src/Vulkan/android_vk_swiftshader.lds already exists).
+ 4. Same macro: the final -Wl,--no-undefined guard got "AND NOT ANDROID" appended
+    (left in place; harmless - the link resolves fully anyway via the real libs).
+ 5. Clang warning list (~line 515): added "-Wno-missing-field-initializers"
+    (soong suppresses it in swiftshader_common; needed for the hw_module_t /
+    hw_device_t designated initializers in the HMI block of VkGetProcAddress.cpp).
+
+File: src/Vulkan/CMakeLists.txt
+ 6. Added the Android external-memory source to the target:
+        if(ANDROID)
+          list(APPEND VULKAN_SRC_FILES
+               VkDeviceMemoryExternalAndroid.cpp VkDeviceMemoryExternalAndroid.hpp)
+        endif()
+ 7. VULKAN_API_LIBRARY_NAME if/elseif: added "elseif(ANDROID) set(... libvulkan.so)"
+    before the else()/FATAL.
+ 8. After set_shared_library_export_map(vk_swiftshader ...): Android link block:
+        if(ANDROID)
+          target_link_options(vk_swiftshader PRIVATE
+              "-L/mnt/laps/system/lib64" "-Wl,--allow-shlib-undefined"
+              "-Wl,-soname,vulkan.pastel.so")
+          target_link_libraries(vk_swiftshader PRIVATE log nativewindow sync)
+        endif()
+    NOTE: the -L points at the target system libs because the NDK sysroot stubs do
+    NOT export the VNDK/platform symbols the HAL needs (AHardwareBuffer_* and
+    sync_wait). -lnativewindow/-lsync resolve against the real libs there.
+    cutils/utils/base/hidlbase are NOT linked: with no HAVE_GRALLOC* and a static
+    libc++, nothing references them (verified via nm -D -u).
+
+SOURCED HEADERS  (dir added with include_directories(SYSTEM "/build/inc"))
+--------------------------------------------------------------------------
+Reason: SwiftShader on Android #includes platform headers that are not in the NDK.
+  /build/inc/hardware/hwvulkan.h   <- frameworks/native main vulkan/include/hardware
+  /build/inc/hardware/hardware.h   <- hardware/libhardware HEAD include_all/hardware
+  /build/inc/hardware/gralloc.h    <- hardware/libhardware HEAD include_all/hardware
+  /build/inc/hardware/gralloc1.h   <- hardware/libhardware HEAD include_all/hardware
+  /build/inc/hardware/fb.h         <- hardware/libhardware HEAD include_all/hardware
+  /build/inc/cutils/native_handle.h<- system/core main libcutils/include/cutils
+  /build/inc/system/graphics.h (+ graphics-base.h, graphics-sw.h,
+      graphics-base-v1.0/1.1/1.2.h) <- system/core main libsystem/include/system
+  /build/inc/vulkan/vk_android_native_buffer.h <- frameworks/native main vulkan/include/vulkan
+  /build/inc/vndk/hardware_buffer.h <- frameworks/native TAG android-14.0.0_r1
+      libs/nativewindow/include/vndk  (the main-branch copy uses C forward-enum
+      return types that are illegal in C++ -Werror; the r14 copy is clean and
+      still provides AHardwareBuffer_getNativeHandle/createFromHandle).
+      Appended compat define (NDK r27c predates the enumerator):
+          #define AHARDWAREBUFFER_FORMAT_YCbCr_P210 0x3c
+  /build/inc/sync/sync.h           <- shim: "#include <android/sync.h>" plus a
+      declaration of int sync_wait(int,int) (platform-only; not in the NDK header).
+  /build/inc/commit.h              <- generated: python3 src/commit_id.py gen
+      (only feeds the ENABLE_BUILD_VERSION_OUTPUT path, which is off).
+Fetch method: curl -s ".../<repo>/+/<ref>/<path>?format=TEXT" | base64 -d
+
+RESULT (readelf -d / nm -D on /build/vulkan.pastel.so)
+------------------------------------------------------
+  HMI exported:  nm -D vulkan.pastel.so | grep -w HMI  ->  D HMI
+  Exported dynamic symbols (exactly 4, per android_vk_swiftshader.lds):
+      HMI, vk_icdGetInstanceProcAddr, vk_icdGetPhysicalDeviceProcAddr,
+      vk_icdNegotiateLoaderICDInterfaceVersion
+  SONAME:  vulkan.pastel.so
+  NEEDED:  liblog.so  libnativewindow.so  libsync.so  libm.so  libdl.so  libc.so
+      (libc++ is statically linked, so there is no libc++_shared dependency and
+       zero std:: symbols are undefined. No cutils/utils/base/hidlbase/mapper deps.)
+  The target device must provide at runtime, reachable from the HAL search path:
+      liblog.so, libnativewindow.so (must export the VNDK AHardwareBuffer_* and
+      AHardwareBuffer_getNativeHandle/createFromHandle), libsync.so (sync_wait),
+      plus the standard libm/libdl/libc. All present on a normal Android image.
+  One weak-undefined symbol remains (_ZTH... rr::Variable TLS init wrapper); weak
+  undefined never blocks dlopen and the TLS var itself is defined in .bss.

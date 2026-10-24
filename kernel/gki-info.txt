@@ -1,0 +1,2 @@
+certify_bootimg_extra_args=--prop ARCH:x86_64 --prop BRANCH: --prop KERNEL_RELEASE:6.18.21-android17-5-g3938c8d97142-ab16302624
+kernel_release=6.18.21-android17-5-g3938c8d97142-ab16302624

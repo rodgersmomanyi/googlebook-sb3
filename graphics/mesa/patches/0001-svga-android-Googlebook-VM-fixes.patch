@@ -1,0 +1,154 @@
+Subject: [PATCH] svga, egl/android: Googlebook VM fixes (RGBA windows, BGRA import, shader cache)
+
+Applied by hand on top of mesa-26.3.0-rc2 (b34c71d9ff2f6514a1f947609d00e49be639edf8) before graphics/mesa/build_mesa.sh's configure step:
+ GB_RGBA_WINDOW   svga: R8G8B8A8_UNORM accepted as a display/window format and R8G8B8X8 mapped (Android windows are
+                  RGBA_8888; with the GB_RGBA_DUMB vmwgfx every 32bpp gralloc buffer is an R8G8B8A8 surface).
+ GB_BGRA_AS_RGBA  egl/android: if a BGRA (ARGB8888/XRGB8888) dma-buf import fails, retry as its R/B-swapped RGBA
+                  twin (CPU-written BGRA pixels then show R/B swapped; GPU-produced content stays consistent).
+ GB_SHADER_CACHE  svga: disk shader cache hook, so EGL_ANDROID_blob_cache is exposed and linked programs persist in
+                  the per-app blob cache (same change as graphics/mesa/patch_svga_shader_cache.py, ported to
+                  BLAKE3 for 26.3).
+Apply in mesa/ with: git apply <this file>. License: MIT (Mesa).
+---
+diff --git a/src/egl/drivers/dri2/platform_android.c b/src/egl/drivers/dri2/platform_android.c
+index 5da2a2523b0..7c82135bd39 100644
+--- a/src/egl/drivers/dri2/platform_android.c
++++ b/src/egl/drivers/dri2/platform_android.c
+@@ -58,13 +58,31 @@ droid_create_image_from_buffer_info(
+    struct u_gralloc_buffer_color_info *color_info, void *priv)
+ {
+    unsigned error;
++   uint32_t fourcc = buf_info->drm_fourcc;
++   struct dri_image *img;
+ 
+-   return dri2_from_dma_bufs(
+-      dri2_dpy->dri_screen_render_gpu, width, height, buf_info->drm_fourcc,
++   img = dri2_from_dma_bufs(
++      dri2_dpy->dri_screen_render_gpu, width, height, fourcc,
+       buf_info->modifier, buf_info->fds, buf_info->num_planes,
+       buf_info->strides, buf_info->offsets, color_info->yuv_color_space,
+       color_info->sample_range, color_info->horizontal_siting,
+       color_info->vertical_siting, 0, &error, priv);
++
++   /* GB_BGRA_AS_RGBA: on VMware with the GB_RGBA_DUMB vmwgfx every 32bpp gralloc buffer is an R8G8B8A8
++    * surface, so svga refuses a BGRA import. Import it as its R/B-swapped RGBA twin instead: GPU-produced
++    * content stays consistent (producer and consumer both import through here); only CPU-written BGRA
++    * pixels show R/B swapped. */
++   if (!img && (fourcc == DRM_FORMAT_ARGB8888 || fourcc == DRM_FORMAT_XRGB8888)) {
++      fourcc = fourcc == DRM_FORMAT_ARGB8888 ? DRM_FORMAT_ABGR8888 : DRM_FORMAT_XBGR8888;
++      img = dri2_from_dma_bufs(
++         dri2_dpy->dri_screen_render_gpu, width, height, fourcc,
++         buf_info->modifier, buf_info->fds, buf_info->num_planes,
++         buf_info->strides, buf_info->offsets, color_info->yuv_color_space,
++         color_info->sample_range, color_info->horizontal_siting,
++         color_info->vertical_siting, 0, &error, priv);
++   }
++
++   return img;
+ }
+ 
+ static struct dri_image *
+diff --git a/src/gallium/drivers/svga/svga_format.c b/src/gallium/drivers/svga/svga_format.c
+index 91df4799c49..053b5bb0520 100644
+--- a/src/gallium/drivers/svga/svga_format.c
++++ b/src/gallium/drivers/svga/svga_format.c
+@@ -88,6 +88,7 @@ static const struct vgpu10_format_entry format_conversion_table[] =
+    [ PIPE_FORMAT_R8G8_UNORM ] =            { SVGA3D_R8G8_UNORM,          SVGA3D_R8G8_UNORM,           SVGA3D_R8G8_UNORM,           TF_GEN_MIPS | TF_UAV },
+    [ PIPE_FORMAT_R8G8B8_UNORM ] =          { SVGA3D_R8G8B8A8_UNORM,      SVGA3D_FORMAT_INVALID,       SVGA3D_FORMAT_INVALID,       VF_W_TO_1 },
+    [ PIPE_FORMAT_R8G8B8A8_UNORM ] =        { SVGA3D_R8G8B8A8_UNORM,      SVGA3D_R8G8B8A8_UNORM,       SVGA3D_R8G8B8A8_UNORM,       TF_GEN_MIPS | TF_UAV },
++   [ PIPE_FORMAT_R8G8B8X8_UNORM ] =        { SVGA3D_FORMAT_INVALID,      SVGA3D_R8G8B8A8_UNORM,       SVGA3D_R8G8B8A8_UNORM,       TF_GEN_MIPS }, /* GB_RGBA_WINDOW: RGBX_8888 */
+    [ PIPE_FORMAT_R8_USCALED ] =            { SVGA3D_R8_UINT,             SVGA3D_FORMAT_INVALID,       SVGA3D_FORMAT_INVALID,       VF_U_TO_F_CAST },
+    [ PIPE_FORMAT_R8G8_USCALED ] =          { SVGA3D_R8G8_UINT,           SVGA3D_FORMAT_INVALID,       SVGA3D_FORMAT_INVALID,       VF_U_TO_F_CAST },
+    [ PIPE_FORMAT_R8G8B8_USCALED ] =        { SVGA3D_R8G8B8A8_UINT,       SVGA3D_FORMAT_INVALID,       SVGA3D_FORMAT_INVALID,       VF_W_TO_1 | VF_U_TO_F_CAST },
+@@ -2223,6 +2224,7 @@ svga_is_format_supported(struct pipe_screen *screen,
+       case SVGA3D_B8G8R8X8_UNORM_SRGB:
+       case SVGA3D_B8G8R8A8_UNORM_SRGB:
+       case SVGA3D_R8G8B8A8_UNORM_SRGB:
++      case SVGA3D_R8G8B8A8_UNORM: /* GB_RGBA_WINDOW: Android windows are RGBA_8888 */
+          break;
+ 
+       /* Often unsupported/problematic. This means we end up with the same
+@@ -2351,6 +2353,7 @@ svga_is_dx_format_supported(struct pipe_screen *screen,
+       case SVGA3D_B8G8R8X8_UNORM_SRGB:
+       case SVGA3D_B8G8R8A8_UNORM_SRGB:
+       case SVGA3D_R8G8B8A8_UNORM_SRGB:
++      case SVGA3D_R8G8B8A8_UNORM: /* GB_RGBA_WINDOW: Android windows are RGBA_8888 */
+          break;
+ 
+       /* Often unsupported/problematic. This means we end up with the same
+diff --git a/src/gallium/drivers/svga/svga_screen.c b/src/gallium/drivers/svga/svga_screen.c
+index 3efadd12012..489f51ecf90 100644
+--- a/src/gallium/drivers/svga/svga_screen.c
++++ b/src/gallium/drivers/svga/svga_screen.c
+@@ -14,6 +14,9 @@
+ #include "util/u_screen.h"
+ #include "util/u_string.h"
+ #include "util/u_math.h"
++#include "util/disk_cache.h"
++#include "util/hex.h"
++#include "util/mesa-blake3.h"
+ 
+ #include "svga_winsys.h"
+ #include "svga_public.h"
+@@ -736,6 +739,7 @@ svga_destroy_screen( struct pipe_screen *screen )
+    struct svga_screen *svgascreen = svga_screen(screen);
+ 
+    svga_screen_cache_cleanup(svgascreen);
++   disk_cache_destroy(svgascreen->disk_shader_cache);
+ 
+    mtx_destroy(&svgascreen->swc_mutex);
+    mtx_destroy(&svgascreen->tex_mutex);
+@@ -755,6 +759,30 @@ svga_screen_get_fd( struct pipe_screen *screen )
+ }
+ 
+ 
++/* GB_SHADER_CACHE: give st/mesa a disk cache so linked GLSL programs (and GL program binaries, used by HWUI's own
++ * shader cache) persist. On Android there is no writable cache dir, so it lives entirely in the EGL loader's
++ * per-app blob cache (EGL_ANDROID_blob_cache, which is only exposed when this hook exists). */
++static struct disk_cache *
++svga_get_disk_shader_cache(struct pipe_screen *pscreen)
++{
++   return svga_screen(pscreen)->disk_shader_cache;
++}
++
++static void
++svga_disk_cache_create(struct svga_screen *svgascreen)
++{
++   blake3_hasher ctx;
++   unsigned char blake3[BLAKE3_KEY_LEN];
++   char cache_id[BLAKE3_KEY_LEN * 2 + 1];
++
++   _mesa_blake3_init(&ctx);
++   if (!disk_cache_get_function_identifier(svga_disk_cache_create, &ctx))
++      return;
++   _mesa_blake3_final(&ctx, blake3);
++   mesa_bytes_to_hex(cache_id, blake3, BLAKE3_KEY_LEN);
++   svgascreen->disk_shader_cache = disk_cache_create("svga", cache_id, 0);
++}
++
+ /**
+  * Create a new svga_screen object
+  */
+@@ -788,6 +816,8 @@ svga_screen_create(struct svga_winsys_screen *sws)
+    screen = &svgascreen->screen;
+ 
+    screen->destroy = svga_destroy_screen;
++   screen->get_disk_shader_cache = svga_get_disk_shader_cache;
++   svga_disk_cache_create(svgascreen);
+    screen->get_name = svga_get_name;
+    screen->get_vendor = svga_get_vendor;
+    screen->get_device_vendor = svga_get_vendor; // TODO actual device vendor
+diff --git a/src/gallium/drivers/svga/svga_screen.h b/src/gallium/drivers/svga/svga_screen.h
+index 27a8bf9f3f6..9bbbec09a4f 100644
+--- a/src/gallium/drivers/svga/svga_screen.h
++++ b/src/gallium/drivers/svga/svga_screen.h
+@@ -81,6 +81,9 @@ struct svga_screen
+       uint64_t __pad[6];
+       uint64_t num_resources;
+    } hud;
++
++   /* GB_SHADER_CACHE: lets st/mesa cache linked programs (EGL_ANDROID_blob_cache on Android) */
++   struct disk_cache *disk_shader_cache;
+ };
+ 
+ #if !MESA_DEBUG

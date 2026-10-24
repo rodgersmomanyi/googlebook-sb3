@@ -1,0 +1,20 @@
+# NVK (Mesa Vulkan for the NVIDIA GTX 1650 in the performance base) - TEST ONLY. Native tree only (gb.hw=native);
+# append to GB_RC_NATIVE (/odm/etc/init/gb.rc). Nothing here makes NVK the system Vulkan driver: lapis keeps
+# ro.hardware.vulkan=intel (ANV) for SurfaceFlinger, HWUI and ANGLE. /vendor/lib64/hw/vulkan.nouveau.so is only
+# loaded by programs that dlopen it explicitly (nvk_probe).
+# Prerequisite: nouveau bound to the dGPU (persist.vendor.gb.nouveau=1, see gb_power) and the base attached.
+# Usage: setprop vendor.gb.nvk_probe 1   -> result in /data/vendor/nvk/probe.txt (+ probe.ppm) and in kmsg on failure.
+service gb_nvk_probe /system/bin/sh -c "/vendor/bin/nvk_probe -n 200 -o /data/vendor/nvk/probe.ppm > /data/vendor/nvk/probe.txt 2>&1; echo nvk_probe exit=$$? >> /data/vendor/nvk/probe.txt"
+    user root
+    group root graphics
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+on post-fs-data
+    mkdir /data/vendor/nvk 0775 root shell
+
+on property:vendor.gb.nvk_probe=1
+    setprop vendor.gb.nvk_probe 0
+    start gb_nvk_probe

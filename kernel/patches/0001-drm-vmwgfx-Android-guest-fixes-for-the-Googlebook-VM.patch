@@ -1,0 +1,407 @@
+Subject: [PATCH] drm/vmwgfx: Android guest fixes for the Googlebook VMware VM
+
+Seven changes, each marked GB_* in the source:
+ GB_RGBA_DUMB      32bpp dumb buffers are backed by SVGA3D_R8G8B8A8_UNORM (was B8G8R8X8) on SM4 hosts, so the
+                   RGBA_8888 window buffers gralloc (minigbm dumb backend) allocates can be imported and rendered
+                   by Mesa svga; ABGR8888/XBGR8888 added to the framebuffer formats.
+ GB_HWCURSOR       cursor plane accepts ABGR8888 (Android pointer sprites, R/B swapped on upload) and is exposed to
+                   clients without DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT (drm_hwcomposer never sets it).
+ GB_DUMB_IMPORT    a dumb buffer keeps its surface's TTM base object alive for its lifetime, so another process can
+                   re-import its dma-buf as a 3D surface (DRM_VMW_GB_SURFACE_REF_EXT).
+ GB_PRIME_LEAK     ttm_prime_fd_to_handle(): drop the dma_buf_get() reference on the foreign-buffer path (each
+                   import leaked a whole buffer + MOB).
+ GB_PRIME_NOHANDLE vmw_buffer_prime_to_surface_base(): take the BO straight from a self-exported dma-buf instead of
+                   creating a GEM handle nothing ever deleted.
+ GB_DUMB_BASE_OWNS fixes a use-after-free introduced by GB_DUMB_IMPORT (base and BO each own a resource reference)
+                   and a base-reference leak on an error path.
+ GB_DUMB_DETACH    detach a dumb buffer's surface when its last GEM reference drops, not in TTM's delayed destroy.
+History: kernel/scripts/kbuild_rgba_psmouse.sh .. kbuild10_detach.sh and the patch_*.py patchers.
+VM only (vmwgfx is not loaded natively).
+
+Base: AOSP kernel/common android17-6.18-2026-06 at 3938c8d97142d5cf31543aa96f864a2cf832dda0 (kernel 6.18.21, ab/16302624;
+     the full pin is kernel/manifest_16302624.xml). Apply in common/ with: git apply <this file>
+License: GPL-2.0 (derived from Linux)
+---
+diff --git a/drivers/gpu/drm/vmwgfx/ttm_object.c b/drivers/gpu/drm/vmwgfx/ttm_object.c
+index 36d46b79562a..6e926e963f82 100644
+--- a/drivers/gpu/drm/vmwgfx/ttm_object.c
++++ b/drivers/gpu/drm/vmwgfx/ttm_object.c
+@@ -547,8 +547,16 @@ int ttm_prime_fd_to_handle(struct ttm_object_file *tfile,
+ 	if (IS_ERR(dma_buf))
+ 		return PTR_ERR(dma_buf);
+ 
+-	if (dma_buf->ops != &tdev->ops)
++	if (dma_buf->ops != &tdev->ops) {
++		/*
++		 * GB_PRIME_LEAK: drop the reference dma_buf_get() took. vmw_prime_fd_to_handle() tries this first for
++		 * every import, and every GEM-exported (dumb / gralloc) buffer lands here, so without this put each
++		 * import leaked a dma-buf reference: the buffer, its pages and its MOB were never freed (~4 MB per
++		 * 1280x800 buffer, until graphics memory ran out and vmw_gb_surface_bind hit its BUG_ON).
++		 */
++		dma_buf_put(dma_buf);
+ 		return -ENOSYS;
++	}
+ 
+ 	prime = (struct ttm_prime_object *) dma_buf->priv;
+ 	base = &prime->base;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+index b22887e8c881..67d45c5a3744 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+@@ -37,37 +37,55 @@
+  *
+  * @bo: Pointer to the embedded struct ttm_buffer_object
+  */
+-static void vmw_bo_free(struct ttm_buffer_object *bo)
++/**
++ * vmw_bo_detach_dumb_surface - Cut a dumb buffer loose from its surface
++ *
++ * @vbo: The dumb buffer object. No-op for other buffers or when already detached.
++ *
++ * GB_DUMB_DETACH: called when the last GEM reference drops (vmw_gem_object_free), and again from vmw_bo_free() as a
++ * no-op fallback. The surface may outlive the buffer (an importer's TTM reference, a context's bindings), so it must
++ * stop pointing at it before TTM's possibly delayed destroy; its next validation allocates a fresh backing buffer.
++ */
++void vmw_bo_detach_dumb_surface(struct vmw_bo *vbo)
+ {
+ 	struct vmw_resource *res;
++
++	if (!vbo->is_dumb || !vbo->dumb_surface)
++		return;
++	res = &vbo->dumb_surface->res;
++	WARN_ON(vbo != res->guest_memory_bo);
++	WARN_ON(!res->guest_memory_bo);
++	if (res->guest_memory_bo) {
++		/* Reserve and switch the backing mob. */
++		mutex_lock(&res->dev_priv->cmdbuf_mutex);
++		(void)vmw_resource_reserve(res, false, true);
++		vmw_resource_mob_detach(res);
++		if (res->dirty)
++			res->func->dirty_free(res);
++		if (res->coherent)
++			vmw_bo_dirty_release(res->guest_memory_bo);
++		res->guest_memory_bo = NULL;
++		res->guest_memory_offset = 0;
++		vmw_resource_unreserve(res, true, false, false, NULL,
++				       0);
++		mutex_unlock(&res->dev_priv->cmdbuf_mutex);
++	}
++	/* GB_DUMB_IMPORT: drop the BO's handle-object reference before the surface it lives in */
++	if (vbo->dumb_base)
++		ttm_base_object_unref(&vbo->dumb_base);
++	vmw_surface_unreference(&vbo->dumb_surface);
++}
++
++static void vmw_bo_free(struct ttm_buffer_object *bo)
++{
+ 	struct vmw_bo *vbo = to_vmw_bo(&bo->base);
+ 
+ 	WARN_ON(kref_read(&vbo->tbo.base.refcount) != 0);
+ 	vmw_bo_unmap(vbo);
+ 
+ 	xa_destroy(&vbo->detached_resources);
+-	WARN_ON(vbo->is_dumb && !vbo->dumb_surface);
+-	if (vbo->is_dumb && vbo->dumb_surface) {
+-		res = &vbo->dumb_surface->res;
+-		WARN_ON(vbo != res->guest_memory_bo);
+-		WARN_ON(!res->guest_memory_bo);
+-		if (res->guest_memory_bo) {
+-			/* Reserve and switch the backing mob. */
+-			mutex_lock(&res->dev_priv->cmdbuf_mutex);
+-			(void)vmw_resource_reserve(res, false, true);
+-			vmw_resource_mob_detach(res);
+-			if (res->dirty)
+-				res->func->dirty_free(res);
+-			if (res->coherent)
+-				vmw_bo_dirty_release(res->guest_memory_bo);
+-			res->guest_memory_bo = NULL;
+-			res->guest_memory_offset = 0;
+-			vmw_resource_unreserve(res, true, false, false, NULL,
+-					       0);
+-			mutex_unlock(&res->dev_priv->cmdbuf_mutex);
+-		}
+-		vmw_surface_unreference(&vbo->dumb_surface);
+-	}
++	/* Normally already done at GEM free (GB_DUMB_DETACH); dumb_surface is NULL then. */
++	vmw_bo_detach_dumb_surface(vbo);
+ 	WARN_ON(!RB_EMPTY_ROOT(&vbo->res_tree));
+ 	drm_gem_object_release(&vbo->tbo.base);
+ 	WARN_ON(vbo->dirty);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.h b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.h
+index cf84a163bfcb..0bd452707700 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.h
+@@ -100,6 +100,8 @@ struct vmw_bo {
+ 
+ 	bool is_dumb;
+ 	struct vmw_surface *dumb_surface;
++	/* GB_DUMB_IMPORT: the dumb surface's TTM handle object, kept alive by this BO */
++	struct ttm_base_object *dumb_base;
+ };
+ 
+ void vmw_bo_placement_set(struct vmw_bo *bo, u32 domain, u32 busy_domain);
+@@ -144,6 +146,7 @@ void vmw_bo_swap_notify(struct ttm_buffer_object *bo);
+ int vmw_bo_add_detached_resource(struct vmw_bo *vbo, struct vmw_resource *res);
+ void vmw_bo_del_detached_resource(struct vmw_bo *vbo, struct vmw_resource *res);
+ struct vmw_surface *vmw_bo_surface(struct vmw_bo *vbo);
++void vmw_bo_detach_dumb_surface(struct vmw_bo *vbo);
+ 
+ int vmw_user_bo_lookup(struct drm_file *filp,
+ 		       u32 handle,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c
+index c46f17ba7236..7b5002461cd7 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.c
+@@ -27,6 +27,27 @@ struct vmw_svga_fifo_cmd_define_cursor {
+ 	SVGAFifoCmdDefineAlphaCursor cursor;
+ };
+ 
++/* GB_HWCURSOR: SVGA alpha cursors are ARGB8888; Android's pointer sprite arrives as ABGR8888 (RGBA bytes). */
++static void vmw_cursor_copy_image(u32 *dst, const u32 *src, u32 count, bool swap_rb)
++{
++	u32 i;
++
++	if (!swap_rb) {
++		memcpy(dst, src, count * sizeof(*src));
++		return;
++	}
++	for (i = 0; i < count; i++) {
++		u32 px = src[i];
++
++		dst[i] = (px & 0xff00ff00) | ((px >> 16) & 0xff) | ((px & 0xff) << 16);
++	}
++}
++
++static bool vmw_cursor_fb_is_abgr(const struct vmw_plane_state *vps)
++{
++	return vps->base.fb && vps->base.fb->format->format == DRM_FORMAT_ABGR8888;
++}
++
+ /**
+  * vmw_send_define_cursor_cmd - queue a define cursor command
+  * @dev_priv: the private driver struct
+@@ -38,7 +59,7 @@ struct vmw_svga_fifo_cmd_define_cursor {
+  */
+ static void vmw_send_define_cursor_cmd(struct vmw_private *dev_priv,
+ 				       u32 *image, u32 width, u32 height,
+-				       u32 hotspotX, u32 hotspotY)
++				       u32 hotspotX, u32 hotspotY, bool swap_rb)
+ {
+ 	struct vmw_svga_fifo_cmd_define_cursor *cmd;
+ 	const u32 image_size = width * height * sizeof(*image);
+@@ -58,7 +79,7 @@ static void vmw_send_define_cursor_cmd(struct vmw_private *dev_priv,
+ 
+ 	memset(cmd, 0, sizeof(*cmd));
+ 
+-	memcpy(&cmd[1], image, image_size);
++	vmw_cursor_copy_image((u32 *)&cmd[1], image, width * height, swap_rb);
+ 
+ 	cmd->cmd = SVGA_CMD_DEFINE_ALPHA_CURSOR;
+ 	cmd->cursor.id = 0;
+@@ -84,7 +105,7 @@ vmw_cursor_plane_update_legacy(struct vmw_private *vmw,
+ 	if (vps->cursor.legacy.id != surface->snooper.id) {
+ 		vmw_send_define_cursor_cmd(vmw, surface->snooper.image,
+ 					   vps->base.crtc_w, vps->base.crtc_h,
+-					   hotspot_x, hotspot_y);
++					   hotspot_x, hotspot_y, false);
+ 		vps->cursor.legacy.id = surface->snooper.id;
+ 	}
+ }
+@@ -129,7 +150,8 @@ static void vmw_cursor_update_mob(struct vmw_private *vmw,
+ 	alpha_header->width = vps->base.crtc_w;
+ 	alpha_header->height = vps->base.crtc_h;
+ 
+-	memcpy(header + 1, image, image_size);
++	vmw_cursor_copy_image((u32 *)(header + 1), image,
++			      vps->base.crtc_w * vps->base.crtc_h, vmw_cursor_fb_is_abgr(vps));
+ 	vmw_write(vmw, SVGA_REG_CURSOR_MOBID, vmw_bo_mobid(vps->cursor.mob));
+ 
+ 	vmw_bo_unmap(bo);
+@@ -774,7 +796,8 @@ vmw_cursor_plane_atomic_update(struct drm_plane *plane,
+ 						   vps->base.crtc_w,
+ 						   vps->base.crtc_h,
+ 						   vps->base.hotspot_x,
+-						   vps->base.hotspot_y);
++						   vps->base.hotspot_y,
++						   vmw_cursor_fb_is_abgr(vps));
+ 		break;
+ 	case VMW_CURSOR_UPDATE_NONE:
+ 		/* do nothing */
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h
+index 0c2cc0699b0d..55b247cb8017 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cursor_plane.h
+@@ -28,6 +28,7 @@ struct vmw_user_object;
+ 
+ static const u32 __maybe_unused vmw_cursor_plane_formats[] = {
+ 	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_ABGR8888,	/* GB_HWCURSOR: Android pointer sprites (RGBA_8888); R/B swapped on upload */
+ };
+ 
+ enum vmw_cursor_update_type {
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index 599052d07ae8..a1ab67250dd6 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -1218,6 +1218,10 @@ static int vmw_driver_open(struct drm_device *dev, struct drm_file *file_priv)
+ 		goto out_no_tfile;
+ 
+ 	file_priv->driver_priv = vmw_fp;
++	/* GB_HWCURSOR: drm_hwcomposer never sets DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, so the DRM core would hide
++	 * this virtualized cursor plane from it. Expose it to every client so the composer can put Android's
++	 * pointer sprite on it: VMware draws the pointer and a mouse move no longer forces a full recomposite. */
++	file_priv->supports_virtualized_cursor_plane = true;
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c b/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
+index eedf1fe60be7..b324300ae743 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
+@@ -36,8 +36,15 @@
+ static void vmw_gem_object_free(struct drm_gem_object *gobj)
+ {
+ 	struct ttm_buffer_object *bo = drm_gem_ttm_of_gem(gobj);
+-	if (bo)
++
++	if (bo) {
++		/*
++		 * GB_DUMB_DETACH: the GEM refcount is 0 now, but a busy BO is destroyed later by TTM's delayed-delete
++		 * worker. Detach a dumb buffer's surface first, so nothing can reach this BO through it in between.
++		 */
++		vmw_bo_detach_dumb_surface(to_vmw_bo(gobj));
+ 		ttm_bo_put(bo);
++	}
+ }
+ 
+ static int vmw_gem_object_open(struct drm_gem_object *obj,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+index 445471fe9be6..e6bea739b887 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+@@ -212,6 +212,8 @@ struct vmw_framebuffer_bo {
+ static const uint32_t __maybe_unused vmw_primary_plane_formats[] = {
+ 	DRM_FORMAT_XRGB8888,
+ 	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_XBGR8888,
+ 	DRM_FORMAT_RGB565,
+ 	DRM_FORMAT_XRGB1555,
+ };
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+index 7e281c3c6bc5..f7975cd3e2a5 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+@@ -16,6 +16,8 @@
+ #include "device_include/svga3d_surfacedefs.h"
+ 
+ #include <drm/ttm/ttm_placement.h>
++#include <drm/drm_prime.h>
++#include <linux/dma-buf.h>
+ 
+ #define SVGA3D_FLAGS_64(upper32, lower32) (((uint64_t)upper32 << 32) | lower32)
+ 
+@@ -938,20 +940,40 @@ static int vmw_buffer_prime_to_surface_base(struct vmw_private *dev_priv,
+ 	struct vmw_bo *bo;
+ 	struct ttm_object_file *tfile = vmw_fpriv(file_priv)->tfile;
+ 	struct vmw_user_surface *user_srf;
++	struct dma_buf *dma_buf;
+ 	int ret;
+ 
+-	ret = drm_gem_prime_fd_to_handle(&dev_priv->drm, file_priv, fd, handle);
+-	if (ret) {
+-		drm_warn(&dev_priv->drm,
+-			 "Wasn't able to find user buffer for fd = %u.\n", fd);
+-		return ret;
+-	}
++	/*
++	 * GB_PRIME_NOHANDLE: a dma-buf exported by this device (every gralloc dumb buffer) maps straight to its
++	 * BO, so take the BO from it. drm_gem_prime_fd_to_handle() created a GEM handle in the importing file
++	 * that nothing ever deleted (userspace never sees it), so a long-lived importer such as SurfaceFlinger
++	 * kept every buffer it ever imported alive, with its pages and MOB, until it exited.
++	 */
++	dma_buf = dma_buf_get(fd);
++	if (IS_ERR(dma_buf))
++		return PTR_ERR(dma_buf);
++	if (drm_gem_is_prime_exported_dma_buf(&dev_priv->drm, dma_buf)) {
++		struct drm_gem_object *obj = dma_buf->priv;
++
++		drm_gem_object_get(obj);
++		dma_buf_put(dma_buf);
++		bo = to_vmw_bo(obj);
++		*handle = 0;
++	} else {
++		dma_buf_put(dma_buf);
++		ret = drm_gem_prime_fd_to_handle(&dev_priv->drm, file_priv, fd, handle);
++		if (ret) {
++			drm_warn(&dev_priv->drm,
++				 "Wasn't able to find user buffer for fd = %u.\n", fd);
++			return ret;
++		}
+ 
+-	ret = vmw_user_bo_lookup(file_priv, *handle, &bo);
+-	if (ret) {
+-		drm_warn(&dev_priv->drm,
+-			 "Wasn't able to lookup user buffer for handle = %u.\n", *handle);
+-		return ret;
++		ret = vmw_user_bo_lookup(file_priv, *handle, &bo);
++		if (ret) {
++			drm_warn(&dev_priv->drm,
++				 "Wasn't able to lookup user buffer for handle = %u.\n", *handle);
++			return ret;
++		}
+ 	}
+ 
+ 	user_srf = vmw_lookup_user_surface_for_buffer(dev_priv, bo, *handle);
+@@ -967,6 +989,8 @@ static int vmw_buffer_prime_to_surface_base(struct vmw_private *dev_priv,
+ 	if (ret) {
+ 		drm_warn(&dev_priv->drm,
+ 			 "Couldn't add an object ref for the buffer (%d).\n", *handle);
++		/* GB_DUMB_BASE_OWNS: drop the lookup's base reference too */
++		ttm_base_object_unref(&base);
+ 		goto out;
+ 	}
+ 
+@@ -2211,8 +2235,12 @@ static SVGA3dSurfaceFormat vmw_format_bpp_to_svga(struct vmw_private *vmw,
+ 	case 16: /* DRM_FORMAT_RGB565 */
+ 		return SVGA3D_R5G6B5;
+ 	case 32: /* DRM_FORMAT_XRGB8888 */
++		/* GB_RGBA_DUMB: Android gralloc (minigbm dumb backend) allocates RGBA_8888 window buffers as
++		 * 32bpp dumb buffers. Back them with R8G8B8A8 (still a DX screen-target format, so they keep the
++		 * render-target/shader-resource binds) instead of B8G8R8X8, so Mesa svga can import them as
++		 * RGBA with alpha and the GPU can render into them. */
+ 		if (has_sm4_context(vmw))
+-			return SVGA3D_B8G8R8X8_UNORM;
++			return SVGA3D_R8G8B8A8_UNORM;
+ 		return SVGA3D_X8R8G8B8;
+ 	default:
+ 		drm_warn(&vmw->drm, "Unsupported format bpp: %d\n", bpp);
+@@ -2334,14 +2362,24 @@ int vmw_dumb_create(struct drm_file *file_priv,
+ 	vbo = res->guest_memory_bo;
+ 	vbo->is_dumb = true;
+ 	vbo->dumb_surface = vmw_res_to_srf(res);
+-	drm_gem_object_put(&vbo->tbo.base);
+ 	/*
+-	 * Unset the user surface dtor since this in not actually exposed
+-	 * to userspace. The suface is owned via the dumb_buffer's GEM handle
++	 * GB_DUMB_BASE_OWNS: the BO keeps the lookup's resource reference (dropped in vmw_bo_free), and the base
++	 * keeps its own one (its normal refcount_release is left in place). Upstream instead set the release to
++	 * NULL and handed the base's reference to the BO, which is only safe while nothing outlives the BO.
+ 	 */
++	res = NULL;
++	drm_gem_object_put(&vbo->tbo.base);
+ 	struct vmw_user_surface *usurf = container_of(vbo->dumb_surface,
+ 						struct vmw_user_surface, srf);
+-	usurf->prime.base.refcount_release = NULL;
++	/*
++	 * GB_DUMB_IMPORT: keep the surface's TTM handle object alive for the BO's lifetime (the BO, not the
++	 * creating file, holds this reference) so another process can re-import the buffer's dma-buf as a 3D
++	 * surface with DRM_VMW_GB_SURFACE_REF_EXT (Mesa svga importing gralloc buffers). Otherwise the object
++	 * dies at the ttm_ref_object_base_unref() below and every import fails "User surface fd .. is null".
++	 * An importer's reference can outlive the BO; the base's own resource reference keeps the memory valid.
++	 */
++	if (kref_get_unless_zero(&usurf->prime.base.refcount))
++		vbo->dumb_base = &usurf->prime.base;
+ err:
+ 	if (res)
+ 		vmw_resource_unreference(&res);

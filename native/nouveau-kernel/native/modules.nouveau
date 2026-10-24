@@ -1,0 +1,14 @@
+# nouveau module set, in load order (format of modules.load: name [params]). Stage these .ko from kernel build #12
+# (/build/dist) into /odm/lib/modules. They are NOT meant for modules.load / modules.load.late by default: the
+# opt-in loader gb_nouveau.sh (gb_nouveau.rc, persist.vendor.gb.nouveau=1) insmods them after boot_completed, i.e.
+# long after i915 (modules.load) has claimed card0/renderD128.
+# Already loaded from modules.load (i915 deps): i2c-algo-bit.ko wmi.ko video.ko drm_display_helper.ko
+drm_exec.ko
+drm_gpuvm.ko
+gpu-sched.ko
+drm_ttm_helper.ko
+nouveau.ko runpm=1 modeset=2
+# mxm-wmi.ko: built (Kleaf must list it) but unused - nouveau calls mxm_wmi_supported() only with CONFIG_VGA_SWITCHEROO.
+# If nouveau should load at boot instead (not recommended: +1-3 s GSP probe, ~160 MB RAM held while runtime-suspended
+# in GSP mode), append the 5 lines above to modules.load.late (loaded after modules.load, so after i915) and set
+# persist.vendor.gb.nouveau=1 so the patched gb_power leaves it bound.

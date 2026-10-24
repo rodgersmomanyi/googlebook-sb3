@@ -1,0 +1,4 @@
+<AudioConfiguration>
+  <soundcard>PCH</soundcard>
+  <audio-config-dir>PCH_sb3_legacy</audio-config-dir>
+</AudioConfiguration>

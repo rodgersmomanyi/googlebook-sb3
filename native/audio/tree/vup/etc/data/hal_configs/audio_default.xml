@@ -1,0 +1,4 @@
+<AudioConfiguration>
+  <soundcard>sof-hda-dsp</soundcard>
+  <audio-config-dir>sof-hda-dsp_sb3</audio-config-dir>
+</AudioConfiguration>

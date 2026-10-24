@@ -1,0 +1,10 @@
+# Add to common/BUILD.bazel kernel_x86_64: BOTH module_implicit_outs and modules_superset (kleaf_add_nouveau.py).
+# All five are new =m modules created by CONFIG_DRM_NOUVEAU=m; Kleaf fails on a built-but-unlisted module.
+drivers/gpu/drm/nouveau/nouveau.ko
+drivers/gpu/drm/drm_exec.ko
+drivers/gpu/drm/drm_gpuvm.ko
+drivers/gpu/drm/scheduler/gpu-sched.ko
+drivers/platform/x86/mxm-wmi.ko
+# Also needed by nouveau and ALREADY listed since build #11 (do not add twice):
+# drivers/gpu/drm/drm_ttm_helper.ko drivers/gpu/drm/display/drm_display_helper.ko drivers/i2c/algos/i2c-algo-bit.ko
+# drivers/acpi/video.ko drivers/platform/x86/wmi.ko

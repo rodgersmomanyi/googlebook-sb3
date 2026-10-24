@@ -1,0 +1,140 @@
+power: supply: test_power: add battery_charge_full, battery_charge_full_design and battery_temp parameters
+
+test_power hard-codes charge_full = charge_full_design = 100 and temp = 26. The Android desktop health HAL derives
+the level from charge_counter*100/charge_full and the time-to-full ETA from (charge_full - charge_counter) / current,
+so a bridged battery needs real uAh values. Defaults keep the old values; writes raise power_supply_changed.
+---
+--- a/drivers/power/supply/test_power.c
++++ b/drivers/power/supply/test_power.c
+@@ -35,6 +35,9 @@
+ static int battery_voltage		= 3300;
+ static int battery_charge_counter	= -1000;
+ static int battery_current		= -1600;
++static int battery_charge_full		= 100;
++static int battery_charge_full_design	= 100;
++static int battery_temp			= 26;
+ static enum power_supply_charge_behaviour battery_charge_behaviour =
+ 	POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+ static enum power_supply_charge_type battery_charge_types =
+@@ -111,15 +114,17 @@
+ 		val->intval = battery_charge_counter;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = battery_charge_full_design;
++		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_FULL:
+-		val->intval = 100;
++		val->intval = battery_charge_full;
+ 		break;
+ 	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
+ 	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
+ 		val->intval = 3600;
+ 		break;
+ 	case POWER_SUPPLY_PROP_TEMP:
+-		val->intval = 26;
++		val->intval = battery_temp;
+ 		break;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+ 		val->intval = battery_voltage;
+@@ -629,6 +634,51 @@
+ 
+ #define param_get_battery_current param_get_int
+ 
++static int param_set_battery_charge_full(const char *key,
++					 const struct kernel_param *kp)
++{
++	int tmp;
++
++	if (1 != sscanf(key, "%d", &tmp))
++		return -EINVAL;
++
++	battery_charge_full = tmp;
++	signal_power_supply_changed(test_power_supplies[TEST_BATTERY]);
++	return 0;
++}
++
++#define param_get_battery_charge_full param_get_int
++
++static int param_set_battery_charge_full_design(const char *key,
++						const struct kernel_param *kp)
++{
++	int tmp;
++
++	if (1 != sscanf(key, "%d", &tmp))
++		return -EINVAL;
++
++	battery_charge_full_design = tmp;
++	signal_power_supply_changed(test_power_supplies[TEST_BATTERY]);
++	return 0;
++}
++
++#define param_get_battery_charge_full_design param_get_int
++
++static int param_set_battery_temp(const char *key,
++				  const struct kernel_param *kp)
++{
++	int tmp;
++
++	if (1 != sscanf(key, "%d", &tmp))
++		return -EINVAL;
++
++	battery_temp = tmp;
++	signal_power_supply_changed(test_power_supplies[TEST_BATTERY]);
++	return 0;
++}
++
++#define param_get_battery_temp param_get_int
++
+ static int param_set_battery_extension(const char *key,
+ 				       const struct kernel_param *kp)
+ {
+@@ -699,6 +749,21 @@
+ 	.get = param_get_battery_current,
+ };
+ 
++static const struct kernel_param_ops param_ops_battery_charge_full = {
++	.set = param_set_battery_charge_full,
++	.get = param_get_battery_charge_full,
++};
++
++static const struct kernel_param_ops param_ops_battery_charge_full_design = {
++	.set = param_set_battery_charge_full_design,
++	.get = param_get_battery_charge_full_design,
++};
++
++static const struct kernel_param_ops param_ops_battery_temp = {
++	.set = param_set_battery_temp,
++	.get = param_get_battery_temp,
++};
++
+ static const struct kernel_param_ops param_ops_battery_extension = {
+ 	.set = param_set_battery_extension,
+ 	.get = param_get_battery_extension,
+@@ -714,6 +779,9 @@
+ #define param_check_battery_voltage(name, p) __param_check(name, p, void);
+ #define param_check_battery_charge_counter(name, p) __param_check(name, p, void);
+ #define param_check_battery_current(name, p) __param_check(name, p, void);
++#define param_check_battery_charge_full(name, p) __param_check(name, p, void);
++#define param_check_battery_charge_full_design(name, p) __param_check(name, p, void);
++#define param_check_battery_temp(name, p) __param_check(name, p, void);
+ #define param_check_battery_extension(name, p) __param_check(name, p, void);
+ 
+ 
+@@ -752,6 +820,17 @@
+ module_param(battery_current, battery_current, 0644);
+ MODULE_PARM_DESC(battery_current, "battery current (milliampere)");
+ 
++module_param(battery_charge_full, battery_charge_full, 0644);
++MODULE_PARM_DESC(battery_charge_full,
++	"battery full charge (microampere-hours)");
++
++module_param(battery_charge_full_design, battery_charge_full_design, 0644);
++MODULE_PARM_DESC(battery_charge_full_design,
++	"battery design full charge (microampere-hours)");
++
++module_param(battery_temp, battery_temp, 0644);
++MODULE_PARM_DESC(battery_temp, "battery temperature (tenths of a degree Celsius)");
++
+ module_param(battery_extension, battery_extension, 0644);
+ MODULE_PARM_DESC(battery_extension, "battery extension");
+ 

@@ -1,0 +1,186 @@
+From 5facfc2e566bdff796754623c1e6e07bb54c9f16 Mon Sep 17 00:00:00 2001
+From: SB3-port <sb3@localhost>
+Date: Sat, 24 Oct 2026 18:34:34 +0000
+Subject: [PATCH 5/7] android: firmware camera location, gralloc stride probe,
+ Android log
+
+---
+ src/android/camera_hal_config.cpp  |  5 +-
+ src/android/camera_hal_manager.cpp | 95 ++++++++++++++++++++++++++++--
+ src/libcamera/base/log.cpp         |  7 ++-
+ 3 files changed, 99 insertions(+), 8 deletions(-)
+
+diff --git a/src/android/camera_hal_config.cpp b/src/android/camera_hal_config.cpp
+index 3631cb7..b03308b 100644
+--- a/src/android/camera_hal_config.cpp
++++ b/src/android/camera_hal_config.cpp
+@@ -159,7 +159,10 @@ CameraHalConfig::CameraHalConfig()
+  */
+ int CameraHalConfig::parseConfigurationFile()
+ {
+-	std::string filePath = LIBCAMERA_SYSCONF_DIR "/camera_hal.yaml";
++	/* LIBCAMERA_HAL_CONFIG overrides the configuration file location. */
++	const char *envPath = getenv("LIBCAMERA_HAL_CONFIG");
++	std::string filePath = envPath ? envPath
++				       : LIBCAMERA_SYSCONF_DIR "/camera_hal.yaml";
+ 
+ 	File file(filePath);
+ 	if (!file.exists()) {
+diff --git a/src/android/camera_hal_manager.cpp b/src/android/camera_hal_manager.cpp
+index a7a2571..0935d83 100644
+--- a/src/android/camera_hal_manager.cpp
++++ b/src/android/camera_hal_manager.cpp
+@@ -12,7 +12,13 @@
+ #include <libcamera/camera.h>
+ #include <libcamera/property_ids.h>
+ 
++#include <stdlib.h>
++
++#include <hardware/gralloc.h>
++#include <hardware/hardware.h>
++
+ #include "camera_device.h"
++#include "mm/minigbm_handle.h"
+ 
+ using namespace libcamera;
+ 
+@@ -44,8 +50,74 @@ CameraHalManager *CameraHalManager::instance()
+ 	return cameraHalManager;
+ }
+ 
++namespace {
++
++/*
++ * Find the line alignment the gralloc applies to linear NV12 camera buffers,
++ * and tell the software ISP to use the same one.
++ */
++void probeGrallocStrideAlignment()
++{
++	if (getenv("LIBCAMERA_SOFTISP_NV12_STRIDE_ALIGN"))
++		return;
++
++	const hw_module_t *module = nullptr;
++	if (hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &module) || !module) {
++		LOG(HAL, Warning) << "No gralloc module, keeping default NV12 alignment";
++		return;
++	}
++
++	alloc_device_t *dev = nullptr;
++	if (gralloc_open(module, &dev) || !dev) {
++		LOG(HAL, Warning) << "gralloc_open() failed, keeping default NV12 alignment";
++		return;
++	}
++
++	/* 1032 = 1024 + 8 gives a distinct stride for every alignment 16..512. */
++	constexpr int width = 1032;
++	buffer_handle_t handle = nullptr;
++	int stride = 0;
++	int ret = dev->alloc(dev, width, 64, HAL_PIXEL_FORMAT_YCbCr_420_888,
++			     GRALLOC_USAGE_HW_CAMERA_WRITE | GRALLOC_USAGE_SW_READ_OFTEN,
++			     &handle, &stride);
++	if (ret || !handle) {
++		LOG(HAL, Warning) << "gralloc NV12 probe allocation failed: " << ret;
++		gralloc_close(dev);
++		return;
++	}
++
++	unsigned int bytesStride = stride;
++	MinigbmHandleInfo gbm;
++	if (minigbmHandleInfo(handle, &gbm))
++		bytesStride = gbm.strides[0];
++
++	unsigned int align = 0;
++	for (unsigned int a = 1; a <= 4096; a <<= 1) {
++		if (((width + a - 1) & ~(a - 1)) == bytesStride) {
++			align = a;
++			break;
++		}
++	}
++
++	dev->free(dev, handle);
++	gralloc_close(dev);
++
++	if (!align) {
++		LOG(HAL, Warning) << "Unexpected gralloc NV12 stride " << bytesStride
++				  << " for width " << width;
++		return;
++	}
++
++	setenv("LIBCAMERA_SOFTISP_NV12_STRIDE_ALIGN", std::to_string(align).c_str(), 0);
++	LOG(HAL, Info) << "gralloc NV12 line alignment: " << align << " bytes";
++}
++
++} /* namespace */
++
+ int CameraHalManager::init()
+ {
++	probeGrallocStrideAlignment();
++
+ 	cameraManager_ = std::make_unique<CameraManager>();
+ 
+ 	/*
+@@ -138,14 +210,20 @@ void CameraHalManager::cameraAdded(std::shared_ptr<Camera> cam)
+ 	 * entry for internal cameras. External cameras can be initialized
+ 	 * without configuration file.
+ 	 */
+-	if (!isCameraExternal && !halConfig_.exists()) {
++	const auto location = cam->properties().get(properties::Location);
++	const bool firmwareLocation =
++		location && (*location == properties::CameraLocationFront ||
++			     *location == properties::CameraLocationBack);
++
++	if (!isCameraExternal && !halConfig_.exists() && !firmwareLocation) {
+ 		LOG(HAL, Error)
+ 			<< "HAL configuration file is mandatory for internal cameras."
+ 			<< " Camera " << cam->id() << " failed to load";
+ 		return;
+ 	}
+ 
+-	const CameraConfigData *cameraConfigData = halConfig_.cameraConfigData(cam->id());
++	const CameraConfigData *cameraConfigData =
++		halConfig_.exists() ? halConfig_.cameraConfigData(cam->id()) : nullptr;
+ 
+ 	/*
+ 	 * Some cameras whose location is reported by libcamera as external may
+@@ -164,10 +242,15 @@ void CameraHalManager::cameraAdded(std::shared_ptr<Camera> cam)
+ 	}
+ 
+ 	if (!isCameraExternal && !cameraConfigData) {
+-		LOG(HAL, Error)
+-			<< "HAL configuration entry for internal camera "
+-			<< cam->id() << " is missing";
+-		return;
++		if (!firmwareLocation) {
++			LOG(HAL, Error)
++				<< "HAL configuration entry for internal camera "
++				<< cam->id() << " is missing";
++			return;
++		}
++
++		LOG(HAL, Info) << "Camera " << cam->id()
++			       << ": no configuration entry, using the firmware location";
+ 	}
+ 
+ 	/* Create a CameraDevice instance to wrap the libcamera Camera. */
+diff --git a/src/libcamera/base/log.cpp b/src/libcamera/base/log.cpp
+index 3404471..bd7c1e6 100644
+--- a/src/libcamera/base/log.cpp
++++ b/src/libcamera/base/log.cpp
+@@ -620,8 +620,13 @@ Logger::Logger()
+ void Logger::parseLogFile()
+ {
+ 	const char *file = utils::secure_getenv("LIBCAMERA_LOG_FILE");
+-	if (!file)
++	if (!file) {
++#if defined(__ANDROID__)
++		/* stderr is not collected for Android HAL services. */
++		logSetTarget(LoggingTargetSyslog);
++#endif
+ 		return;
++	}
+ 
+ 	if (!strcmp(file, "syslog")) {
+ 		logSetTarget(LoggingTargetSyslog);
+-- 
+2.43.0
+

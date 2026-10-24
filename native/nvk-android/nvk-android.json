@@ -1,0 +1,19 @@
+{
+ "name": "nvk-android",
+ "source": "${GB_BUILD}\\native\\nvk-android",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\nvk-android\\bin\\vulkan.nouveau.so",
+   "dest": "vup/lib64/hw/vulkan.nouveau.so",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\nvk-android\\bin\\nvk_probe",
+   "dest": "vup/bin/nvk_probe",
+   "mode": "0755"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\nvk-android\\gb_nvk.rc"
+ ]
+}

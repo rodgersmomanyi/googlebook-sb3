@@ -1,0 +1,21 @@
+<?xml version='1.0' encoding='utf-8'?>
+<audio_config>
+	<!--
+GB VM: VMware Workstation virtual HD Audio (vmx sound.virtualDev = "hdaudio", PCI 15ad:1977) on legacy
+snd-hda-intel with the generic HDA codec parser. ALSA card "HD-Audio Generic", id "Generic"; one analog PCM 0 for
+playback (forwarded by VMware to the host's default output device) and capture (the host's default microphone).
+-->
+	<SoundCardName>hw:Generic</SoundCardName>
+	<HiFi>
+		<Speaker>
+			<PlaybackPCM>hw:Generic,0</PlaybackPCM>
+		</Speaker>
+		<!-- the host's microphone. DRAS requires JackDev on Mic/Headphone/HDMI*, and IntrinsicSensitivity on
+		     InternalMic (values as in lapis's own config) -->
+		<InternalMic>
+			<CapturePCM>hw:Generic,0</CapturePCM>
+			<IntrinsicSensitivity>-2600</IntrinsicSensitivity>
+			<RampUpMs>100</RampUpMs>
+		</InternalMic>
+	</HiFi>
+</audio_config>

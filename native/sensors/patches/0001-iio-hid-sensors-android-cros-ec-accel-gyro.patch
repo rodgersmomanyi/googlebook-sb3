@@ -1,0 +1,671 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Googlebook SB3 native bring-up <gb-sb3@localhost>
+Date: Sat, 24 Oct 2026 19:00:00 +0000
+Subject: [PATCH 1/2] iio: hid-sensors: present ISH accel/gyro as cros-ec-accel/cros-ec-gyro for the Android IIO sensors HAL
+
+The lapis sensors sub-HAL (android.hardware.sensors@2.1-Desktop-IIO-Subhal.so) only accepts IIO
+devices named like ChromeOS EC sensors and decodes samples the cros_ec_sensors way: s16 channels packed
+in the first 8 bytes of a 16-byte scan, CLOCK_BOOTTIME timestamp in the last 8 bytes, one shared
+"scale" and "sampling_frequency" (+_available), label accel-display/accel-base, Android axis signs.
+With android=1 (default) hid-sensor-accel-3d (usage 0x200073 only; gravity keeps its ABI) and
+hid-sensor-gyro-3d register as cros-ec-accel / cros-ec-gyro with that layout: samples are converted to
+s16 counts (accel 1/4096 g, gyro 1 mrad/s), axes remapped by android_axes (accel default -x,-y,-z: HID/Windows gravity sign), timestamps
+from ktime_get_boottime_ns(), change sensitivity set to 0, 0 Hz writes ignored. android=0 restores
+the upstream ABI. Parameters: android, android_label, android_axes (0644), android_hyst0.
+---
+ 3 files changed, 441 insertions(+), 13 deletions(-)
+ drivers/iio/common/hid-sensors/hid-sensor-android.h
+ drivers/iio/accel/hid-sensor-accel-3d.c
+ drivers/iio/gyro/hid-sensor-gyro-3d.c
+
+diff --git a/drivers/iio/common/hid-sensors/hid-sensor-android.h b/drivers/iio/common/hid-sensors/hid-sensor-android.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/iio/common/hid-sensors/hid-sensor-android.h
+@@ -0,0 +1,195 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Android "cros-ec" presentation of HID sensor hub IIO devices.
++ *
++ * The Android desktop IIO sensors sub-HAL (android.hardware.sensors@2.1-Desktop-IIO-Subhal.so)
++ * only accepts IIO devices whose name is one of the ChromeOS EC sensor names (cros-ec-accel,
++ * cros-ec-gyro, cros-ec-light, ...), and it decodes buffered samples the way cros_ec_sensors
++ * lays them out:
++ *  - every data channel is a signed 16-bit value; the channel with scan index i is taken from
++ *    bits [16*i, 16*i+16) of the first 8 bytes of a 16-byte scan (it ignores realbits/storagebits),
++ *  - the timestamp is the last 8 bytes of that 16-byte scan and is used as the Android event
++ *    timestamp, so it must be CLOCK_BOOTTIME nanoseconds,
++ *  - value = raw * <the attribute whose name ends in "scale">, in Android units and Android axis
++ *    convention (accelerometer reads +9.81 on the axis pointing up),
++ *  - the label "accel-display" / "accel-base" gives the sensor location; only an "accel-display"
++ *    accelerometer gets the derived device-orientation (auto-rotate) sensor,
++ *  - the rate is set through files ending in "sampling_frequency"; ueventd only makes the plain
++ *    "sampling_frequency" file writable for the HAL (user system), so it must be shared_by_all.
++ *
++ * HID sensors (Intel ISH on the Surface Book 3) report 32-bit fields, in Windows axis
++ * convention, with the ISH's own timestamps. In Android mode the drivers convert each sample to
++ * the layout above. Android mode is the default (module parameter android=1); android=0 gives
++ * the stock upstream ABI. The axis mapping is the runtime-writable parameter android_axes
++ * (accelerometer "-x,-y,-z": HID/Windows report gravity as -1 g on the axis pointing up, Android
++ * as +9.81; gyroscope "x,y,z": both use the right-hand rule on the same display-aligned axes).
++ */
++#ifndef _HID_SENSOR_ANDROID_H
++#define _HID_SENSOR_ANDROID_H
++
++#include <linux/bits.h>
++#include <linux/compiler.h>
++#include <linux/errno.h>
++#include <linux/iio/iio.h>
++#include <linux/kernel.h>
++#include <linux/limits.h>
++#include <linux/math64.h>
++#include <linux/minmax.h>
++#include <linux/moduleparam.h>
++#include <linux/overflow.h>
++#include <linux/time64.h>
++#include <linux/timekeeping.h>
++#include <linux/unaligned.h>
++#include <asm/page.h>
++
++/* Advertised rates (Hz) as IIO_VAL_INT_PLUS_MICRO pairs. The HAL derives minDelay/maxDelay from them. */
++static const int hid_sensor_android_freq_avail[] = {
++	1, 0,
++	5, 0,
++	10, 0,
++	25, 0,
++	50, 0,
++	100, 0,
++};
++
++/* Scan buffer pushed in Android mode: x, y, z as s16, timestamp in the last 8 bytes (16 bytes total). */
++struct hid_sensor_android_scan {
++	s16 val[3];
++	aligned_s64 timestamp;
++};
++
++#define HID_SENSOR_ANDROID_CHANNEL(_type, _mod, _si) {				\
++	.type = (_type),							\
++	.modified = 1,								\
++	.channel2 = (_mod),							\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),				\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_HYSTERESIS),		\
++	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SCALE) |			\
++				   BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
++	.info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
++	.scan_index = (_si),							\
++	.scan_type = {								\
++		.sign = 's',							\
++		.realbits = 16,							\
++		.storagebits = 16,						\
++		.endianness = IIO_CPU,						\
++	},									\
++}
++
++/* Only the full x|y|z set is ever captured; the IIO core demuxes for partial users. */
++static const unsigned long hid_sensor_android_scan_masks[] = { 0x7, 0 };
++
++/* Read one HID input field of raw_len bytes and sign-extend it when the field is signed. */
++static inline s32 hid_sensor_android_get_raw(const char *raw_data, size_t raw_len,
++					     bool is_signed)
++{
++	switch (raw_len) {
++	case 1:
++		return is_signed ? (s32)(s8)raw_data[0] : (s32)(u8)raw_data[0];
++	case 2:
++		return is_signed ? (s32)(s16)get_unaligned_le16(raw_data) :
++				   (s32)get_unaligned_le16(raw_data);
++	default:
++		return (s32)get_unaligned_le32(raw_data);
++	}
++}
++
++/*
++ * Convert a raw HID value to an s16 count of lsb_nano (Android SI unit * 1e-9 per count).
++ * scale_int/scale_nano is the driver's HID scale (raw -> SI), IIO_VAL_INT_PLUS_NANO.
++ */
++static inline s16 hid_sensor_android_to_s16(s32 raw, int scale_int, int scale_nano,
++					    s64 lsb_nano, bool negate)
++{
++	s64 scale = (s64)scale_int * NSEC_PER_SEC + scale_nano;
++	s64 v;
++
++	if (check_mul_overflow((s64)raw, scale, &v))
++		v = ((raw < 0) != (scale < 0)) ? S64_MIN : S64_MAX;
++	else if (v >= 0)
++		v = div64_s64(v + lsb_nano / 2, lsb_nano);
++	else
++		v = div64_s64(v - lsb_nano / 2, lsb_nano);
++	if (negate)
++		v = (v == S64_MIN) ? S64_MAX : -v;
++
++	return (s16)clamp_t(s64, v, S16_MIN, S16_MAX);
++}
++
++static inline s64 hid_sensor_android_timestamp(void)
++{
++	return ktime_get_boottime_ns();
++}
++
++/*
++ * Axis mapping (module parameter "android_axes", e.g. "-x,-y,-z"): Android axis i takes HID axis
++ * SRC(i), negated if NEG(i). Packed into a u32 so the sample path reads it with one READ_ONCE():
++ * bits [2i+1:2i] = source axis, bit 6+i = negate.
++ */
++#define HID_SENSOR_ANDROID_AXES(s0, s1, s2, n0, n1, n2)			\
++	((s0) | ((s1) << 2) | ((s2) << 4) | ((n0) << 6) | ((n1) << 7) | ((n2) << 8))
++#define HID_SENSOR_ANDROID_AXIS_SRC(axes, i)	(((axes) >> (2 * (i))) & 3)
++#define HID_SENSOR_ANDROID_AXIS_NEG(axes, i)	(((axes) >> (6 + (i))) & 1)
++
++static inline int hid_sensor_android_axes_parse(const char *s, u32 *axes)
++{
++	unsigned int used = 0, n = 0, neg = 0;
++	u32 v = 0;
++
++	for (; *s && *s != '\n'; s++) {
++		if (*s == ',' || *s == ' ' || *s == '+')
++			continue;
++		if (*s == '-') {
++			neg = 1;
++			continue;
++		}
++		if (*s < 'x' || *s > 'z' || n >= 3 || (used & BIT(*s - 'x')))
++			return -EINVAL;
++		used |= BIT(*s - 'x');
++		v |= (u32)(*s - 'x') << (2 * n);
++		v |= (u32)neg << (6 + n);
++		neg = 0;
++		n++;
++	}
++	if (n != 3)
++		return -EINVAL;
++	*axes = v;
++	return 0;
++}
++
++static inline int hid_sensor_android_axes_print(char *buf, u32 axes)
++{
++	int i, len = 0;
++
++	for (i = 0; i < 3; i++)
++		len += scnprintf(buf + len, PAGE_SIZE - len, "%s%s%c", i ? "," : "",
++				 HID_SENSOR_ANDROID_AXIS_NEG(axes, i) ? "-" : "",
++				 'x' + HID_SENSOR_ANDROID_AXIS_SRC(axes, i));
++	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
++	return len;
++}
++
++/* Declares the runtime-writable "android_axes" parameter of a driver, backed by u32 <var>. */
++#define HID_SENSOR_ANDROID_AXES_PARAM(var, desc)				\
++static int var##_set(const char *val, const struct kernel_param *kp)		\
++{										\
++	u32 a;									\
++	int ret = hid_sensor_android_axes_parse(val, &a);			\
++										\
++	if (ret)								\
++		return ret;							\
++	WRITE_ONCE(var, a);							\
++	return 0;								\
++}										\
++static int var##_get(char *buf, const struct kernel_param *kp)		\
++{										\
++	return hid_sensor_android_axes_print(buf, READ_ONCE(var));		\
++}										\
++static const struct kernel_param_ops var##_ops = {				\
++	.set = var##_set,							\
++	.get = var##_get,							\
++};										\
++module_param_cb(android_axes, &var##_ops, NULL, 0644);				\
++MODULE_PARM_DESC(android_axes, desc)
++
++#endif
+diff --git a/drivers/iio/accel/hid-sensor-accel-3d.c b/drivers/iio/accel/hid-sensor-accel-3d.c
+--- a/drivers/iio/accel/hid-sensor-accel-3d.c
++++ b/drivers/iio/accel/hid-sensor-accel-3d.c
+@@ -12,6 +12,26 @@
+ #include <linux/iio/iio.h>
+ #include <linux/iio/buffer.h>
+ #include "../common/hid-sensors/hid-sensor-trigger.h"
++#include "../common/hid-sensors/hid-sensor-android.h"
++
++/*
++ * Android mode (default): present the HID accelerometer as the ChromeOS EC "cros-ec-accel" device the
++ * Android desktop IIO sensors sub-HAL expects. See hid-sensor-android.h.
++ */
++static bool android = true;
++module_param(android, bool, 0444);
++MODULE_PARM_DESC(android, "Present the accelerometer as cros-ec-accel for the Android sensors HAL (default: 1)");
++static char *android_label = "accel-display";
++module_param(android_label, charp, 0444);
++MODULE_PARM_DESC(android_label, "IIO label in Android mode: accel-display (lid/tablet, default) or accel-base");
++static u32 android_axes = HID_SENSOR_ANDROID_AXES(0, 1, 2, 1, 1, 1);
++HID_SENSOR_ANDROID_AXES_PARAM(android_axes, "Android mode: Android x,y,z from HID axes, - negates (default: -x,-y,-z = HID/Windows gravity sign -> Android)");
++static bool android_hyst0 = true;
++module_param(android_hyst0, bool, 0444);
++MODULE_PARM_DESC(android_hyst0, "Android mode: set change sensitivity to 0 at probe so samples are periodic (default: 1)");
++
++/* Android mode: 1 count = 1/4096 g (+-8 g range); scale = 0.002394202 m/s^2 */
++#define ACCEL_3D_ANDROID_LSB_NANO	2394202LL
+ 
+ enum accel_3d_channel {
+ 	CHANNEL_SCAN_INDEX_X,
+@@ -35,6 +55,10 @@
+ 	int scale_precision;
+ 	int value_offset;
+ 	int64_t timestamp;
++	/* Android mode */
++	bool android;
++	s32 android_raw[ACCEL_3D_CHANNEL_MAX];
++	struct hid_sensor_android_scan android_scan;
+ };
+ 
+ static const u32 accel_3d_addresses[ACCEL_3D_CHANNEL_MAX] = {
+@@ -119,6 +143,20 @@
+ 	IIO_CHAN_SOFT_TIMESTAMP(CHANNEL_SCAN_INDEX_TIMESTAMP),
+ };
+ 
++/* Android mode channels: s16 x/y/z + timestamp, shared "scale" and "sampling_frequency" */
++static const struct iio_chan_spec accel_3d_android_channels[] = {
++	HID_SENSOR_ANDROID_CHANNEL(IIO_ACCEL, IIO_MOD_X, CHANNEL_SCAN_INDEX_X),
++	HID_SENSOR_ANDROID_CHANNEL(IIO_ACCEL, IIO_MOD_Y, CHANNEL_SCAN_INDEX_Y),
++	HID_SENSOR_ANDROID_CHANNEL(IIO_ACCEL, IIO_MOD_Z, CHANNEL_SCAN_INDEX_Z),
++	IIO_CHAN_SOFT_TIMESTAMP(CHANNEL_SCAN_INDEX_TIMESTAMP),
++};
++
++static s16 accel_3d_android_value(struct accel_3d_state *st, s32 raw, bool negate)
++{
++	return hid_sensor_android_to_s16(raw, st->scale_pre_decml, st->scale_post_decml,
++					 ACCEL_3D_ANDROID_LSB_NANO, negate);
++}
++
+ /* Adjust channel real bits based on report descriptor */
+ static void accel_3d_adjust_channel_bit_mask(struct iio_chan_spec *channels,
+ 						int channel, int size)
+@@ -141,6 +179,8 @@
+ 	u32 address;
+ 	int ret_type;
+ 	s32 min;
++	u32 axes = READ_ONCE(android_axes);
++	int idx = chan->scan_index;
+ 	struct hid_sensor_hub_device *hsdev =
+ 					accel_state->common_attributes.hsdev;
+ 
+@@ -149,16 +189,22 @@
+ 	switch (mask) {
+ 	case IIO_CHAN_INFO_RAW:
+ 		hid_sensor_power_state(&accel_state->common_attributes, true);
+-		report_id = accel_state->accel[chan->scan_index].report_id;
+-		min = accel_state->accel[chan->scan_index].logical_minimum;
+-		address = accel_3d_addresses[chan->scan_index];
+-		if (report_id >= 0)
++		/* Android mode: Android axis scan_index comes from HID axis SRC(scan_index) */
++		if (accel_state->android)
++			idx = HID_SENSOR_ANDROID_AXIS_SRC(axes, chan->scan_index);
++		report_id = accel_state->accel[idx].report_id;
++		min = accel_state->accel[idx].logical_minimum;
++		address = accel_3d_addresses[idx];
++		if (report_id >= 0) {
+ 			*val = sensor_hub_input_attr_get_raw_value(
+ 					accel_state->common_attributes.hsdev,
+ 					hsdev->usage, address, report_id,
+ 					SENSOR_HUB_SYNC,
+ 					min < 0);
+-		else {
++			if (accel_state->android)
++				*val = accel_3d_android_value(accel_state, *val,
++					HID_SENSOR_ANDROID_AXIS_NEG(axes, chan->scan_index));
++		} else {
+ 			*val = 0;
+ 			hid_sensor_power_state(&accel_state->common_attributes,
+ 						 false);
+@@ -168,6 +214,12 @@
+ 		ret_type = IIO_VAL_INT;
+ 		break;
+ 	case IIO_CHAN_INFO_SCALE:
++		if (accel_state->android) {
++			*val = 0;
++			*val2 = ACCEL_3D_ANDROID_LSB_NANO;
++			ret_type = IIO_VAL_INT_PLUS_NANO;
++			break;
++		}
+ 		*val = accel_state->scale_pre_decml;
+ 		*val2 = accel_state->scale_post_decml;
+ 		ret_type = accel_state->scale_precision;
+@@ -204,6 +256,9 @@
+ 
+ 	switch (mask) {
+ 	case IIO_CHAN_INFO_SAMP_FREQ:
++		/* The Android HAL writes 0 Hz when it stops a sensor; keep the last real interval. */
++		if (accel_state->android && val == 0 && val2 == 0)
++			break;
+ 		ret = hid_sensor_write_samp_freq_value(
+ 				&accel_state->common_attributes, val, val2);
+ 		break;
+@@ -218,9 +273,24 @@
+ 	return ret;
+ }
+ 
++static int accel_3d_read_avail(struct iio_dev *indio_dev,
++			       struct iio_chan_spec const *chan,
++			       const int **vals, int *type, int *length,
++			       long mask)
++{
++	if (mask != IIO_CHAN_INFO_SAMP_FREQ)
++		return -EINVAL;
++
++	*vals = hid_sensor_android_freq_avail;
++	*type = IIO_VAL_INT_PLUS_MICRO;
++	*length = ARRAY_SIZE(hid_sensor_android_freq_avail);
++	return IIO_AVAIL_LIST;
++}
++
+ static const struct iio_info accel_3d_info = {
+ 	.read_raw = &accel_3d_read_raw,
+ 	.write_raw = &accel_3d_write_raw,
++	.read_avail = &accel_3d_read_avail,
+ };
+ 
+ /* Function to push data to buffer */
+@@ -240,6 +310,22 @@
+ 	struct accel_3d_state *accel_state = iio_priv(indio_dev);
+ 
+ 	dev_dbg(&indio_dev->dev, "accel_3d_proc_event\n");
++	if (accel_state->android) {
++		struct hid_sensor_android_scan *scan = &accel_state->android_scan;
++		u32 axes = READ_ONCE(android_axes);
++		int i;
++
++		if (atomic_read(&accel_state->common_attributes.data_ready)) {
++			for (i = 0; i < ACCEL_3D_CHANNEL_MAX; i++)
++				scan->val[i] = accel_3d_android_value(accel_state,
++					accel_state->android_raw[HID_SENSOR_ANDROID_AXIS_SRC(axes, i)],
++					HID_SENSOR_ANDROID_AXIS_NEG(axes, i));
++			iio_push_to_buffers_with_ts(indio_dev, scan, sizeof(*scan),
++						    hid_sensor_android_timestamp());
++		}
++		accel_state->timestamp = 0;
++		return 0;
++	}
+ 	if (atomic_read(&accel_state->common_attributes.data_ready)) {
+ 		if (!accel_state->timestamp)
+ 			accel_state->timestamp = iio_get_time_ns(indio_dev);
+@@ -271,6 +357,13 @@
+ 	case HID_USAGE_SENSOR_ACCEL_Y_AXIS:
+ 	case HID_USAGE_SENSOR_ACCEL_Z_AXIS:
+ 		offset = usage_id - HID_USAGE_SENSOR_ACCEL_X_AXIS;
++		if (accel_state->android) {
++			accel_state->android_raw[CHANNEL_SCAN_INDEX_X + offset] =
++				hid_sensor_android_get_raw(raw_data, raw_len,
++					accel_state->accel[CHANNEL_SCAN_INDEX_X + offset].logical_minimum < 0);
++			ret = 0;
++			break;
++		}
+ 		accel_state->scan.accel_val[CHANNEL_SCAN_INDEX_X + offset] =
+ 						*(u32 *)raw_data;
+ 		ret = 0;
+@@ -347,7 +440,14 @@
+ 	accel_state->common_attributes.hsdev = hsdev;
+ 	accel_state->common_attributes.pdev = pdev;
+ 
+-	if (hsdev->usage == HID_USAGE_SENSOR_ACCEL_3D) {
++	if (hsdev->usage == HID_USAGE_SENSOR_ACCEL_3D && android) {
++		/* Android mode only for the real accelerometer; the gravity sensor keeps its ABI */
++		accel_state->android = true;
++		name = "accel_3d";
++		channel_spec = accel_3d_android_channels;
++		channel_size = sizeof(accel_3d_android_channels);
++		indio_dev->num_channels = ARRAY_SIZE(accel_3d_android_channels);
++	} else if (hsdev->usage == HID_USAGE_SENSOR_ACCEL_3D) {
+ 		name = "accel_3d";
+ 		channel_spec = accel_3d_channels;
+ 		channel_size = sizeof(accel_3d_channels);
+@@ -386,6 +486,23 @@
+ 	indio_dev->name = name;
+ 	indio_dev->modes = INDIO_DIRECT_MODE;
+ 
++	if (accel_state->android) {
++		struct iio_chan_spec *chans = (struct iio_chan_spec *)indio_dev->channels;
++		int i;
++
++		/* parse_report set the HID field widths; Android mode always pushes s16/16 */
++		for (i = 0; i < ACCEL_3D_CHANNEL_MAX; i++)
++			chans[i].scan_type = accel_3d_android_channels[i].scan_type;
++		indio_dev->name = "cros-ec-accel";
++		indio_dev->label = android_label;
++		indio_dev->available_scan_masks = hid_sensor_android_scan_masks;
++		if (android_hyst0 && accel_state->common_attributes.sensitivity.index >= 0)
++			hid_sensor_write_raw_hyst_value(&accel_state->common_attributes, 0, 0);
++		dev_info(&pdev->dev, "Android mode: cros-ec-accel (%s), HID scale %d.%09d\n",
++			 android_label, accel_state->scale_pre_decml,
++			 accel_state->scale_post_decml);
++	}
++
+ 	atomic_set(&accel_state->common_attributes.data_ready, 0);
+ 
+ 	ret = hid_sensor_setup_trigger(indio_dev, name,
+diff --git a/drivers/iio/gyro/hid-sensor-gyro-3d.c b/drivers/iio/gyro/hid-sensor-gyro-3d.c
+--- a/drivers/iio/gyro/hid-sensor-gyro-3d.c
++++ b/drivers/iio/gyro/hid-sensor-gyro-3d.c
+@@ -12,6 +12,26 @@
+ #include <linux/iio/iio.h>
+ #include <linux/iio/buffer.h>
+ #include "../common/hid-sensors/hid-sensor-trigger.h"
++#include "../common/hid-sensors/hid-sensor-android.h"
++
++/*
++ * Android mode (default): present the HID gyroscope as the ChromeOS EC "cros-ec-gyro" device the
++ * Android desktop IIO sensors sub-HAL expects. See hid-sensor-android.h.
++ */
++static bool android = true;
++module_param(android, bool, 0444);
++MODULE_PARM_DESC(android, "Present the gyroscope as cros-ec-gyro for the Android sensors HAL (default: 1)");
++static char *android_label = "accel-display";
++module_param(android_label, charp, 0444);
++MODULE_PARM_DESC(android_label, "IIO label in Android mode: accel-display (lid/tablet, default) or accel-base");
++static u32 android_axes = HID_SENSOR_ANDROID_AXES(0, 1, 2, 0, 0, 0);
++HID_SENSOR_ANDROID_AXES_PARAM(android_axes, "Android mode: Android x,y,z from HID axes, - negates (default: x,y,z, HID and Android both use the right-hand rule)");
++static bool android_hyst0 = true;
++module_param(android_hyst0, bool, 0444);
++MODULE_PARM_DESC(android_hyst0, "Android mode: set change sensitivity to 0 at probe so samples are periodic (default: 1)");
++
++/* Android mode: 1 count = 1 mrad/s (+-32.7 rad/s = +-1877 dps range); scale = 0.001 rad/s */
++#define GYRO_3D_ANDROID_LSB_NANO	1000000LL
+ 
+ enum gyro_3d_channel {
+ 	CHANNEL_SCAN_INDEX_X,
+@@ -34,6 +54,10 @@
+ 	int scale_precision;
+ 	int value_offset;
+ 	s64 timestamp;
++	/* Android mode */
++	bool android;
++	s32 android_raw[GYRO_3D_CHANNEL_MAX];
++	struct hid_sensor_android_scan android_scan;
+ };
+ 
+ static const u32 gyro_3d_addresses[GYRO_3D_CHANNEL_MAX] = {
+@@ -82,6 +106,20 @@
+ 	IIO_CHAN_SOFT_TIMESTAMP(CHANNEL_SCAN_INDEX_TIMESTAMP)
+ };
+ 
++/* Android mode channels: s16 x/y/z + timestamp, shared "scale" and "sampling_frequency" */
++static const struct iio_chan_spec gyro_3d_android_channels[] = {
++	HID_SENSOR_ANDROID_CHANNEL(IIO_ANGL_VEL, IIO_MOD_X, CHANNEL_SCAN_INDEX_X),
++	HID_SENSOR_ANDROID_CHANNEL(IIO_ANGL_VEL, IIO_MOD_Y, CHANNEL_SCAN_INDEX_Y),
++	HID_SENSOR_ANDROID_CHANNEL(IIO_ANGL_VEL, IIO_MOD_Z, CHANNEL_SCAN_INDEX_Z),
++	IIO_CHAN_SOFT_TIMESTAMP(CHANNEL_SCAN_INDEX_TIMESTAMP),
++};
++
++static s16 gyro_3d_android_value(struct gyro_3d_state *st, s32 raw, bool negate)
++{
++	return hid_sensor_android_to_s16(raw, st->scale_pre_decml, st->scale_post_decml,
++					 GYRO_3D_ANDROID_LSB_NANO, negate);
++}
++
+ /* Adjust channel real bits based on report descriptor */
+ static void gyro_3d_adjust_channel_bit_mask(struct iio_chan_spec *channels,
+ 						int channel, int size)
+@@ -104,23 +142,31 @@
+ 	u32 address;
+ 	int ret_type;
+ 	s32 min;
++	u32 axes = READ_ONCE(android_axes);
++	int idx = chan->scan_index;
+ 
+ 	*val = 0;
+ 	*val2 = 0;
+ 	switch (mask) {
+ 	case IIO_CHAN_INFO_RAW:
+ 		hid_sensor_power_state(&gyro_state->common_attributes, true);
+-		report_id = gyro_state->gyro[chan->scan_index].report_id;
+-		min = gyro_state->gyro[chan->scan_index].logical_minimum;
+-		address = gyro_3d_addresses[chan->scan_index];
+-		if (report_id >= 0)
++		/* Android mode: Android axis scan_index comes from HID axis SRC(scan_index) */
++		if (gyro_state->android)
++			idx = HID_SENSOR_ANDROID_AXIS_SRC(axes, chan->scan_index);
++		report_id = gyro_state->gyro[idx].report_id;
++		min = gyro_state->gyro[idx].logical_minimum;
++		address = gyro_3d_addresses[idx];
++		if (report_id >= 0) {
+ 			*val = sensor_hub_input_attr_get_raw_value(
+ 					gyro_state->common_attributes.hsdev,
+ 					HID_USAGE_SENSOR_GYRO_3D, address,
+ 					report_id,
+ 					SENSOR_HUB_SYNC,
+ 					min < 0);
+-		else {
++			if (gyro_state->android)
++				*val = gyro_3d_android_value(gyro_state, *val,
++					HID_SENSOR_ANDROID_AXIS_NEG(axes, chan->scan_index));
++		} else {
+ 			*val = 0;
+ 			hid_sensor_power_state(&gyro_state->common_attributes,
+ 						false);
+@@ -130,6 +176,12 @@
+ 		ret_type = IIO_VAL_INT;
+ 		break;
+ 	case IIO_CHAN_INFO_SCALE:
++		if (gyro_state->android) {
++			*val = 0;
++			*val2 = GYRO_3D_ANDROID_LSB_NANO;
++			ret_type = IIO_VAL_INT_PLUS_NANO;
++			break;
++		}
+ 		*val = gyro_state->scale_pre_decml;
+ 		*val2 = gyro_state->scale_post_decml;
+ 		ret_type = gyro_state->scale_precision;
+@@ -166,6 +218,9 @@
+ 
+ 	switch (mask) {
+ 	case IIO_CHAN_INFO_SAMP_FREQ:
++		/* The Android HAL writes 0 Hz when it stops a sensor; keep the last real interval. */
++		if (gyro_state->android && val == 0 && val2 == 0)
++			break;
+ 		ret = hid_sensor_write_samp_freq_value(
+ 				&gyro_state->common_attributes, val, val2);
+ 		break;
+@@ -180,9 +235,24 @@
+ 	return ret;
+ }
+ 
++static int gyro_3d_read_avail(struct iio_dev *indio_dev,
++			      struct iio_chan_spec const *chan,
++			      const int **vals, int *type, int *length,
++			      long mask)
++{
++	if (mask != IIO_CHAN_INFO_SAMP_FREQ)
++		return -EINVAL;
++
++	*vals = hid_sensor_android_freq_avail;
++	*type = IIO_VAL_INT_PLUS_MICRO;
++	*length = ARRAY_SIZE(hid_sensor_android_freq_avail);
++	return IIO_AVAIL_LIST;
++}
++
+ static const struct iio_info gyro_3d_info = {
+ 	.read_raw = &gyro_3d_read_raw,
+ 	.write_raw = &gyro_3d_write_raw,
++	.read_avail = &gyro_3d_read_avail,
+ };
+ 
+ /* Callback handler to send event after all samples are received and captured */
+@@ -194,6 +264,22 @@
+ 	struct gyro_3d_state *gyro_state = iio_priv(indio_dev);
+ 
+ 	dev_dbg(&indio_dev->dev, "gyro_3d_proc_event\n");
++	if (gyro_state->android) {
++		struct hid_sensor_android_scan *scan = &gyro_state->android_scan;
++		u32 axes = READ_ONCE(android_axes);
++		int i;
++
++		if (atomic_read(&gyro_state->common_attributes.data_ready)) {
++			for (i = 0; i < GYRO_3D_CHANNEL_MAX; i++)
++				scan->val[i] = gyro_3d_android_value(gyro_state,
++					gyro_state->android_raw[HID_SENSOR_ANDROID_AXIS_SRC(axes, i)],
++					HID_SENSOR_ANDROID_AXIS_NEG(axes, i));
++			iio_push_to_buffers_with_ts(indio_dev, scan, sizeof(*scan),
++						    hid_sensor_android_timestamp());
++		}
++		gyro_state->timestamp = 0;
++		return 0;
++	}
+ 	if (atomic_read(&gyro_state->common_attributes.data_ready)) {
+ 		if (!gyro_state->timestamp)
+ 			gyro_state->timestamp = iio_get_time_ns(indio_dev);
+@@ -223,6 +309,13 @@
+ 	case HID_USAGE_SENSOR_ANGL_VELOCITY_Y_AXIS:
+ 	case HID_USAGE_SENSOR_ANGL_VELOCITY_Z_AXIS:
+ 		offset = usage_id - HID_USAGE_SENSOR_ANGL_VELOCITY_X_AXIS;
++		if (gyro_state->android) {
++			gyro_state->android_raw[CHANNEL_SCAN_INDEX_X + offset] =
++				hid_sensor_android_get_raw(raw_data, raw_len,
++					gyro_state->gyro[CHANNEL_SCAN_INDEX_X + offset].logical_minimum < 0);
++			ret = 0;
++			break;
++		}
+ 		gyro_state->scan.gyro_val[CHANNEL_SCAN_INDEX_X + offset] =
+ 				*(u32 *)raw_data;
+ 		ret = 0;
+@@ -304,8 +397,13 @@
+ 		return ret;
+ 	}
+ 
+-	indio_dev->channels = devm_kmemdup(&pdev->dev, gyro_3d_channels,
+-					   sizeof(gyro_3d_channels), GFP_KERNEL);
++	gyro_state->android = android;
++	if (gyro_state->android)
++		indio_dev->channels = devm_kmemdup(&pdev->dev, gyro_3d_android_channels,
++						   sizeof(gyro_3d_android_channels), GFP_KERNEL);
++	else
++		indio_dev->channels = devm_kmemdup(&pdev->dev, gyro_3d_channels,
++						   sizeof(gyro_3d_channels), GFP_KERNEL);
+ 	if (!indio_dev->channels) {
+ 		dev_err(&pdev->dev, "failed to duplicate channels\n");
+ 		return -ENOMEM;
+@@ -324,6 +422,24 @@
+ 	indio_dev->name = name;
+ 	indio_dev->modes = INDIO_DIRECT_MODE;
+ 
++	if (gyro_state->android) {
++		struct iio_chan_spec *chans = (struct iio_chan_spec *)indio_dev->channels;
++		int i;
++
++		/* parse_report set the HID field widths; Android mode always pushes s16/16 */
++		for (i = 0; i < GYRO_3D_CHANNEL_MAX; i++)
++			chans[i].scan_type = gyro_3d_android_channels[i].scan_type;
++		indio_dev->num_channels = ARRAY_SIZE(gyro_3d_android_channels);
++		indio_dev->name = "cros-ec-gyro";
++		indio_dev->label = android_label;
++		indio_dev->available_scan_masks = hid_sensor_android_scan_masks;
++		if (android_hyst0 && gyro_state->common_attributes.sensitivity.index >= 0)
++			hid_sensor_write_raw_hyst_value(&gyro_state->common_attributes, 0, 0);
++		dev_info(&pdev->dev, "Android mode: cros-ec-gyro (%s), HID scale %d.%09d\n",
++			 android_label, gyro_state->scale_pre_decml,
++			 gyro_state->scale_post_decml);
++	}
++
+ 	atomic_set(&gyro_state->common_attributes.data_ready, 0);
+ 
+ 	ret = hid_sensor_setup_trigger(indio_dev, name,
+-- 
+2.43.0

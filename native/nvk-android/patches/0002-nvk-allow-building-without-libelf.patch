@@ -1,0 +1,56 @@
+--- a/meson.build
++++ b/meson.build
+@@ -2152,7 +2152,8 @@
+ elif with_gallium_radeonsi and with_gfx_compute
+   error('Gallium driver radeonsi requires libelf')
+ elif with_nouveau_vk
+-  error('NVK requires libelf')
++  # libelf is only used by the NVK cubin (VK_NVX_binary_import) entrypoints, which NVK does not advertise.
++  warning('libelf not found: building NVK without the cubin (VK_NVX_binary_import) entrypoints')
+ endif
+ 
+ dep_valgrind = dependency('valgrind', required : get_option('valgrind'))
+--- a/src/nouveau/meson.build
++++ b/src/nouveau/meson.build
+@@ -14,7 +14,9 @@
+ endif
+ 
+ if with_nouveau_vk
+-  subdir('cubin')
++  if dep_elf.found()
++    subdir('cubin')
++  endif
+   subdir('mme')
+   subdir('vulkan')
+ endif
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -34,8 +34,6 @@
+   'nvk_cmd_pool.c',
+   'nvk_cmd_pool.h',
+   'nvk_cmd_video.c',
+-  'nvk_cubin.c',
+-  'nvk_cubin.h',
+   'nvk_debug.h',
+   'nvk_descriptor_set.h',
+   'nvk_descriptor_set.c',
+@@ -162,7 +160,6 @@
+   idep_nir,
+   idep_nir_headers,
+   idep_mesautil,
+-  idep_nouveau_cubin,
+   idep_nouveau_mme,
+   idep_nouveau_ws,
+   idep_nvidia_headers,
+@@ -173,6 +170,11 @@
+   idep_vulkan_wsi,
+   idep_vulkan_wsi_headers,
+ ]
++
++if dep_elf.found()
++  nvk_files += files('nvk_cubin.c', 'nvk_cubin.h')
++  nvk_deps += idep_nouveau_cubin
++endif
+ 
+ nvk_include_directories = [
+   fs.relative_to(meson.project_build_root(), meson.current_source_dir()),

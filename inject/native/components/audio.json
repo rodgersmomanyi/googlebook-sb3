@@ -1,0 +1,104 @@
+{
+ "name": "audio",
+ "source": "${GB_BUILD}\\native\\audio",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\gb_audio.sh",
+   "dest": "gb_audio.sh",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\gb_audiodiag.sh",
+   "dest": "gb_audiodiag.sh",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\gb_test_tone.wav",
+   "dest": "gb_test_tone.wav",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\bin\\tinymix",
+   "dest": "vup/bin/tinymix",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\bin\\tinyplay",
+   "dest": "vup/bin/tinyplay",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\bin\\tinycap",
+   "dest": "vup/bin/tinycap",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\bin\\tinypcminfo",
+   "dest": "vup/bin/tinypcminfo",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\data\\hal_configs\\audio_default.xml",
+   "dest": "vup/etc/data/hal_configs/audio_default.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\audio\\sof-hda-dsp_sb3\\audio_config.xml",
+   "dest": "vup/etc/audio/sof-hda-dsp_sb3/audio_config.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\audio\\sof-hda-dsp_sb3\\mixer_paths.xml",
+   "dest": "vup/etc/audio/sof-hda-dsp_sb3/mixer_paths.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\audio\\sof-hda-dsp_sb3\\volume_curves.xml",
+   "dest": "vup/etc/audio/sof-hda-dsp_sb3/volume_curves.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\audio\\PCH_sb3_legacy\\audio_config.xml",
+   "dest": "vup/etc/audio/PCH_sb3_legacy/audio_config.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\audio\\PCH_sb3_legacy\\mixer_paths.xml",
+   "dest": "vup/etc/audio/PCH_sb3_legacy/mixer_paths.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\audio\\PCH_sb3_legacy\\volume_curves.xml",
+   "dest": "vup/etc/audio/PCH_sb3_legacy/volume_curves.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\audio\\tree\\vup\\etc\\audio\\PCH_sb3_legacy\\audio_default.xml",
+   "dest": "vup/etc/audio/PCH_sb3_legacy/audio_default.xml",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_HOME}\\inject\\native\\firmware\\intel\\sof\\sof-icl.ri",
+   "dest": "firmware/intel/sof/sof-icl.ri",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_HOME}\\inject\\native\\firmware\\intel\\sof-tplg\\sof-hda-generic-2ch.tplg",
+   "dest": "firmware/intel/sof-tplg/sof-hda-generic-2ch.tplg",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_HOME}\\inject\\native\\firmware\\intel\\sof-tplg\\sof-hda-generic-4ch.tplg",
+   "dest": "firmware/intel/sof-tplg/sof-hda-generic-4ch.tplg",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_HOME}\\inject\\native\\firmware\\intel\\sof-tplg\\sof-hda-generic.tplg",
+   "dest": "firmware/intel/sof-tplg/sof-hda-generic.tplg",
+   "mode": "0644"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\audio\\rc\\gb_audio.rc"
+ ]
+}

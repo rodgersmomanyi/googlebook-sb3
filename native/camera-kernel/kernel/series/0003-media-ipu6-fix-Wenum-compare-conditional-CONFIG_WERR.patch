@@ -1,0 +1,28 @@
+From f2fae06493b6a5bed7a524cb084b015543995012 Mon Sep 17 00:00:00 2001
+From: gb <gb@local>
+Date: Sat, 24 Oct 2026 18:06:10 +0000
+Subject: [PATCH 3/6] media: ipu6: fix -Wenum-compare-conditional
+ (CONFIG_WERROR) in IPU4P SysCom setup
+
+---
+ drivers/media/pci/intel/ipu6/ipu6-fw-com.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-fw-com.c b/drivers/media/pci/intel/ipu6/ipu6-fw-com.c
+index 7986f6f..1c74298 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-fw-com.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-fw-com.c
+@@ -254,8 +254,8 @@ void *ipu6_fw_com_prepare(struct ipu6_fw_com_cfg *cfg,
+ 
+ 	/* initialize input queues */
+ 	offset += specific_size;
+-	res.reg = ctx->dmem_syscom ? IPU4P_SYSCOM_QPR_BASE_REG :
+-				     SYSCOM_QPR_BASE_REG;
++	res.reg = ctx->dmem_syscom ? (unsigned int)IPU4P_SYSCOM_QPR_BASE_REG :
++				     (unsigned int)SYSCOM_QPR_BASE_REG;
+ 	res.host_address = (uintptr_t)(ctx->dma_buffer + offset);
+ 	res.vied_address = ctx->dma_addr + offset;
+ 	for (i = 0; i < cfg->num_input_queues; i++)
+-- 
+2.43.0
+

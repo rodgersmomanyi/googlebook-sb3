@@ -1,0 +1,19 @@
+platform/surface: dtx: send latch changes from the state update path as SDTX_EVENT_LATCH_STATUS
+
+__sdtx_device_state_update_latch() (resume / state re-check) emitted a latch change as SDTX_EVENT_BASE_CONNECTION
+with length sizeof(struct sdtx_base_info) = 4, from a struct sdtx_status_event that has a 2-byte payload: user space
+got a bogus base-connection event and 2 bytes of stack were copied out. Still present in mainline (checked Oct 2026).
+---
+--- a/drivers/platform/surface/surface_dtx.c
++++ b/drivers/platform/surface/surface_dtx.c
+@@ -864,8 +864,8 @@
+ 
+ 	ddev->state.latch_status = status;
+ 
+-	event.e.length = sizeof(struct sdtx_base_info);
+-	event.e.code = SDTX_EVENT_BASE_CONNECTION;
++	event.e.length = sizeof(u16);
++	event.e.code = SDTX_EVENT_LATCH_STATUS;
+ 	event.v = sdtx_translate_latch_status(ddev, status);
+ 
+ 	sdtx_push_event(ddev, &event.e);

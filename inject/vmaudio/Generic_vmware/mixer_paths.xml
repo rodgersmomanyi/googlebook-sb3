@@ -1,0 +1,18 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mixer enum_mixer_numeric_fallback="true">
+	<!-- GB VM: VMware HD Audio, generic HDA codec (4 line outs). The generic parser starts with Master muted at 0
+	     and capture off; gb_vmaudio.sh also sets these at boot, before the audio HAL starts. -->
+	<ctl name="Master Playback Switch" value="1" />
+	<ctl name="Master Playback Volume" value="64" />
+	<ctl name="Front Playback Switch" value="1" />
+	<ctl name="Front Playback Volume" value="64" />
+	<ctl name="Capture Switch" value="1" />
+	<ctl name="Capture Volume" value="36" />
+	<path name="Speaker">
+		<ctl name="Master Playback Switch" value="1" />
+		<ctl name="Front Playback Switch" value="1" />
+	</path>
+	<path name="InternalMic">
+		<ctl name="Capture Switch" value="1" />
+	</path>
+</mixer>

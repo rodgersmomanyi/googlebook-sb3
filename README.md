@@ -1,0 +1,154 @@
+# googlebook-sb3
+
+Run **Googlebook OS** ("lapis", Google's Android 17 desktop build for the ASUS Googlebook, x86_64) on a
+**Microsoft Surface Book 3 13.5"** (i7-1065G7 Ice Lake): inside **VMware Workstation** on the laptop's own Windows 11,
+and natively from a **USB stick** or an **internal partition** next to Windows.
+
+This repository holds our own build scripts, kernel patches, guest daemons, Android init/overlay configuration and
+documentation. It does **not** contain Google's OS images, vendor binaries, firmware blobs or anything built from
+them. You have to get the lapis image yourself (see [Requirements](#requirements)).
+
+> Unofficial hobby project. Not affiliated with or endorsed by Google, ASUS, Microsoft, NVIDIA or VMware.
+> Running a modified OS on your hardware is at your own risk. Everything marked *untested on hardware* below has
+> only been checked in the VM, in QEMU, on the builder or against disk-image files.
+
+## Status
+
+Build tested: lapis **CL3B.260622.271.R1** (installed from the recovery image) updated in the VM by OTA to
+**CL3B.260622.276.R4**; our GKI kernel **android17-6.18 (6.18.21)**, built with Kleaf.
+
+| Area | VMware VM | Native Surface Book 3 |
+|---|---|---|
+| Boot to the desktop, user sign-in | **works** (first boot is slow: dexopt) | untested on hardware |
+| Display | **works**: vmwgfx (patched), 2560x1600 @ 320 dpi | untested: i915 (Gen11 Iris Plus 8086:8A52) + DMC firmware, stock lapis composer |
+| GPU / 3D | **works**: VMware SVGA3D through Mesa gallium `svga` 26.3 (patched) as the system GLES driver, SkiaGL; Vulkan is SwiftShader (CPU) | untested: lapis's own Mesa ANV (Vulkan) + ANGLE on i915 |
+| Pointer / keyboard | **works**: seamless absolute mouse (`gb_absmouse` + vmmouse + mini VMware Tools `gb_vmtools`), wheel, VMware keyboard | untested: SAM base keyboard + touchpad (`surface_hid`) |
+| Touchscreen + pen | n/a | untested: IPTS (linux-surface driver, MEI 8086:34E4) + `iptsd` 3.1.1 for Android (end-to-end tested on the builder with a fake HID device) |
+| Batteries | **works**: Windows' combined level (both packs) via `gb_hostbatt` -> guestinfo -> `gb_vmtools` -> `test_power` | untested: `gb_power` sums clipboard + base battery into one Android battery (unit-tested) |
+| Charger / AC | **works** (host AC state) | untested: `surface_charger` mirrored by `gb_power` |
+| Detach (DTX) | n/a | untested: `gb_power` handles detach requests like `surface-dtx-daemon`; tablet mode from `surface_dtx` |
+| NVIDIA GTX 1650 Max-Q (TU117, in the base) | not visible to the guest; VMware uses it on the host to render the VM | untested: no Android driver; kept unbound and runtime-suspended (D3cold) by `gb_power`. Opt-in nouveau/NVK experiments in `native/` |
+| Audio | **works**: VMware HD Audio through lapis's HDA drivers | untested: SOF (Ice Lake DSP 8086:34C8) + ALC274 with lapis's vendor modules and our card configs |
+| Wi-Fi / Bluetooth | VM networking via vmxnet3 (NAT); Bluetooth disabled | untested: AX201 (iwlwifi, firmware -77) and Intel BT (8087:0026) with our signed GKI modules |
+| Sensors | n/a | untested: ISH accelerometer/gyro and APDS-9960 light sensor exposed in the form lapis's sensors HAL accepts (QEMU-tested; not yet in the default build) |
+| Cameras (IPU4, 8086:8A19) | n/a | **not supported**: Linux has no IPU4 driver. An out-of-tree experiment lives in `native/camera-*` (compiles, never run) |
+| Power / volume buttons, lid | VMware power button = clean shutdown | untested: `soc_button_array` (MSHW0040), `surface_gpe` |
+| Platform profile | n/a | untested: `surface_platform_profile`, set by `gb_power` (`persist.vendor.gb.perf_profile`) |
+| OTA system updates | **works** (one update so far, .271 -> .276): the A/B update installs and the VM boots the new slot; `gb_slotsync` switches the boot entry (see [OTA.md](docs/OTA.md) for what was observed) | same mechanism; untested on hardware |
+| Screen lock PIN / hardware-backed keys | **no**: software KeyMint, no Gatekeeper/Weaver (no Trusty/GSC) | same |
+
+Details per device, with the kernel config, firmware and userspace pieces behind each line:
+[docs/DRIVERS.md](docs/DRIVERS.md).
+
+## How it works (short)
+
+systemd-boot on an ESP starts **our own GKI kernel** with an initrd we assemble: a small cpio of our overlay tree
+(`/gbinit` + the VM tree `/gbstage` or the native tree `/gbnative`), then lapis's vendor ramdisk, its generic ramdisk
+and a bootconfig. `gbinit` (busybox) copies the selected tree to a tmpfs `/odm`, loads the native modules, and
+`exec`s Android's init. Our `/odm/etc/init/gb.rc` overlays `/vendor` (overlayfs, upper dir `/odm/vup`), stubs the
+Googlebook-only security/firmware services that cannot work on this hardware, and starts our daemons. Android's own
+system, vendor and product partitions are used unmodified. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
+## Requirements
+
+* **The lapis disk image**, which you obtain yourself: the official Googlebook (ASUS, codename lapis) recovery image,
+  `android-desktop_signed_recovery_image.bin` (build CL3B.260622.271.R1 here). This repository does not distribute
+  it, links to no copy of it, and contains no file from it: no binaries, libraries, modules or verbatim configs.
+  The only lapis-derived text is small and listed in [LICENSES.md](LICENSES.md): our edited fstab and VINTF
+  manifest (`inject/`) and the generated list of SELinux type names in `inject/odm_sepolicy.cil`.
+* A few further inputs you build or fetch yourself (busybox, systemd-boot, the AOSP software KeyMint from an Android
+  emulator image, linux-firmware files, Mesa, SwiftShader, lapis's own minigbm patched by our script ...):
+  [docs/INPUTS.md](docs/INPUTS.md) lists every one, where it comes from and its checksum.
+* **Windows 10/11 x64** with Python 3.10+ (`python` on PATH, or set `GB_PYTHON`), **VMware Workstation 17.5+** for
+  the VM, and the in-box .NET Framework `csc.exe` for the two small C# helpers.
+* A **Linux x86_64 builder** (we use an Ubuntu 24.04 VM with ~120 GB of disk) for the kernel (Kleaf/Bazel), the
+  Android NDK r27c builds and image work: [builder/README.md](builder/README.md).
+* Native: a Surface Book 3 13.5" with **Secure Boot disabled** (our loader and kernel are unsigned), a USB stick of
+  32 GB or more, and for dual boot free space on the internal disk.
+
+## Getting started
+
+| Goal | Guide |
+|---|---|
+| Run it in VMware on Windows | [docs/VMWARE.md](docs/VMWARE.md) |
+| Boot the Surface Book 3 natively from USB (`build_usb.py`) | [docs/NATIVE.md](docs/NATIVE.md) |
+| Install next to Windows on the internal NVMe | [native/dualboot/README_DUALBOOT.md](native/dualboot/README_DUALBOOT.md) |
+| System updates (OTA) and the A/B slot follower | [docs/OTA.md](docs/OTA.md) |
+| Build the kernel | [kernel/README.md](kernel/README.md) |
+
+## Repository layout
+
+The repository root is also the **workspace**: the scripts look for `lapis.bin`, `boot/`, `debs/` and `inject/` next
+to themselves (override with `GB_HOME`). Everything you add there that must not be published (images, binaries,
+firmware, keys, logs) is excluded by [.gitignore](.gitignore).
+
+```
+build_esp.py         ESP + initrd builder (VM and native trees); writes the ESP into lapis.bin
+build_usb.py         raw GPT image for a USB stick (+ partition export for the dual-boot installer)
+extract_slot.py      A/B slot detection and ramdisk extraction from lapis.bin
+stage_kernel.py      fetch a kernel build from the builder, check module dependencies/vermagic, stage modules
+carve_lp.py          extract dynamic partitions (e.g. vendor_dlkm_b) from super
+grow_esp.py, grow_userdata.py, wipe_data.py, gen_edid.py     one-time lapis.bin preparation / maintenance
+gbsh.py, gbnet.py    host side of the VM's serial root console, fast file transfer over the VM network
+boot_live.ps1, cycle.ps1, vmx_set.ps1, wait_boot.sh, measure.sh    VM run / test loop helpers
+vm/                  VMware .vmx template, lapis.vmdk descriptor generator
+inject/              our text configs for the overlay tree (fstab, VINTF manifest, sepolicy CIL, audio, ADB, native manifests)
+guest/               guest daemons in C (gb_vmtools, gb_absmouse, gb_layout, gb_slotsync, vkenum) + NDK build script
+host/                Windows helpers (gb_hostbatt battery bridge, scrcpy launcher)
+kernel/              kernel patches, config deltas, Kleaf build scripts, pinned manifest
+graphics/            Mesa svga build + patches, SwiftShader build notes, minigbm patcher, EGL/AHB probes
+native/              Surface Book 3 components: audio, iptsd, power, sensors, hw-gap-audit, dualboot, camera-*, nouveau-kernel, nvk-android
+builder/             builder VM cloud-init template and helpers
+tools/               frametime (host-side frame cadence measurement)
+legacy/              the first bring-up ISO builder (historical)
+docs/                architecture, VMware, native, OTA, drivers, inputs
+```
+
+### Environment variables
+
+| Variable | Default | Used by |
+|---|---|---|
+| `GB_HOME` | the folder of the script (repository root) | all host scripts: workspace with `lapis.bin`, `boot/`, `debs/`, `inject/` |
+| `GB_BUILD` | the workspace if it has `native/`, else `C:\GB-build` | `stage_kernel.py`, component manifests (`${GB_BUILD}`) |
+| `GB_PYTHON` | `python` | the PowerShell/bash helpers |
+| `GB_BUILDER`, `GB_BUILDER_KEY` | `builder@192.168.115.132`, `C:\GB-build\builder_key` | `stage_kernel.py` (ssh to the builder) |
+| `GB_PIPE` | `\\.\pipe\lapis_con` | `gbsh.py` (the VM's serial console pipe) |
+| `GB_SLOT` | read from lapis.bin's GPT | `build_esp.py`: force slot a/b |
+| `NDK` | `/build/ndk` | builder-side build scripts |
+
+The original development setup used `C:\GB-x86` as the workspace and `C:\GB-build` for builder-side sources and
+component work; a few comments and defaults still name those folders.
+
+## Safety
+
+Native mode is built to leave the Surface's firmware, TPM and Windows alone:
+
+* **Firmware updaters are stubbed.** lapis's OTA postinstall would flash the *Googlebook's* AP/EC firmware
+  (`google_desktop_firmware_updater`); it is replaced by a script that skips and succeeds. `fwupdmgr`, `flashrom`,
+  `futility`, `ectool`, the futility executor and lapis's disk installer `android-desktop-install` (which would
+  erase the whole disk) are replaced by scripts that refuse; `fwupd` idles.
+* **No TPM / SPI flash / EFI NVRAM writes.** The native command line blacklists the TPM, SPI-NOR/`spi-intel` and
+  `gsmi` modules and sets `efi_pstore.pstore_disable=1`, so kernel panics are not written into UEFI variables.
+  `efivarfs` is not built.
+* **Nothing from the VM's /data is copied** into USB or internal images: userdata, metadata, misc and the security
+  partitions are created blank, with fresh partition GUIDs.
+* The dual-boot installer is a dry run unless `-Apply`, backs up the GPT and BCD first, never moves C:, the Windows
+  ESP, MSR or Recovery, and was exercised against disk images only. Read its README before using it.
+* Known hazard: lapis's boot_control HAL rewrites the GPT of the disk holding `vbmeta_a/b` (A/B slot bits). On an
+  internal install that is the Windows disk. In the VM those writes were correct and limited to the vbmeta entries.
+* Security model: SELinux runs **permissive**, there is no hardware-backed keystore (software KeyMint) and no lock
+  screen credential storage (Gatekeeper/Weaver are absent). Do not keep sensitive data in it.
+
+## Licenses
+
+Our own code and docs: **Apache-2.0** ([LICENSE](LICENSE)). Kernel patches are **GPL-2.0** (derived from Linux);
+parts derived from linux-surface, iptsd, Mesa, libcamera, tinyalsa and AOSP keep their licenses. See
+[LICENSES.md](LICENSES.md).
+
+## Acknowledgements and prior art
+
+[linux-surface](https://github.com/linux-surface/linux-surface) (Surface Aggregator, IPTS, DTX knowledge),
+[iptsd](https://github.com/linux-surface/iptsd), [Mesa](https://mesa3d.org), [SwiftShader](https://github.com/google/swiftshader),
+[libcamera](https://libcamera.org), and the other projects that boot Googlebook OS on non-Googlebook PCs:
+[gbOS86 / gbos-x86](https://github.com/linuxkid473/gbos-x86), [Project Churro](https://github.com/alesimula/project-churro)
+and gbrunch.

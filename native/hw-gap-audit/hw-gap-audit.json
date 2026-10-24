@@ -1,0 +1,69 @@
+{
+ "name": "hw-gap-audit",
+ "source": "${GB_BUILD}\\native\\hw-gap-audit",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\gb_hw.sh",
+   "dest": "gb_hw.sh",
+   "mode": "0755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\idc\\Microsoft_Surface_045E_09AE_Keyboard.idc",
+   "dest": "vup/usr/idc/Microsoft_Surface_045E_09AE_Keyboard.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\idc\\Microsoft_Surface_045E_09AF_Touchpad.idc",
+   "dest": "vup/usr/idc/Microsoft_Surface_045E_09AF_Touchpad.idc",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\keylayout\\Vendor_045e_Product_0921.kl",
+   "dest": "vup/usr/keylayout/Vendor_045e_Product_0921.kl",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\usr\\keylayout\\Surface_Slim_Pen_2_Keyboard.kl",
+   "dest": "vup/usr/keylayout/Surface_Slim_Pen_2_Keyboard.kl",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153a-2.fw",
+   "dest": "firmware/rtl_nic/rtl8153a-2.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153a-3.fw",
+   "dest": "firmware/rtl_nic/rtl8153a-3.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153a-4.fw",
+   "dest": "firmware/rtl_nic/rtl8153a-4.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153b-2.fw",
+   "dest": "firmware/rtl_nic/rtl8153b-2.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8153c-1.fw",
+   "dest": "firmware/rtl_nic/rtl8153c-1.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8156a-2.fw",
+   "dest": "firmware/rtl_nic/rtl8156a-2.fw",
+   "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\firmware\\rtl_nic\\rtl8156b-2.fw",
+   "dest": "firmware/rtl_nic/rtl8156b-2.fw",
+   "mode": "0644"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\hw-gap-audit\\gb_hw.rc"
+ ]
+}

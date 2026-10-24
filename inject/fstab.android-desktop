@@ -1,0 +1,25 @@
+system /system erofs ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+system /system ext4 ro,noatime wait,logical,first_stage_mount,slotselect,avb=vbmeta
+vendor /vendor erofs ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+vendor /vendor ext4 ro,noatime wait,logical,first_stage_mount,slotselect,avb=vbmeta
+system_dlkm /system_dlkm erofs ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+system_dlkm /system_dlkm ext4 noatime,ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+product /product erofs ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+product /product ext4 noatime,ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+system_ext /system_ext erofs ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+system_ext /system_ext ext4 noatime,ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+vendor_dlkm /vendor_dlkm erofs ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+vendor_dlkm /vendor_dlkm ext4 noatime,ro wait,logical,first_stage_mount,slotselect,avb=vbmeta
+
+/dev/block/by-name/boot /boot emmc defaults slotselect,avb=boot,first_stage_mount
+/dev/block/by-name/init_boot /init_boot emmc defaults slotselect,avb=init_boot,first_stage_mount
+/dev/block/by-name/vendor_boot /vendor_boot emmc defaults slotselect,avb=vendor_boot,first_stage_mount
+/dev/block/by-name/vbmeta /vbmeta emmc defaults slotselect,first_stage_mount
+/dev/block/by-name/userdata /data ext4 rw,nodev,noatime,nosuid,errors=continue wait,formattable,latemount,reservedsize=128M
+
+/dev/block/by-name/metadata /metadata ext4 noatime,nosuid,nodev,discard,data=journal,commit=1 wait,formattable,first_stage_mount,check
+/dev/block/by-name/misc /misc emmc defaults defaults
+
+/devices/*/nvme/nvme[2-9]*/* auto   auto     defaults voldmanaged=sdcard1:auto
+/devices/*/mmc_host*      auto      auto     defaults voldmanaged=sdcard1:auto
+/devices/*/usb*           auto      auto     defaults voldmanaged=usb:auto

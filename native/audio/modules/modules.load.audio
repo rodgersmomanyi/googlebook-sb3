@@ -1,0 +1,15 @@
+# GB native audio: lapis vendor_dlkm HDA codec modules (unsigned vendor modules, taken from build 271's
+# vendor_dlkm). Their modversion CRCs match build #11 vmlinux.symvers (0 mismatches) and their symbols are closed in
+# this order. gbinit insmods them before Android init, so they are resident when ueventd autoloads
+# snd-sof-pci-intel-icl and SOF probes the codecs. Without them SOF drops the ALC274 (GKI has no request_module) and
+# there is no analog audio. If the booted slot's vendor_dlkm comes from another lapis build and its SOF modules
+# reject these, gb_audio.sh unloads them and loads the vendor_dlkm copies instead (refresh with src/refresh_modules.sh).
+# Append these lines to inject/native/modules/modules.load after i915.ko. The order within this block matters.
+snd-hda-core.ko
+snd-hda-codec.ko
+snd-hda-codec-generic.ko
+snd-hda-codec-realtek-lib.ko
+snd-hda-scodec-component.ko
+snd-hda-codec-alc269.ko
+snd-hda-codec-hdmi.ko
+snd-hda-codec-intelhdmi.ko

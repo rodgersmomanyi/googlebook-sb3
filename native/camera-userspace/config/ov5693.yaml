@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+# Surface Book 3 front camera, OV5693 - libcamera simple (software ISP) IPA tuning.
+# STARTER FILE, NOT CALIBRATED: no colour checker / CCM measurement exists for this module.
+# libcamera upstream ships no ov5693 tuning for any IPA; only the sensor helper (gain model,
+# black level 1024 = 16 @ 10 bit) exists in src/ipa/libipa/camera_sensor_helper.cpp.
+# The black level matches the SB3 measurement in github.com/ulfendk/sb3-ipu4-camera
+# (camera/front_isp.py: "OV5693 optical-black rows read exactly 16").
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 1024
+  - Awb:
+  # A colour correction matrix needs a calibration; leave disabled (CPU cost, untuned).
+  # - Ccm:
+  #     ccms:
+  #       - ct: 6500
+  #         ccm: [ 1, 0, 0,
+  #                0, 1, 0,
+  #                0, 0, 1 ]
+  - Adjust:
+  - Agc:
+...

@@ -1,0 +1,29 @@
+# nouveau for the SB3 dGPU (NVIDIA TU117) -- OPT-IN, native tree only: append to GB_RC_NATIVE (/odm/etc/init/gb.rc).
+# Default (property unset): nouveau is NOT loaded; gb_power keeps every 10de function driverless with runtime PM auto
+# so the root port 00:1d.4 drops to D3cold and ACPI \_SB.PCI0.RP13.PRPD._OFF (HGOF) cuts the dGPU's power.
+#   setprop persist.vendor.gb.nouveau 1   -> load nouveau (runpm=1 modeset=2) now / at every boot after boot_completed
+#   setprop persist.vendor.gb.nouveau 0   -> unbind + unload it again
+#   persist.vendor.gb.nouveau.args        -> extra nouveau args, e.g. "config=NvGspRm=0" (non-GSP firmware path)
+# REQUIRES gb_power with coordination/gb_power-nouveau-optin.patch: unpatched gb_power unbinds ANY driver from the dGPU
+# within 0.5 s of its "bind" uevent (by design), so nouveau would be torn down right after probing.
+# Files: /odm/vup/bin/gb_nouveau.sh (-> /vendor/bin/gb_nouveau.sh, 0755); /odm/lib/modules/{drm_exec,drm_gpuvm,
+# gpu-sched,drm_ttm_helper,nouveau}.ko (NOT in modules.load / modules.load.late); /odm/firmware/nvidia/tu117.
+service gb_nouveau /system/bin/sh /vendor/bin/gb_nouveau.sh
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_nouveau_off /system/bin/sh /vendor/bin/gb_nouveau.sh off
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1 && property:persist.vendor.gb.nouveau=1
+    start gb_nouveau
+
+on property:sys.boot_completed=1 && property:persist.vendor.gb.nouveau=0
+    start gb_nouveau_off

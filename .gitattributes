@@ -1,0 +1,5 @@
+# Scripts, rc files, patches and configs end up inside Android or on the Linux builder: keep LF everywhere.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.patch -whitespace
+*.diff -whitespace

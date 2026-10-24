@@ -1,0 +1,54 @@
+<?xml version='1.0' encoding='utf-8'?>
+<audio_config>
+	<!--
+GB native: Microsoft Surface Book 3 (Ice Lake cAVS 8086:34C8, SOF IPC3 firmware intel/sof/sof-icl.ri,
+topology intel/sof-tplg/sof-hda-generic-<N>ch.tplg, Realtek ALC274 HDA codec plus 2 PCH DMICs).
+Machine driver skl_hda_dsp_generic: card "sof-hda-dsp", ALSA id "sofhdadsp".
+PCM device numbers are the topology PCM ids (SOF sets use_dai_pcm_id). Verified from sof-hda-generic-2ch.tplg:
+  0  HDA Analog            playback + capture (ALC274: speaker/headphone out, headset-mic in)
+  31 HDA Analog Deep Buffer playback (mixed into the same HDA0.OUT DAI as PCM 0)
+  3/4/5 HDMI1/HDMI2/HDMI3   playback (iDisp1-3)
+  6  DMIC                   capture 48 kHz (2 ch with -2ch.tplg, 4 ch with -4ch.tplg)
+  7  DMIC16kHz              capture 16 kHz
+Headphone uses PCM 31 so no two output devices share one PCM. The codec's Auto-Mute picks speaker or
+headphone in hardware.
+Jack input devices are named "<card shortname> <jack>" (sound/core/jack.c), so "sof-hda-dsp Headphone",
+"sof-hda-dsp Mic" (the generic parser's label; "Headset Mic" or "Headphone Mic" when a fixup applies) and
+"sof-hda-dsp HDMI/DP,pcm=N". Check them with /proc/bus/input/devices (gb_audiodiag.sh dumps it).
+-->
+	<SoundCardName>hw:sofhdadsp</SoundCardName>
+	<HiFi>
+		<Speaker>
+			<PlaybackPCM>hw:sofhdadsp,0</PlaybackPCM>
+		</Speaker>
+		<Headphone>
+			<PlaybackPCM>hw:sofhdadsp,31</PlaybackPCM>
+			<JackDev>sof-hda-dsp Headphone</JackDev>
+			<JackSwitch>2</JackSwitch>
+		</Headphone>
+		<InternalMic>
+			<CapturePCM>hw:sofhdadsp,6</CapturePCM>
+			<IntrinsicSensitivity>-2600</IntrinsicSensitivity>
+			<RampUpMs>100</RampUpMs>
+		</InternalMic>
+		<Mic>
+			<CapturePCM>hw:sofhdadsp,0</CapturePCM>
+			<JackDev>sof-hda-dsp Mic</JackDev>
+		</Mic>
+		<HDMI1>
+			<PlaybackPCM>hw:sofhdadsp,3</PlaybackPCM>
+			<JackDev>sof-hda-dsp HDMI/DP,pcm=3</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI1>
+		<HDMI2>
+			<PlaybackPCM>hw:sofhdadsp,4</PlaybackPCM>
+			<JackDev>sof-hda-dsp HDMI/DP,pcm=4</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI2>
+		<HDMI3>
+			<PlaybackPCM>hw:sofhdadsp,5</PlaybackPCM>
+			<JackDev>sof-hda-dsp HDMI/DP,pcm=5</JackDev>
+			<PlaybackChannels>2</PlaybackChannels>
+		</HDMI3>
+	</HiFi>
+</audio_config>

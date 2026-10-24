@@ -1,0 +1,42 @@
+# gb_hw (source C:\GB-build\native\hw-gap-audit\tree\gb_hw.sh): Surface Book 3 native-mode hardware glue.
+# Native tree only (gb.hw=native): append to GB_RC_NATIVE (/odm/etc/init/gb.rc), install gb_hw.sh as /odm/gb_hw.sh.
+# 1. early-init: snapshot the firmware CPU package power limits (MSR 0x610) before lapis init.lapis.rc 'on init'
+#    overwrites them with the lapis board's PL1=25 W / PL2=55 W.
+# 2. on boot: put the firmware limits back (persist.vendor.gb.rapl.mode=fw|lapis|custom, default fw) and let the
+#    composer (user system) write any backlight (lapis only chowns intel_backlight).
+# 3. boot_completed: re-apply the limits once more and log a hardware summary to kmsg (picked up by gb_bootlog).
+service gb_hw_rapl_snap /system/bin/sh /odm/gb_hw.sh rapl-snapshot
+    user root
+    group root
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+service gb_hw_boot /system/bin/sh /odm/gb_hw.sh boot
+    user root
+    group root system
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+service gb_hw_diag /system/bin/sh /odm/gb_hw.sh diag
+    user root
+    group root system log readproc
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+on early-init
+    exec_start gb_hw_rapl_snap
+
+on boot
+    start gb_hw_boot
+
+on property:sys.boot_completed=1
+    start gb_hw_diag
+
+on property:persist.vendor.gb.rapl.mode=*
+    start gb_hw_boot
