@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Android Lint configuration for GbGpu (UI-02). Every suppression says why. -->
+<lint>
+    <!-- versionCode/versionName are injected by aapt2 link (its version-code option; epoch minutes, INTERFACES 13.1). -->
+    <issue id="MissingVersion" severity="ignore" />
+    <!-- targetSdkVersion 36 is mandated by INTERFACES 13.1 (lapis is API 37; 36 is the spec's choice). -->
+    <issue id="OldTargetApi" severity="ignore" />
+    <!-- No Gradle build exists (no Maven/Gradle downloads are allowed); these checks need one. -->
+    <issue id="GradleDependency" severity="ignore" />
+    <issue id="NewerVersionAvailable" severity="ignore" />
+    <!-- QUERY_ALL_PACKAGES is required by INTERFACES 13.2 v1.2 (decision D3): the app catalog of 24.3 must list every
+         launchable app with its ApplicationInfo flags and category, and the holder names of 12.3/27.4 come from any
+         package that holds the GPU. The app is not distributed through a store; the permission is normal level. -->
+    <issue id="QueryAllPackagesPermission" severity="ignore" />
+</lint>

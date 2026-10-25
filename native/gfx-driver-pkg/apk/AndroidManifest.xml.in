@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GbGfxDriver: per-app Vulkan driver package (Android "updatable graphics driver", ro.gfx.driver.0 in the native
+     /odm/etc/build.prop). No code: Android loads lib/x86_64/vulkan.intel.so (the shim: NVK first while
+     vendor.gb.gfx_active=nvidia, else the platform driver only) straight from this APK for the apps that
+     Settings.Global selects (updatable_driver_all_apps 0/3, ..._production_opt_in_apps, ..._production_opt_out_apps,
+     all written by gb_power through gb_notify; INTERFACES v1.2 section 24). Installed as a non-privileged system app
+     (/odm/app/GbGfxDriver) on every native image. The APK MUST NOT contain assets/allowlist.txt (INTERFACES 24.5).
+     @VERSION_CODE@ / @BUILD_TIME@ are filled in by build_apk.sh. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="gb.sb3.gfxdriver"
+    android:versionCode="@VERSION_CODE@"
+    android:versionName="1.0.@VERSION_CODE@">
+
+    <uses-sdk android:minSdkVersion="36" android:targetSdkVersion="36" />
+
+    <application
+        android:hasCode="false"
+        android:extractNativeLibs="false"
+        android:label="NVIDIA app graphics">
+        <meta-data
+            android:name="com.android.graphics.driver.build_time"
+            android:value="L@BUILD_TIME@" />
+    </application>
+</manifest>

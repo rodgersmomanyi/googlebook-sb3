@@ -1,0 +1,99 @@
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -995,46 +995,56 @@
+          }
+          assert(image->vk.drm_format_mod != DRM_FORMAT_MOD_INVALID);
+       }
+-
+-      if (image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR) {
+-         for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+-            VkFormat format = ycbcr_info ?
+-               ycbcr_info->planes[plane].format : image->vk.format;
+-            const uint8_t width_scale = ycbcr_info ?
+-               ycbcr_info->planes[plane].denominator_scales[0] : 1;
+-            const uint8_t height_scale = ycbcr_info ?
+-               ycbcr_info->planes[plane].denominator_scales[1] : 1;
+-
+-            struct nil_image_init_info tiled_shadow_nil_info = {
+-               .dim = vk_image_type_to_nil_dim(image->vk.image_type),
+-               .format = nil_format(nvk_format_to_pipe_format(format)),
+-               .modifier = DRM_FORMAT_MOD_INVALID,
+-               .extent_px = {
+-                  .width = image->vk.extent.width / width_scale,
+-                  .height = image->vk.extent.height / height_scale,
+-                  .depth = image->vk.extent.depth,
+-                  .array_len = image->vk.array_layers,
+-               },
+-               .levels = image->vk.mip_levels,
+-               .samples = image->vk.samples,
+-               .usage = usage & ~NIL_IMAGE_USAGE_LINEAR_BIT,
+-            };
+-
+-            bool ok = nil_image_init(&pdev->info,
+-                                     &image->linear_tiled_shadows[plane].nil,
+-                                     &tiled_shadow_nil_info);
+-            if (!ok)
+-               return vk_errorf(dev, VK_ERROR_UNKNOWN,
+-                                "Invalid image creation parameters");
+-
+-            /* These are always allocated by the driver so the offset
+-             * doesn't matter.
+-             */
+-            image->linear_tiled_shadows[plane].plane_offset_B = 0;
+-            image->linear_tiled_shadows[plane].plane_align_B =
+-               MAX2(image->linear_tiled_shadows[plane].nil.align_B,
+-                    pdev->nvkmd->bind_align_B);
+-         }
++   }
++
++   /* Rendering to a LINEAR image goes through a tiled shadow unless the
++    * attachment is aligned for direct linear rendering (see
++    * nvk_image_plane_aligned_for_linear_attachment()).  Besides explicit
++    * DRM-modifier images this covers Android swapchain (ANB) images: libvulkan
++    * creates them with VK_IMAGE_TILING_OPTIMAL around a gralloc buffer whose
++    * modifier is LINEAR, and their shadow used to be left zero-sized.
++    */
++   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR &&
++       (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
++        vk_image_is_android_native_buffer(&image->vk) ||
++        vk_image_is_android_hardware_buffer(&image->vk))) {
++      for (uint8_t plane = 0; plane < image->plane_count; plane++) {
++         VkFormat format = ycbcr_info ?
++            ycbcr_info->planes[plane].format : image->vk.format;
++         const uint8_t width_scale = ycbcr_info ?
++            ycbcr_info->planes[plane].denominator_scales[0] : 1;
++         const uint8_t height_scale = ycbcr_info ?
++            ycbcr_info->planes[plane].denominator_scales[1] : 1;
++
++         struct nil_image_init_info tiled_shadow_nil_info = {
++            .dim = vk_image_type_to_nil_dim(image->vk.image_type),
++            .format = nil_format(nvk_format_to_pipe_format(format)),
++            .modifier = DRM_FORMAT_MOD_INVALID,
++            .extent_px = {
++               .width = image->vk.extent.width / width_scale,
++               .height = image->vk.extent.height / height_scale,
++               .depth = image->vk.extent.depth,
++               .array_len = image->vk.array_layers,
++            },
++            .levels = image->vk.mip_levels,
++            .samples = image->vk.samples,
++            .usage = usage & ~NIL_IMAGE_USAGE_LINEAR_BIT,
++         };
++
++         bool ok = nil_image_init(&pdev->info,
++                                  &image->linear_tiled_shadows[plane].nil,
++                                  &tiled_shadow_nil_info);
++         if (!ok)
++            return vk_errorf(dev, VK_ERROR_UNKNOWN,
++                             "Invalid image creation parameters");
++
++         /* These are always allocated by the driver so the offset
++          * doesn't matter.
++          */
++         image->linear_tiled_shadows[plane].plane_offset_B = 0;
++         image->linear_tiled_shadows[plane].plane_align_B =
++            MAX2(image->linear_tiled_shadows[plane].nil.align_B,
++                 pdev->nvkmd->bind_align_B);
+       }
+    }
+ 

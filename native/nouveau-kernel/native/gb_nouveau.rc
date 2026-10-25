@@ -1,29 +1,100 @@
-# nouveau for the SB3 dGPU (NVIDIA TU117) -- OPT-IN, native tree only: append to GB_RC_NATIVE (/odm/etc/init/gb.rc).
-# Default (property unset): nouveau is NOT loaded; gb_power keeps every 10de function driverless with runtime PM auto
-# so the root port 00:1d.4 drops to D3cold and ACPI \_SB.PCI0.RP13.PRPD._OFF (HGOF) cuts the dGPU's power.
-#   setprop persist.vendor.gb.nouveau 1   -> load nouveau (runpm=1 modeset=2) now / at every boot after boot_completed
-#   setprop persist.vendor.gb.nouveau 0   -> unbind + unload it again
-#   persist.vendor.gb.nouveau.args        -> extra nouveau args, e.g. "config=NvGspRm=0" (non-GSP firmware path)
-# gb_power (native/power, merged + reviewed opt-in support) keeps a nouveau-bound dGPU bound while
-# persist.vendor.gb.nouveau=1, unbinds it before any base detach is confirmed, and cancels the detach if it cannot.
-# Files: /odm/vup/bin/gb_nouveau.sh (-> /vendor/bin/gb_nouveau.sh, 0755); /odm/lib/modules/{drm_exec,drm_gpuvm,
-# gpu-sched,drm_ttm_helper,nouveau}.ko (NOT in modules.load / modules.load.late); /odm/firmware/nvidia/tu117.
-service gb_nouveau /system/bin/sh /vendor/bin/gb_nouveau.sh
+# gb_nouveau.rc -- nouveau policy services for the SB3 dGPU (NVIDIA TU117). Native tree only: build_esp appends it
+# to the native gb.rc (/odm/etc/init/gb.rc) through inject\native\components\nouveau.json. Content below the header
+# is exactly INTERFACES.md v1.2 section 15.1-v12; behaviour is sections 7 and 25.3 (gb_nouveau.sh,
+# gb_dgpu_report.sh, gb_notify.sh).
+# Graphics mode persist.vendor.gb.gfx_mode (INTERFACES 22.2; set by GbGpu through gb_power, or by adb):
+#   unset or auto (default), nvidia -> gb_nouveau runs at boot_completed and loads nouveau whenever the keyboard base
+#                                     with the dGPU is attached (the first 3 clean boots are probation); a later
+#                                     switch to auto/nvidia after booted=1 starts it again (insmod or bind path)
+#   intel                           -> nothing is loaded at boot; after booted=1 the switch starts gb_nouveau_off
+#                                     (refcnt-gated unbind, then rmmod unless foreign)
+#   boot menu "e", append gb.nouveau=0 (kill switch) | gb.nouveau=once | gb.nouveau=test (or the [NVIDIA test] entry)
+# gb_gfx_selftest (the NVIDIA app-graphics self-test) is started only by gb_power and stopped by gb_power and off.
+# nouveau and its helpers are never in modules.load*; firmware/modules come from /odm (legacy) or the dGPU payload.
+on early-init
+    mkdir /dev/gb_dgpu 0700 root root
+
+on post-fs-data
+    mkdir /data/vendor/gb 0751 root shell
+    mkdir /data/vendor/gb/report 0750 root shell
+    mkdir /data/vendor/gb/notify 0770 root shell
+    mkdir /data/vendor/gb/payload 0700 root root
+    mkdir /data/vendor/gb/selftest 0700 root root
+
+service gb_nouveau /system/bin/sh /vendor/bin/gb_nouveau.sh auto
     user root
-    group root
+    group root shell
     seclabel u:r:shell:s0
     oneshot
     disabled
 
 service gb_nouveau_off /system/bin/sh /vendor/bin/gb_nouveau.sh off
     user root
-    group root
+    group root shell
     seclabel u:r:shell:s0
     oneshot
     disabled
 
-on property:sys.boot_completed=1 && property:persist.vendor.gb.nouveau=1
+service gb_dgpu_dmesg /system/bin/sh /vendor/bin/gb_nouveau.sh dmesg-stream
+    user root
+    group root shell log
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_dgpu_report /system/bin/sh /vendor/bin/gb_dgpu_report.sh report
+    user root
+    group root shell log readproc graphics
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_dgpu_test /system/bin/sh /vendor/bin/gb_dgpu_report.sh test
+    user root
+    group root shell log readproc graphics
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_gfx_selftest /system/bin/sh /vendor/bin/gb_dgpu_report.sh selftest
+    user root
+    group root shell log readproc graphics
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+service gb_notify /system/bin/sh /vendor/bin/gb_notify.sh
+    user shell
+    group shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
     start gb_nouveau
 
-on property:sys.boot_completed=1 && property:persist.vendor.gb.nouveau=0
+on property:vendor.gb.nouveau.booted=1 && property:persist.vendor.gb.gfx_mode=auto
+    start gb_nouveau
+
+on property:vendor.gb.nouveau.booted=1 && property:persist.vendor.gb.gfx_mode=nvidia
+    start gb_nouveau
+
+on property:vendor.gb.nouveau.booted=1 && property:persist.vendor.gb.gfx_mode=intel
     start gb_nouveau_off
+
+on property:vendor.gb.dgpu_report=1
+    setprop vendor.gb.dgpu_report 0
+    start gb_dgpu_report
+
+on property:vendor.gb.dgpu_report=2
+    setprop vendor.gb.dgpu_report 0
+    start gb_dgpu_test
+
+on property:vendor.gb.dgpu.dmesg=1
+    start gb_dgpu_dmesg
+
+on property:vendor.gb.dgpu.dmesg=0
+    stop gb_dgpu_dmesg
+
+on property:vendor.gb.notify=*
+    start gb_notify

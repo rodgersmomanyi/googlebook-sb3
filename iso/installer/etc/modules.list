@@ -1,0 +1,41 @@
+# Googlebook SB3 installer: kernel modules, loaded in this order by /init (modprobe -q; failures are logged and
+# never stop the boot). BUILD resolves every name with modprobe --show-depends (DESIGN.md 3.3).
+# storage: payload media and targets (VMware: nvme, ahci, pvscsi/mptspi/mptsas; Surface: nvme, xhci + uas/usb-storage)
+xhci_pci
+usb_storage
+uas
+vmd
+nvme
+ahci
+vmw_pvscsi
+mptspi
+mptsas
+# file systems: payload discovery and checks (ntfs3: read-only payload discovery on removable/USB disks only, 4.0.8)
+isofs
+exfat
+ntfs3
+nls_iso8859_1
+nls_utf8
+nls_ascii
+# input: USB keyboards (PS/2 is built in)
+hid
+hid_generic
+usbhid
+hid_multitouch
+hid_microsoft
+hid_logitech_dj
+hid_logitech_hidpp
+# Surface Book 3 base keyboard/touchpad: Surface Aggregator Module on the LPSS UART (GPIO irq: pinctrl_icelake)
+pinctrl_icelake
+intel_lpss_pci
+intel_lpss_acpi
+8250_dw
+surface_aggregator
+surface_aggregator_registry
+surface_aggregator_hub
+surface_hid_core
+surface_hid
+surface_kbd
+# Surface Book 3 power state for the AC check (4.0.15)
+surface_charger
+surface_battery

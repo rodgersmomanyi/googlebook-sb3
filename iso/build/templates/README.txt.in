@@ -1,0 +1,30 @@
+Googlebook SB3 installer - build @BUILD_ID@
+=============================================
+
+PERSONAL USE ONLY. This medium contains Google's proprietary Googlebook OS
+("lapis", Android @ANDROID_BUILD@) disk image for the owner's own Microsoft
+Surface Book 3. Do not share, upload or publish it.
+
+What it is: a UEFI x86_64 boot medium (GRUB + a small Linux installer) that
+can
+  1) write Googlebook OS to a whole disk (for example a USB stick),
+  2) install Googlebook OS next to Windows into unallocated space,
+  3) remove what option 2 added,
+  4) tools: shell, logs, payload verification, compare, save logs, reboot.
+
+Ways to use the .iso:
+  - Rufus: ISO mode (recommended) or DD mode, GPT + UEFI, stick >= 16 GB.
+  - Ventoy: copy the .iso to an exFAT (default) or NTFS Ventoy partition.
+    Not tested with real Ventoy; if its normal mode fails, use its GRUB2
+    mode, and keep the installer log (tools l / tools w).
+  - VMware: attach as a CD/DVD image (EFI firmware, Secure Boot off).
+
+Secure Boot must be OFF. Stay on AC power. On the Surface Book 3 keep the
+clipboard docked and plug the stick into the keyboard base. Have a wired USB
+keyboard at hand (plug it into the base) in case the base keyboard does not
+respond in the installer.
+
+Payload: gbsb3/ (manifest.json, marker, compressed partition images).
+The whole gbsb3 folder must be present for the installer to work.
+
+Full instructions: README-ISO.md next to the .iso on the build PC.

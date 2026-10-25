@@ -1,0 +1,15 @@
+on post-fs-data
+    mkdir /data/vendor/gb 0751 root shell
+    mkdir /data/vendor/gb/models 0775 root shell
+    mkdir /data/vendor/gb/compute 0700 nobody graphics
+
+service gb_gpu_compute /vendor/bin/gb_gpu_compute
+    user nobody
+    group graphics
+    seclabel u:r:shell:s0
+    socket gb_gpu_compute stream 0666 nobody graphics
+    setenv MESA_SHADER_CACHE_DIR /data/vendor/gb/compute/cache
+    setenv MESA_SHADER_CACHE_DISABLE false
+    oom_score_adjust 800
+    oneshot
+    disabled

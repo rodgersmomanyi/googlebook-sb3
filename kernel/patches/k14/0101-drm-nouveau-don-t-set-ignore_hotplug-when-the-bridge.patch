@@ -1,0 +1,94 @@
+From 1be55375f3a1887217db6a457f63103131346e40 Mon Sep 17 00:00:00 2001
+From: GB-build k14 <k14@builder.invalid>
+Date: Sun, 25 Oct 2026 12:00:00 +0000
+Subject: [PATCH 101/103] drm/nouveau: don't set ignore_hotplug when the bridge
+ has _PR3
+
+nouveau_pmops_runtime_suspend() calls pci_ignore_hotplug() on every
+runtime suspend.  The flag is never cleared again and is propagated to
+the upstream port: pciehp then ignores every later slot event of that
+port, and acpiphp's trim_stale_devices() treats the GPU as alive.  It is
+only needed when the GPU's power is cut behind the PCI core's back, i.e.
+the Optimus/_DSM path.
+
+When the upstream bridge may enter D3 and has ACPI power resources
+(_PR3), nouveau already skips the Optimus _DSM (nouveau_dsm_pci_probe())
+and the PCI core powers the slot down itself through the port's runtime
+PM, around which pciehp disables and re-checks its events.  On such
+platforms a genuine removal must still be seen; on the Surface Book 3
+the GPU sits in the detachable base and after one nouveau runtime
+suspend a later base removal is never handled.
+
+Skip pci_ignore_hotplug() in that case, as amdgpu did in commit
+ceb4de67c960 ("drm/amdgpu: no need to call pci_ignore_hotplug for
+_PR3"), and say once in the log which path is in use.  Only do so when
+pciehp really quiesces: it masks the slot interrupt across the port's
+D3cold only if the OS owns PME (pciehp_disable_interrupt()), otherwise
+the link-down would be handled as a removal.  Without native PCIe
+hotplug, pciehp is not involved and acpiphp only acts on ACPI
+notifications.  pci_find_host_bridge() is open-coded because it is not
+exported by this GKI kernel.
+
+Local patch N1 for the Googlebook SB3 k14 kernel (not upstream).
+---
+ drivers/gpu/drm/nouveau/nouveau_drm.c | 40 ++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index d05da2d..65ae3b8 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -1112,6 +1112,31 @@ nouveau_pmops_runtime(void)
+ 	return nouveau_runtime_pm == 1;
+ }
+ 
++/*
++ * True when the PCI core, not nouveau's _DSM path, cuts power to the GPU and the
++ * upstream port's hotplug driver copes with that:
++ *  - the bridge may enter D3 and has ACPI power resources (_PR3), the test
++ *    nouveau_dsm_pci_probe() uses to skip the Optimus _DSM, and
++ *  - the OS owns PME, so pciehp masks its slot interrupt while the port is
++ *    powered down (pciehp_disable_interrupt()), or PCIe native hotplug is not
++ *    in use at all (acpiphp only acts on ACPI notifications).
++ */
++static bool
++nouveau_pr3_power_managed(struct pci_dev *pdev)
++{
++	struct pci_dev *bridge = pci_upstream_bridge(pdev);
++	struct pci_bus *bus = pdev->bus;
++	struct pci_host_bridge *host;
++
++	if (!bridge || !bridge->bridge_d3 || !pci_pr3_present(bridge))
++		return false;
++
++	while (bus->parent)	/* pci_find_host_bridge(), which is not exported */
++		bus = bus->parent;
++	host = to_pci_host_bridge(bus->bridge);
++	return host->native_pme || !host->native_pcie_hotplug;
++}
++
+ static int
+ nouveau_pmops_runtime_suspend(struct device *dev)
+ {
+@@ -1128,7 +1153,20 @@ nouveau_pmops_runtime_suspend(struct device *dev)
+ 	ret = nouveau_do_suspend(drm, true);
+ 	pci_save_state(pdev);
+ 	pci_disable_device(pdev);
+-	pci_ignore_hotplug(pdev);
++	/*
++	 * pci_ignore_hotplug() is sticky: nothing clears it again, pciehp then
++	 * ignores every later event of the upstream port and acpiphp treats the
++	 * device as alive.  It is meant for GPUs whose power is cut behind the
++	 * PCI core's back (_DSM/Optimus).  With _PR3 on the upstream bridge the
++	 * PCI core powers the slot down itself and the hotplug drivers quiesce
++	 * around that, so keep hotplug enabled: a real removal (e.g. a detached
++	 * Surface Book base) must still be handled.  Same as amdgpu commit
++	 * ceb4de67c960 ("drm/amdgpu: no need to call pci_ignore_hotplug for _PR3").
++	 */
++	if (nouveau_pr3_power_managed(pdev))
++		dev_info_once(dev, "runtime PM through ACPI _PR3, hotplug left enabled\n");
++	else
++		pci_ignore_hotplug(pdev);
+ 	pci_set_power_state(pdev, PCI_D3cold);
+ 	drm->dev->switch_power_state = DRM_SWITCH_POWER_DYNAMIC_OFF;
+ 	return ret;

@@ -1,0 +1,126 @@
+--- a/src/nouveau/vulkan/nvk_android.c
++++ b/src/nouveau/vulkan/nvk_android.c
+@@ -18,7 +18,10 @@
+ #include "vk_device.h"
+ #include "vk_queue.h"
+ 
++#include "util/log.h"
+ #include "util/os_misc.h"
++#include "util/stack_array.h"
++#include "util/u_debug.h"
+ 
+ #include <hardware/gralloc.h>
+ #if ANDROID_API_LEVEL >= 26
+@@ -89,6 +92,86 @@
+ }
+ #endif
+ 
++/* Submits the wait semaphores and signals the queue's SYNC_FD-exportable
++ * anb_semaphore (destroyed by vk_queue_finish()), then exports it.  The
++ * signal operation's first synchronization scope is every command submitted to
++ * this queue before it, so the fence also covers rendering the app submitted
++ * without semaphores.  The sync_file wraps a nouveau dma_fence that the
++ * consumer (SurfaceFlinger's RenderEngine on ANV, which imports it with
++ * vkImportSemaphoreFdKHR) waits on.
++ */
++static VkResult
++nvk_android_release_sync_fd(struct vk_queue *queue,
++                            uint32_t waitSemaphoreCount,
++                            const VkSemaphore *pWaitSemaphores,
++                            int *pNativeFenceFd)
++{
++   struct vk_device *device = queue->base.device;
++   const VkDevice _device = vk_device_to_handle(device);
++   const VkQueue _queue = vk_queue_to_handle(queue);
++   VkResult result;
++
++   if (queue->anb_semaphore == VK_NULL_HANDLE) {
++      const VkExportSemaphoreCreateInfo export_info = {
++         .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
++         .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
++      };
++      const VkSemaphoreCreateInfo create_info = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++         .pNext = &export_info,
++      };
++      result = device->dispatch_table.CreateSemaphore(_device, &create_info,
++                                                      NULL,
++                                                      &queue->anb_semaphore);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   STACK_ARRAY(VkSemaphoreSubmitInfo, wait_infos, waitSemaphoreCount);
++   for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
++      wait_infos[i] = (VkSemaphoreSubmitInfo){
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++         .semaphore = pWaitSemaphores[i],
++         .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++      };
++   }
++   const VkSemaphoreSubmitInfo signal_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++      .semaphore = queue->anb_semaphore,
++      .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++   };
++   const VkSubmitInfo2 submit_info = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
++      .waitSemaphoreInfoCount = waitSemaphoreCount,
++      .pWaitSemaphoreInfos = wait_infos,
++      .signalSemaphoreInfoCount = 1,
++      .pSignalSemaphoreInfos = &signal_info,
++   };
++   result = device->dispatch_table.QueueSubmit2(_queue, 1, &submit_info,
++                                                VK_NULL_HANDLE);
++   STACK_ARRAY_FINISH(wait_infos);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkSemaphoreGetFdInfoKHR get_fd = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
++      .semaphore = queue->anb_semaphore,
++      .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
++   };
++   result = device->dispatch_table.GetSemaphoreFdKHR(_device, &get_fd,
++                                                     pNativeFenceFd);
++   if (result != VK_SUCCESS) {
++      /* The semaphore is still pending-signalled and a binary semaphore must
++       * not be signalled twice: drain the queue and start with a new one.
++       */
++      device->dispatch_table.QueueWaitIdle(_queue);
++      device->dispatch_table.DestroySemaphore(_device, queue->anb_semaphore,
++                                              NULL);
++      queue->anb_semaphore = VK_NULL_HANDLE;
++   }
++   return result;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ nvk_QueueSignalReleaseImageANDROID(VkQueue _queue,
+                                    uint32_t waitSemaphoreCount,
+@@ -99,7 +182,24 @@
+    VK_FROM_HANDLE(vk_queue, queue, _queue);
+    struct vk_device *device = queue->base.device;
+ 
+-   /* This is to workaround nouveau not supporting native_fence_fd cap. On
++   /* NVK_ANB_WAITIDLE (debug.mesa.nvk.anb.waitidle) = 1 restores the
++    * QueueWaitIdle() + -1 behaviour below for bring-up.
++    */
++   if (!debug_get_bool_option("NVK_ANB_WAITIDLE", false)) {
++      int fd = -1;
++      VkResult result = nvk_android_release_sync_fd(queue, waitSemaphoreCount,
++                                                    pWaitSemaphores, &fd);
++      if (result == VK_SUCCESS) {
++         *pNativeFenceFd = fd;
++         return VK_SUCCESS;
++      }
++      if (result == VK_ERROR_DEVICE_LOST)
++         return result;
++      mesa_logw("NVK: sync_fd release failed (%d), using QueueWaitIdle",
++                result);
++   }
++
++   /* Fallback.  This is to workaround nouveau not supporting native_fence_fd cap. On
+     * Android, the platform SurfaceFlinger RenderEngine has required
+     * EGL_ANDROID_native_fence_sync to import the sync file presented along
+     * with the wsi image when the sync fd is not -1.

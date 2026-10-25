@@ -1,18 +1,16 @@
 {
  "name": "nvk",
+ "source": "${GB_BUILD}\\native\\nvk-android",
  "files": [
-  {
-   "src": "${GB_BUILD}\\native\\nvk-android\\bin\\vulkan.nouveau.so",
-   "dest": "vup/lib64/hw/vulkan.nouveau.so",
-   "mode": "0644"
-  },
-  {
-   "src": "${GB_BUILD}\\native\\nvk-android\\bin\\nvk_probe",
-   "dest": "vup/bin/nvk_probe",
-   "mode": "0755"
-  }
+  {"src": "${GB_BUILD}\\native\\nvk-android\\bin\\nvk_probe", "dest": "vup/bin/nvk_probe", "mode": "0755"}
  ],
- "rc_files": [],
- "rc_text": "# NVK test only - NVK is never the system Vulkan driver (ro.hardware.vulkan stays intel). Native tree only.\n# Prerequisite: persist.vendor.gb.nouveau=1 (gb_power leaves the dGPU on nouveau), base attached.\nservice gb_nvk_probe /system/bin/sh -c \"/vendor/bin/nvk_probe -n 200 -o /data/vendor/nvk/probe.ppm > /data/vendor/nvk/probe.txt 2>&1; echo nvk_probe exit=$$? >> /data/vendor/nvk/probe.txt\"\n    user root\n    group root graphics\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\non post-fs-data\n    mkdir /data/vendor/nvk 0775 root shell\n\non property:vendor.gb.nvk_probe=1\n    setprop vendor.gb.nvk_probe 0\n    start gb_nvk_probe",
+ "payload": [
+  {"src": "${GB_BUILD}\\native\\nvk-android\\bin\\vulkan.nouveau.so", "dest": "lib64/hw/vulkan.nouveau.so", "mode": "0644"}
+ ],
+ "symlinks": [
+  {"dest": "vup/lib64/hw/vulkan.nouveau.so", "target": "/odm/dgpu/lib64/hw/vulkan.nouveau.so"}
+ ],
+ "rc_files": ["${GB_BUILD}\\native\\nvk-android\\gb_nvk.rc"],
+ "rc_text": "",
  "build_prop": []
 }

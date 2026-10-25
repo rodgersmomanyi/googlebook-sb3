@@ -1,0 +1,12 @@
+{
+ "name": "gpu_ui",
+ "source": "${GB_BUILD}\\native\\gpu-ui",
+ "files": [
+  {"src": "${GB_BUILD}\\native\\gpu-ui\\out\\GbGpu.apk", "dest": "app/GbGpu/GbGpu.apk", "mode": "0644"},
+  {"src": "${GB_BUILD}\\native\\gpu-ui\\gb_gpu_ui_setup.sh", "dest": "vup/bin/gb_gpu_ui_setup.sh", "mode": "0755"},
+  {"src": "${GB_BUILD}\\native\\gpu-ui\\gfx_app_prefs.default", "dest": "etc/gb/gfx_app_prefs.default", "mode": "0644"}
+ ],
+ "rc_files": ["${GB_BUILD}\\native\\gpu-ui\\gb_gpu_ui.rc"],
+ "rc_text": "",
+ "build_prop": []
+}

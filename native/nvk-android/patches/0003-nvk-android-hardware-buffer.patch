@@ -1,0 +1,318 @@
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -24,6 +24,20 @@
+ #include "clc197.h"
+ #include "clc597.h"
+ #include "clcd97.h"
++
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++/* AHB images are created deferred and laid out from the buffer at bind time */
++static const VkExternalMemoryProperties nvk_ahb_mem_props = {
++   .externalMemoryFeatures =
++      VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT |
++      VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
++      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++   .exportFromImportedHandleTypes =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++   .compatibleHandleTypes =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++};
++#endif
+ 
+ static bool
+ nvk_use_separate_zs(const struct nvk_physical_device *pdev, VkFormat vk_format)
+@@ -590,6 +604,25 @@
+          ext_mem_props = &nvk_dma_buf_mem_props;
+          break;
+ 
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID: {
++         VkResult result = vk_android_get_ahb_image_properties(
++            physicalDevice, pImageFormatInfo, pImageFormatProperties);
++         if (result != VK_SUCCESS)
++            return result;
++
++         /* The image gets a LINEAR DRM-modifier layout from the AHB at bind
++          * time (vk_android_init_deferred_image), which NIL only supports as a
++          * single-level, single-layer, single-sample 2D image.
++          */
++         ext_mem_props = &nvk_ahb_mem_props;
++         maxMipLevels = 1;
++         maxArraySize = 1;
++         sampleCounts = VK_SAMPLE_COUNT_1_BIT;
++         break;
++      }
++#endif
++
+       default:
+          /* From the Vulkan 1.3.256 spec:
+           *
+@@ -846,14 +879,30 @@
+    return true;
+ }
+ 
++/* nvk_image_init() without vk_image_init(): lets an AHB image that was created
++ * deferred (vk_android_init_deferred_image) be laid out at bind time without
++ * re-initialising its vk_image (object base, private data, deferred info).
++ */
++static VkResult
++nvk_image_init_layout(struct nvk_device *dev,
++                      struct nvk_image *image,
++                      const VkImageCreateInfo *pCreateInfo);
++
+ static VkResult
+ nvk_image_init(struct nvk_device *dev,
+                struct nvk_image *image,
+                const VkImageCreateInfo *pCreateInfo)
+ {
++   vk_image_init(&dev->vk, &image->vk, pCreateInfo);
++   return nvk_image_init_layout(dev, image, pCreateInfo);
++}
++
++static VkResult
++nvk_image_init_layout(struct nvk_device *dev,
++                      struct nvk_image *image,
++                      const VkImageCreateInfo *pCreateInfo)
++{
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+-
+-   vk_image_init(&dev->vk, &image->vk, pCreateInfo);
+ 
+    nil_image_usage_flags usage = 0;
+    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR)
+@@ -1302,6 +1351,35 @@
+                                                pImage);
+    }
+ 
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++   /* AHB images: the layout comes from the buffer, which is only known at
++    * vkBindImageMemory2 time (nvk_android_ahb_image_init()).
++    */
++   const VkExternalMemoryImageCreateInfo *ext_info =
++      vk_find_struct_const(pCreateInfo->pNext,
++                           EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
++   if (ext_info != NULL &&
++       (ext_info->handleTypes &
++        VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)) {
++      image = vk_zalloc2(&dev->vk.alloc, pAllocator, sizeof(*image), 8,
++                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++      if (!image)
++         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++      vk_image_init(&dev->vk, &image->vk, pCreateInfo);
++      result = vk_android_init_deferred_image(&dev->vk, &image->vk,
++                                              pCreateInfo, pAllocator);
++      if (result != VK_SUCCESS) {
++         vk_image_finish(&image->vk);
++         vk_free2(&dev->vk.alloc, pAllocator, image);
++         return vk_error(dev, result);
++      }
++
++      *pImage = nvk_image_to_handle(image);
++      return VK_SUCCESS;
++   }
++#endif
++
+    image = vk_zalloc2(&dev->vk.alloc, pAllocator, sizeof(*image), 8,
+                       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    if (!image)
+@@ -1406,7 +1484,11 @@
+       switch (sType) {
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *dedicated = ext;
+-         if (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++         if (vk_image_is_android_hardware_buffer(&image->vk)) {
++            /* VK_ANDROID_external_memory_android_hardware_buffer */
++            dedicated->prefersDedicatedAllocation = true;
++            dedicated->requiresDedicatedAllocation = true;
++         } else if (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+              image->vk.drm_format_mod != DRM_FORMAT_MOD_LINEAR) {
+             dedicated->prefersDedicatedAllocation = true;
+             dedicated->requiresDedicatedAllocation = true;
+@@ -1696,6 +1778,45 @@
+    return VK_SUCCESS;
+ }
+ 
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++static VkResult
++nvk_android_ahb_image_init(struct nvk_device *dev,
++                           struct nvk_image *image,
++                           struct AHardwareBuffer *ahb)
++{
++   const VkImageCreateInfo *deferred = image->vk.android_deferred_create_info;
++   VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info;
++   VkSubresourceLayout layouts[NVK_MAX_IMAGE_PLANES];
++
++   VkResult result = vk_android_get_ahb_layout(ahb, &mod_info, layouts,
++                                               NVK_MAX_IMAGE_PLANES);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* Same rule as for gralloc ANB imports: NIL panics on foreign modifiers. */
++   if (mod_info.drmFormatModifier != DRM_FORMAT_MOD_LINEAR &&
++       !fourcc_mod_is_vendor(mod_info.drmFormatModifier, NVIDIA)) {
++      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "AHB has DRM modifier 0x%016llx; NVK can only import "
++                       "LINEAR or NVIDIA modifiers",
++                       (unsigned long long)mod_info.drmFormatModifier);
++   }
++
++   const VkExternalMemoryImageCreateInfo ext_info = {
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++      .pNext = deferred->pNext,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   mod_info.pNext = &ext_info;
++
++   VkImageCreateInfo create_info = *deferred;
++   create_info.pNext = &mod_info;
++   assert(create_info.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
++
++   return nvk_image_init_layout(dev, image, &create_info);
++}
++#endif
++
+ static VkResult
+ nvk_bind_image_memory(struct nvk_device *dev,
+                       const VkBindImageMemoryInfo *info)
+@@ -1712,6 +1833,19 @@
+       /* We do the actual bind the end of CreateImage() */
+       assert(mem == NULL);
+       return VK_SUCCESS;
++   }
++#endif
++
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++   /* Deferred AHB image (nvk_CreateImage): lay it out from the buffer now. */
++   if (image->vk.android_deferred_create_info != NULL &&
++       image->plane_count == 0) {
++      if (mem == NULL || mem->vk.ahardware_buffer == NULL)
++         return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++      result = nvk_android_ahb_image_init(dev, image,
++                                          mem->vk.ahardware_buffer);
++      if (result != VK_SUCCESS)
++         return result;
+    }
+ #endif
+ 
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -324,6 +324,10 @@
+       .AMD_buffer_marker = true,
+ #if DETECT_OS_ANDROID
+       .ANDROID_native_buffer = vk_android_get_ugralloc() != NULL,
++#if ANDROID_API_LEVEL >= 26
++      .ANDROID_external_memory_android_hardware_buffer =
++         vk_android_get_ugralloc() != NULL,
++#endif
+ #endif
+       .GOOGLE_decorate_string = true,
+ #ifdef NVK_USE_WSI_PLATFORM
+--- a/src/nouveau/vulkan/nvk_buffer.c
++++ b/src/nouveau/vulkan/nvk_buffer.c
+@@ -11,6 +11,9 @@
+ #include "nvk_physical_device.h"
+ #include "nvk_queue.h"
+ #include "nvkmd/nvkmd.h"
++
++#include "util/detect_os.h"
++#include "vk_android.h"
+ 
+ #define NVK_BUFFER_CREATE_CAPTURE_REPLAY_BITS \
+    (VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT | \
+@@ -240,6 +243,12 @@
+       pExternalBufferProperties->externalMemoryProperties =
+          nvk_dma_buf_mem_props;
+       return;
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
++      vk_android_get_ahb_buffer_properties(physicalDevice, pExternalBufferInfo,
++                                           pExternalBufferProperties);
++      return;
++#endif
+    default:
+       goto unsupported;
+    }
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -10,7 +10,12 @@
+ #include "nvk_physical_device.h"
+ #include "nvkmd/nvkmd.h"
+ 
++#include "util/detect_os.h"
+ #include "util/u_atomic.h"
++
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++#include <vndk/hardware_buffer.h>
++#endif
+ 
+ #include <inttypes.h>
+ #include <sys/mman.h>
+@@ -157,6 +162,28 @@
+    if (fd_info != NULL)
+       handle_types |= fd_info->handleType;
+ 
++   int import_fd = (fd_info != NULL && fd_info->handleType) ? fd_info->fd : -1;
++   bool is_ahb = false;
++#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++   /* AHB import (VkImportAndroidHardwareBufferInfoANDROID) and AHB export
++    * allocations: vk_device_memory_create() has already acquired or allocated
++    * mem->vk.ahardware_buffer.  Import its dma-buf; the AHB keeps owning that
++    * fd, so it is not closed below.
++    */
++   if (mem->vk.ahardware_buffer != NULL) {
++      const native_handle_t *handle =
++         AHardwareBuffer_getNativeHandle(mem->vk.ahardware_buffer);
++      if (handle == NULL || handle->numFds < 1) {
++         result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++         goto fail_alloc;
++      }
++      import_fd = handle->data[0];
++      is_ahb = true;
++      handle_types |=
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
++   }
++#endif
++
+    const bool not_shared = handle_types == 0;
+    bool pinned_to_vram = false;
+ 
+@@ -172,7 +199,8 @@
+ 
+       mem->dedicated_image = image;
+ 
+-      if (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++      if (!is_ahb &&
++          image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+           image->vk.drm_format_mod != DRM_FORMAT_MOD_LINEAR) {
+          /* This image might be shared with GL so we need to set the BO flags
+           * such that GL can bind and use it.
+@@ -209,15 +237,16 @@
+    const uint64_t aligned_size =
+       align64(pAllocateInfo->allocationSize, alignment);
+ 
+-   const bool is_import = fd_info && fd_info->handleType;
++   const bool is_import = import_fd >= 0;
+    if (is_import) {
+-      assert(fd_info->handleType ==
++      assert(is_ahb ||
++             fd_info->handleType ==
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+              fd_info->handleType ==
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+ 
+       result = nvkmd_dev_import_dma_buf(dev->nvkmd, &dev->vk.base,
+-                                        fd_info->fd, &mem->mem);
++                                        import_fd, &mem->mem);
+       if (result != VK_SUCCESS)
+          goto fail_alloc;
+ 
+@@ -289,7 +318,7 @@
+       }
+    }
+ 
+-   if (fd_info && fd_info->handleType) {
++   if (fd_info && fd_info->handleType && !is_ahb) {
+       /* From the Vulkan spec:
+        *
+        *    "Importing memory from a file descriptor transfers ownership of

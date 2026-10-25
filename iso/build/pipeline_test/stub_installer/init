@@ -1,0 +1,68 @@
+#!/bin/sh
+# Googlebook ISO PIPELINE-TEST STUB /init. This is NOT the installer and writes nothing to any disk: it shows
+# that the kernel, the initramfs packaging (busybox, Python, tools, modules, fonts) and the payload medium work,
+# prints "GBSTUB ..." lines on ttyS0 and the console, then powers off.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+[ -e /proc/self ] || mount -t proc proc /proc
+grep -q ' /sys ' /proc/mounts || mount -t sysfs sys /sys
+grep -q ' /dev ' /proc/mounts || mount -t devtmpfs dev /dev
+mount -t tmpfs -o mode=0755 run /run
+mount -t tmpfs tmp /tmp
+say() { echo "GBSTUB $*" > /dev/ttyS0 2>/dev/null; echo "GBSTUB $*" > /dev/console 2>/dev/null; }
+. /etc/gb/build.env
+say "init build=$GB_BUILD_ID kernel=$(uname -r) pid1=$(readlink /proc/1/exe)"
+say "cmdline $(cat /proc/cmdline)"
+ok=0
+bad=""
+while read -r m; do
+  case "$m" in ""|"#"*) continue ;; esac
+  if modprobe -q "$m" 2>/dev/null; then ok=$((ok + 1)); else bad="$bad $m"; fi
+done < /etc/gb/modules.list
+say "modules loaded=$ok failed=${bad:- none}"
+say "selftest $(python3 -I -B /opt/gb/lib/gbinstall.py --selftest 2>&1 | tail -n 1)"
+miss=""
+for p in $(sed -n 's/^bin[[:space:]][[:space:]]*//p' /etc/gb/initramfs.list); do
+  "$p" --version >/dev/null 2>&1 </dev/null
+  [ $? = 127 ] && miss="$miss $p"
+done
+say "tools missing=${miss:- none}"
+say "fb0 $(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null || echo none)"
+font=kernel
+for f in /usr/share/consolefonts/gb-ter-32x64.psf /usr/share/consolefonts/Lat15-TerminusBold32x16.psf.gz \
+         /usr/share/consolefonts/Lat15-Terminus16.psf.gz; do
+  if e=$(setfont -C /dev/tty1 "$f" 2>&1); then font=$f; break; fi
+  say "setfont $f failed: $e"
+done
+say "font $font size $(stty size < /dev/tty1 2>/dev/null)"
+mkdir -p /mnt/p
+found=no
+i=0
+while [ $i -lt 15 ] && [ $found = no ]; do
+  for d in /sys/class/block/*; do
+    k=${d##*/}
+    case "$k" in loop*|ram*|zram*) continue ;; esac
+    # whole-device rule: a disk with kernel partitions is not probed itself
+    if [ -d "/sys/block/$k" ] && ls -d "/sys/block/$k/$k"* >/dev/null 2>&1; then continue; fi
+    [ "$(blkid -p -o value -s LABEL "/dev/$k" 2>/dev/null)" = GBSB3INST ] || continue
+    t=$(blkid -p -o value -s TYPE "/dev/$k")
+    mount -t "$t" -o ro "/dev/$k" /mnt/p 2>/dev/null || continue
+    mk=/mnt/p/gbsb3/GBSB3-$GB_BUILD_ID.marker
+    if [ -f "$mk" ]; then
+      want=$(sed -n 's/^manifest_sha256=//p' "$mk")
+      have=$(sha256sum /mnt/p/gbsb3/manifest.json | cut -d' ' -f1)
+      z=bad
+      zstd -t -q --long=27 /mnt/p/gbsb3/parts/esp-usb.000.zst && z=ok
+      say "payload dev=/dev/$k type=$t marker=ok manifest_sha=$([ "$want" = "$have" ] && echo ok || echo BAD) zstd=$z"
+      found=yes
+    fi
+    umount /mnt/p
+    [ $found = yes ] && break
+  done
+  i=$((i + 1))
+  [ $found = no ] && sleep 1
+done
+[ $found = yes ] || say "payload NOT FOUND"
+say "DONE"
+sync
+poweroff -f

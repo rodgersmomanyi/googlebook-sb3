@@ -1,0 +1,47 @@
+set gb_build=@BUILD_ID@
+set timeout=10
+set timeout_style=menu
+set default=gb_normal
+insmod all_video
+insmod smbios
+set gb_vm=0
+if smbios --type 1 --get-string 4 --set gb_vendor; then
+  if [ "$gb_vendor" = "VMware, Inc." ]; then set gb_vm=1; fi
+fi
+if [ "$gb_vm" = "1" ]; then
+  if serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1; then
+    terminal_input console serial
+    terminal_output console serial
+  fi
+fi
+set gb_args="gb.build=${gb_build} loglevel=4 panic=0 reboot=pci iommu.passthrough=1 efi_pstore.pstore_disable=1 initcall_blacklist=init_tis,crb_acpi_driver_init"
+
+menuentry "Googlebook SB3 installer" --id gb_normal --hotkey=n {
+  set gfxpayload=keep
+  linux /boot/vmlinuz ${gb_args} console=tty0
+  initrd /boot/initrd.img
+}
+menuentry "Googlebook SB3 installer (basic display: nomodeset, kernel font)" --id gb_basic --hotkey=b {
+  linux /boot/vmlinuz ${gb_args} console=tty0 nomodeset gb.font=kernel
+  initrd /boot/initrd.img
+}
+if [ "$gb_vm" = "1" ]; then
+  menuentry "TEST: installer on serial console ttyS0" --id gb_serial --hotkey=s {
+    set gfxpayload=keep
+    linux /boot/vmlinuz ${gb_args} console=ttyS0,115200n8 console=tty0 gb.serial=1
+    initrd /boot/initrd.img
+  }
+  menuentry "TEST: serial console, ISO9660 volume discovery off" --id gb_serial_nocd --hotkey=d {
+    set gfxpayload=keep
+    linux /boot/vmlinuz ${gb_args} console=ttyS0,115200n8 console=tty0 gb.serial=1 gb.discover=marker,isofile
+    initrd /boot/initrd.img
+  }
+  menuentry "TEST: serial console, ISO9660 discovery off, NTFS on any disk" --id gb_serial_ntfs --hotkey=t {
+    set gfxpayload=keep
+    linux /boot/vmlinuz ${gb_args} console=ttyS0,115200n8 console=tty0 gb.serial=1 gb.discover=marker,isofile gb.ntfs_any=1
+    initrd /boot/initrd.img
+  }
+fi
+menuentry "UEFI firmware setup" --id gb_fwsetup --hotkey=f { insmod efifwsetup; fwsetup }
+menuentry "Reboot" --id gb_reboot --hotkey=r { reboot }
+menuentry "Power off" --id gb_halt --hotkey=p { halt }

@@ -1,0 +1,320 @@
+#!/bin/sh
+# Googlebook SB3 installer: /init of the installer initramfs (busybox sh, PID 1). DESIGN.md 3.4 / 3.5.
+#
+# 1 mounts (each only if missing: under Ventoy's normal mode this script is exec'd by Ventoy's own init, which may
+#   have mounted /proc, /sys and /dev already), efivarfs read-only; 2 kernel parameters -> /run/gb/cmdline.env;
+# 3 kernel modules, console font; 4 UI console; 5 printk; 6 /etc/inittab; 7 exec busybox init.
+# Everything is logged to /run/gb/log/init.log. This script never touches a disk.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 022
+
+GB_LOG=""
+GB_LOGBUF=""
+GB_DEBUG=0
+
+log() {
+    _line="$(date -u +%Y-%m-%dT%H:%M:%SZ) INFO $*"
+    if [ -n "$GB_LOG" ]; then
+        printf '%s\n' "$_line" >>"$GB_LOG"
+    else
+        GB_LOGBUF="${GB_LOGBUF}${_line}
+"
+    fi
+}
+
+log_cmd() {
+    # log_cmd <title> <command...>: the command's output into the log
+    _title=$1
+    shift
+    log "---- $_title"
+    if [ -n "$GB_LOG" ]; then
+        "$@" >>"$GB_LOG" 2>&1
+    fi
+}
+
+fatal() {
+    echo "Googlebook installer: fatal init error: $*" >/dev/console 2>&1 || echo "fatal init error: $*"
+    log "FATAL: $*"
+    if [ "$GB_DEBUG" = 1 ]; then
+        echo "gb.debug=1: dropping to a shell" >/dev/console 2>&1
+        exec /bin/sh </dev/console >/dev/console 2>&1
+    fi
+    echo "Hold the power button to switch off." >/dev/console 2>&1
+    while :; do
+        sleep 3600
+    done
+}
+
+# this script only ever runs as PID 1 of the installer initramfs
+if [ "$$" != 1 ] || [ ! -f /etc/gb-installer-release ]; then
+    echo "init: not PID 1 of the Googlebook installer initramfs - refusing"
+    exit 1
+fi
+
+is_mounted() {
+    [ -r /proc/mounts ] || return 1
+    while read -r _dev _mp _rest; do
+        if [ "$_mp" = "$1" ]; then
+            return 0
+        fi
+    done </proc/mounts
+    return 1
+}
+
+mount_if_missing() {
+    # mount_if_missing <fstype> <source> <mountpoint> [options]
+    if is_mounted "$3"; then
+        log "mount: $3 already mounted (kept)"
+        return 0
+    fi
+    mkdir -p "$3"
+    if [ -n "$4" ]; then
+        _err=$(mount -t "$1" -o "$4" "$2" "$3" 2>&1)
+    else
+        _err=$(mount -t "$1" "$2" "$3" 2>&1)
+    fi
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        log "mount -t $1 $2 $3 failed ($_rc): $_err"
+        return 1
+    fi
+    log "mounted $1 on $3"
+    return 0
+}
+
+# ------------------------------------------------------------------------------------------------ 1 mounts
+if [ ! -e /proc/self ]; then
+    mkdir -p /proc
+    if mount -t proc proc /proc; then
+        log "mounted proc on /proc"
+    else
+        log "mount -t proc proc /proc failed"
+    fi
+else
+    log "mount: /proc already mounted (kept)"
+fi
+mount_if_missing sysfs sys /sys
+mount_if_missing devtmpfs dev /dev
+mkdir -p /dev/pts
+mount_if_missing devpts devpts /dev/pts
+mount_if_missing tmpfs run /run mode=0755
+mount_if_missing tmpfs tmp /tmp
+if [ -d /sys/firmware/efi ]; then
+    if is_mounted /sys/firmware/efi/efivars; then
+        if mount -o remount,ro,nosuid,nodev,noexec /sys/firmware/efi/efivars; then
+            log "efivarfs remounted read-only"
+        else
+            log "efivarfs read-only remount failed"
+        fi
+    else
+        mount_if_missing efivarfs efivarfs /sys/firmware/efi/efivars ro,nosuid,nodev,noexec
+    fi
+else
+    log "no /sys/firmware/efi (not booted by UEFI)"
+fi
+mkdir -p /run/gb/log /run/gb/probe /run/gb/backup /run/gb/state || fatal "cannot create /run/gb"
+GB_LOG=/run/gb/log/init.log
+printf '%s' "$GB_LOGBUF" >>"$GB_LOG"
+GB_LOGBUF=""
+log "Googlebook SB3 installer init: $(cat /etc/gb-installer-release 2>/dev/null)"
+log_cmd "/proc/cmdline" cat /proc/cmdline
+log_cmd "/proc/mounts" cat /proc/mounts
+log_cmd "ls -l /dev/mapper" ls -l /dev/mapper
+if [ -e /ventoy ]; then
+    log_cmd "ls -la /ventoy (ignored)" ls -la /ventoy
+fi
+log "realpath /proc/1/exe: $(realpath /proc/1/exe 2>/dev/null)"
+
+# ------------------------------------------------------------------------------------------------ 2 kernel parameters
+GB_SERIAL=0
+GB_DISCOVER=""
+GB_FONT=auto
+GB_NTFS_ANY=0
+GB_CMDLINE=""
+read -r GB_CMDLINE </proc/cmdline
+set -f
+for w in $GB_CMDLINE; do
+    case "$w" in
+        gb.serial=1) GB_SERIAL=1 ;;
+        gb.discover=*) GB_DISCOVER=${w#gb.discover=} ;;
+        gb.font=*) GB_FONT=${w#gb.font=} ;;
+        gb.debug=1) GB_DEBUG=1 ;;
+        gb.ntfs_any=1) GB_NTFS_ANY=1 ;;
+    esac
+done
+set +f
+case "$GB_DISCOVER" in
+    *[!a-z0-9,]*) log "gb.discover value with unexpected characters ignored"; GB_DISCOVER="" ;;
+esac
+case "$GB_FONT" in
+    auto|32x64|16x32|8x16|kernel) ;;
+    *) log "gb.font=$GB_FONT unknown: auto"; GB_FONT=auto ;;
+esac
+{
+    echo "GB_SERIAL=$GB_SERIAL"
+    echo "GB_DISCOVER=$GB_DISCOVER"
+    echo "GB_FONT=$GB_FONT"
+    echo "GB_DEBUG=$GB_DEBUG"
+    echo "GB_NTFS_ANY=$GB_NTFS_ANY"
+} >/run/gb/cmdline.env
+
+# ------------------------------------------------------------------------------------------------ 3 modules
+if [ -r /etc/gb/modules.list ]; then
+    while read -r _mod _rest; do
+        case "$_mod" in
+            ''|'#'*) continue ;;
+        esac
+        if _err=$(/sbin/modprobe -q "$_mod" 2>&1); then
+            log "modprobe $_mod: ok"
+        else
+            log "modprobe $_mod: failed $_err"
+        fi
+    done </etc/gb/modules.list
+else
+    log "no /etc/gb/modules.list"
+fi
+if echo /sbin/modprobe >/proc/sys/kernel/modprobe; then
+    log "kernel module helper: /sbin/modprobe"
+fi
+# input devices (names and handlers only; the U:/uniq lines can carry serial numbers and are never logged) and the
+# power supplies' type/online/status, so that a real-hardware run shows whether the keyboard and charger drivers bound
+sleep 1
+log_cmd "input devices (N:/H: lines)" grep -E '^(N|H):' /proc/bus/input/devices
+for _ps in /sys/class/power_supply/*; do
+    [ -d "$_ps" ] || continue
+    log "power supply ${_ps##*/}: type=$(cat "$_ps/type" 2>/dev/null) online=$(cat "$_ps/online" 2>/dev/null) status=$(cat "$_ps/status" 2>/dev/null)"
+done
+
+# console font (3.5)
+font_file() {
+    case "$1" in
+        3) echo /usr/share/consolefonts/gb-ter-32x64.psf ;;
+        2) echo /usr/share/consolefonts/Lat15-TerminusBold32x16.psf.gz ;;
+        1) echo /usr/share/consolefonts/Lat15-Terminus16.psf.gz ;;
+    esac
+}
+
+font_fits() {
+    # font_fits <file>: set the font on tty1 and check that 80x24 still fit
+    if ! setfont -C /dev/tty1 "$1" >/dev/null 2>&1; then
+        log "setfont $1 failed"
+        return 1
+    fi
+    _size=$(stty size </dev/tty1 2>/dev/null)
+    FONT_ROWS=${_size% *}
+    FONT_COLS=${_size#* }
+    case "$FONT_ROWS$FONT_COLS" in
+        ''|*[!0-9]*) log "stty size after $1: '$_size'"; return 1 ;;
+    esac
+    if [ "$FONT_ROWS" -lt 24 ] || [ "$FONT_COLS" -lt 80 ]; then
+        log "font $1 gives ${FONT_COLS}x${FONT_ROWS}: too small"
+        return 1
+    fi
+    return 0
+}
+
+fbcon_bound() {
+    for _vc in /sys/class/vtconsole/vtcon*; do
+        if grep -q 'frame buffer' "$_vc/name" 2>/dev/null && [ "$(cat "$_vc/bind" 2>/dev/null)" = 1 ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Ubuntu's kernel defers the framebuffer console takeover until the first text reaches the console
+# (CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER); until then tty1 is the dummy console, where setfont fails.
+# Write one line to tty1 and wait (<= 3 s) for fbcon to bind before choosing the font.
+if [ -e /sys/class/graphics/fb0 ]; then
+    printf '\nGooglebook SB3 installer: starting ...\n' >/dev/tty1 2>/dev/null
+    _i=0
+    while [ "$_i" -lt 30 ] && ! fbcon_bound; do
+        sleep 0.1 2>/dev/null || sleep 1
+        _i=$((_i + 1))
+    done
+    if fbcon_bound; then
+        log "framebuffer console bound"
+    else
+        log "framebuffer console not bound after 3 s"
+    fi
+fi
+VSIZE=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)
+FB_W=${VSIZE%,*}
+FB_H=${VSIZE#*,}
+case "$FB_W$FB_H" in
+    ''|*[!0-9]*) FB_W=0; FB_H=0 ;;
+esac
+FONT_LEVEL=0
+case "$GB_FONT" in
+    kernel) FONT_LEVEL=0 ;;
+    32x64) FONT_LEVEL=3 ;;
+    16x32) FONT_LEVEL=2 ;;
+    8x16) FONT_LEVEL=1 ;;
+    *)
+        if [ -z "$VSIZE" ] || [ "$FB_W" -eq 0 ]; then
+            FONT_LEVEL=0
+        elif [ "$FB_W" -ge 2560 ] && [ "$FB_H" -ge 1536 ]; then
+            FONT_LEVEL=3
+        elif [ "$FB_W" -ge 1280 ] && [ "$FB_H" -ge 768 ]; then
+            FONT_LEVEL=2
+        else
+            FONT_LEVEL=1
+        fi
+        ;;
+esac
+FONT_USED=kernel
+while [ "$FONT_LEVEL" -gt 0 ]; do
+    _f=$(font_file "$FONT_LEVEL")
+    if [ -r "$_f" ] && font_fits "$_f"; then
+        FONT_USED=${_f##*/}
+        break
+    fi
+    FONT_LEVEL=$((FONT_LEVEL - 1))
+done
+_size=$(stty size </dev/tty1 2>/dev/null)
+log "framebuffer ${FB_W}x${FB_H} font=$FONT_USED cols=${_size#* } rows=${_size% *}"
+
+# ------------------------------------------------------------------------------------------------ 4 UI console
+GB_UI=tty1
+if [ "$GB_SERIAL" = 1 ]; then
+    if grep -q '^0: uart:' /proc/tty/driver/serial 2>/dev/null && \
+            ! grep -q '^0: uart:unknown' /proc/tty/driver/serial 2>/dev/null && [ -c /dev/ttyS0 ]; then
+        GB_UI=ttyS0
+    else
+        log "warning: gb.serial=1 ignored: ttyS0 is not a real UART; the UI stays on tty1"
+    fi
+fi
+if [ "$GB_UI" = ttyS0 ]; then
+    : >/run/gb/markers
+fi
+{
+    echo "GB_UI_TTY=$GB_UI"
+    echo "GB_FONT_USED=$FONT_USED"
+} >/run/gb/console.env
+log "UI console: $GB_UI"
+
+# ------------------------------------------------------------------------------------------------ 5 printk
+if [ "$GB_DEBUG" != 1 ]; then
+    echo "1 4 1 7" >/proc/sys/kernel/printk
+fi
+
+# ------------------------------------------------------------------------------------------------ 6 inittab
+{
+    echo "::sysinit:/bin/true"
+    echo "$GB_UI::respawn:/opt/gb/bin/gbinstall.sh --console $GB_UI"
+    if [ "$GB_UI" = ttyS0 ]; then
+        echo "tty1::respawn:/opt/gb/bin/gbmirror.sh"
+    fi
+    echo "::ctrlaltdel:/opt/gb/bin/gbinstall.sh --shutdown reboot"
+    echo "::shutdown:/opt/gb/bin/gbinstall.sh --shutdown cleanup"
+} >/etc/inittab || fatal "cannot write /etc/inittab"
+log_cmd "/etc/inittab" cat /etc/inittab
+
+# ------------------------------------------------------------------------------------------------ 7 init
+[ -x /bin/busybox ] || fatal "/bin/busybox missing"
+log "exec /bin/busybox init"
+# shellcheck disable=SC2093  # the line after exec only runs when exec itself failed
+exec /bin/busybox init
+fatal "exec /bin/busybox init failed"

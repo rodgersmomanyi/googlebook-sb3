@@ -1,0 +1,14 @@
+{
+ "name": "gpu_compute",
+ "source": "${GB_BUILD}\\native\\gpu-compute",
+ "files": [
+  {"src": "${GB_BUILD}\\native\\gpu-compute\\out\\gb_gpu_compute", "dest": "vup/bin/gb_gpu_compute", "mode": "0755"}
+ ],
+ "payload": [
+  {"src": "${GB_BUILD}\\native\\gpu-compute\\out\\lib64\\libgb_nvk_loader.so", "dest": "lib64/gpu-compute/libgb_nvk_loader.so", "mode": "0644"},
+  {"src": "${GB_BUILD}\\native\\gpu-compute\\out\\lib64\\libgb_gpu_compute.so", "dest": "lib64/gpu-compute/libgb_gpu_compute.so", "mode": "0644"}
+ ],
+ "rc_files": ["${GB_BUILD}\\native\\gpu-compute\\gb_gpu_compute.rc"],
+ "rc_text": "",
+ "build_prop": []
+}

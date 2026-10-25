@@ -12,7 +12,8 @@ Here nothing does: systemd-boot just starts its default entry, and our initrd em
 ## gb_slotsync
 
 [guest/gb_slotsync.c](../guest/gb_slotsync.c) runs in the guest (VM and native) from `sys.boot_completed`, every 60 s
-(`gb_slotsync --watch 60`, root, logs `gb_slotsync: ...` to kmsg):
+(`gb_slotsync --watch 60`, root, logs `gb_slotsync: ...` to kmsg; host test:
+[guest/test/test_gb_slotsync.sh](../guest/test/test_gb_slotsync.sh)):
 
 1. Reads the booted slot (`ro.boot.slot_suffix`).
 2. Switches only for an update that `update_engine` **completed during this boot**:
@@ -20,13 +21,16 @@ Here nothing does: systemd-boot just starts its default entry, and our initrd em
    A stale GPT flag (an update rolled back by booting the old slot) is ignored.
 3. Picks the target the way depthcharge would: from the vbmeta GPT attributes, the highest priority among slots that
    are successful or have tries left.
-4. Mounts the ESP (`/dev/block/by-name/EFI-SYSTEM`) and builds `/initrd-<x>.img` for the target from **that slot's**
+4. Takes the ESP lock (`/dev/gb_esp.lock`, shared with `gb_bootlog` and the NVIDIA policy, which must never load
+   nouveau while the ESP is mounted; after 10 minutes of waiting it skips this cycle), mounts the ESP
+   (`/dev/block/by-name/EFI-SYSTEM`, with `flush`) and builds `/initrd-<x>.img` for the target from **that slot's**
    `init_boot_<x>` and `vendor_boot_<x>` partitions plus the ESP's `/gb/inject.gz` (our cpio) and
    `/gb/bootconfig_extra`: the same format as `build_esp.py` (`gzip cpio | vendor ramdisk | generic ramdisk |
    bootconfig + androidboot.slot_suffix=_<x>`). A CRC-32 stamp (`/gb/slot_<x>.stamp`, computed like
    `build_esp.slot_stamp()`) skips the rebuild when nothing changed.
 5. Writes `loader/entries/gb-<x>.conf` from the booted slot's entry (same kernel and options, new initrd and title)
-   and sets `default gb-<x>` in `loader/loader.conf`. The old slot's entry stays in the menu as a fallback.
+   and, on native ESPs, `gb-<x>-nvtest.conf` from the booted slot's `[NVIDIA test]` entry, then sets
+   `default gb-<x>` in `loader/loader.conf`. The old slot's entries stay in the menu as a fallback.
 6. Otherwise it keeps the default on the slot that actually booted, so after a failed new slot (you pick the old one
    in the menu) the default falls back.
 

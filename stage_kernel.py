@@ -4,11 +4,16 @@
   inject/native/modules/*.ko      <- the native Surface Book 3 set + modules.load (loaded by gbinit before Android init)
                                      + modules.load.late (loaded by gb_modules at early-init, after lapis's first stage)
 Every module's 'depends' is checked against the load order (an earlier entry, a built-in, or -- late list only --
-a lapis first-stage module), and all vermagics must match. Previous files are kept as *.pre-<tag>.
+a lapis first-stage module), and all vermagics must match. Previous files (incl. both load lists) are copied once to
+<archive>\\pre-<TAG>\\<path below C:\\GB-x86>, never next to the live file: build_esp packs inject\\native\\modules.
 
-Usage: python -I stage_kernel.py TAG [--dry-run]
+Usage: python -I stage_kernel.py TAG [--dist DIR] [--archive DIR] [--dry-run] [--force]
+  TAG     k<number>[a-z0-9]*, e.g. k14 or k13r (the archive folder and the load-list header)
+  DIR     the builder's Kleaf dist directory: /build/dist (k13, default) or /build/dist14 (k14); /build/dist* only
+  --archive  backup root (default C:\\GB-x86\\archive\\module-backups)
+Run it from PowerShell or cmd: Git Bash rewrites /build/dist14 into a Windows path (use MSYS_NO_PATHCONV=1 there).
 """
-import io, os, shutil, subprocess, sys, tarfile
+import io, os, re, shutil, subprocess, sys, tarfile
 
 HERE = os.environ.get("GB_HOME") or os.path.dirname(os.path.abspath(__file__))   # workspace (README: GB_HOME)
 GB_BUILD = os.environ.get("GB_BUILD") or (HERE if os.path.isdir(os.path.join(HERE, "native")) else r"C:\GB-build")
@@ -16,6 +21,7 @@ KEY = os.environ.get("GB_BUILDER_KEY") or r"C:\GB-build\builder_key"   # ssh key
 HOST = os.environ.get("GB_BUILDER") or "builder@192.168.115.132"
 SSH = ["ssh", "-i", KEY, "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=60", HOST]
 DIST = "/build/dist"
+ARCHIVE = os.path.join(HERE, "archive", "module-backups")
 
 VM_MODS = ["drm_sysfb_helper", "efidrm", "drm_ttm_helper", "vmwgfx", "psmouse", "vmxnet3", "ac", "battery", "test_power"]
 
@@ -41,7 +47,8 @@ NATIVE_EARLY = [
     "v4l2-cci", "ipu-bridge", "intel_skl_int3472_common", "intel_skl_int3472_discrete",
     "ov5693", "ov8865", "ov7251", "dw9719", "intel-ipu6", "intel-ipu6-isys",
 ]
-# staged in /odm/lib/modules but in NO load list: nouveau is opt-in (persist.vendor.gb.nouveau=1 -> gb_nouveau.sh)
+# in NO load list. Staged in inject\native\modules as the payload's source: build_esp puts them into
+# ESP:/gb/dgpu-<krel>.erofs (INTERFACES 6), never into the native cpio; gb_nouveau.sh loads them from /odm/dgpu.
 NATIVE_OPTIN = ["drm_exec", "drm_gpuvm", "gpu-sched", "drm_ttm_helper", "nouveau"]
 # gb_modules, after lapis's first stage loaded its mfd-core (hid-sensor-hub must link against that one)
 NATIVE_LATE = [
@@ -74,9 +81,37 @@ def ssh(cmd):
     return subprocess.run(SSH + [cmd], capture_output=True, text=True, check=True).stdout
 
 
+def _opt(name):
+    """Value of a `--name VALUE` option (None when absent)."""
+    if name not in sys.argv:
+        return None
+    i = sys.argv.index(name)
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        sys.exit(f"usage: {name} needs a value")
+    return sys.argv[i + 1]
+
+
 def main():
+    global DIST, ARCHIVE
+    if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
+        sys.exit(__doc__)
     tag = sys.argv[1]
+    if not re.fullmatch(r"k[0-9]+[a-z0-9]*", tag):
+        sys.exit(f"TAG must look like k14 or k13r, not {tag!r}")
     dry = "--dry-run" in sys.argv
+    if _opt("--dist") is not None:
+        DIST = _opt("--dist")
+        # /build/dist* with no further '/' (and nothing a remote shell would interpret: DIST goes into ssh commands)
+        if not re.fullmatch(r"/build/dist[A-Za-z0-9._-]*", DIST):
+            sys.exit(f"--dist must be a /build/dist* directory, not {DIST!r}")
+    if _opt("--archive") is not None:
+        ARCHIVE = _opt("--archive")
+    known = {"--dist", "--archive", "--dry-run", "--force"}
+    vals = {_opt("--dist"), _opt("--archive")}
+    extra = [x for x in sys.argv[2:] if x not in known and x not in vals]
+    if extra:
+        sys.exit(f"unknown arguments {extra}")
+    print(f"dist {DIST}; backups -> {os.path.join(ARCHIVE, 'pre-' + tag)}")
     wanted = sorted(set(VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN))
     info = ssh("cd %s && for m in %s; do f=$m.ko; [ -f $f ] || f=$(echo $m | tr - _).ko; "
                "if [ -f $f ]; then echo \"$m|$f|$(modinfo -F depends $f)|$(modinfo -F vermagic $f)\"; "
@@ -136,11 +171,16 @@ def main():
     tf = tarfile.open(fileobj=io.BytesIO(raw))
     blobs = {m.name: tf.extractfile(m).read() for m in tf.getmembers() if m.isfile()}
 
-    def put(path, data):
+    def backup(path):
+        """Copy an existing file once to <ARCHIVE>\\pre-<tag>\\<path relative to C:\\GB-x86> (a re-run keeps the first)."""
         if os.path.exists(path):
-            bak = f"{path}.pre-{tag}"
+            bak = os.path.join(ARCHIVE, f"pre-{tag}", os.path.relpath(path, HERE))
             if not os.path.exists(bak):
+                os.makedirs(os.path.dirname(bak), exist_ok=True)
                 shutil.copy2(path, bak)
+
+    def put(path, data):
+        backup(path)
         with open(path, "wb") as f:
             f.write(data)
 
@@ -172,6 +212,8 @@ def main():
         early.append(line(n))
         if n == "i915":
             early += [ko + "\n" for ko in audio]
+    backup(os.path.join(nat, "modules.load"))
+    backup(os.path.join(nat, "modules.load.late"))
     with open(os.path.join(nat, "modules.load"), "w", newline="\n") as f:
         f.write(hdr + "".join(early))
     with open(os.path.join(nat, "modules.load.late"), "w", newline="\n") as f:

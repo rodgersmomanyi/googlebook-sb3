@@ -1,0 +1,55 @@
+# WHENCE excerpt for the NVIDIA TU117 firmware shipped by Googlebook OS (Surface Book 3 dGPU payload).
+# Source: linux-firmware tag 20260916 (commit ab23307cfe7f9366c819025ca3e4778299bc2db2), https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
+# The 30 files under firmware/nvidia/tu117/ of the payload are the resolved copies of the names below;
+# the full licence text is LICENCE.nvidia next to this file.
+
+Driver: nouveau - NVIDIA GPU driver
+
+File: nvidia/tu116/acr/bl.bin
+File: nvidia/tu116/acr/ucode_ahesasc.bin
+File: nvidia/tu116/acr/ucode_asb.bin
+File: nvidia/tu116/acr/ucode_unload.bin
+File: nvidia/tu116/acr/unload_bl.bin
+File: nvidia/tu116/gr/fecs_bl.bin
+File: nvidia/tu116/gr/gpccs_bl.bin
+File: nvidia/tu116/nvdec/scrubber.bin
+File: nvidia/tu116/sec2/desc.bin
+File: nvidia/tu116/sec2/image.bin
+File: nvidia/tu116/sec2/sig.bin
+Link: nvidia/tu117/acr/bl.bin -> ../../tu116/acr/bl.bin
+Link: nvidia/tu117/acr/ucode_ahesasc.bin -> ../../tu116/acr/ucode_ahesasc.bin
+Link: nvidia/tu117/acr/ucode_asb.bin -> ../../tu116/acr/ucode_asb.bin
+Link: nvidia/tu117/acr/ucode_unload.bin -> ../../tu116/acr/ucode_unload.bin
+Link: nvidia/tu117/acr/unload_bl.bin -> ../../tu116/acr/unload_bl.bin
+Link: nvidia/tu117/gr/fecs_bl.bin -> ../../tu116/gr/fecs_bl.bin
+File: nvidia/tu117/gr/fecs_data.bin
+File: nvidia/tu117/gr/fecs_inst.bin
+File: nvidia/tu117/gr/fecs_sig.bin
+Link: nvidia/tu117/gr/gpccs_bl.bin -> ../../tu116/gr/gpccs_bl.bin
+File: nvidia/tu117/gr/gpccs_data.bin
+File: nvidia/tu117/gr/gpccs_inst.bin
+File: nvidia/tu117/gr/gpccs_sig.bin
+File: nvidia/tu117/gr/sw_bundle_init.bin
+File: nvidia/tu117/gr/sw_ctx.bin
+File: nvidia/tu117/gr/sw_method_init.bin
+File: nvidia/tu117/gr/sw_nonctx.bin
+File: nvidia/tu117/gr/sw_veid_bundle_init.bin
+Link: nvidia/tu117/nvdec/scrubber.bin -> ../../tu116/nvdec/scrubber.bin
+Link: nvidia/tu117/sec2/desc.bin -> ../../tu116/sec2/desc.bin
+Link: nvidia/tu117/sec2/image.bin -> ../../tu116/sec2/image.bin
+Link: nvidia/tu117/sec2/sig.bin -> ../../tu116/sec2/sig.bin
+File: nvidia/tu102/gsp/bootloader-535.113.01.bin
+File: nvidia/tu116/gsp/booter_load-535.113.01.bin
+File: nvidia/tu116/gsp/booter_unload-535.113.01.bin
+Link: nvidia/tu116/gsp/bootloader-535.113.01.bin -> ../../tu102/gsp/bootloader-535.113.01.bin
+File: nvidia/tu102/gsp/gsp-535.113.01.bin
+Link: nvidia/tu116/gsp/gsp-535.113.01.bin -> ../../tu102/gsp/gsp-535.113.01.bin
+File: nvidia/tu102/gsp/bootloader-570.144.bin
+File: nvidia/tu116/gsp/booter_load-570.144.bin
+File: nvidia/tu116/gsp/booter_unload-570.144.bin
+Link: nvidia/tu116/gsp/bootloader-570.144.bin -> ../../tu102/gsp/bootloader-570.144.bin
+File: nvidia/tu102/gsp/gsp-570.144.bin
+Link: nvidia/tu116/gsp/gsp-570.144.bin -> ../../tu102/gsp/gsp-570.144.bin
+Link: nvidia/tu117/gsp -> ../tu116/gsp
+
+Licence: Redistributable. See LICENCE.nvidia for details

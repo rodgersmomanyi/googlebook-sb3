@@ -12,17 +12,24 @@ Same partitions as build_usb.py --export, but:
 
 Only READS lapis.bin (the running VM may hold it open) and writes into --out.
 
+The ESP is a native one (WAVE2_PLAN_v2 B-04): the [NVIDIA test] entry gb-<slot>-nvtest.conf and the dGPU payload
+gb/dgpu-<krel>.erofs + .sha256 (INTERFACES 6.1, 16), at least max(initrd) + 144 MiB left free. After manifest.json is
+written, C:\\GB-x86\\verify_image.py --esp <out>\\EFI-SYSTEM.img --boot internal --super-guid <super> must pass; if it
+does not, manifest.json is renamed manifest.json.unverified and the exit code is 1 (with --clear-nx-compat or a --test-*
+option, which change or truncate the export and are never used by the ISO, problems are reported but not fatal).
+
 Usage: python -I build_internal.py --out D:\\gb-export [--esp-mib 512] [--boot-devices] [--reuse-guids OLD\\manifest.json]
                                    [--clear-nx-compat] [--dry-run] [--test-super-mib N]
   --reuse-guids   keep the GUIDs of an installed set (needed to rebuild only the ESP: install_dualboot.ps1 -UpdateEspOnly)
   --test-super-mib  TEST ONLY: export just the first N MiB of super (manifest marked test_truncated; the installer
                   refuses such a manifest on a real disk) for quick image-mode tests.
 """
-import argparse, datetime, hashlib, importlib.util, json, os, struct, sys, uuid
+import argparse, datetime, hashlib, importlib.util, json, os, struct, subprocess, sys, uuid
 
 sys.dont_write_bytecode = True   # never write __pycache__ into the workspace (same as python -B)
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # <repo>/native/dualboot
 HERE = os.environ.get("GB_HOME") or (_REPO if os.path.isfile(os.path.join(_REPO, "build_esp.py")) else r"C:\GB-x86")
+VERIFY_IMAGE = os.path.join(HERE, "verify_image.py")
 spec = importlib.util.spec_from_file_location("build_usb", os.path.join(HERE, "build_usb.py"))
 bu = importlib.util.module_from_spec(spec); spec.loader.exec_module(bu)   # imports build_esp itself (no disk write)
 be = bu.be
@@ -111,13 +118,13 @@ def main():
         print("dry run: nothing built or written")
         return
 
-    files = be.slot_files(cmdline, be.INJECT_CPIO_NATIVE, TITLE, timeout=4)
+    files = be.slot_files(cmdline, be.INJECT_CPIO_NATIVE, TITLE, timeout=4, native=True)
     nx_note = None
     if a.clear_nx_compat:
         files["vmlinuz"], v = clear_nx_compat(files["vmlinuz"])
         nx_note = f"DllCharacteristics 0x{v:04x} -> 0x{v & ~0x100:04x}"
         print("kernel NX_COMPAT cleared in the ESP copy:", nx_note)
-    esp = be.make_esp(files, a.esp_mib * MiB)
+    esp = be.make_esp(files, a.esp_mib * MiB, min_free=be.native_min_free(files))
 
     os.makedirs(a.out, exist_ok=True)
     parts = []
@@ -156,9 +163,30 @@ def main():
         "test_truncated": test,
         "partitions": parts,
     }
-    with open(os.path.join(a.out, "manifest.json"), "w") as f:
+    mpath = os.path.join(a.out, "manifest.json")
+    with open(mpath, "w") as f:
         json.dump(manifest, f, indent=1)
-    print(f"wrote {os.path.join(a.out, 'manifest.json')} ({len(parts)} partitions{', TEST export' if test else ''})")
+    print(f"wrote {mpath} ({len(parts)} partitions{', TEST export' if test else ''})")
+
+    # the export ESP passes the same checks as the USB image's ESP (B-04; the ISO's export cross-check 8 relies on it)
+    cmd = [sys.executable, "-I", "-B", VERIFY_IMAGE, "--esp", os.path.join(a.out, "EFI-SYSTEM.img"),
+           "--boot", "internal", "--super-guid", guid["super"]]
+    if os.environ.get("GB_GFXDRIVER") == "0":     # build_esp's bisect opt-out: the tree has no gfx driver package
+        cmd.append("--no-gfxdriver")
+    print("$ python -I -B " + " ".join(cmd[3:]), flush=True)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        print("  [verify] " + line, flush=True)
+    if r.returncode != 0:
+        if a.clear_nx_compat or test:
+            print("verify_image.py reported problems: not fatal for a --clear-nx-compat / --test-* export "
+                  "(never used by the ISO)")
+        else:
+            os.replace(mpath, mpath + ".unverified")
+            sys.exit(f"verify_image.py reports problems on the export ESP (exit {r.returncode}); "
+                     f"{mpath} renamed to manifest.json.unverified")
+    else:
+        print("verify_image.py: the export ESP is OK")
 
 
 if __name__ == "__main__":

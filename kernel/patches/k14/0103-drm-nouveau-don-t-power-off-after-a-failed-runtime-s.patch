@@ -1,0 +1,100 @@
+From 9803e99eb657e66bb4a0c73592cfe267cde96b4f Mon Sep 17 00:00:00 2001
+From: GB-build k14 <k14@builder.invalid>
+Date: Sun, 25 Oct 2026 12:00:00 +0000
+Subject: [PATCH 103/103] drm/nouveau: don't power off after a failed runtime
+ suspend
+
+nouveau_pmops_runtime_suspend() ignores the result of
+nouveau_do_suspend(): it saves PCI state, disables the device and puts
+it into D3cold, then returns the error.  The PM core keeps such a device
+RPM_ACTIVE (and for errors other than -EBUSY/-EAGAIN records
+runtime_error), so the next access hits a powered-off GPU whose VRAM or
+GSP-RM state was never saved.  The VRAM eviction result is ignored as
+well, so a failed eviction silently loses buffer contents.
+
+Make runtime suspend return -EBUSY before touching the power state when
+nouveau_do_suspend() fails, and mark the device busy so that the
+autosuspend timer retries later (the same pattern mainline uses for its
+GCX readiness check).  In nouveau_do_suspend(), fail a runtime suspend
+when ttm_resource_manager_evict_all() fails (system suspend keeps its
+best-effort behaviour), and undo the SVM, dmem and LED suspend steps on
+every failure path.
+
+Local patch N3 for the Googlebook SB3 k14 kernel (not upstream).
+---
+ drivers/gpu/drm/nouveau/nouveau_drm.c | 36 ++++++++++++++++++++++++---
+ 1 file changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index eedfc6d..476c72d 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -988,13 +988,24 @@ nouveau_do_suspend(struct nouveau_drm *drm, bool runtime)
+ 		NV_DEBUG(drm, "suspending display...\n");
+ 		ret = nouveau_display_suspend(dev, runtime);
+ 		if (ret)
+-			return ret;
++			goto fail_suspend;
+ 	}
+ 
+ 	NV_DEBUG(drm, "evicting buffers...\n");
+ 
+ 	man = ttm_manager_type(&drm->ttm.bdev, TTM_PL_VRAM);
+-	ttm_resource_manager_evict_all(&drm->ttm.bdev, man);
++	ret = ttm_resource_manager_evict_all(&drm->ttm.bdev, man);
++	if (ret) {
++		NV_ERROR(drm, "failed to evict VRAM: %d\n", ret);
++		/*
++		 * Runtime suspend cuts power, so anything left in VRAM would
++		 * be lost: abort.  System suspend keeps its best-effort
++		 * behaviour.
++		 */
++		if (runtime)
++			goto fail_display;
++		ret = 0;
++	}
+ 
+ 	NV_DEBUG(drm, "waiting for kernel channels to go idle...\n");
+ 	if (drm->cechan) {
+@@ -1033,6 +1044,12 @@ fail_display:
+ 		NV_DEBUG(drm, "resuming display...\n");
+ 		nouveau_display_resume(dev, runtime);
+ 	}
++
++fail_suspend:
++	/* undo the suspend steps above, as nouveau_do_resume() would */
++	nouveau_led_resume(dev);
++	nouveau_dmem_resume(drm);
++	nouveau_svm_resume(drm);
+ 	return ret;
+ }
+ 
+@@ -1188,6 +1205,19 @@ nouveau_pmops_runtime_suspend(struct device *dev)
+ 
+ 	nouveau_switcheroo_optimus_dsm();
+ 	ret = nouveau_do_suspend(drm, true);
++	if (ret) {
++		/*
++		 * Never power the GPU off after a failed suspend: VRAM or the
++		 * GSP-RM state may not have been saved, and the PM core would
++		 * keep treating a device in D3cold as active.  -EBUSY leaves
++		 * it active without setting runtime_error; marking it busy
++		 * re-arms the autosuspend timer for another attempt.
++		 */
++		dev_warn_ratelimited(dev, "runtime suspend failed (%d), staying in D0\n", ret);
++		pm_runtime_mark_last_busy(dev);
++		return -EBUSY;
++	}
++
+ 	pci_save_state(pdev);
+ 	pci_disable_device(pdev);
+ 	/*
+@@ -1206,7 +1236,7 @@ nouveau_pmops_runtime_suspend(struct device *dev)
+ 		pci_ignore_hotplug(pdev);
+ 	pci_set_power_state(pdev, PCI_D3cold);
+ 	drm->dev->switch_power_state = DRM_SWITCH_POWER_DYNAMIC_OFF;
+-	return ret;
++	return 0;
+ }
+ 
+ static int

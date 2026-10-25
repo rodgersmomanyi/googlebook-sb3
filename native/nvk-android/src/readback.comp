@@ -1,0 +1,12 @@
+#version 450
+// ahb-i915-readback, ANV leg: sample the AHB NVK rendered into (imported into ANV as an AHB image) with texelFetch and
+// write packUnorm4x8 of every texel into a host-visible buffer (byte order R, G, B, A like the RGBA8 buffer itself).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D img;
+layout(set = 0, binding = 1, std430) buffer Out { uint px[]; };
+layout(push_constant) uniform PC { uint width; uint height; } pc;
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  if (p.x >= pc.width || p.y >= pc.height) return;
+  px[p.y * pc.width + p.x] = packUnorm4x8(texelFetch(img, ivec2(p), 0));
+}

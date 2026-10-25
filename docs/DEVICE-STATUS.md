@@ -2,8 +2,9 @@
 
 Every device of the Surface Book 3 13.5" (i7-1065G7) and what drives it when Googlebook OS ("lapis") boots natively
 (`gb.hw=native`). This is the hardware audit from `native/hw-gap-audit` (2026-10-24, kernel build #11), updated for
-**kernel build #13** and the native tree as `build_esp.py` assembles it from `inject/native/components/*.json`
-(2026-10-25). The audit covered every device in the Windows inventory: the live PnP list, the HID hardware IDs and
+**kernel build #13**, the **NVIDIA graphics switching** stack with **kernel build #14** (native images, 2026-10-25),
+and the native tree as `build_esp.py` assembles it from `inject/native/components/*.json`. The audit covered every
+device in the Windows inventory: the live PnP list, the HID hardware IDs and
 the ACPI tables of a Surface Book 3 (read from `HKLM\HARDWARE\ACPI`, decompiled with iasl; the dumps are not part
 of this repository).
 
@@ -44,9 +45,13 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
   `pinctrl-intel-platform` was refused against their protected exports, and a module failure in first-stage init
   stops the boot. `stage_kernel.py` now refuses such a load list. The cameras only need the buses, which lapis's own
   modules provide.
-* **NVIDIA dGPU (row 17):** nouveau is built and staged but in no load list; it loads only on request
-  (`persist.vendor.gb.nouveau=1`, `native/nouveau-kernel`). `gb_power` has the opt-in support merged. NVK ships
-  inert (row 17 notes).
+* **NVIDIA dGPU (row 17), 2026-10-25:** graphics switching. With the base attached, nouveau now loads
+  automatically after boot (graphics mode **Auto**, the default), with the safety rails of [NVIDIA.md](NVIDIA.md):
+  the crash-loop guard, the `gb.nouveau=0` kill switch, `kernel.panic=30`, refcnt-gated detach. Games and the apps you
+  choose render on NVK through the per-app driver package. The system UI always stays on Intel. A self-test gates
+  NVIDIA app graphics, and a compute service runs llama.cpp on NVK. The firmware, modules and NVK ICD moved into the
+  `gb/dgpu-<krel>.erofs` payload on the boot partition. Native images run kernel build #14 (nouveau backports and
+  hardening). The v1 opt-in property `persist.vendor.gb.nouveau` is retired.
 * **Audit files in the default build:** `gb_hw.sh` (CPU power limits), the keyboard/touchpad IDCs, the pen key
   layouts and `excluded-input-devices.xml` are now in the native tree (`inject/native/components/hw.json`).
 
@@ -75,7 +80,7 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 | 14 | Intel Iris Plus 8A52 (00:02.0) | `i915.ko` + video/wmi/drm helpers (ours, gbinit) | `i915/icl_dmc_ver1_09.bin` staged (GuC/HuC optional) | lapis Mesa ANV (gfx11 + i915 backend), ANGLE, minigbm (i915 table includes 0x8a52), hwc3-drm | Ready | Uses lapis's stock graphics stack; the VMware-only overrides stay out of the native tree. |
 | 15 | Internal panel "Surface Calibrated Panel" MEI96A2, 3000x2000 eDP, backlight | i915 → `intel_backlight` | – | hwc3-drm drives `/sys/class/backlight/*` [V, strings]; lights HAL disabled (`ro.vendor.lights.backlight.enabled=false`) [V]; lapis `init.device-x86.rc` chowns `intel_backlight` [V] | Ready + **New here** | `gb_hw.sh boot` also chowns every other backlight to system (for example `acpi_video0`, if it ever appears). Brightness keys arrive only as keyboard HID consumer keys: ACPI `BRTN` has no caller, so there are no duplicate ACPI events [V, DSDT]. If the panel flickers, try `i915.enable_psr=0` (untested). |
 | 16 | External display: base USB-C (DP alt mode) and Surface Connect / SurfaceDock DP | i915 DDI | – | – | Ready [I] | The USB-C port sits behind the base USB hub (`XHC.RHUB.HS02.PRT1`, `_UPC` type 0x09) [V], so DP comes through a mux in the base that the EC/PD controller drives. There is no OS UCSI (row 33). Expected to work as a plain DP connector. Unverified. |
-| 17 | NVIDIA GTX 1650 Max-Q 10DE:1F91 (base, behind 00:1d.4); MSHW0216 "IHV GPU Power Controller"; MSHW0153 hot-plug | Default: no driver; `gb_power` sets runtime PM → D3cold. **Opt-in nouveau** (`persist.vendor.gb.nouveau=1`: built in #13, staged, loaded by `gb_nouveau.rc` after boot). `surface_hotplug`. MSHW0216: no Linux driver anywhere | `nvidia/tu117` (only for opt-in nouveau; you fetch it) | NVK (`vulkan.nouveau.so`) is shipped but **inactive**: lapis's `ro.hardware.vulkan=intel` makes the Vulkan loader load only ANV, so NVK is reachable only from the on-demand `nvk_probe` test | Partial | Android never renders on it; the dGPU has no display outputs. Battery life depends on D3cold being reached; check row 46. |
+| 17 | NVIDIA GTX 1650 Max-Q 10DE:1F91 (base, behind 00:1d.4; its HDA function stays driverless); MSHW0216 "IHV GPU Power Controller"; MSHW0153 hot-plug | **nouveau** (build #14 = #13 + 37 linux-6.18.y nouveau backports + hardening N1-N3; `runpm=1 modeset=2`, headless), in no boot-time load list: `gb_nouveau.sh` loads it after `sys.boot_completed` when the base is attached and the graphics mode is Auto/NVIDIA (default Auto), and binds it again on reattach. Intel mode: no driver, D3cold. `gb_power` owns detach (refcnt gate, unbind + PCI remove in a worker), rescan and the re-bind guard. `surface_hotplug`. MSHW0216: no Linux driver anywhere | `nvidia/tu117` (30 files, GSP-RM 570.144, 535.113.01 fallback; linux-firmware tag 20260916, with WHENCE + `LICENCE.nvidia`) in the `gb/dgpu-<krel>.erofs` payload on the ESP, mounted at `/odm/dgpu`; you fetch it | **Per-app NVIDIA graphics:** the driver package GbGfxDriver (`ro.gfx.driver.0`, Android's updatable-driver settings decided by gb_power) gives games and **Use NVIDIA** apps a shim that puts NVK (Mesa 26.3 + our Android patches) first. HWUI, SurfaceFlinger and the system UI stay on ANV. QS tile and Settings page "Graphics" (GbGpu). Automatic self-test (`nvk_probe`) before the first NVIDIA app. Compute service `gb_gpu_compute` (llama.cpp on NVK, UNIX socket). | Ready, untested on hardware | Everything runs headless: the dGPU has no display outputs, and its frames are composed by Intel. Apps switch GPU only when restarted, and detach is refused while apps hold the dGPU ("Close apps and detach"). Battery life depends on D3cold being reached when idle; check row 46 and the checklist. Recovery without a shell: `gb.nouveau=0` in the boot menu. Details: [NVIDIA.md](NVIDIA.md). |
 
 ## 3. Input
 
@@ -163,6 +168,20 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 11. Suspend: lid close → s2idle → lid open wakes. Power button wakes. After a long sleep, check the battery drop and `/sys/power/suspend_stats`. Check that the dGPU is in D3cold (`gb_hw: diag: dGPU ... power_state=D3cold`).
 12. Clock: compare Android time before and after Wi-Fi connects (row 6).
 13. Reboot and shutdown complete without hanging at the Surface logo.
+14. NVIDIA, first boot with the base attached: about 2 minutes after boot, `vendor.gb.nouveau.result=clean`
+    (`getprop`, or the `gblog\boot<N>-t420.txt` report). While idle the dGPU reads `power_state=D3cold`
+    (`gb_dgpu_check.sh`). The Graphics tile goes `Intel (testing NVIDIA)` → `NVIDIA`, and Settings → System →
+    Graphics shows the self-test as passed. If the boot hangs once Android is up, hold Power for 10 s and boot again:
+    the next boot must come up on Intel with "Switched to Intel graphics". The manual override is `gb.nouveau=0` in the
+    boot menu.
+15. NVIDIA apps: start a Vulkan game (or vkcube). `logcat -s gb_gfxdriver` shows `NVK: 1 NVIDIA physical device(s)
+    first`, and `dumpsys gfxinfo` keeps HWUI on Intel. An **Always Intel** app does not map the driver package.
+16. Detach and reattach: idle → released within seconds, "Tablet mode - Intel graphics". With the game open →
+    "Can't detach yet", then **Close apps and detach** completes it. Reattach → "Performance base connected", and the
+    tile shows `NVIDIA` again. Repeat a few times, then suspend/resume with the base attached.
+17. Intel only mode: the dGPU stays in D3cold across a reboot. Compare idle battery drain with Auto mode.
+18. The `[NVIDIA test]` boot entry once (follow its on-screen suspend prompts), then keep the whole `gblog\` folder:
+    it holds the dGPU power and PM-stress report.
 
 ## Cross-component notes
 
@@ -173,8 +192,10 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 
 ## Not possible (or not without the real device)
 
-- **NVIDIA dGPU for Android rendering:** lapis has no NVIDIA userspace and the dGPU has no display outputs. It is
-  kept in D3cold; nouveau is opt-in and NVK is not used by the system Vulkan loader.
+- **NVIDIA dGPU for the system UI or a display:** SurfaceFlinger, HWUI and every system app stay on Intel. Only
+  third-party apps can render on NVIDIA (per-app driver package), and the dGPU has no display outputs. Also absent:
+  NVIDIA video decode/encode, temperature or clock readout (nouveau on 6.18), CUDA, the proprietary driver
+  ([NVIDIA.md](NVIDIA.md#what-will-not-work)).
 - **USB-C PD / role / alt-mode status in Android (UCSI):** UCSI is tunnelled through an undocumented SAM HID
   collection (045E:09A6, usage page FF00 usage F900). No Linux driver exists, and the ACPI UCSI device is disabled on
   this SKU.

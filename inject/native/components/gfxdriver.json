@@ -1,0 +1,10 @@
+{
+ "name": "gfxdriver",
+ "source": "${GB_BUILD}\\native\\gfx-driver-pkg",
+ "files": [
+  {"src": "${GB_BUILD}\\native\\gfx-driver-pkg\\out\\GbGfxDriver.apk", "dest": "app/GbGfxDriver/GbGfxDriver.apk", "mode": "0644"}
+ ],
+ "rc_files": [],
+ "rc_text": "",
+ "build_prop": ["ro.gfx.driver.0=gb.sb3.gfxdriver"]
+}

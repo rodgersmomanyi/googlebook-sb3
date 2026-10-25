@@ -1,195 +1,253 @@
 NVK (Mesa Vulkan for NVIDIA via nouveau) on Googlebook "lapis" / Surface Book 3 - integration notes
 =====================================================================================================
-Component: nvk-android. Mesa mesa-26.3.0-rc2 (+2 small local patches), NDK r27c (API 35), x86_64.
+Component: nvk-android (owner: nvk-gfxdriver, INTERFACES.md 1.1). Mesa mesa-26.3.0-rc2 + local patches 0001-0006,
+NDK r27c (compiler target API 35), x86_64. Revised 2026-10-25 (Wave 1: plan Phase 0 items 1/3/4 + Phase 8 code).
 Status: compile-tested and partially run-tested on the builder VM (no NVIDIA GPU there); nothing here has run on the
 real GTX 1650 yet. Every hardware statement below is either "verified in source" or "to be verified natively".
+Previous revision: superseded/INTEGRATION_NOTES.txt.orig-1b610523.
 
 1. What was built
 -----------------
 bin/vulkan.nouveau.so      NVK ICD as an Android hwvulkan HAL module (exports HMI + vk_icdGetInstanceProcAddr),
-                           SONAME vulkan.nouveau.so, stripped. Install: /vendor/lib64/hw/vulkan.nouveau.so (tree
-                           path vup/lib64/hw/). Inert there: libvulkan only loads vulkan.<ro.hardware.vulkan>.so and
-                           lapis sets ro.hardware.vulkan=intel (vendor build.prop).
-                           sha256 f7e9154f2e049cdfbb8fc3c1d92815eb96a4b22b5105a04f625eeb41fadf0723 (verification
-                           rebuild with the corrected patch 0002, see section 7). The first delivery (f727a064...,
-                           moved to superseded/) advertised VK_NVX_binary_import under NVK_EXPERIMENTAL=dlss although
-                           its entrypoints were compiled out.
-                           Note: NVK's meson does not apply Mesa's Android version script, so the .so exports 3157
-                           dynamic symbols (Rust std/crates, static libc++, static libdrm, nak_*/nil_*), not only
-                           HMI + vk_icd*. With RTLD_LOCAL loading and -Bsymbolic (DT_SYMBOLIC) nothing is
-                           interposed; it only costs ~0.3 MB of dynsym/dynstr.
-bin/nvk_probe              NDK test binary (/vendor/bin/nvk_probe, tree vup/bin/). dlopens the ICD directly.
+                           SONAME vulkan.nouveau.so, stripped. Patch set 8a (0001 0002 0004 0005 0006),
+                           -Dplatform-sdk-version=37, shader cache compiled in (NDK zlib linked statically), 16 KiB
+                           max-page-size. Install: /vendor/lib64/hw/vulkan.nouveau.so (legacy tree path
+                           vup/lib64/hw/) or /odm/dgpu/lib64/hw/vulkan.nouveau.so (Phase 5 payload). Inert there:
+                           libvulkan only loads vulkan.<ro.hardware.vulkan>.so and lapis sets ro.hardware.vulkan=intel.
+                           sha256 625314e09c8f9adb82d57b8abfd6ea2e855308a1ea79c59f6670783e52f2409b (unstripped
+                           63b0aa686dc340747e341f87b6ef973d07cd53220318759fb0aa2bbf7d5d5377; libgb_nvk.so 6bb6dc80...;
+                           reproduced bit-identically by a second clean build in another directory, NV-05)
+                           The same build relinked with SONAME libgb_nvk.so is the NVK inside the per-app driver package
+                           (C:\GB-build\native\gfx-driver-pkg). The 2026-10-24 build (patch set base, f7e9154f...) is in
+                           superseded/ and is still reproduced bit-identically by PATCHSET=base (NV-01, section 7).
+                           NVK's meson does not apply Mesa's Android version script, so the .so exports ~3150 dynamic
+                           symbols (Rust std/crates, static libc++, static libdrm, zlib, nak_*/nil_*), not only HMI +
+                           vk_icd*. With RTLD_LOCAL loading and -Bsymbolic (DT_SYMBOLIC) nothing is interposed.
+bin/nvk_probe              NDK test binary (/vendor/bin/nvk_probe, tree vup/bin/). dlopens the ICD directly. Modes:
+                           offscreen, anb-swapchain, anb-linear, ahb-i915-readback (gate G0), a17-swapchain-model
+                           (section 5). sha256 412e080aca1a03d3220a8ef7da1aef4a78897c52c6e5cadd30097f3e07043054
 bin/nvk_probe_host         same source built for Linux/glibc (validation only; not for the device).
-patches/0001-*.patch       NVK: a gralloc buffer with a foreign DRM modifier (e.g. Intel Y-tiled from minigbm) now
-                           fails vkCreateImage with VK_ERROR_INVALID_EXTERNAL_HANDLE. Upstream 26.3 calls
-                           BlockLinearModifier::try_from(mod).unwrap() in nil/image.rs (new_tiled) -> Rust panic ->
-                           the whole process aborts.
-patches/0002-*.patch       Build NVK without libelf (no libelf in the NDK). libelf is used only by nvk_cubin.c
-                           (VK_NVX_binary_import cubin entrypoints). CORRECTED: NVK 26.3 does advertise
-                           VK_NVX_binary_import when NVK_EXPERIMENTAL=dlss is set (nvk_physical_device.c:339; on
-                           Android also `setprop debug.mesa.nvk.experimental dlss`, see util/os_misc.c). The first
-                           version of this patch only dropped nvk_cubin.c, so with that opt-in the extension was
-                           listed while vkCreateCuModuleNVX & co. returned NULL (reproduced with drm-shim:
-                           logs/verify/chroot_shim_orig.log). The patch now also defines NVK_NO_CUBIN and stops
-                           advertising the extension (logs/verify/chroot_fixed.log). Default behaviour is unchanged.
-scripts/                   00_env.sh, 10_build_host_clc.sh (host mesa_clc/vtn_bindgen2, needed because NVK
-                           compiles its OpenCL-C meta kernels at build time), 20_build_nvk_android.sh,
-                           30_build_probe.sh, 35_build_drm_shim_test.sh + 40_bionic_chroot_test.sh (builder-only
-                           tests), apply_patches.py, x86_64-android-nvk.ini (cross file as used). Toolchain: rustup stable 1.99.1 +
-                           x86_64-linux-android target, bindgen-cli 0.73.2, cbindgen 0.29.4, meson 1.12.1,
-                           host LLVM 18 + SPIRV-LLVM-Translator 18 (only for the host mesa_clc).
-src/                       nvk_probe.c, tri.vert/tri.frag (+ generated SPIR-V header).
-nvk-android.json, gb_nvk.rc  native-tree manifest (same format as components/*.json) and an optional on-demand
-                           probe service (setprop vendor.gb.nvk_probe 1). No build.prop lines are needed.
-logs/                      build, host-validation and bionic-chroot test logs.
+patches/0001..0006         generated by scripts/apply_patches.py (the source of truth; --set base|8a|8b, --check):
+  0001 NVK ANB import: a gralloc buffer with a foreign DRM modifier (e.g. Intel Y-tiled from minigbm) fails
+       vkCreateImage with VK_ERROR_INVALID_EXTERNAL_HANDLE instead of a Rust panic in NIL (process abort).
+  0002 build without libelf (no libelf in the NDK); also stops advertising VK_NVX_binary_import (NVK_NO_CUBIN) so that
+       NVK_EXPERIMENTAL=dlss / debug.mesa.nvk.experimental=dlss cannot list an extension whose entry points are absent.
+  0004 force LINEAR for buffers shared with a foreign gralloc: if /dev/dri/renderD128 is not NVK's own render node
+       (override debug.mesa.nvk.anb.linear=1/0), vkGetSwapchainGrallocUsage(2)ANDROID add
+       GRALLOC_USAGE_SW_WRITE_RARELY / GRALLOC1_PRODUCER_USAGE_CPU_WRITE and (new runtime switch
+       vk_android_set_force_linear_ahb) the AHB usage query and AHB allocations add AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY,
+       the mechanism vk_android.c already uses for MUTABLE_FORMAT/COMPRESSION_DISABLED (vk_android.c:905-916). Upstream
+       minigbm i915 allocates LINEAR whenever a SW usage bit is set (i915.c:226-228 linear_mask) - to be confirmed for
+       Google's lapis build on hardware (nvk_probe prints the modifier).
+  0005 set up the LINEAR->tiled render shadow for every image with a LINEAR modifier (ANB/AHB included), not only for
+       VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT images (nvk_image.c:939-1024; see B4).
+  0006 vkQueueSignalReleaseImageANDROID returns a sync_fd: submit the wait semaphores + signal a per-queue SYNC_FD
+       semaphore (its signal covers all earlier work on the queue), export it. Falls back to the old QueueWaitIdle()+-1
+       when the export fails; debug.mesa.nvk.anb.waitidle=1 forces the old path (bring-up escape hatch).
+  0003 (8b only, not shipped) VK_ANDROID_external_memory_android_hardware_buffer: MR !33700 (head 21cc50e0, open, no
+       reviewer) rebased onto 26.3.0-rc2 in the structure of Project Churro's nvk-android-hardware-buffer.patch, minus
+       both of their double initialisations of the vk_image and Churro's double free of the deferred create info
+       (vk_image_finish() frees it in 26.3); foreign AHB modifiers rejected like 0001; AHB format properties limited to
+       1 mip / 1 layer / 1 sample (LINEAR DRM-modifier layout).
+  9001 TEST-ONLY drm-shim bionic ioctl prototype (applied by scripts/35_*, never shipped).
+scripts/                   00_env.sh (PATCHSET profiles base|8a|8b, PLATFORM_SDK, SHADER_CACHE, B, STAGE, HOST_CLC),
+                           10_build_host_clc.sh (host mesa_clc/vtn_bindgen2 of the same Mesa version),
+                           20_build_nvk_android.sh, 30_build_probe.sh, 35_build_drm_shim_test.sh,
+                           40_bionic_chroot_test.sh (old image-file chroot), 50_rebase_mesa.sh (section 9.4),
+                           apply_patches.py, x86_64-android-nvk.ini (base cross file). Toolchain: rustup stable 1.99.1 +
+                           x86_64-linux-android target, bindgen-cli 0.73.2, cbindgen 0.29.4, meson 1.12.1, host LLVM 18 +
+                           SPIRV-LLVM-Translator 18 (only for the host mesa_clc).
+src/                       nvk_probe.c, tri.vert/tri.frag, fs.vert/pat.frag (bit-exact pattern), readback.comp (ANV leg)
+                           (+ generated SPIR-V header).
+verify/                    import_check.py, chroot_dir.sh (read-only chroot of an unpacked rootfs), run_checks.sh
+                           (NV-02/03/06), hmi_check.c (libvulkan's HAL contract).
+nvk-android.json, gb_nvk.rc  native-tree manifest and the on-demand probe service (setprop vendor.gb.nvk_probe 1). The rc
+                           now sets vendor.gb.nouveau.foreign=1 and /dev/gb_dgpu/foreign before the probe (INTERFACES
+                           15.5): the anb/ahb modes import i915 buffers, so this boot may not rmmod nouveau any more.
+logs/                      build, host-validation and chroot logs (list in C:\GB-build\native\dgpu\integration\
+                           nvk-gfxdriver.md).
 
-2. Kernel / firmware prerequisites (owned by the nouveau-kernel and power components, not by this one)
-------------------------------------------------------------------------------------------------------
-- nouveau.ko (CONFIG_DRM_NOUVEAU=m) + drm_exec, drm_gpuvm, gpu-sched, mxm-wmi, drm_ttm_helper, drm_display_helper.
-  NVK needs the VM_BIND/EXEC uAPI (present since 6.6; 6.18.21 is fine). Nothing extra for NVK beyond that.
+2. Kernel / firmware prerequisites (owned by the nouveau-policy, gb-power and k14 components)
+----------------------------------------------------------------------------------------------
+- nouveau.ko (CONFIG_DRM_NOUVEAU=m) + drm_exec, drm_gpuvm, gpu-sched, drm_ttm_helper. NVK needs the VM_BIND/EXEC uAPI
+  (present since 6.6; 6.18.21 is fine). Nothing extra for NVK beyond that.
 - GSP-RM firmware: 6.18 enables GSP on Turing by default (nvkm/subdev/gsp/tu102.c: NvGspRm defaults to true).
-  Staged: firmware/nvidia/tu117/gsp/{booter_load,booter_unload,bootloader,gsp}-570.144.bin (+ the acr/gr/sec2/nvdec
-  files). Without GSP NVK still works on Turing but at boot clocks.
+  570.144 primary, 535.113.01 fallback (gb.nouveau.fw=535). Without GSP NVK still works on Turing but at boot clocks.
 - Module ORDER MATTERS: i915 must register its DRM device BEFORE nouveau, i.e. i915 = card0/renderD128.
   lapis' minigbm (libminigbm_gralloc.so, allocator-service.minigbm, libgbm.so) has a "nouveau" (dumb) backend
-  (strings: backend_nouveau) and opens the first render node it can drive. If nouveau ever becomes renderD128,
-  gralloc and HWC would try to use the NVIDIA GPU -> no display. CORRECTED: nouveau must NOT go into modules.load or
-  modules.load.late (that would load it, and power the dGPU, at every boot, against the "dGPU off" default). It is
-  loaded only on demand by the nouveau-kernel component's gb_nouveau service (native/gb_nouveau.rc:
-  sys.boot_completed=1 && persist.vendor.gb.nouveau=1), long after i915 has registered renderD128. Check
-  `ls -l /sys/class/drm/renderD128/device/driver` -> i915.
-- Runtime PM / detach: gb_power keeps the dGPU unbound by default; persist.vendor.gb.nouveau=1 leaves it on nouveau
-  (runpm=1) and unbinds it before a confirmed detach. Any process holding NVK at that moment gets
-  VK_ERROR_DEVICE_LOST (or dies). Acceptable for test binaries, NOT for SurfaceFlinger (see 4b).
+  (strings: backend_nouveau) and opens the first render node it can drive. If nouveau ever became renderD128,
+  gralloc and HWC would try to use the NVIDIA GPU -> no display. nouveau is never in modules.load or modules.load.late;
+  gb_nouveau.sh (component nouveau-policy) loads it after sys.boot_completed only in once/test/persist modes and checks
+  that renderD128 and card0 are i915 first (INTERFACES 7.2). Patch 0004 relies on the same fact: "renderD128 is not
+  mine" = "gralloc is foreign".
+- Runtime PM / detach: gb_power keeps the dGPU unbound by default; with nouveau bound it locks the latch, refuses
+  detach while /sys/module/nouveau/refcnt > 0 and names the holders (INTERFACES 10). Any process holding NVK at a
+  forced removal would get VK_ERROR_DEVICE_LOST (or die). Acceptable for test binaries, NOT for SurfaceFlinger (4b).
 
 3. Recommended default: option (a)
 ----------------------------------
 Keep ANV (vulkan.intel.so) as THE system Vulkan driver (SurfaceFlinger RenderEngine/Skia-Vulkan, HWUI, ANGLE GLES).
-Ship NVK only as /vendor/lib64/hw/vulkan.nouveau.so for explicit users (nvk_probe, benchmarks, compute tools that
-dlopen it themselves). Nothing in the boot path loads it, so it cannot break the UI, and the dGPU stays powered off
-unless persist.vendor.gb.nouveau=1 is set AND a program actually opens it.
-Linker namespaces: /vendor/bin/* binaries run in the vendor namespace, which may dlopen /vendor/lib64/hw/*.
-The ICD's NEEDED list is exactly: libhardware, liblog, libnativewindow, libsync, libm, libdl, libc (libc++ is linked
-statically). Its non-libc imports (AHardwareBuffer_{acquire,allocate,describe,getNativeHandle,release},
-__android_log_write, hw_get_module, sync_merge) were checked against the lapis system image (CL3B.260622.271.R1,
-SDK 37) and vendor libhardware.so: all exported. Full import list: bin/undef.txt.
-Cost of shipping it in the native tree: ~16 MB in the /odm tmpfs (RAM) and a larger initrd. Drop the two files from
-the tree if that matters; nothing else depends on them.
-Apps cannot use it: an app's classloader namespace cannot load /vendor/lib64/hw; and Android's Vulkan loader has no
-multi-ICD support. (Even via the "updatable graphics driver" mechanism, the per-app driver also becomes HWUI's
-driver, so the same blockers as in 4b apply to that app's UI.)
+Ship NVK only as the payload ICD for explicit users (nvk_probe, the gpu-compute service). Nothing in the boot path
+loads it, so it cannot break the UI, and the dGPU stays powered off unless nouveau is enabled AND a program opens it.
+Linker namespaces: /vendor/bin/* binaries run in the vendor namespace, which may dlopen /vendor/lib64/hw/* and
+/odm/dgpu/* (vendor default namespace permits /odm, /vendor; 276.R4 /linkerconfig/ld.config.txt).
+The ICD's NEEDED list is exactly: libhardware, liblog, libnativewindow, libsync, libm, libdl, libc (libc++ and zlib
+are linked statically). Re-checked against lapis CL3B.260622.276.R4 (section 7a): every import resolves; liblog,
+libnativewindow, libsync, libm, libdl, libc are LLNDK (system/etc/llndk.libraries.txt), libhardware.so is in
+/vendor/lib64 (and in GraphicsEnv's formerly-VNDK-SP list for the per-app driver namespace).
+Apps cannot use the payload ICD: an app's classloader namespace cannot load /vendor or /odm/dgpu, and Android's
+Vulkan loader has no multi-ICD support. The per-app path is the GbGfxDriver package (option A2, gfx-driver-pkg):
+an ANV-first shim that keeps HWUI on ANV and adds NVK only for the app's own instances.
 
 4. Option (b): NVK as the system Vulkan driver (NVIDIA renders, i915 scans out) - assessment
 ---------------------------------------------------------------------------------------------
-Mechanism would be easy (e.g. gbinit writes ro.hardware.vulkan=nouveau into /odm/etc/build.prop, which init loads
-after vendor's build.prop and lets override it; ANGLE and Skia then run on NVK). It would NOT boot to a usable UI with
-NVK 26.3:
+Mechanism would be easy (ro.hardware.vulkan=nouveau); it would NOT boot to a usable UI with NVK 26.3:
 
- B1 (hard, verified in source AND in the built binary) NVK does not implement
-    VK_ANDROID_external_memory_android_hardware_buffer. nvk_physical_device.c has no such entry (ANV, RADV, panvk,
-    v3dv and venus set it), and the drm-shim run of our vulkan.nouveau.so lists it as absent (logs/chroot_test.log). SurfaceFlinger's Skia-Vulkan RenderEngine (lapis: debug.renderengine.vulkan=true) and HWUI
-    (ro.hwui.use_vulkan=true) wrap every layer/window buffer as an AHardwareBuffer-imported VkImage, and ANGLE needs
-    it for EGLImage/EGL_ANDROID_image_native_buffer. Android's CDD requires it for Vulkan >= 1.1. Without it SF
-    cannot composite a single client layer. Fix = port the AHB plumbing (panvk_android.c is the model: deferred
-    image init, vk_android_get_ahb_layout, AHB import/export in AllocateMemory, image format props, external
-    formats/YCbCr) - a few hundred lines in NVK, plus testing.
- B2 (hard; NVK side verified in source, minigbm side expected - nvk_probe anb-swapchain prints the real modifier)
-    Buffer layouts. All gralloc buffers come from minigbm's i915 backend in system RAM; for GPU render/texture/
-    composer usage upstream minigbm picks Intel X/Y-tiled (or CCS) modifiers, and lapis' libminigbm_gralloc.so
-    contains those (Y_TILED, Y_TILED_CCS, ...). NVIDIA hardware can only address LINEAR or NVIDIA block-linear
-    (nvk_image.c: format features are 0 for any other vendor modifier). Unpatched NVK aborts the process on such a
-    buffer (patch 0001 turns that into an error, which still means "no surface"). Making it work needs every buffer
-    NVK touches to be LINEAR: e.g. NVK's GetSwapchainGrallocUsage adding a SW_READ usage (upstream minigbm i915 only
-    uses tiled layouts when no SW usage is set; not verified for Google's build) - but SF's own client-target/
-    screenshot buffers, camera, video decoder
-    (Y-tiled NV12) and ANGLE-allocated AHBs are not allocated through that path, so in practice minigbm itself
-    would have to be rebuilt to force LINEAR when an NVIDIA renderer is active (costs: no Intel render compression,
-    no FBC for scanout).
- B3 Present path: nvk_android.c QueueSignalReleaseImageANDROID does QueueWaitIdle() and returns fence -1, so every
-    present stalls the CPU until the dGPU is idle (correct but no CPU/GPU overlap).
- B4 Copies over PCIe: imported buffers live in Intel system RAM; NVK renders LINEAR targets through a VRAM tiled
-    shadow and copies back each frame (linear_tiled_shadow path in nvk_cmd_draw.c). A 3000x2000 RGBA layer is
-    ~24 MB per frame per surface across the base connector's PCIe link, plus sampling sysmem textures over PCIe.
-    For desktop composition this is likely SLOWER than ANV on the Iris Plus G7; only heavy 3D apps could gain.
- B5 Power: SF would keep the dGPU awake permanently (no D3cold), several watts more, large battery-life loss.
- B6 Detach: the GPU is in the detachable base. With SF on NVK, detaching = device lost in SF/system_server = UI
-    crash/reboot. Would require locking the DTX latch whenever NVIDIA mode is active and refusing detach requests.
- B7 Boot fragility: if nouveau/GSP fails to init (firmware, base not attached, GSP boot timeout), libvulkan has no
-    fallback to ANV -> no RenderEngine -> no UI. The NVIDIA boot entry would need a probe-and-fallback in gbinit.
-Verdict for (b): not viable with NVK 26.3 on lapis; it needs B1 + B2 fixed upstream-quality first, and even then
-B4-B6 make it a poor trade on this machine. Do not add an "NVIDIA" boot entry.
+ B1 (verified in source and in the binary) NVK 26.3 does not implement
+    VK_ANDROID_external_memory_android_hardware_buffer (the drm-shim run lists it as absent). SurfaceFlinger's
+    Skia-Vulkan RenderEngine (lapis: debug.renderengine.vulkan=true), HWUI (ro.hwui.use_vulkan=true) and ANGLE
+    (EGLImage/EGL_ANDROID_image_native_buffer, WebView/Chrome) need it, and CDD 17 C-3-1 requires it for Vulkan >= 1.1.
+    Patch 0003 (8b) implements it; it compiles and the extension is advertised under the drm-shim (section 7b), but it
+    is unreviewed upstream and untested on hardware.
+    NOT needed for window swapchains any more, see "Android 16+ swapchain fall-through" below.
+ B2 (THE swapchain blocker; NVK side verified in source, minigbm side to be measured) Buffer layouts. All gralloc
+    buffers come from minigbm's i915 backend in system RAM; for GPU render/texture/composer usage minigbm picks Intel
+    X/Y-tiled (or CCS) modifiers (lapis' libminigbm_gralloc.so contains Y_TILED, Y_TILED_CCS, ...). NVIDIA hardware can
+    only address LINEAR or NVIDIA block-linear. Unpatched NVK aborts the process on such a buffer (0001 turns that into
+    an error). Patch 0004 makes every buffer NVK allocates through gralloc LINEAR by adding a SW usage bit (upstream
+    minigbm: SW usage -> LINEAR; Google's build to be confirmed, nvk_probe prints the modifier). Buffers allocated by
+    others (SurfaceFlinger client targets, camera, video, ANGLE AHBs on ANV) are not affected: those still cannot be
+    shared with NVK unless their producer also asks for LINEAR.
+ B3 Present path: unpatched nvk_android.c QueueSignalReleaseImageANDROID does QueueWaitIdle() and returns fence -1,
+    so every present stalls the CPU until the dGPU is idle. Patch 0006 returns a sync_fd instead (fallback kept).
+ B4 (CORRECTED) Rendering into imported buffers: NVK renders directly into a LINEAR colour target only when every
+    colour attachment of the render pass is LINEAR with base address and row stride multiples of 128 B and there is no
+    depth/stencil attachment (nvk_cmd_draw.c nvk_rendering_linear(); NIL's LINEAR images are 2D, single level, single
+    layer, single sample anyway). Otherwise it renders into a VRAM tiled shadow and copies back at the end of the
+    render pass. That shadow was only initialised for VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT images
+    (nvk_image.c:939-1024), but Android swapchain images are created with VK_IMAGE_TILING_OPTIMAL around a LINEAR
+    gralloc buffer, so for them the fallback had a zero-sized shadow. Patch 0005 fixes that. Cost either way: the
+    buffers live in Intel system RAM across the base connector's PCIe Gen3 x4 link; a 3000x2000 RGBA frame is ~24 MB
+    per surface per frame (written directly, or copied from the shadow), plus sampling sysmem textures over PCIe.
+ B5 Power: SF would keep the dGPU awake permanently (no D3cold), several watts more.
+ B6 Detach: with SF on NVK, detaching = device lost in SF/system_server = UI crash/reboot.
+ B7 Boot fragility: if nouveau/GSP fails, libvulkan has no fallback to ANV -> no RenderEngine -> no UI.
+ B8 (new) HWUI needs 2 graphics queues: a17 VulkanManager.cpp:245-253 asks for a second queue in the graphics family
+    and HWUI aborts without it (and on VK_ERROR_DEVICE_LOST, :486-543). NVK 26.3 exposes queue_count = 1
+    (26.3.0-rc2 nvk_physical_device.c:1723). Churro patches that to 2; we do not (plan 8b 0007 "not planned"): the per-app shim
+    never hands NVK to HWUI ("android framework" engine), so HWUI stays on ANV.
+ Android 16+ swapchain fall-through (replaces the draft's B9, which is refuted): since android16-release libvulkan's
+    getProducerUsage() falls through to vkGetSwapchainGrallocUsage*ANDROID when the AHB-typed
+    vkGetPhysicalDeviceImageFormatProperties2 query fails (a17 swapchain.cpp:1764-1784 "Fall through to gralloc path
+    on error"; Android 15 returned VK_ERROR_SURFACE_LOST_KHR there). lapis 276.R4 libvulkan.so carries the Android 17
+    strings. So a window swapchain on NVK without AHB support is blocked by tiling (B2), not by missing AHB. NVK 26.3
+    exposes no GrallocUsage3/4, so the fallback lands on GrallocUsage2 (patched by 0004). nvk_probe -t
+    a17-swapchain-model reproduces exactly this sequence.
+Verdict for (b): still not viable on this machine (B5-B8); the per-app experiment (gfx-driver-pkg) is the only
+NVIDIA graphics path, gated (plan Phase 8 gate G0 first).
 
 5. What nvk_probe measures (run natively; results decide whether any of this is worth pursuing)
 -----------------------------------------------------------------------------------------------
-  setprop persist.vendor.gb.nouveau 1   (after boot_completed, gb_nouveau.rc loads nouveau immediately and at every
-                                         later boot; gb_power needs the nouveau opt-in patch so it stays bound)
+  Prerequisite: nouveau loaded (gb.nouveau=test boot entry, or persist.vendor.gb.nouveau=1).
   /vendor/bin/nvk_probe -n 200 -o /data/local/tmp/nvk.ppm      (as root; or: setprop vendor.gb.nvk_probe 1 and
                                                                read /data/vendor/nvk/probe.txt)
-  test offscreen     : instance/device on the GTX 1650, NAK pipeline compile, render+copy, pixel check, timing.
-  test anb-swapchain : AHardwareBuffer with swapchain-like usage (driver usage | HW_COMPOSER) -> prints the minigbm
-                       modifier -> VkNativeBufferANDROID import into NVK. Expected: FAIL with I915_*_TILED and
-                       VK_ERROR_INVALID_EXTERNAL_HANDLE (this is blocker B2, measured).
-  test anb-linear    : same + CPU_READ_OFTEN -> expected LINEAR -> NVK renders into the i915-allocated sysmem
-                       buffer over PCIe; CPU reads it back via AHardwareBuffer_lock and checks the pixels. PASS here
-                       proves cross-device PRIME (nouveau writing i915 GEM memory) works on this hardware.
+  -t offscreen          instance/device on the GTX 1650, NAK pipeline compile, render+copy, pixel check, timing.
+  -t anb-swapchain      AHB with the driver's swapchain usage | HW_COMPOSER -> prints the minigbm modifier ->
+                        VkNativeBufferANDROID import. Unpatched: FAIL with I915_*_TILED (B2). With 0004 the usage
+                        includes SW_WRITE_RARELY -> expected LINEAR -> PASS.
+  -t anb-linear         same + CPU_READ_OFTEN (LINEAR) + CPU read-back pixel check (cross-device PRIME works).
+  -t ahb-i915-readback  Phase 8 gate G0: AHB CPU_WRITE_RARELY|CPU_READ_RARELY|GPU_COLOR_OUTPUT|GPU_SAMPLED_IMAGE
+                        (CPU_READ_RARELY added to the plan's usage: AHardwareBuffer_lock(CPU_READ) requires it) ->
+                        NVK import -> per-pixel unique pattern (pat.frag) -> release (sync_fd with 0006) -> bit-exact
+                        read-back with AHardwareBuffer_lock AND by sampling on ANV (vulkan.intel.so imports the same
+                        AHB, readback.comp texelFetch()es every texel). PASS = both bit-exact.
+  -t a17-swapchain-model  GPDIFP2 with the AHB handle type (expected VK_ERROR_FORMAT_NOT_SUPPORTED without 0003) ->
+                        GrallocUsage4/3/2/1 like libvulkan -> allocate with SF consumer usage (COMPOSER_OVERLAY |
+                        GPU_SAMPLED_IMAGE) + producer usage -> VkNativeBufferANDROID + VkSwapchainImageCreateInfoANDROID
+                        -> vkAcquireImageANDROID(fd -1, fence) -> render -> vkQueueSignalReleaseImageANDROID with a wait
+                        semaphore -> poll the sync_fd -> pixels checked on ANV. Must PASS with 0004 (plan 8, gate).
+  -T <s> per-test watchdog (default 60 s, SIGALRM -> "TIMED OUT"), -A <icd> ANV for the read-back legs.
   Exit codes: 0 pass, 1 a test failed, 2 ICD/instance error, 3 NO_DEVICE (expected in the VMware VM).
 
-6. Validation actually performed (builder VM: VMware vmwgfx GPU only, no NVIDIA hardware)
------------------------------------------------------------------------------------------
-- Build: Mesa NVK for Android x86_64 builds cleanly (logs/nvk_build.log); host mesa_clc built (logs/host_clc.log).
-  Note: logs/nvk_build.log is from the earlier patchelf variant (16549321 bytes); the shipped binary's build log is
-  logs/verify/fixed_build.log (see section 7).
-- nvk_probe logic (host build): lavapipe -> offscreen PASS (correct clear/triangle pixels, 31.75 % coverage);
-  host NVK (Ubuntu Mesa 25.2.8) -> NO_DEVICE exit 3 (logs/host_validation.log).
-- Android binaries on bionic: scripts/40_bionic_chroot_test.sh runs OUR bionic nvk_probe + vulkan.nouveau.so in a
-  read-only chroot of the real lapis system image (CL3B.260622.271.R1, SDK 37, com.android.runtime APEX) + lapis
-  vendor image, on the builder kernel. Both entry paths (vk_icdGetInstanceProcAddr and the hwvulkan HMI path that
-  Android's libvulkan uses) load the ICD, create a Vulkan 1.4.363 instance and enumerate 0 devices -> NO_DEVICE
-  exit 3: exactly what the VMware VM will show (logs/chroot_test.log).
-- With Mesa's nouveau no-op drm-shim (LD_PRELOAD, NOUVEAU_CHIPSET=167 = TU117; test-only build, scripts/35_*):
-  NVK on bionic creates the physical + logical device (driverID 24 MESA_NVK, Vulkan 1.4.363, 166 device extensions,
-  +ANDROID_native_buffer, -ANDROID_external_memory_android_hardware_buffer), compiles the probe pipeline with NAK in
-  ~2-4 ms, records and "submits" (no-op). Pixels are 0 as expected since no GPU executes anything. In that chroot
-  there are no Android properties, so hw_get_module("gralloc") cannot select gralloc.minigbm.so and u_gralloc most
-  likely came up on its fallback backend; on the device (ro.hardware.gralloc=minigbm) it should pick the
-  "CrOS Gralloc" (gralloc.minigbm.so) backend like ANV does - nvk_probe's anb tests print which one.
-- NOT tested (needs the real machine): anything executing on the GTX 1650, GSP boot, nouveau runtime PM, gralloc
-  buffer import, performance.
+6. Facts and limits for app developers / testers (P0-4)
+--------------------------------------------------------
+- Texture compression: NVK reports textureCompressionETC2 = false and ASTC only on Tegra SoCs (26.3.0-rc2
+  nvk_physical_device.c:377-379, nvk_has_astc() :105-109); BC is supported.
+  Many Android games and the Android Baseline profile expect ETC2/ASTC, so they will skip or reject the NVK device
+  (the shim keeps ANV as device 0, so they still run, on ANV).
+- Mesa options on Android: environment variables do not reach zygote-forked apps; Mesa reads them from properties
+  named debug.mesa.<x> and then vendor.mesa.<x> (lower case, "_" -> "."; MESA_FOO -> mesa.foo). The bare mesa.<x>
+  prefix is ignored at ANDROID_API_LEVEL >= 33 (util/os_misc.c:197-205). Examples: NVK_DEBUG ->
+  debug.mesa.nvk.debug; NVK_ANB_LINEAR -> debug.mesa.nvk.anb.linear; MESA_SHADER_CACHE_DISABLE ->
+  debug.mesa.shader.cache.disable.
+- platform-sdk-version 35 vs 37 / android-strict: the NDK r27c sysroot tops out at API 35 (compiler target
+  x86_64-linux-android35), lapis is SDK 37. -Dplatform-sdk-version only sets Mesa's ANDROID_API_LEVEL; 26.3.0-rc2 has
+  no NVK/runtime/util code guarded by a level above 35 (grep 2026-10-25), so 37 changes no code today (base profile
+  keeps 35 for the bit-identical NV-01 rebuild). android-strict (Mesa default true) only caps NVK at Vulkan 1.1 when
+  ANDROID_API_LEVEL <= 32 (nvk_physical_device.c:69), so it has no effect at 35/37; at >= 33 it does drop the bare
+  "mesa." property prefix (above). Re-check both greps on every Mesa bump (50_rebase_mesa.sh).
+- Property-name length: our own properties stay <= 31 characters (INTERFACES 2.4). Mesa 26.3 itself handles long
+  names (os_misc.c raises PROP_NAME_MAX to 128 at API >= 26; older Mesa cut names at 31 - Churro carries a patch for
+  that). The two new Mesa options were chosen so that even the vendor.* spelling fits: vendor.mesa.nvk.anb.linear
+  (26), vendor.mesa.nvk.anb.waitidle (28).
+- Shader cache: compiled in (8a), but Mesa keeps the disk cache OFF on Android unless MESA_SHADER_CACHE_DISABLE=false
+  (property debug.mesa.shader.cache.disable=false) and a writable MESA_SHADER_CACHE_DIR are set (disk_cache_os.c).
+  The gpu-compute service must set both (integration note for component 5).
 
-7. Independent verification (adversarial re-check, 2026-10-24; builder work dir /build/native/nvk-verify)
---------------------------------------------------------------------------------------------------------
-Source provenance: the Mesa tree used is upstream mesa-26.3.0-rc2 (tag object e54926ad, commit b34c71d9, matches
-  `git ls-remote https://gitlab.freedesktop.org/mesa/mesa.git`). `diff -r` against `git archive mesa-26.3.0-rc2`
-  shows only the 4 files changed by patches 0001/0002 (+ __pycache__/subprojects); every *.orig equals pristine.
-Reproducibility: the delivered scripts + patches rebuilt the first delivery BIT-IDENTICALLY (f727a064..., also the
-  unstripped 9fa5dddd...) in another directory (logs/verify/repro_build.log), so the shipped binary really is what
-  the scripts produce. After correcting patch 0002 (NVK_NO_CUBIN) the rebuild gives f7e9154f... (now in bin/;
-  logs/verify/fixed_build.log). Import list identical (292 symbols), NEEDED/SONAME/segments unchanged.
-ELF (logs/verify/elf_checks_fixed.log): ELF64 x86-64 DYN, .note.android.ident = NDK r27c / API 35, NEEDED only
-  libhardware, liblog, libnativewindow, libsync, libm, libdl, libc; symbol versions only LIBC/LIBC_N/P/Q/R/U (bionic),
-  zero GLIBC references. HMI is a 248-byte object in writable .data (libvulkan writes hmi->dso): tag 'HWMT',
-  module_api_version 0x0001, hal_api_version 0x0100, id "vulkan", name "Mesa 3D Vulkan HAL".
-  liblog/libnativewindow/libsync are LLNDK in lapis (system/etc/llndk.libraries.txt), libhardware.so is in
-  /vendor/lib64; every import (AHardwareBuffer_* @LIBNATIVEWINDOW, __android_log_write @LIBLOG, sync_merge,
-  hw_get_module) is exported there, and dlopen(RTLD_NOW) succeeding on lapis bionic proves all 292 resolve.
-libvulkan-equivalent loader check: verify/hmi_check.c re-implements what lapis libvulkan does (its strings confirm the
-  same flow: ro.vulkan.apex / ro.hardware.vulkan / ro.board.platform -> vulkan.<x>.so via android_load_sphal_library,
-  "HAL id '%s' != '%s'", "invalid dispatchable object magic"): dlsym HMI, id check, write hmi->dso, open("vk0"),
-  device tag/version/module, CreateInstance, HWVULKAN_DISPATCH_MAGIC 0x01CDC0DE on VkInstance/VkPhysicalDevice/
-  VkDevice/VkQueue. All checks PASS in the lapis bionic chroot, identical to lapis' own vulkan.intel.so
-  (logs/verify/chroot_fixed.log). With the drm-shim TU117: device with +VK_ANDROID_native_buffer (spec 8),
-  vkGetSwapchainGrallocUsage(2)ANDROID / vkAcquireImageANDROID / vkQueueSignalReleaseImageANDROID present,
-  GrallocUsage3/4 absent (libvulkan falls back to Usage2), no AHB extension (B1 confirmed in the binary).
-  hmi_check can also be run natively: /path/hmi_check /vendor/lib64/hw/vulkan.nouveau.so (not in the tree manifest).
-Integration facts re-checked on the lapis images: vendor build.prop ro.hardware.vulkan=intel, ro.board.platform empty,
-  no ro.vulkan.apex in the vendor, system or system_ext props -> NVK is never loaded by libvulkan; ro.hardware.gralloc=minigbm and gralloc.minigbm.so
-  ("CrOS Gralloc") exists; lapis ANV links no IMapper/libui either, so ANV and NVK use the same u_gralloc CrOS
-  backend; surfaceflinger and libhwui both reference VK_ANDROID_external_memory_android_hardware_buffer;
-  debug.renderengine.vulkan=true, ro.hwui.use_vulkan=true, ro.hardware.egl=angle. libminigbm_gralloc.so and
-  libgbm.so contain backend_nouveau and "%s/renderD%d" (render-node ordering risk is real). 6.18 tu102.c:
-  nvkm_boolopt("NvGspRm", true) and TU117 booter 570.144/535.113.01 - matches the staged firmware.
-Corrections made: patch 0002 + scripts/apply_patches.py + bin/vulkan.nouveau(.unstripped).so (old ones in
-  superseded/); section 1/2/5 texts above. Builder note: /build/native/nvk-android still holds the OLD
-  apply_patches.py; copy scripts/apply_patches.py from here before rebuilding there.
+7. Validation (builder VM: VMware vmwgfx GPU only, no NVIDIA hardware)
+----------------------------------------------------------------------
+7a. Phase 0 re-checks against lapis CL3B.260622.276.R4 (2026-10-25; previous run used 271.R1)
+  The rootfs (system/lib64, apex/com.android.runtime, vendor/lib64, a few /system/bin tools, llndk.libraries.txt)
+  was streamed READ-ONLY from the user's running VM with `adb exec-out "cd / && tar -cf - ..."` into
+  builder:/build/native/dgpu/nvk-sync/rootfs-276R4 (972 MB). lapis.bin was NOT read (hard rule: never touch the VM
+  disk files), see the integration file "Deviations".
+  - verify/import_check.py: NEEDED within LLNDK(276.R4) + libhardware; all 292 imports of the 2026-10-24 ICD and all
+    44 of nvk_probe resolve -> PASS (logs/p03_276R4_checks.log).
+  - bionic chroot (verify/chroot_dir.sh): nvk_probe on the vk_icd and the HMI entry path -> 1.4.363 instance,
+    0 devices, exit 3 NO_DEVICE; hmi_check PASS.
+  - drm-shim TU117: device + NAK compile (2.4 ms), +ANDROID_native_buffer, -AHB, GrallocUsage(2) present, 3/4 absent.
+7b. This revision's builds and checks: see C:\GB-build\native\dgpu\integration\nvk-gfxdriver.md (NV-01..NV-06 with
+  hashes and log paths): NV-01 base rebuild bit-identical (f7e9154f, unstripped 4d8ea403); 8a twice (NV-05); 8b
+  compile + AHB advertised; chroot NO_DEVICE + drm-shim on the 8a ICD; every probe mode reaching its first device
+  call; import/NEEDED checks of vulkan.nouveau.so, libgb_nvk.so and nvk_probe.
+7c. Earlier record (2026-10-24, kept): source provenance - mesa-26.3.0-rc2 tag object e54926ad, commit b34c71d9,
+  matches git ls-remote; ELF - ELF64 x86-64 DYN, .note.android.ident NDK r27c / API 35, symbol versions only bionic
+  LIBC*, HMI a 248-byte object in writable .data (libvulkan writes hmi->dso): tag 'HWMT', module_api_version 0x0001,
+  hal_api_version 0x0100, id "vulkan". hmi_check.c re-implements libvulkan's LoadDriver / Hal::Open / CreateInstance /
+  dispatch-magic (0x01CDC0DE) checks. Integration facts: vendor build.prop ro.hardware.vulkan=intel,
+  ro.board.platform empty, no ro.vulkan.apex; ro.hardware.gralloc=minigbm and gralloc.minigbm.so ("CrOS Gralloc");
+  ANV and NVK use the same u_gralloc CrOS backend; libminigbm_gralloc.so and libgbm.so contain backend_nouveau and
+  "%s/renderD%d".
 Still NOT verified (needs the Surface Book 3): everything that executes on the GTX 1650 - GSP boot, rendering,
-  gralloc/PRIME import, runtime PM, detach.
+  gralloc/PRIME import (gate G0), the LINEAR choice of Google's minigbm build, the sync_fd consumed by RenderEngine,
+  runtime PM, detach.
+
+8. Builder notes
+----------------
+- Work dir builder:/build/native/nvk-android (rustup/cargo/host-clc there); results/<name>/ per build, logs/.
+- /build/mesa-android/mesa is a blobless partial clone: fetch / archive only (no log -S, no blame).
+- Builds take ~10 minutes alone; run_queue.sh starts each only when the 1-min load is < 2 and no gbiso job runs.
+
+9. Later work
+-------------
+9.1 Gate G0 on hardware before any further Phase 8 hours (plan section 9, Phase 8).
+9.2 0007 (2 graphics queues) only if HWUI-on-NVK is ever wanted (not planned, B8).
+9.3 platform-sdk-version: when Mesa starts using levels > 35, either an NDK with API 37 headers or a stub check.
+9.4 Mesa 26.3.0 final: scripts/50_rebase_mesa.sh [--check] mesa-26.3.0 refuses until the tag exists and is 14 days
+    old (2026-10-25 --check: "mesa-26.3.0 does not exist", latest tag mesa-26.3.0-rc2). It builds into new dirs only.
+
+10. INTERFACES v1.2 (graphics switching, wave 1b, 2026-10-25)
+-------------------------------------------------------------
+10.1 NVK, patches and the payload ICD are unchanged (vulkan.nouveau.so 625314e0..., libgb_nvk.so 6bb6dc80...).
+10.2 nvk_probe is now also the probe of the automatic self-test gate (decision D4, INTERFACES 25): root service
+     gb_gfx_selftest runs `timeout 150 nvk_probe -t ahb-i915-readback -T 60`, then the same with
+     a17-swapchain-model, on the first healthy bind per identity (build id, kernel, gfx_build_id with icd/nvk/probe
+     hashes). The probe binary hash is part of that identity (probe=), so every probe rebuild re-runs the test once.
+10.3 v1.2 probe changes (src/nvk_probe.c "Supervision"; README "Self-test invocations"): stop signals kill the test
+     child before the probe ends, PDEATHSIG in both directions, parent-side -T deadline, "requested test not in
+     this build / no test ran" is exit 1, an explicit -d/-A path that does not exist is exit 2 (no silent fallback).
+     Exit codes 0/1/2/3 are otherwise unchanged. Evidence: logs/wave1b/, integration\nvk-gfxdriver.md section 7.
+10.4 Per-app NVK (the shim in gfx-driver-pkg) is no longer an experiment: NVK first while vendor.gb.gfx_active is
+     nvidia, for the apps that gb_power's Settings select (games + "Use NVIDIA", or all; "Always Intel" wins).
+     Sections 3-6 above (option (a), facts for app developers) still hold; "ANV is device 0" is replaced by
+     "NVK is device 0 when gb_power says nvidia" (gfx-driver-pkg\README.md).

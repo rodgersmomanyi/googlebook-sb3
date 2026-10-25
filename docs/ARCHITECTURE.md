@@ -6,6 +6,7 @@
 UEFI (VMware EFI, or Surface UEFI with Secure Boot off)
  └─ \EFI\BOOT\BOOTX64.EFI = systemd-boot 262.1           (ESP "EFI-SYSTEM", FAT32, written by build_esp.py)
      └─ loader/entries/gb-<slot>.conf                     default = the A/B slot to boot
+        (native ESPs also: gb-<slot>-nvtest.conf "[NVIDIA test]" = the same + gb.nouveau=test; gb/dgpu-<krel>.erofs)
          linux  /vmlinuz          our GKI kernel (android17-6.18, 6.18.21, Kleaf build, EFI stub)
          initrd /initrd-<slot>.img
          options <kernel command line>  (rdinit=/gbinit ... gb.hw=vm|native androidboot.boot_devices|boot_part_uuid=...)
@@ -99,13 +100,40 @@ diagnostics; optional network ADB for scrcpy, together with the eth0 watchdog `g
 ### Native tree only (`/gbnative`)
 
 Our module set (two passes: `gbinit` before Android, `gb_modules.sh` at early-init for modules that must link against
-lapis's first-stage `mfd-core`/`platform_profile`; nouveau staged for on-demand loading only; never a copy of a
-module lapis loads in its first stage, see [NATIVE.md](NATIVE.md)), the Surface Book 3 firmware, the native `build.prop`
-(320 dpi, no colour pipeline in the composer for i915), refusing stubs for every firmware/EC/SPI flashing tool and
-the disk installer, `gb_bootlog` (writes `gblog\bootN-tSECONDS.txt` to the boot partition at 40/90/180/420 s, since
-there is no serial console), and the components from `inject/native/components/*.json` (audio, iptsd, power, hw,
-sensors, camera, nouveau, nvk; manifests may add rc text and native `build.prop` lines, e.g. `ro.hardware.camera=sb3`).
-Nothing VMware-specific; `gb_console` is left out because the LPSS UART carries the Surface Aggregator.
+lapis's first-stage `mfd-core`/`platform_profile`; never a copy of a module lapis loads in its first stage, see
+[NATIVE.md](NATIVE.md)), the Surface Book 3 firmware, the native `build.prop` (320 dpi, no colour pipeline in the
+composer for i915, `ro.gfx.driver.0=gb.sb3.gfxdriver`), refusing stubs for every firmware/EC/SPI flashing tool and
+the disk installer, `gb_bootlog` (writes `gblog\bootN-tSECONDS.txt` to the boot partition at 40/90/180/420/900 s,
+since there is no serial console), and the components from `inject/native/components/*.json` (audio, iptsd, power,
+hw, sensors, camera, nouveau, nvk, gfxdriver, gpu_compute, gpu_ui). Manifests list `files` for the tree, `payload`
+files for the dGPU erofs, `symlinks` into the payload mount, `rc_files`/`rc_text` for `gb.rc` and native
+`build.prop` lines (e.g. `ro.hardware.camera=sb3`). Nothing VMware-specific; `gb_console` is left out because the
+LPSS UART carries the Surface Aggregator.
+
+## NVIDIA dGPU (native)
+
+The GTX 1650 in the keyboard base is never needed to boot or to draw the screen. Its stack sits beside the Intel one
+([NVIDIA.md](NVIDIA.md); the normative spec is [native/dgpu/INTERFACES.md](../native/dgpu/INTERFACES.md)):
+
+```
+ESP gb/dgpu-<krel>.erofs ──copy+verify──> /data/vendor/gb/payload/dgpu.erofs ──mount──> /odm/dgpu
+   firmware/nvidia/tu117/* (+ WHENCE, LICENCE)   ── bind ──> /odm/firmware/nvidia
+   lib/modules/{nouveau,drm_exec,drm_gpuvm,gpu-sched,drm_ttm_helper}.ko
+   lib64/hw/vulkan.nouveau.so (NVK ICD; /vendor/lib64/hw/vulkan.nouveau.so links here)
+   lib64/gpu-compute/{libgb_gpu_compute.so,libgb_nvk_loader.so}
+
+sys.boot_completed + base attached + mode auto/nvidia ──> gb_nouveau.sh auto: guards, ESP lock, marker, insmod,
+   health check (30 s), clean mark (120 s)                                     (gb.nouveau=0: never)
+gb_power (root, the single writer of the graphics state):
+   DTX events, PCI uevents, the nouveau state  ──> vendor.gb.gfx_active / gfx_reason, render node mode,
+   Settings.Global updatable_driver_* (through gb_notify), self-test start, detach decision, /dev/socket/gb_power
+GbGpu (untrusted app) ── socket ──> gb_power        tile "Graphics", Settings > System > Graphics, notifications
+app process with the GbGfxDriver package ──> shim vulkan.intel.so: NVK first while gfx_active=nvidia, else ANV
+gb_gpu_compute (nobody) ── /dev/socket/gb_gpu_compute (HTTP) ──> llama.cpp ──> loader stub ──> NVK
+```
+
+All of these services run in permissive existing domains (`u:r:shell:s0`, apps in their own app domains). No new
+SELinux type is added.
 
 ## Kernel command lines
 
@@ -143,7 +171,8 @@ lapis's own ACPI `battery.ko` autoloads for VMware's BAT1; `gb_battunbind.sh` un
 * **VM**: `lapis.bin` is the lapis recovery image as a raw disk (`lapis.vmdk` = flat descriptor), with the ESP grown
   into the unused ChromeOS `KERN-A` partition (`grow_esp.py`, 192 MiB) and userdata grown by +28 GB
   (`grow_userdata.py`). `build_esp.py` rewrites only the ESP region.
-* **USB / internal**: `build_usb.py` builds a fresh GPT: ESP (512 MiB), the A/B `boot`/`init_boot`/`vendor_boot`/
+* **USB / internal**: `build_usb.py` builds a fresh GPT: ESP (512 MiB: both slots' initrds, the dGPU payload and the
+  logs), the A/B `boot`/`init_boot`/`vendor_boot`/
   `vbmeta`/`pvmfw` copies **with their GPT attribute bits** (the A/B slot state lives there), blank `misc`,
   `metadata`, `frp_persist`, `desktop_security_*`, `super` copied, blank `userdata`; fresh partition GUIDs.
   It refuses to run while the other slot has a pending (not yet successful) update.

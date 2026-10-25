@@ -65,8 +65,10 @@ cleanly first); Workstation rewrites the .vmx from its own copy otherwise.
 ## 5. Build the ESP and boot
 
 ```powershell
+$env:GB_WRITE_LAPIS = "1"      # build_esp.py refuses to write lapis.bin without it (boot_live/cycle inherit it)
 python -I -B build_esp.py      # builds the ESP (systemd-boot, kernel, initrd for the booted slot) and writes it
-                               # into lapis.bin's EFI-SYSTEM partition - only with the VM powered off
+                               # into lapis.bin's EFI-SYSTEM partition - only with the VM powered off: it refuses
+                               # while VMware has the VM open (a lapis*.lck folder next to lapis.bin)
 .\boot_live.ps1                # clean power-off if running, rebuild, start the VM, summarize serial0.log
 ```
 

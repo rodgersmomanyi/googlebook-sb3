@@ -3,27 +3,53 @@
  *
  * Loads a Vulkan ICD .so DIRECTLY (not through Android's libvulkan, which only ever loads the one system HAL
  * driver vulkan.<ro.hardware.vulkan>.so = ANV), lists the DRM render nodes, enumerates physical devices and runs:
- *   test 1 "offscreen": renders a triangle into a 256x256 optimal-tiled VkImage (device-local), copies it to a
- *                       host-visible buffer and checks the pixels (clear colour in the corner, triangle colour in the
- *                       middle, covered-pixel count ~32 %).
- *   test 2/3 (Android only) "anb-*": what Android's swapchain does with a gralloc buffer: allocate an
- *                       AHardwareBuffer through the system allocator (minigbm on lapis = i915 GEM memory), wrap its
- *                       native_handle in VkNativeBufferANDROID, vkCreateImage (NVK imports the dma-buf via u_gralloc),
- *                       render into it on the NVIDIA GPU and (linear variant) read it back with AHardwareBuffer_lock.
- *                       anb-swapchain = the usage bits a real window swapchain would get (driver usage + HW_COMPOSER);
- *                       anb-linear    = same + CPU_READ_OFTEN (makes minigbm pick a linear layout).
- * Each test runs in its own forked child, so a crash/abort inside the driver is reported instead of killing the run.
+ *   offscreen          renders a triangle into a 256x256 optimal-tiled VkImage (device-local), copies it to a
+ *                      host-visible buffer and checks the pixels (clear colour in the corner, triangle colour in the
+ *                      middle, covered-pixel count ~32 %).
+ *   anb-swapchain      (Android) what Android's swapchain does with a gralloc buffer: allocate an AHardwareBuffer
+ *                      through the system allocator (minigbm on lapis = i915 GEM memory), wrap its native_handle in
+ *                      VkNativeBufferANDROID, vkCreateImage (NVK imports the dma-buf via u_gralloc), render into it on
+ *                      the NVIDIA GPU. Usage = the driver's swapchain usage + HW_COMPOSER.
+ *   anb-linear         (Android) same + CPU_READ_OFTEN (minigbm picks LINEAR) and a CPU read-back check.
+ *   ahb-i915-readback  (Android) Phase 8 gate G0: AHB with CPU_WRITE_RARELY|CPU_READ_RARELY|GPU_COLOR_OUTPUT|
+ *                      GPU_SAMPLED_IMAGE -> VkNativeBufferANDROID import into NVK -> render a per-pixel unique pattern
+ *                      -> release (sync_fd) -> read back (1) with AHardwareBuffer_lock and (2) by sampling the same
+ *                      buffer on ANV (vulkan.intel.so imports it as an AHB image, a compute shader texelFetch()es every
+ *                      texel). PASS only if both read-backs are bit-exact.
+ *   a17-swapchain-model (Android) the Android 17 libvulkan swapchain sequence for this driver (swapchain.cpp:
+ *                      getProducerUsage): vkGetPhysicalDeviceImageFormatProperties2 with the AHB handle type
+ *                      (expected to fail on NVK without AHB support) -> GetSwapchainGrallocUsage4/3/2/1 fallback ->
+ *                      allocate with SurfaceFlinger's consumer usage + the returned producer usage -> VkNativeBufferANDROID
+ *                      (+ VkSwapchainImageCreateInfoANDROID) image -> vkAcquireImageANDROID -> render ->
+ *                      vkQueueSignalReleaseImageANDROID with a wait semaphore -> wait the returned sync_fd -> verify the
+ *                      pixels on ANV when available. Needs NVK patch 0004 (LINEAR forcing) to pass on i915 gralloc.
+ * Each test runs in its own forked child with a watchdog (-T), so a crash/abort/hang inside a driver is reported
+ * instead of killing the run.
+ * Supervision (INTERFACES v1.2 25.3, the automatic self-test runs `timeout 150 nvk_probe -t <mode> -T 60` as root):
+ * the probe never outlives whoever runs it, and a test child never outlives the probe. SIGTERM/SIGINT/SIGHUP to the
+ * probe SIGKILL the running test child, wait for it (at most 5 s: a child stuck in an uninterruptible driver ioctl
+ * cannot be reaped) and then end the probe with that signal; the probe gets SIGTERM when its parent dies, and every
+ * test child gets SIGKILL when the probe dies, even by SIGKILL. (lapis' toybox `timeout` signals the command's whole
+ * process group, but a signal sent to the probe's pid alone, or a `timeout` that is itself killed - which is what the
+ * self-test script's TERM trap does - used to leave the probe and/or its test child running with the device open;
+ * verify/selftest_invocation.sh S5/S6/S9.)
  *
- * Exit codes: 0 all run tests passed | 1 a test failed | 2 ICD could not be loaded / instance failed
+ * Exit codes: 0 all run tests passed | 1 a test failed (also: a requested test is not in this build, or no test ran)
+ *             2 ICD could not be loaded / instance failed
  *             3 no matching (NVIDIA) Vulkan device - e.g. in the VMware VM, or nouveau not loaded
+ *             killed by SIGTERM/SIGINT/SIGHUP: see "Supervision"
  *
- * Usage: nvk_probe [-d icd.so] [-a] [-n frames] [-o out.ppm] [-t offscreen|anb|all] [-F] [-H]
- *   -d  ICD to load (default: $NVK_ICD, /odm/lib64/nvk/vulkan.nouveau.so, /vendor/lib64/hw/vulkan.nouveau.so,
+ * Usage: nvk_probe [-d icd.so] [-A anv.so] [-a] [-n frames] [-o out.ppm] [-t TESTS] [-T secs] [-F] [-H]
+ *   -d  ICD to load (default: $NVK_ICD, /vendor/lib64/hw/vulkan.nouveau.so, /odm/dgpu/lib64/hw/vulkan.nouveau.so,
  *       ./vulkan.nouveau.so, ./libvulkan_nouveau.so)
+ *   -A  ANV (Intel) ICD for the read-back leg (default: $NVK_PROBE_ANV, /vendor/lib64/hw/vulkan.intel.so)
  *   -a  accept any vendor (default: only vendorID 0x10de) - used to validate this program with lavapipe/ANV
  *   -n  also time N render+submit+wait iterations of the offscreen test (default 0)
  *   -o  write the offscreen result as a PPM image
- *   -F  do not fork (debugging)
+ *   -t  comma-separated tests: offscreen, anb (= anb-swapchain,anb-linear), anb-swapchain, anb-linear,
+ *       ahb-i915-readback, a17-swapchain-model, all (default: all; non-Android builds only have offscreen)
+ *   -T  per-test watchdog in seconds (default 60; 0 = none)
+ *   -F  do not fork (debugging; disables the watchdog)
  *   -H  enter the driver through its hwvulkan HAL module (HMI->open("vk0")), exactly like Android's libvulkan,
  *       instead of vk_icdGetInstanceProcAddr
  *
@@ -38,6 +64,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +75,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan.h>
@@ -56,9 +87,11 @@
 #include <cutils/native_handle.h>
 #include <hardware/gralloc.h>
 #include <vulkan/vk_android_native_buffer.h>
+#include <vulkan/vulkan_android.h>
 #endif
 
-#include "probe_shaders.h" /* tri_vert_spv[], tri_frag_spv[] (glslangValidator --vn) */
+/* tri_vert_spv[], tri_frag_spv[], fs_vert_spv[], pat_frag_spv[], readback_comp_spv[] (glslangValidator --vn) */
+#include "probe_shaders.h"
 
 /* ---------- minimal DRM uapi (avoid header dependencies) ---------- */
 struct probe_drm_version {
@@ -108,8 +141,8 @@ struct hal_vulkan_device {
 };
 
 /* ---------- globals ---------- */
-static const char *g_icd;
-static int g_any_vendor, g_frames, g_nofork, g_first = -1, g_force_hmi;
+static const char *g_icd, *g_anv_icd;
+static int g_any_vendor, g_frames, g_nofork, g_first = -1, g_force_hmi, g_timeout = 60;
 static const char *g_ppm;
 static PFN_vkGetInstanceProcAddr gipa;
 
@@ -187,36 +220,37 @@ static void list_drm_nodes(void) {
 }
 
 /* ---------- ICD loading ---------- */
-static int load_icd(void) {
-  const char *cands[] = {g_icd,
-                         getenv("NVK_ICD"),
-                         "/odm/lib64/nvk/vulkan.nouveau.so",
-                         "/vendor/lib64/hw/vulkan.nouveau.so",
-                         "./vulkan.nouveau.so",
-                         "./libvulkan_nouveau.so",
-                         NULL};
+/* Loads an ICD and returns its vkGetInstanceProcAddr (vk_icd* entry or the hwvulkan HMI path). */
+static PFN_vkGetInstanceProcAddr load_icd_file(const char *const *cands, int explicit_path, int force_hmi,
+                                               const char *what) {
   void *h = NULL;
   const char *used = NULL;
-  for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++) {
+  for (size_t i = 0; cands[i] != (const char *)-1; i++) {
     if (!cands[i] || !cands[i][0]) continue;
-    if (access(cands[i], R_OK)) continue;
+    if (access(cands[i], R_OK)) {
+      if (explicit_path && i == 0) { /* -d/-A given (always cands[0]): never fall back to a default */
+        say("  %s: %s\n", cands[i], strerror(errno));
+        break;
+      }
+      continue;
+    }
     h = dlopen(cands[i], RTLD_NOW | RTLD_LOCAL);
     if (h) {
       used = cands[i];
       break;
     }
     say("  dlopen(%s) failed: %s\n", cands[i], dlerror());
-    if (g_icd) break; /* explicit path: do not silently fall back */
+    if (explicit_path) break; /* explicit path: do not silently fall back */
   }
   if (!h) {
-    say("ERROR: no loadable Vulkan ICD found (use -d /path/to/vulkan.nouveau.so)\n");
-    return -1;
+    say("  %s: no loadable Vulkan ICD found\n", what);
+    return NULL;
   }
-  say("== ICD %s\n", used);
+  say("== %s ICD %s\n", what, used);
   typedef VkResult(VKAPI_PTR * PFN_negotiate)(uint32_t *);
   PFN_negotiate neg = (PFN_negotiate)dlsym(h, "vk_icdNegotiateLoaderICDInterfaceVersion");
-  gipa = g_force_hmi ? NULL : (PFN_vkGetInstanceProcAddr)dlsym(h, "vk_icdGetInstanceProcAddr");
-  if (gipa) {
+  PFN_vkGetInstanceProcAddr gp = force_hmi ? NULL : (PFN_vkGetInstanceProcAddr)dlsym(h, "vk_icdGetInstanceProcAddr");
+  if (gp) {
     if (neg) {
       uint32_t ver = 5;
       neg(&ver);
@@ -224,22 +258,34 @@ static int load_icd(void) {
     } else {
       say("  entry: vk_icdGetInstanceProcAddr\n");
     }
-    return 0;
+    return gp;
   }
   /* Android HAL module path, exactly what libvulkan does */
   struct hal_module *hmi = (struct hal_module *)dlsym(h, "HMI");
   if (!hmi || !hmi->methods || !hmi->methods->open) {
-    say("ERROR: %s exports neither vk_icdGetInstanceProcAddr nor HMI\n", used);
-    return -1;
+    say("  ERROR: %s exports neither vk_icdGetInstanceProcAddr nor HMI\n", used);
+    return NULL;
   }
   struct hal_device *dev = NULL;
   int r = hmi->methods->open(hmi, "vk0", &dev);
   if (r || !dev) {
-    say("ERROR: HMI open(vk0) failed: %d\n", r);
-    return -1;
+    say("  ERROR: HMI open(vk0) failed: %d\n", r);
+    return NULL;
   }
-  gipa = ((struct hal_vulkan_device *)dev)->GetInstanceProcAddr;
   say("  entry: HMI '%s' by '%s' (hwvulkan HAL)\n", hmi->name ? hmi->name : "?", hmi->author ? hmi->author : "?");
+  return ((struct hal_vulkan_device *)dev)->GetInstanceProcAddr;
+}
+
+static int load_icd(void) {
+  const char *cands[] = {g_icd,
+                         getenv("NVK_ICD"),
+                         "/vendor/lib64/hw/vulkan.nouveau.so",
+                         "/odm/dgpu/lib64/hw/vulkan.nouveau.so",
+                         "./vulkan.nouveau.so",
+                         "./libvulkan_nouveau.so",
+                         (const char *)-1};
+  gipa = load_icd_file(cands, g_icd != NULL, g_force_hmi, "NVK");
+  if (!gipa) say("ERROR: no loadable Vulkan ICD found (use -d /path/to/vulkan.nouveau.so)\n");
   return gipa ? 0 : -1;
 }
 
@@ -254,6 +300,7 @@ IFN(GetPhysicalDeviceProperties);
 IFN(GetPhysicalDeviceProperties2);
 IFN(GetPhysicalDeviceMemoryProperties);
 IFN(GetPhysicalDeviceQueueFamilyProperties);
+IFN(GetPhysicalDeviceImageFormatProperties2);
 IFN(EnumerateDeviceExtensionProperties);
 IFN(CreateDevice);
 IFN(GetDeviceProcAddr);
@@ -301,6 +348,8 @@ DFN(CreateFence);
 DFN(DestroyFence);
 DFN(WaitForFences);
 DFN(ResetFences);
+DFN(CreateSemaphore);
+DFN(DestroySemaphore);
 
 static void load_global(void) {
   vkCreateInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
@@ -315,6 +364,7 @@ static void load_instance(VkInstance inst) {
   L(GetPhysicalDeviceProperties2);
   L(GetPhysicalDeviceMemoryProperties);
   L(GetPhysicalDeviceQueueFamilyProperties);
+  L(GetPhysicalDeviceImageFormatProperties2);
   L(EnumerateDeviceExtensionProperties);
   L(CreateDevice);
   L(GetDeviceProcAddr);
@@ -367,6 +417,8 @@ static void load_device(VkDevice d) {
   L(DestroyFence);
   L(WaitForFences);
   L(ResetFences);
+  L(CreateSemaphore);
+  L(DestroySemaphore);
 #undef L
 }
 
@@ -390,6 +442,7 @@ static const char *vkr(VkResult r) {
     C(VK_ERROR_TOO_MANY_OBJECTS);
     C(VK_ERROR_FORMAT_NOT_SUPPORTED);
     C(VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    C(VK_ERROR_SURFACE_LOST_KHR);
     C(VK_ERROR_UNKNOWN);
 #undef C
   default: return "VK_?";
@@ -453,8 +506,9 @@ static int setup(int verbose) {
   if (n == 0) {
     if (verbose)
       say("NO_DEVICE: the ICD found no usable GPU. Expected in the VMware VM (no NVIDIA GPU). On the Surface Book 3 "
-          "check: performance base attached, nouveau.ko loaded & bound to 10de:1f91 (persist.vendor.gb.nouveau=1), "
-          "/dev/dri/renderD129 present, GSP firmware nvidia/tu117/gsp/*-570.144.bin loaded (dmesg | grep nouveau).\n");
+          "check: performance base attached, nouveau.ko loaded & bound to 10de:1f91 (vendor.gb.nouveau.result), "
+          "a second /dev/dri/renderD* driven by nouveau, GSP firmware nvidia/tu117/gsp/*-570.144.bin loaded "
+          "(dmesg | grep nouveau).\n");
     return 3;
   }
   VkPhysicalDevice pds[16];
@@ -565,10 +619,12 @@ struct rt {
   VkCommandBuffer cb;
 };
 
-static int make_pipeline(struct rt *t, VkImage img, VkImageLayout final_layout) {
+/* Render pass + pipeline + command buffer. pattern=0: the triangle; pattern=1: full-screen pattern (pat.frag).
+ * Creating this first means every test mode reaches its first device call (NAK compile) before any allocation. */
+static int make_rt_core(struct rt *t, VkImageLayout final_layout, int pattern) {
   VkAttachmentDescription att = {.format = VK_FORMAT_R8G8B8A8_UNORM,
                                  .samples = VK_SAMPLE_COUNT_1_BIT,
-                                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                 .loadOp = pattern ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR,
                                  .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                                  .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                  .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -593,27 +649,13 @@ static int make_pipeline(struct rt *t, VkImage img, VkImageLayout final_layout) 
                                  .dependencyCount = 1,
                                  .pDependencies = &dep};
   CHECK(vkCreateRenderPass(g_dev, &rpci, NULL, &t->rp));
-  VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                               .image = img,
-                               .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                               .format = VK_FORMAT_R8G8B8A8_UNORM,
-                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-  CHECK(vkCreateImageView(g_dev, &vci, NULL, &t->view));
-  VkFramebufferCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-                                 .renderPass = t->rp,
-                                 .attachmentCount = 1,
-                                 .pAttachments = &t->view,
-                                 .width = W,
-                                 .height = H,
-                                 .layers = 1};
-  CHECK(vkCreateFramebuffer(g_dev, &fci, NULL, &t->fb));
   VkShaderModule vs, fs;
   VkShaderModuleCreateInfo smci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                   .codeSize = sizeof tri_vert_spv,
-                                   .pCode = tri_vert_spv};
+                                   .codeSize = pattern ? sizeof fs_vert_spv : sizeof tri_vert_spv,
+                                   .pCode = pattern ? fs_vert_spv : tri_vert_spv};
   CHECK(vkCreateShaderModule(g_dev, &smci, NULL, &vs));
-  smci.codeSize = sizeof tri_frag_spv;
-  smci.pCode = tri_frag_spv;
+  smci.codeSize = pattern ? sizeof pat_frag_spv : sizeof tri_frag_spv;
+  smci.pCode = pattern ? pat_frag_spv : tri_frag_spv;
   CHECK(vkCreateShaderModule(g_dev, &smci, NULL, &fs));
   VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   CHECK(vkCreatePipelineLayout(g_dev, &plci, NULL, &t->pl));
@@ -660,7 +702,7 @@ static int make_pipeline(struct rt *t, VkImage img, VkImageLayout final_layout) 
                                        .renderPass = t->rp};
   double t0 = now_ms();
   CHECK(vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gpci, NULL, &t->pipe));
-  say("  pipeline compiled in %.1f ms\n", now_ms() - t0);
+  say("  %s pipeline compiled in %.1f ms\n", pattern ? "pattern" : "triangle", now_ms() - t0);
   vkDestroyShaderModule(g_dev, vs, NULL);
   vkDestroyShaderModule(g_dev, fs, NULL);
   VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -673,6 +715,29 @@ static int make_pipeline(struct rt *t, VkImage img, VkImageLayout final_layout) 
                                       .commandBufferCount = 1};
   CHECK(vkAllocateCommandBuffers(g_dev, &cbai, &t->cb));
   return 0;
+}
+
+static int make_rt_target(struct rt *t, VkImage img) {
+  VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                               .image = img,
+                               .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                               .format = VK_FORMAT_R8G8B8A8_UNORM,
+                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+  CHECK(vkCreateImageView(g_dev, &vci, NULL, &t->view));
+  VkFramebufferCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                 .renderPass = t->rp,
+                                 .attachmentCount = 1,
+                                 .pAttachments = &t->view,
+                                 .width = W,
+                                 .height = H,
+                                 .layers = 1};
+  CHECK(vkCreateFramebuffer(g_dev, &fci, NULL, &t->fb));
+  return 0;
+}
+
+static int make_pipeline(struct rt *t, VkImage img, VkImageLayout final_layout) {
+  if (make_rt_core(t, final_layout, 0)) return 1;
+  return make_rt_target(t, img);
 }
 
 static void record_draw(struct rt *t) {
@@ -724,6 +789,42 @@ static int verify(const uint8_t *px, size_t row_bytes, const char *tag) {
   return ok ? 0 : 1;
 }
 
+/* pat.frag reference value of texel (x, y), bytes R,G,B,A. */
+__attribute__((unused)) static void pattern_px(uint32_t x, uint32_t y, uint8_t out[4]) {
+  out[0] = (uint8_t)(x & 255u);
+  out[1] = (uint8_t)(y & 255u);
+  out[2] = (uint8_t)((x ^ y) & 255u);
+  out[3] = (uint8_t)((x + 3u * y) & 255u);
+}
+
+/* Bit-exact check of the pattern. row_bytes = row pitch in bytes. Returns 0 on pass. */
+__attribute__((unused)) static int verify_pattern(const uint8_t *px, size_t row_bytes, const char *tag) {
+  long bad = 0;
+  int fx = -1, fy = -1;
+  uint8_t got[4] = {0}, want[4] = {0};
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++) {
+      const uint8_t *p = px + (size_t)y * row_bytes + (size_t)x * 4;
+      uint8_t e[4];
+      pattern_px((uint32_t)x, (uint32_t)y, e);
+      if (memcmp(p, e, 4)) {
+        if (!bad) {
+          fx = x;
+          fy = y;
+          memcpy(got, p, 4);
+          memcpy(want, e, 4);
+        }
+        bad++;
+      }
+    }
+  if (bad)
+    say("  [%s] %ld of %d texels differ; first at (%d,%d): got (%u,%u,%u,%u) want (%u,%u,%u,%u) -> BIT-EXACT FAIL\n",
+        tag, bad, W * H, fx, fy, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+  else
+    say("  [%s] all %d texels bit-exact -> PASS\n", tag, W * H);
+  return bad ? 1 : 0;
+}
+
 static void write_ppm(const char *path, const uint8_t *px, size_t row_bytes) {
   FILE *f = fopen(path, "wbe");
   if (!f) {
@@ -737,7 +838,7 @@ static void write_ppm(const char *path, const uint8_t *px, size_t row_bytes) {
   say("  wrote %s\n", path);
 }
 
-/* ---------- test 1: offscreen optimal image + copy to buffer ---------- */
+/* ---------- test: offscreen optimal image + copy to buffer ---------- */
 static int test_offscreen(void) {
   say("== test offscreen: %dx%d R8G8B8A8_UNORM optimal image, device-local\n", W, H);
   VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -831,7 +932,7 @@ static int test_offscreen(void) {
 }
 
 #ifdef __ANDROID__
-/* ---------- tests 2/3: gralloc (AHardwareBuffer) -> VkNativeBufferANDROID -> NVK, as Android's swapchain does ------- */
+/* ---------- Android: gralloc (AHardwareBuffer) -> VkNativeBufferANDROID -> NVK, as Android's swapchain does ------- */
 typedef const native_handle_t *(*PFN_getNativeHandle)(const AHardwareBuffer *);
 
 /* minigbm "CrOS Gralloc" gralloc0 perform() query - the same call Mesa's u_gralloc_cros backend (used by both ANV and
@@ -861,7 +962,8 @@ static const char *mod_name(uint64_t m) {
   }
 }
 
-static void print_gralloc_layout(const native_handle_t *nh) {
+/* Prints the minigbm layout; returns the modifier or UINT64_MAX when unknown. */
+static uint64_t print_gralloc_layout(const native_handle_t *nh) {
   static gralloc_module_t *gm;
   static int tried;
   if (!tried) {
@@ -873,14 +975,91 @@ static void print_gralloc_layout(const native_handle_t *nh) {
     if (gm) say("  gralloc0 module: '%s' (Mesa's u_gralloc_cros needs 'CrOS Gralloc')\n", gm->common.name);
     else say("  gralloc0 module: not loadable (hw_get_module(\"gralloc\") failed)\n");
   }
-  if (!gm || !gm->perform || !nh) return;
+  if (!gm || !gm->perform || !nh) return UINT64_MAX;
   struct cros_gralloc0_buffer_info bi;
   memset(&bi, 0, sizeof bi);
-  if (gm->perform(gm, CROS_GRALLOC_DRM_GET_BUFFER_INFO, nh, &bi) == 0)
+  if (gm->perform(gm, CROS_GRALLOC_DRM_GET_BUFFER_INFO, nh, &bi) == 0) {
     say("  minigbm layout: fourcc=%.4s planes=%d modifier=0x%016" PRIx64 " (%s) stride0=%d offset0=%d\n",
         (const char *)&bi.drm_fourcc, bi.num_fds, bi.modifier, mod_name(bi.modifier), bi.stride[0], bi.offset[0]);
-  else
-    say("  minigbm layout: perform(GET_BUFFER_INFO) failed\n");
+    return bi.modifier;
+  }
+  say("  minigbm layout: perform(GET_BUFFER_INFO) failed\n");
+  return UINT64_MAX;
+}
+
+static PFN_getNativeHandle get_native_handle_fn(void) {
+  void *nw = dlopen("libnativewindow.so", RTLD_NOW);
+  PFN_getNativeHandle f = nw ? (PFN_getNativeHandle)dlsym(nw, "AHardwareBuffer_getNativeHandle") : NULL;
+  if (!f) say("  FAIL: AHardwareBuffer_getNativeHandle not found in libnativewindow.so\n");
+  return f;
+}
+
+/* Allocates a W x H RGBA8 AHB with exactly `usage` and prints its layout. */
+static AHardwareBuffer *alloc_ahb(uint64_t usage, AHardwareBuffer_Desc *desc, const native_handle_t **nh,
+                                  uint64_t *modifier) {
+  PFN_getNativeHandle get_nh = get_native_handle_fn();
+  if (!get_nh) return NULL;
+  AHardwareBuffer_Desc d = {.width = W, .height = H, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                            .usage = usage};
+  AHardwareBuffer *ahb = NULL;
+  int ar = AHardwareBuffer_allocate(&d, &ahb);
+  if (ar || !ahb) {
+    say("  FAIL: AHardwareBuffer_allocate(usage=0x%" PRIx64 ") -> %d (gralloc allocator unavailable?)\n", usage, ar);
+    return NULL;
+  }
+  AHardwareBuffer_describe(ahb, &d);
+  *desc = d;
+  *nh = get_nh(ahb);
+  say("  AHB %ux%u stride=%u px usage=0x%" PRIx64 "; native_handle numFds=%d numInts=%d\n", d.width, d.height,
+      d.stride, (uint64_t)d.usage, *nh ? (*nh)->numFds : -1, *nh ? (*nh)->numInts : -1);
+  *modifier = print_gralloc_layout(*nh);
+  return ahb;
+}
+
+/* VkNativeBufferANDROID import, like libvulkan's CreateSwapchainKHR (OPTIMAL tiling, usage/usage2/usage3/ahb). */
+static VkResult import_anb(AHardwareBuffer *ahb, const native_handle_t *nh, const AHardwareBuffer_Desc *desc,
+                           uint64_t usage, int with_swapchain_info, VkImageUsageFlags img_usage, VkImage *img) {
+  VkSwapchainImageCreateInfoANDROID sci = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_IMAGE_CREATE_INFO_ANDROID,
+                                           .usage = 0};
+  VkNativeBufferANDROID nb = {.sType = VK_STRUCTURE_TYPE_NATIVE_BUFFER_ANDROID,
+                              .pNext = with_swapchain_info ? &sci : NULL,
+                              .handle = nh,
+                              .stride = (int)desc->stride,
+                              .format = 1 /* HAL_PIXEL_FORMAT_RGBA_8888 */,
+                              .usage = (int)(usage & 0xffffffffu),
+                              .usage2 = {.consumer = usage, .producer = usage},
+                              .usage3 = usage,
+                              .ahb = ahb};
+  VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                           .pNext = &nb,
+                           .imageType = VK_IMAGE_TYPE_2D,
+                           .format = VK_FORMAT_R8G8B8A8_UNORM,
+                           .extent = {W, H, 1},
+                           .mipLevels = 1,
+                           .arrayLayers = 1,
+                           .samples = VK_SAMPLE_COUNT_1_BIT,
+                           .tiling = VK_IMAGE_TILING_OPTIMAL, /* what libvulkan's swapchain passes */
+                           .usage = img_usage,
+                           .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+  VkResult r = vkCreateImage(g_dev, &ici, NULL, img);
+  say("  vkCreateImage(VkNativeBufferANDROID%s) -> %s\n", with_swapchain_info ? " + SwapchainImageCreateInfo" : "",
+      vkr(r));
+  return r;
+}
+
+/* Waits for a sync_file fd (poll POLLIN). Returns 0 signalled, 1 timeout/error. Closes the fd. */
+static int wait_sync_fd(int fd, int timeout_ms, const char *what) {
+  if (fd < 0) {
+    say("  %s: fence fd -1 (nothing to wait for)\n", what);
+    return 0;
+  }
+  struct pollfd pfd = {.fd = fd, .events = POLLIN};
+  double t0 = now_ms();
+  int pr = poll(&pfd, 1, timeout_ms);
+  say("  %s: sync_fd %d poll -> %d (%s) after %.2f ms\n", what, fd, pr,
+      pr > 0 ? "signalled" : pr == 0 ? "TIMEOUT" : strerror(errno), now_ms() - t0);
+  close(fd);
+  return pr > 0 ? 0 : 1;
 }
 
 static int test_anb(int linear) {
@@ -889,12 +1068,6 @@ static int test_anb(int linear) {
   if (!g_has_anb) {
     say("  SKIP/FAIL: driver does not expose VK_ANDROID_native_buffer (u_gralloc found no gralloc: needs "
         "ro.hardware.gralloc=minigbm and /vendor/lib64/hw/gralloc.minigbm.so readable)\n");
-    return 1;
-  }
-  void *nw = dlopen("libnativewindow.so", RTLD_NOW);
-  PFN_getNativeHandle get_nh = nw ? (PFN_getNativeHandle)dlsym(nw, "AHardwareBuffer_getNativeHandle") : NULL;
-  if (!get_nh) {
-    say("  FAIL: AHardwareBuffer_getNativeHandle not found in libnativewindow.so\n");
     return 1;
   }
   /* The usage a window swapchain image gets: the driver's swapchain gralloc usage (vkGetSwapchainGrallocUsage2ANDROID)
@@ -911,53 +1084,27 @@ static int test_anb(int linear) {
     say("  vkGetSwapchainGrallocUsage2ANDROID not available; using HW_RENDER|HW_TEXTURE\n");
     prod = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
   }
+  struct rt t;
+  memset(&t, 0, sizeof t);
+  if (make_rt_core(&t, VK_IMAGE_LAYOUT_GENERAL, 0)) return 1;
   uint64_t usage = cons | prod | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
   if (linear) usage |= AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
-  AHardwareBuffer_Desc desc = {.width = W, .height = H, .layers = 1,
-                               .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, .usage = usage};
-  AHardwareBuffer *ahb = NULL;
-  int ar = AHardwareBuffer_allocate(&desc, &ahb);
-  if (ar || !ahb) {
-    say("  FAIL: AHardwareBuffer_allocate(usage=0x%" PRIx64 ") -> %d\n", usage, ar);
-    return 1;
-  }
-  AHardwareBuffer_describe(ahb, &desc);
-  const native_handle_t *nh = get_nh(ahb);
-  say("  AHB %ux%u stride=%u px usage=0x%" PRIx64 "; native_handle numFds=%d numInts=%d\n", desc.width, desc.height,
-      desc.stride, (uint64_t)desc.usage, nh ? nh->numFds : -1, nh ? nh->numInts : -1);
-  print_gralloc_layout(nh);
-  VkNativeBufferANDROID nb = {.sType = VK_STRUCTURE_TYPE_NATIVE_BUFFER_ANDROID,
-                              .handle = nh,
-                              .stride = (int)desc.stride,
-                              .format = 1 /* HAL_PIXEL_FORMAT_RGBA_8888 */,
-                              .usage = (int)(usage & 0xffffffffu),
-                              .usage2 = {.consumer = usage, .producer = usage},
-                              .usage3 = usage,
-                              .ahb = ahb};
-  VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                           .pNext = &nb,
-                           .imageType = VK_IMAGE_TYPE_2D,
-                           .format = VK_FORMAT_R8G8B8A8_UNORM,
-                           .extent = {W, H, 1},
-                           .mipLevels = 1,
-                           .arrayLayers = 1,
-                           .samples = VK_SAMPLE_COUNT_1_BIT,
-                           .tiling = VK_IMAGE_TILING_OPTIMAL, /* what libvulkan's swapchain passes */
-                           .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                           .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+  AHardwareBuffer_Desc desc;
+  const native_handle_t *nh = NULL;
+  uint64_t mod;
+  AHardwareBuffer *ahb = alloc_ahb(usage, &desc, &nh, &mod);
+  if (!ahb) return 1;
   VkImage img;
-  VkResult r = vkCreateImage(g_dev, &ici, NULL, &img);
-  say("  vkCreateImage(VkNativeBufferANDROID) -> %s\n", vkr(r));
+  VkResult r = import_anb(ahb, nh, &desc, usage, 0,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &img);
   if (r != VK_SUCCESS) {
     say("  %s: FAIL (NVK could not import this gralloc buffer: typically an Intel tiling modifier from minigbm's "
         "i915 backend, which NVIDIA hardware cannot address)\n", tag);
     AHardwareBuffer_release(ahb);
     return 1;
   }
-  struct rt t;
-  memset(&t, 0, sizeof t);
-  if (make_pipeline(&t, img, VK_IMAGE_LAYOUT_GENERAL)) return 1;
+  if (make_rt_target(&t, img)) return 1;
   VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   CHECK(vkBeginCommandBuffer(t.cb, &bi));
   record_draw(&t);
@@ -970,8 +1117,8 @@ static int test_anb(int linear) {
   if (rel) {
     int fence_fd = -2;
     r = rel(g_queue, 0, NULL, img, &fence_fd);
-    say("  vkQueueSignalReleaseImageANDROID -> %s fence_fd=%d (NVK 26.3 waits idle and returns -1)\n", vkr(r),
-        fence_fd);
+    say("  vkQueueSignalReleaseImageANDROID -> %s fence_fd=%d (unpatched NVK 26.3 waits idle and returns -1)\n",
+        vkr(r), fence_fd);
     if (fence_fd >= 0) close(fence_fd);
   }
   CHECK(vkQueueWaitIdle(g_queue));
@@ -979,7 +1126,7 @@ static int test_anb(int linear) {
   int fail = 0;
   if (linear) {
     void *p = NULL;
-    ar = AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &p);
+    int ar = AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &p);
     if (ar || !p) {
       say("  FAIL: AHardwareBuffer_lock -> %d\n", ar);
       fail = 1;
@@ -996,69 +1143,735 @@ static int test_anb(int linear) {
   say("  %s: %s\n", tag, fail ? "FAIL" : "PASS");
   return fail;
 }
+
+/* Renders the pattern into an imported ANB image, releases it to the "presentation engine" with
+ * vkQueueSignalReleaseImageANDROID and waits for the returned sync_fd. wait_sem: also signal a semaphore in the
+ * render submit and hand it to the release call (what vkQueuePresentKHR does with its pWaitSemaphores).
+ * Returns 0 on success, 1 on failure. On success the rendering is complete when this returns. */
+static int render_pattern_and_release(struct rt *t, VkImage img, int wait_sem, const char *tag) {
+  VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  CHECK(vkBeginCommandBuffer(t->cb, &bi));
+  record_draw(t);
+  /* Release the image to the foreign (gralloc consumer) queue family, like a WSI present. */
+  VkImageMemoryBarrier rel_b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                .dstAccessMask = 0,
+                                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                .srcQueueFamilyIndex = g_qf,
+                                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+                                .image = img,
+                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+  vkCmdPipelineBarrier(t->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                       0, NULL, 0, NULL, 1, &rel_b);
+  CHECK(vkEndCommandBuffer(t->cb));
+  VkSemaphore sem = VK_NULL_HANDLE;
+  if (wait_sem) {
+    VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    CHECK(vkCreateSemaphore(g_dev, &sci, NULL, &sem));
+  }
+  VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                     .commandBufferCount = 1,
+                     .pCommandBuffers = &t->cb,
+                     .signalSemaphoreCount = wait_sem ? 1 : 0,
+                     .pSignalSemaphores = &sem};
+  double t0 = now_ms();
+  CHECK(vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE));
+  PFN_vkQueueSignalReleaseImageANDROID rel =
+      (PFN_vkQueueSignalReleaseImageANDROID)vkGetDeviceProcAddr(g_dev, "vkQueueSignalReleaseImageANDROID");
+  int fail = 0;
+  if (!rel) {
+    say("  [%s] vkQueueSignalReleaseImageANDROID missing\n", tag);
+    fail = 1;
+  } else {
+    int fence_fd = -2;
+    VkResult r = rel(g_queue, wait_sem ? 1 : 0, &sem, img, &fence_fd);
+    say("  [%s] vkQueueSignalReleaseImageANDROID(%d wait semaphore(s)) -> %s fence_fd=%d%s\n", tag,
+        wait_sem ? 1 : 0, vkr(r), fence_fd,
+        fence_fd >= 0 ? " (sync_fd: patch 0006)" : " (-1: QueueWaitIdle path, unpatched or fallback)");
+    if (r != VK_SUCCESS || fence_fd < -1) fail = 1;
+    else if (wait_sync_fd(fence_fd, 5000, tag)) fail = 1;
+  }
+  say("  [%s] render + release %.2f ms\n", tag, now_ms() - t0);
+  /* Read-backs below happen BEFORE QueueWaitIdle, so they also prove that the sync_fd covered the rendering. */
+  if (sem) {
+    /* the release consumed the wait; destroy after the queue is idle */
+    vkQueueWaitIdle(g_queue);
+    vkDestroySemaphore(g_dev, sem, NULL);
+  }
+  return fail;
+}
+
+/* ---------- ANV (Intel) read-back leg: import the AHB into vulkan.intel.so and texelFetch every texel ---------- */
+struct anv {
+  PFN_vkGetInstanceProcAddr gipa;
+  VkInstance inst;
+  VkPhysicalDevice pd;
+  VkPhysicalDeviceMemoryProperties mem;
+  VkDevice dev;
+  VkQueue q;
+  uint32_t qf;
+  PFN_vkGetDeviceProcAddr gdpa;
+};
+
+#define ANV_I(a, name) ((PFN_vk##name)(a)->gipa((a)->inst, "vk" #name))
+#define ANV_D(a, name) ((PFN_vk##name)(a)->gdpa((a)->dev, "vk" #name))
+#define ACHECK(call)                                                                     \
+  do {                                                                                   \
+    VkResult _r = (call);                                                                \
+    if (_r != VK_SUCCESS) {                                                              \
+      say("  [anv] FAIL: %s -> %s (%d) [line %d]\n", #call, vkr(_r), _r, __LINE__);      \
+      return 1;                                                                          \
+    }                                                                                    \
+  } while (0)
+
+/* Returns 0 ok, 2 = ANV not available (no ICD / no Intel device), 1 = error. */
+static int anv_open(struct anv *a) {
+  memset(a, 0, sizeof *a);
+  const char *cands[] = {g_anv_icd, getenv("NVK_PROBE_ANV"), "/vendor/lib64/hw/vulkan.intel.so", (const char *)-1};
+  a->gipa = load_icd_file(cands, g_anv_icd != NULL, 0, "ANV (read-back leg)");
+  if (!a->gipa) return 2;
+  PFN_vkCreateInstance ci = (PFN_vkCreateInstance)a->gipa(NULL, "vkCreateInstance");
+  if (!ci) return 2;
+  VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                           .pApplicationName = "nvk_probe readback",
+                           .apiVersion = VK_API_VERSION_1_1};
+  VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+  ACHECK(ci(&ici, NULL, &a->inst));
+  uint32_t n = 0;
+  ANV_I(a, EnumeratePhysicalDevices)(a->inst, &n, NULL);
+  VkPhysicalDevice pds[8];
+  if (n > 8) n = 8;
+  ANV_I(a, EnumeratePhysicalDevices)(a->inst, &n, pds);
+  for (uint32_t i = 0; i < n && !a->pd; i++) {
+    VkPhysicalDeviceProperties p;
+    ANV_I(a, GetPhysicalDeviceProperties)(pds[i], &p);
+    say("  [anv] device [%u] %s vendor=0x%04x\n", i, p.deviceName, p.vendorID);
+    if (p.vendorID == 0x8086) a->pd = pds[i];
+  }
+  if (!a->pd) {
+    say("  [anv] no Intel Vulkan device (%u device(s))\n", n);
+    return 2;
+  }
+  ANV_I(a, GetPhysicalDeviceMemoryProperties)(a->pd, &a->mem);
+  uint32_t nq = 0;
+  ANV_I(a, GetPhysicalDeviceQueueFamilyProperties)(a->pd, &nq, NULL);
+  VkQueueFamilyProperties qf[8];
+  if (nq > 8) nq = 8;
+  ANV_I(a, GetPhysicalDeviceQueueFamilyProperties)(a->pd, &nq, qf);
+  a->qf = UINT32_MAX;
+  for (uint32_t i = 0; i < nq && a->qf == UINT32_MAX; i++)
+    if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) a->qf = i;
+  if (a->qf == UINT32_MAX) return 1;
+  float prio = 1.0f;
+  VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                 .queueFamilyIndex = a->qf,
+                                 .queueCount = 1,
+                                 .pQueuePriorities = &prio};
+  const char *ext[] = {"VK_ANDROID_external_memory_android_hardware_buffer", "VK_EXT_queue_family_foreign"};
+  VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                            .queueCreateInfoCount = 1,
+                            .pQueueCreateInfos = &qci,
+                            .enabledExtensionCount = 2,
+                            .ppEnabledExtensionNames = ext};
+  ACHECK(ANV_I(a, CreateDevice)(a->pd, &dci, NULL, &a->dev));
+  a->gdpa = (PFN_vkGetDeviceProcAddr)a->gipa(a->inst, "vkGetDeviceProcAddr");
+  ANV_D(a, GetDeviceQueue)(a->dev, a->qf, 0, &a->q);
+  return 0;
+}
+
+static int anv_find_mem(const struct anv *a, uint32_t bits, VkMemoryPropertyFlags want) {
+  for (uint32_t i = 0; i < a->mem.memoryTypeCount; i++)
+    if ((bits & (1u << i)) && (a->mem.memoryTypes[i].propertyFlags & want) == want) return (int)i;
+  return -1;
+}
+
+/* Samples the AHB on ANV and compares with the pattern. Returns 0 pass, 1 fail, 2 ANV unavailable. */
+static int anv_readback(AHardwareBuffer *ahb, const char *tag) {
+  struct anv a;
+  int rc = anv_open(&a);
+  if (rc) return rc;
+  VkAndroidHardwareBufferFormatPropertiesANDROID fp = {
+      .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
+  VkAndroidHardwareBufferPropertiesANDROID hp = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
+                                                 .pNext = &fp};
+  ACHECK(ANV_D(&a, GetAndroidHardwareBufferPropertiesANDROID)(a.dev, ahb, &hp));
+  say("  [anv] AHB properties: allocationSize=%" PRIu64 " memoryTypeBits=0x%x format=%d\n",
+      (uint64_t)hp.allocationSize, hp.memoryTypeBits, fp.format);
+  VkExternalMemoryImageCreateInfo emi = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+                                         .handleTypes =
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+  VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                           .pNext = &emi,
+                           .imageType = VK_IMAGE_TYPE_2D,
+                           .format = VK_FORMAT_R8G8B8A8_UNORM,
+                           .extent = {W, H, 1},
+                           .mipLevels = 1,
+                           .arrayLayers = 1,
+                           .samples = VK_SAMPLE_COUNT_1_BIT,
+                           .tiling = VK_IMAGE_TILING_OPTIMAL,
+                           .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+                           .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+  VkImage img;
+  ACHECK(ANV_D(&a, CreateImage)(a.dev, &ici, NULL, &img));
+  VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+                                                  .buffer = ahb};
+  VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                                       .pNext = &imp,
+                                       .image = img};
+  int mt = anv_find_mem(&a, hp.memoryTypeBits, 0);
+  if (mt < 0) {
+    say("  [anv] FAIL: no memory type for the AHB\n");
+    return 1;
+  }
+  VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                              .pNext = &ded,
+                              .allocationSize = hp.allocationSize,
+                              .memoryTypeIndex = (uint32_t)mt};
+  VkDeviceMemory imem;
+  ACHECK(ANV_D(&a, AllocateMemory)(a.dev, &mai, NULL, &imem));
+  ACHECK(ANV_D(&a, BindImageMemory)(a.dev, img, imem, 0));
+  VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                               .image = img,
+                               .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                               .format = VK_FORMAT_R8G8B8A8_UNORM,
+                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+  VkImageView view;
+  ACHECK(ANV_D(&a, CreateImageView)(a.dev, &vci, NULL, &view));
+  VkSamplerCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                             .magFilter = VK_FILTER_NEAREST,
+                             .minFilter = VK_FILTER_NEAREST,
+                             .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                             .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                             .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+  VkSampler smp;
+  ACHECK(ANV_D(&a, CreateSampler)(a.dev, &smi, NULL, &smp));
+  /* output buffer */
+  VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                            .size = (VkDeviceSize)W * H * 4,
+                            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+  VkBuffer buf;
+  ACHECK(ANV_D(&a, CreateBuffer)(a.dev, &bci, NULL, &buf));
+  VkMemoryRequirements mr;
+  ANV_D(&a, GetBufferMemoryRequirements)(a.dev, buf, &mr);
+  int bmt = anv_find_mem(&a, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (bmt < 0) return 1;
+  VkMemoryAllocateInfo bmai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .allocationSize = mr.size,
+                               .memoryTypeIndex = (uint32_t)bmt};
+  VkDeviceMemory bmem;
+  ACHECK(ANV_D(&a, AllocateMemory)(a.dev, &bmai, NULL, &bmem));
+  ACHECK(ANV_D(&a, BindBufferMemory)(a.dev, buf, bmem, 0));
+  /* compute pipeline */
+  VkDescriptorSetLayoutBinding b[2] = {
+      {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT}};
+  VkDescriptorSetLayoutCreateInfo dli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                         .bindingCount = 2,
+                                         .pBindings = b};
+  VkDescriptorSetLayout dsl;
+  ACHECK(ANV_D(&a, CreateDescriptorSetLayout)(a.dev, &dli, NULL, &dsl));
+  VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 8};
+  VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                    .setLayoutCount = 1,
+                                    .pSetLayouts = &dsl,
+                                    .pushConstantRangeCount = 1,
+                                    .pPushConstantRanges = &pcr};
+  VkPipelineLayout pl;
+  ACHECK(ANV_D(&a, CreatePipelineLayout)(a.dev, &pli, NULL, &pl));
+  VkShaderModuleCreateInfo smci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                   .codeSize = sizeof readback_comp_spv,
+                                   .pCode = readback_comp_spv};
+  VkShaderModule cs;
+  ACHECK(ANV_D(&a, CreateShaderModule)(a.dev, &smci, NULL, &cs));
+  VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                     .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                               .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                               .module = cs,
+                                               .pName = "main"},
+                                     .layout = pl};
+  VkPipeline pipe;
+  ACHECK(ANV_D(&a, CreateComputePipelines)(a.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe));
+  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+  VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                    .maxSets = 1,
+                                    .poolSizeCount = 2,
+                                    .pPoolSizes = ps};
+  VkDescriptorPool dp;
+  ACHECK(ANV_D(&a, CreateDescriptorPool)(a.dev, &dpi, NULL, &dp));
+  VkDescriptorSetAllocateInfo dsai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                      .descriptorPool = dp,
+                                      .descriptorSetCount = 1,
+                                      .pSetLayouts = &dsl};
+  VkDescriptorSet ds;
+  ACHECK(ANV_D(&a, AllocateDescriptorSets)(a.dev, &dsai, &ds));
+  VkDescriptorImageInfo dii = {.sampler = smp, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkDescriptorBufferInfo dbi = {.buffer = buf, .offset = 0, .range = VK_WHOLE_SIZE};
+  VkWriteDescriptorSet wr[2] = {
+      {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
+       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &dii},
+      {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 1, .descriptorCount = 1,
+       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &dbi}};
+  ANV_D(&a, UpdateDescriptorSets)(a.dev, 2, wr, 0, NULL);
+  /* commands */
+  VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = a.qf};
+  VkCommandPool pool;
+  ACHECK(ANV_D(&a, CreateCommandPool)(a.dev, &cpci, NULL, &pool));
+  VkCommandBufferAllocateInfo cbai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                      .commandPool = pool,
+                                      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                      .commandBufferCount = 1};
+  VkCommandBuffer cb;
+  ACHECK(ANV_D(&a, AllocateCommandBuffers)(a.dev, &cbai, &cb));
+  /* AHB contents are owned by the foreign producer: queue family foreign acquire. ANV must not discard them; the
+   * buffer is LINEAR (no aux surface), so the GENERAL -> SHADER_READ_ONLY transition is a no-op on the data. */
+  VkImageMemoryBarrier acq = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                              .srcAccessMask = 0,
+                              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                              .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                              .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+                              .dstQueueFamilyIndex = a.qf,
+                              .image = img,
+                              .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+  VkBufferMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                              .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                              .buffer = buf,
+                              .offset = 0,
+                              .size = VK_WHOLE_SIZE};
+  VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  ACHECK(ANV_D(&a, BeginCommandBuffer)(cb, &bi));
+  ANV_D(&a, CmdPipelineBarrier)(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL,
+                                0, NULL, 1, &acq);
+  ANV_D(&a, CmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+  ANV_D(&a, CmdBindDescriptorSets)(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, NULL);
+  uint32_t pc[2] = {W, H};
+  ANV_D(&a, CmdPushConstants)(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+  ANV_D(&a, CmdDispatch)(cb, (W + 15) / 16, (H + 15) / 16, 1);
+  ANV_D(&a, CmdPipelineBarrier)(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &hb,
+                                0, NULL);
+  ACHECK(ANV_D(&a, EndCommandBuffer)(cb));
+  VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+  ACHECK(ANV_D(&a, QueueSubmit)(a.q, 1, &si, VK_NULL_HANDLE));
+  ACHECK(ANV_D(&a, QueueWaitIdle)(a.q));
+  void *map = NULL;
+  ACHECK(ANV_D(&a, MapMemory)(a.dev, bmem, 0, VK_WHOLE_SIZE, 0, &map));
+  int fail = verify_pattern((const uint8_t *)map, W * 4, tag);
+  ANV_D(&a, UnmapMemory)(a.dev, bmem);
+  ANV_D(&a, DestroyDevice)(a.dev, NULL);
+  ANV_I(&a, DestroyInstance)(a.inst, NULL);
+  return fail;
+}
+
+/* ---------- test: gate G0, ahb-i915-readback ---------- */
+static int test_ahb_i915_readback(void) {
+  const char *tag = "ahb-i915-readback";
+  say("== test %s: gralloc (i915) AHB -> NVK render -> bit-exact read-back by CPU lock and by ANV sampling\n", tag);
+  if (!g_has_anb) {
+    say("  FAIL: driver does not expose VK_ANDROID_native_buffer (no u_gralloc)\n");
+    return 1;
+  }
+  struct rt t;
+  memset(&t, 0, sizeof t);
+  if (make_rt_core(&t, VK_IMAGE_LAYOUT_GENERAL, 1)) return 1; /* first device call: NAK compile of the pattern */
+  /* Plan G0 usage + CPU_READ_RARELY: AHardwareBuffer_lock(CPU_READ) requires a CPU read usage at allocation time;
+   * both are SW usage bits, so minigbm's i915 backend picks LINEAR either way. */
+  const uint64_t usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
+                         AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+  AHardwareBuffer_Desc desc;
+  const native_handle_t *nh = NULL;
+  uint64_t mod;
+  AHardwareBuffer *ahb = alloc_ahb(usage, &desc, &nh, &mod);
+  if (!ahb) return 1;
+  if (mod != 0 && mod != UINT64_MAX) say("  NOTE: minigbm did not pick LINEAR for a SW-usage buffer\n");
+  VkImage img;
+  VkResult r = import_anb(ahb, nh, &desc, usage, 0, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                          &img);
+  if (r != VK_SUCCESS) {
+    say("  %s: FAIL (import into NVK)\n", tag);
+    AHardwareBuffer_release(ahb);
+    return 1;
+  }
+  if (make_rt_target(&t, img)) return 1;
+  int rel_fail = render_pattern_and_release(&t, img, 0, tag);
+  /* leg 1: CPU */
+  void *p = NULL;
+  int ar = AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, NULL, &p);
+  int cpu_fail = 1;
+  if (ar || !p) {
+    say("  [cpu] FAIL: AHardwareBuffer_lock -> %d\n", ar);
+  } else {
+    cpu_fail = verify_pattern((const uint8_t *)p, (size_t)desc.stride * 4, "cpu lock read-back");
+    AHardwareBuffer_unlock(ahb, NULL);
+  }
+  CHECK(vkQueueWaitIdle(g_queue));
+  /* leg 2: ANV sampling */
+  int anv = anv_readback(ahb, "anv texelFetch read-back");
+  if (anv == 2) say("  [anv] FAIL: ANV leg unavailable (needs /vendor/lib64/hw/vulkan.intel.so and an Intel GPU)\n");
+  destroy_rt(&t);
+  vkDestroyImage(g_dev, img, NULL);
+  AHardwareBuffer_release(ahb);
+  int fail = rel_fail || cpu_fail || anv != 0;
+  say("  %s: release=%s cpu=%s anv=%s -> %s\n", tag, rel_fail ? "FAIL" : "ok", cpu_fail ? "FAIL" : "PASS",
+      anv == 0 ? "PASS" : anv == 2 ? "UNAVAILABLE" : "FAIL", fail ? "FAIL" : "PASS");
+  return fail;
+}
+
+/* ---------- test: Android 17 libvulkan swapchain model ---------- */
+static uint64_t gralloc1_to_buffer_usage(uint64_t producer, uint64_t consumer) {
+  /* libvulkan swapchain.cpp convertGralloc1ToBufferUsage(): only the *_OFTEN CPU bits differ between gralloc1 and
+   * BufferUsage; CPU_READ_OFTEN = 0x6 -> 0x3, CPU_WRITE_OFTEN = 0x60 -> 0x30. */
+  uint64_t merged = producer | consumer;
+  if ((merged & 0x6) == 0x6) merged = (merged & ~0x6ull) | 0x3;
+  if ((merged & 0x60) == 0x60) merged = (merged & ~0x60ull) | 0x30;
+  return merged;
+}
+
+static int test_a17_swapchain_model(void) {
+  const char *tag = "a17-swapchain-model";
+  say("== test %s: Android 17 libvulkan CreateSwapchainKHR/QueuePresentKHR driver calls\n", tag);
+  if (!g_has_anb) {
+    say("  FAIL: driver does not expose VK_ANDROID_native_buffer (libvulkan's CreateDevice would fail)\n");
+    return 1;
+  }
+  const VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+  const VkImageUsageFlags img_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  /* 1. getProducerUsageGPDIFP2: AHB-typed format query (swapchain.cpp:1654-1760) */
+  uint64_t producer = 0;
+  int have_producer = 0;
+  if (vkGetPhysicalDeviceImageFormatProperties2) {
+    VkPhysicalDeviceExternalImageFormatInfo ext = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+    VkPhysicalDeviceImageFormatInfo2 fi = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+                                           .pNext = &ext,
+                                           .format = fmt,
+                                           .type = VK_IMAGE_TYPE_2D,
+                                           .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                           .usage = img_usage};
+    VkAndroidHardwareBufferUsageANDROID au = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_USAGE_ANDROID};
+    VkImageFormatProperties2 fp = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &au};
+    VkResult r = vkGetPhysicalDeviceImageFormatProperties2(g_pd, &fi, &fp);
+    say("  GPDIFP2(AHB handle type) -> %s%s", vkr(r),
+        r == VK_SUCCESS ? "" : " (expected without patch 0003: libvulkan falls through to the gralloc path)\n");
+    if (r == VK_SUCCESS) {
+      say(" androidHardwareBufferUsage=0x%" PRIx64 "%s\n", (uint64_t)au.androidHardwareBufferUsage,
+          (au.androidHardwareBufferUsage & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY) ? " (+CPU_WRITE_RARELY: 0004)" : "");
+      producer = au.androidHardwareBufferUsage;
+      have_producer = 1;
+    }
+  } else {
+    say("  vkGetPhysicalDeviceImageFormatProperties2 not exposed\n");
+  }
+  struct rt t;
+  memset(&t, 0, sizeof t);
+  if (!have_producer) {
+    /* 2. gralloc fallback, same order as libvulkan: Usage4 > Usage3 > Usage2 > Usage */
+    PFN_vkGetSwapchainGrallocUsage4ANDROID u4 =
+        (PFN_vkGetSwapchainGrallocUsage4ANDROID)vkGetDeviceProcAddr(g_dev, "vkGetSwapchainGrallocUsage4ANDROID");
+    PFN_vkGetSwapchainGrallocUsage3ANDROID u3 =
+        (PFN_vkGetSwapchainGrallocUsage3ANDROID)vkGetDeviceProcAddr(g_dev, "vkGetSwapchainGrallocUsage3ANDROID");
+    PFN_vkGetSwapchainGrallocUsage2ANDROID u2 =
+        (PFN_vkGetSwapchainGrallocUsage2ANDROID)vkGetDeviceProcAddr(g_dev, "vkGetSwapchainGrallocUsage2ANDROID");
+    PFN_vkGetSwapchainGrallocUsageANDROID u1 =
+        (PFN_vkGetSwapchainGrallocUsageANDROID)vkGetDeviceProcAddr(g_dev, "vkGetSwapchainGrallocUsageANDROID");
+    VkResult r = VK_ERROR_INCOMPATIBLE_DRIVER;
+    if (u4) {
+      VkGrallocUsageInfo2ANDROID gi = {.sType = VK_STRUCTURE_TYPE_GRALLOC_USAGE_INFO_2_ANDROID,
+                                       .format = fmt, .imageUsage = img_usage, .swapchainImageUsage = 0};
+      r = u4(g_dev, &gi, &producer);
+      say("  vkGetSwapchainGrallocUsage4ANDROID -> %s usage=0x%" PRIx64 "\n", vkr(r), producer);
+    } else if (u3) {
+      VkGrallocUsageInfoANDROID gi = {.sType = VK_STRUCTURE_TYPE_GRALLOC_USAGE_INFO_ANDROID,
+                                      .format = fmt, .imageUsage = img_usage};
+      r = u3(g_dev, &gi, &producer);
+      say("  vkGetSwapchainGrallocUsage3ANDROID -> %s usage=0x%" PRIx64 "\n", vkr(r), producer);
+    } else if (u2) {
+      uint64_t c = 0, p = 0;
+      r = u2(g_dev, fmt, img_usage, 0, &c, &p);
+      producer = gralloc1_to_buffer_usage(p, c);
+      say("  vkGetSwapchainGrallocUsage2ANDROID -> %s consumer=0x%" PRIx64 " producer=0x%" PRIx64
+          " -> native usage 0x%" PRIx64 "%s\n", vkr(r), c, p, producer,
+          (producer & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY) ? " (+CPU_WRITE: patch 0004 LINEAR forcing)" :
+                                                                " (no SW bit: minigbm will tile -> needs 0004)");
+    } else if (u1) {
+      int lu = 0;
+      r = u1(g_dev, fmt, img_usage, &lu);
+      producer = (uint64_t)(uint32_t)lu;
+      say("  vkGetSwapchainGrallocUsageANDROID -> %s usage=0x%x\n", vkr(r), lu);
+    } else {
+      say("  FAIL: no vkGetSwapchainGrallocUsage*ANDROID (libvulkan's CreateDevice returns INCOMPATIBLE_DRIVER)\n");
+    }
+    if (r != VK_SUCCESS) {
+      say("  %s: FAIL (libvulkan would return VK_ERROR_SURFACE_LOST_KHR)\n", tag);
+      return 1;
+    }
+  }
+  if (make_rt_core(&t, VK_IMAGE_LAYOUT_GENERAL, 1)) return 1;
+  /* 3. consumer usage of an app window queue in SurfaceFlinger: HW_COMPOSER | HW_TEXTURE */
+  const uint64_t consumer = AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+  const uint64_t usage = consumer | producer;
+  AHardwareBuffer_Desc desc;
+  const native_handle_t *nh = NULL;
+  uint64_t mod;
+  AHardwareBuffer *ahb = alloc_ahb(usage, &desc, &nh, &mod);
+  if (!ahb) return 1;
+  VkImage img;
+  VkResult r = import_anb(ahb, nh, &desc, usage, 1, img_usage, &img);
+  if (r != VK_SUCCESS) {
+    say("  %s: FAIL (swapchain image creation; with an Intel-tiled buffer this is blocker B2 -> patch 0004)\n", tag);
+    AHardwareBuffer_release(ahb);
+    return 1;
+  }
+  if (make_rt_target(&t, img)) return 1;
+  /* 4. vkAcquireImageANDROID with no fence fd (buffer idle), signalling a VkFence like libvulkan's AcquireNextImage */
+  PFN_vkAcquireImageANDROID acq = (PFN_vkAcquireImageANDROID)vkGetDeviceProcAddr(g_dev, "vkAcquireImageANDROID");
+  int fail = 0;
+  if (acq) {
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence f;
+    CHECK(vkCreateFence(g_dev, &fci, NULL, &f));
+    r = acq(g_dev, img, -1, VK_NULL_HANDLE, f);
+    VkResult wr = r == VK_SUCCESS ? vkWaitForFences(g_dev, 1, &f, VK_TRUE, 2000000000ull) : r;
+    say("  vkAcquireImageANDROID(fd -1, fence) -> %s, fence wait -> %s\n", vkr(r), vkr(wr));
+    if (r != VK_SUCCESS || wr != VK_SUCCESS) fail = 1;
+    vkDestroyFence(g_dev, f, NULL);
+  } else {
+    say("  FAIL: vkAcquireImageANDROID missing\n");
+    fail = 1;
+  }
+  /* 5. render + vkQueueSignalReleaseImageANDROID with the present's wait semaphore, wait for the sync_fd */
+  if (render_pattern_and_release(&t, img, 1, tag)) fail = 1;
+  /* 6. what SurfaceFlinger's RenderEngine (ANV) would sample */
+  int anv = anv_readback(ahb, "anv texelFetch (compositor view)");
+  if (anv == 2) say("  [anv] pixels not verified: ANV leg unavailable\n");
+  else if (anv) fail = 1;
+  vkQueueWaitIdle(g_queue);
+  destroy_rt(&t);
+  vkDestroyImage(g_dev, img, NULL);
+  AHardwareBuffer_release(ahb);
+  say("  %s: %s\n", tag, fail ? "FAIL" : "PASS");
+  return fail;
+}
 #endif
+
+enum { T_OFFSCREEN, T_ANB_SWAPCHAIN, T_ANB_LINEAR, T_AHB_READBACK, T_A17_MODEL, T_COUNT };
+static const char *const k_names[T_COUNT] = {"offscreen", "anb-swapchain", "anb-linear", "ahb-i915-readback",
+                                             "a17-swapchain-model"};
 
 static int run_one(int which) {
   int rc = setup(which == g_first);
   if (rc) return rc;
-  if (which == 0) return test_offscreen();
+  switch (which) {
+  case T_OFFSCREEN: return test_offscreen();
 #ifdef __ANDROID__
-  return test_anb(which == 2);
-#else
-  return 0;
+  case T_ANB_SWAPCHAIN: return test_anb(0);
+  case T_ANB_LINEAR: return test_anb(1);
+  case T_AHB_READBACK: return test_ahb_i915_readback();
+  case T_A17_MODEL: return test_a17_swapchain_model();
 #endif
+  default: return 1;
+  }
+}
+
+/* Parses -t. Returns 0 ok, -1 unknown name. named[i]: the test was asked for by name (or "anb"), not only by "all". */
+static int parse_tests(const char *spec, int want[T_COUNT], int named[T_COUNT]) {
+  char buf[256];
+  snprintf(buf, sizeof buf, "%s", spec);
+  for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+    int hit = 0;
+    if (!strcmp(tok, "all")) {
+      for (int i = 0; i < T_COUNT; i++) want[i] = 1;
+      hit = 1;
+    } else if (!strcmp(tok, "anb")) {
+      want[T_ANB_SWAPCHAIN] = want[T_ANB_LINEAR] = 1;
+      named[T_ANB_SWAPCHAIN] = named[T_ANB_LINEAR] = 1;
+      hit = 1;
+    } else {
+      for (int i = 0; i < T_COUNT; i++)
+        if (!strcmp(tok, k_names[i])) want[i] = named[i] = hit = 1;
+    }
+    if (!hit) {
+      printf("unknown test '%s'\n", tok);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* ---------- supervision (header: "Supervision") ---------- */
+static volatile sig_atomic_t g_child;    /* running test child, 0 = none; set and cleared with the stop signals blocked */
+static volatile sig_atomic_t g_stop_sig; /* first SIGTERM/SIGINT/SIGHUP received */
+
+static void on_stop_signal(int sig) {
+  if (!g_stop_sig) g_stop_sig = sig;
+  pid_t c = (pid_t)g_child;
+  if (c > 0) {
+    kill(c, SIGKILL); /* the main loop reaps it and then ends the probe with g_stop_sig */
+    return;
+  }
+  signal(sig, SIG_DFL); /* no test child: nothing to clean up, end now with this signal */
+  raise(sig);
+}
+
+static void stop_signals(sigset_t *set) {
+  sigemptyset(set);
+  sigaddset(set, SIGTERM);
+  sigaddset(set, SIGINT);
+  sigaddset(set, SIGHUP);
+}
+
+static void supervise_init(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = on_stop_signal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0; /* no SA_RESTART: a blocking waitid() returns EINTR */
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGHUP, &sa, NULL);
+#ifdef __linux__
+  pid_t parent = getppid();
+  prctl(PR_SET_PDEATHSIG, SIGTERM); /* e.g. `timeout` killed: the probe stops too */
+  if (getppid() != parent) raise(SIGTERM); /* the parent died before the prctl */
+#endif
+}
+
+/* Waits for the test child and reaps it, polling every 100 ms (a stop signal also cuts the sleep short). The child is
+ * first only observed (WNOWAIT), so its pid cannot be reused while g_child still names it. Bounds: 5 s after a stop
+ * signal (the handler SIGKILLed the child); with -T, the parent SIGKILLs a child that outlived its own alarm by 5 s
+ * (*overdue = 1) and waits 5 s more. Returns 0 with *st set, -1 if the child could not be reaped (stuck in the kernel:
+ * g_child stays set, so a further stop signal kills it again). */
+static int wait_child(pid_t pid, int *st, int *overdue) {
+  siginfo_t si;
+  long ticks = 0, stop_ticks = 0, kill_ticks = 0;
+  const long deadline = g_timeout > 0 ? (g_timeout + 5) * 10L : -1;
+  *overdue = 0;
+  for (;;) {
+    memset(&si, 0, sizeof si);
+    if (waitid(P_PID, (id_t)pid, &si, WEXITED | WNOWAIT | WNOHANG) == 0) {
+      if (si.si_pid == pid) break; /* exited, not reaped yet */
+    } else if (errno != EINTR) {
+      return -1;
+    }
+    if (g_stop_sig && ++stop_ticks > 50) return -1;
+    if (deadline > 0 && ++ticks > deadline && !*overdue) {
+      *overdue = 1;
+      kill(pid, SIGKILL);
+    }
+    if (*overdue && ++kill_ticks > 50) return -1;
+    struct timespec ts = {0, 100 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+  }
+  sigset_t stop, old;
+  stop_signals(&stop);
+  sigprocmask(SIG_BLOCK, &stop, &old);
+  g_child = 0;
+  pid_t r = waitpid(pid, st, 0);
+  sigprocmask(SIG_SETMASK, &old, NULL);
+  return r == pid ? 0 : -1;
 }
 
 int main(int argc, char **argv) {
   const char *tests = "all";
   int opt;
-  while ((opt = getopt(argc, argv, "d:an:o:t:FHh")) != -1) {
+  while ((opt = getopt(argc, argv, "d:A:an:o:t:T:FHh")) != -1) {
     switch (opt) {
     case 'd': g_icd = optarg; break;
+    case 'A': g_anv_icd = optarg; break;
     case 'a': g_any_vendor = 1; break;
     case 'n': g_frames = atoi(optarg); break;
     case 'o': g_ppm = optarg; break;
     case 't': tests = optarg; break;
+    case 'T': g_timeout = atoi(optarg); break;
     case 'F': g_nofork = 1; break;
     case 'H': g_force_hmi = 1; break;
     default:
-      printf("usage: %s [-d icd.so] [-a] [-n frames] [-o out.ppm] [-t offscreen|anb|all] [-F] [-H]\n", argv[0]);
+      printf("usage: %s [-d icd.so] [-A anv.so] [-a] [-n frames] [-o out.ppm] [-t offscreen|anb|anb-swapchain|"
+             "anb-linear|ahb-i915-readback|a17-swapchain-model|all[,...]] [-T secs] [-F] [-H]\n", argv[0]);
       return 2;
     }
   }
+  int want[T_COUNT] = {0}, named[T_COUNT] = {0};
+  if (parse_tests(tests, want, named)) return 2;
   setvbuf(stdout, NULL, _IOLBF, 0);
+  supervise_init();
   say("nvk_probe (built %s %s) pid %d\n", __DATE__, __TIME__, getpid());
   list_drm_nodes();
   if (load_icd()) return 2;
-  int want[3] = {1, 0, 0};
-  (void)tests;
-#ifdef __ANDROID__
-  if (!strcmp(tests, "all") || !strcmp(tests, "anb")) want[1] = want[2] = 1;
-  if (!strcmp(tests, "anb")) want[0] = 0;
+  int missing = 0; /* tests asked for by name that this build does not have: never a PASS */
+#ifndef __ANDROID__
+  for (int i = T_ANB_SWAPCHAIN; i < T_COUNT; i++)
+    if (want[i] && named[i]) {
+      say("  %s: SKIP (Android-only test, not in this build)\n", k_names[i]);
+      missing++;
+    }
+  for (int i = T_ANB_SWAPCHAIN; i < T_COUNT; i++) want[i] = 0;
 #endif
-  const char *names[3] = {"offscreen", "anb-swapchain", "anb-linear"};
-  for (int i = 2; i >= 0; i--)
+  for (int i = T_COUNT - 1; i >= 0; i--)
     if (want[i]) g_first = i;
-  int results[3] = {-1, -1, -1}, worst = 0;
-  for (int i = 0; i < 3; i++) {
+  int results[T_COUNT], worst = 0, ran = 0;
+  for (int i = 0; i < T_COUNT; i++) results[i] = -1;
+  for (int i = 0; i < T_COUNT && !g_stop_sig; i++) {
     if (!want[i]) continue;
     int rc;
+    ran++;
     if (g_nofork) {
       rc = run_one(i);
     } else {
+      sigset_t stop, old;
+      stop_signals(&stop);
+      sigprocmask(SIG_BLOCK, &stop, &old); /* a stop signal now waits until g_child names the child */
+      pid_t parent = getpid();
       fflush(stdout);
       pid_t pid = fork();
-      if (pid == 0) _exit(run_one(i));
-      int st = 0;
-      waitpid(pid, &st, 0);
-      if (WIFSIGNALED(st)) {
-        say("  %s: CRASHED in the driver with signal %d (see logcat / tombstone)\n", names[i], WTERMSIG(st));
+      if (pid == 0) {
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGKILL); /* the probe died (even by SIGKILL): the test child dies with it */
+        if (getppid() != parent) _exit(1);
+#endif
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        if (g_timeout > 0) alarm((unsigned)g_timeout); /* watchdog: a hung driver call is reported as SIGALRM */
+        _exit(run_one(i));
+      }
+      if (pid > 0) g_child = pid;
+      sigprocmask(SIG_SETMASK, &old, NULL);
+      int st = 0, overdue = 0;
+      if (pid < 0) {
+        say("  %s: fork failed: %s\n", k_names[i], strerror(errno));
+        rc = 1;
+      } else if (wait_child(pid, &st, &overdue)) {
+        say("  %s: test child %d did not exit after SIGKILL within 5 s (stuck in the driver/kernel)\n", k_names[i],
+            (int)pid);
+        rc = 1;
+      } else if (g_stop_sig) {
+        say("  %s: INTERRUPTED by signal %d, test child killed\n", k_names[i], (int)g_stop_sig);
+        rc = -2;
+      } else if (overdue) {
+        say("  %s: TIMED OUT: no exit %d s after the -T alarm, SIGKILLed by the parent\n", k_names[i], 5);
+        rc = 1;
+      } else if (WIFSIGNALED(st)) {
+        say("  %s: %s in the driver with signal %d (see logcat / tombstone)\n", k_names[i],
+            WTERMSIG(st) == SIGALRM ? "TIMED OUT" : "CRASHED", WTERMSIG(st));
         rc = 1;
       } else {
         rc = WEXITSTATUS(st);
       }
     }
     results[i] = rc;
+    if (rc == -2) break;
+    if (g_child) { /* a test child that cannot be reaped still holds the device: run nothing more */
+      worst = 1;
+      break;
+    }
     if (rc == 2 || rc == 3) { /* no device / no instance: the other tests cannot run either */
       worst = rc;
       break;
@@ -1066,9 +1879,22 @@ int main(int argc, char **argv) {
     if (rc) worst = 1;
   }
   say("== summary:");
-  for (int i = 0; i < 3; i++)
-    if (results[i] >= 0)
-      say(" %s=%s", names[i], results[i] == 0 ? "PASS" : results[i] == 3 ? "NO_DEVICE" : results[i] == 2 ? "ERROR" : "FAIL");
+  for (int i = 0; i < T_COUNT; i++)
+    if (results[i] >= 0 || results[i] == -2)
+      say(" %s=%s", k_names[i], results[i] == 0 ? "PASS" : results[i] == 3 ? "NO_DEVICE" : results[i] == 2 ? "ERROR" :
+          results[i] == -2 ? "INTERRUPTED" : "FAIL");
+  if (g_stop_sig) {
+    int sig = (int)g_stop_sig;
+    say("\nRESULT: INTERRUPTED (signal %d)\n", sig);
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(128 + sig);
+  }
+  if (worst == 0 && (missing || !ran)) {
+    worst = 1;
+    say("\nRESULT: FAIL (%s)\n", missing ? "a requested test is not in this build" : "no test ran");
+    return worst;
+  }
   say("\nRESULT: %s\n", worst == 0 ? "PASS" : worst == 3 ? "NO_DEVICE" : worst == 2 ? "ERROR" : "FAIL");
   return worst;
 }

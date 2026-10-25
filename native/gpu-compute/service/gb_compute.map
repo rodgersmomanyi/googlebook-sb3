@@ -1,0 +1,7 @@
+/* libgb_gpu_compute.so: the launcher only needs gb_gpu_compute_main; llama/ggml/libc++ stay internal. */
+{
+  global:
+    gb_gpu_compute_main;
+  local:
+    *;
+};

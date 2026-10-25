@@ -1,0 +1,192 @@
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -1746,6 +1746,12 @@
+       goto fail_disk_cache;
+ #endif
+ 
++#if DETECT_OS_ANDROID
++   pdev->android_foreign_gralloc = nvk_android_gralloc_is_foreign(pdev);
++   if (pdev->android_foreign_gralloc)
++      vk_android_set_force_linear_ahb(true);
++#endif
++
+    *pdev_out = &pdev->vk;
+ 
+    return VK_SUCCESS;
+--- a/src/vulkan/runtime/vk_android.h
++++ b/src/vulkan/runtime/vk_android.h
+@@ -106,6 +106,13 @@
+ 
+ uint64_t vk_android_get_front_buffer_usage(void);
+ 
++/* Set by a driver that can only share LINEAR buffers with the system gralloc
++ * (e.g. NVK when gralloc allocates on another GPU).  From then on the AHB usage
++ * query and AHB allocations of this driver add AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY,
++ * which gralloc implementations treat as "allocate LINEAR".
++ */
++void vk_android_set_force_linear_ahb(bool force_linear);
++
+ VkFormat vk_ahb_format_to_image_format(uint32_t ahb_format);
+ 
+ uint32_t vk_image_format_to_ahb_format(VkFormat vk_format);
+@@ -183,6 +190,12 @@
+    return 0;
+ }
+ 
++static inline void
++vk_android_set_force_linear_ahb(bool force_linear)
++{
++   (void)force_linear;
++}
++
+ static inline VkFormat
+ vk_ahb_format_to_image_format(uint32_t ahb_format)
+ {
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -627,6 +627,17 @@
+ }
+ 
+ #if ANDROID_API_LEVEL >= 26
++
++/* See vk_android_set_force_linear_ahb() in vk_android.h.  One gralloc per
++ * process and one driver per copy of this runtime, so a plain global is enough.
++ */
++static bool vk_android_force_linear_ahb;
++
++void
++vk_android_set_force_linear_ahb(bool force_linear)
++{
++   vk_android_force_linear_ahb = force_linear;
++}
+ 
+ uint64_t
+ vk_android_get_front_buffer_usage(void)
+@@ -912,7 +923,7 @@
+        !vk_format_is_depth_or_stencil(vk_format))
+       force_linear = true;
+ 
+-   if (force_linear)
++   if (force_linear || vk_android_force_linear_ahb)
+       ahb_usage |= AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
+ 
+    return ahb_usage;
+@@ -997,8 +1008,9 @@
+             image->android_deferred_create_info);
+       } else {
+          usage = vk_image_usage_to_ahb_usage(image->create_flags, image->usage);
+-         if ((image->compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) &&
+-             !vk_format_is_depth_or_stencil(image->format))
++         if (vk_android_force_linear_ahb ||
++             ((image->compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) &&
++              !vk_format_is_depth_or_stencil(image->format)))
+             usage |= AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
+       }
+    } else {
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -57,7 +57,15 @@
+ 
+    struct nvk_queue_family queue_families[3];
+    uint8_t queue_family_count;
++
++   /* Android: the system gralloc allocates on another GPU (minigbm on the
++    * Intel iGPU), so every buffer NVK shares with it must be LINEAR.
++    */
++   bool android_foreign_gralloc;
+ };
++
++/* nvk_android.c, Android builds only */
++bool nvk_android_gralloc_is_foreign(const struct nvk_physical_device *pdev);
+ 
+ static inline uint32_t
+ nvk_min_cbuf_alignment(const struct nv_device_info *info)
+--- a/src/nouveau/vulkan/nvk_android.c
++++ b/src/nouveau/vulkan/nvk_android.c
+@@ -8,11 +8,86 @@
+ 
+ #include "nvk_private.h"
+ 
++#include "nvk_device.h"
+ #include "nvk_entrypoints.h"
++#include "nvk_physical_device.h"
++#include "nvkmd/nvkmd.h"
+ #include "vk_android.h"
++#include "vk_common_entrypoints.h"
+ 
+ #include "vk_device.h"
+ #include "vk_queue.h"
++
++#include "util/os_misc.h"
++
++#include <hardware/gralloc.h>
++#if ANDROID_API_LEVEL >= 26
++#include <hardware/gralloc1.h>
++#endif
++#include <sys/stat.h>
++
++/* Is the system gralloc allocator on another GPU than this physical device?
++ *
++ * Android's gralloc (minigbm on lapis) opens the first DRM render node it can
++ * drive; with i915 on renderD128 every gralloc buffer is an i915 buffer whose
++ * Intel X/Y tiling NVIDIA hardware cannot address.  Only LINEAR buffers can be
++ * shared then.  NVK_ANB_LINEAR (Android property
++ * debug.mesa.nvk.anb.linear) = 1 forces "foreign", 0 forces "native".
++ */
++bool
++nvk_android_gralloc_is_foreign(const struct nvk_physical_device *pdev)
++{
++   const char *opt = os_get_option("NVK_ANB_LINEAR");
++   if (opt != NULL && opt[0] == '1')
++      return true;
++   if (opt != NULL && opt[0] == '0')
++      return false;
++
++   struct stat st;
++   if (stat("/dev/dri/renderD128", &st) != 0 || !S_ISCHR(st.st_mode))
++      return true;
++
++   return pdev->nvkmd->drm.render_dev == 0 ||
++          st.st_rdev != pdev->nvkmd->drm.render_dev;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++nvk_GetSwapchainGrallocUsageANDROID(VkDevice device,
++                                    VkFormat format,
++                                    VkImageUsageFlags imageUsage,
++                                    int *grallocUsage)
++{
++   VK_FROM_HANDLE(nvk_device, dev, device);
++
++   VkResult result = vk_common_GetSwapchainGrallocUsageANDROID(
++      device, format, imageUsage, grallocUsage);
++   if (result == VK_SUCCESS && nvk_device_physical(dev)->android_foreign_gralloc)
++      *grallocUsage |= GRALLOC_USAGE_SW_WRITE_RARELY;
++
++   return result;
++}
++
++#if ANDROID_API_LEVEL >= 26
++VKAPI_ATTR VkResult VKAPI_CALL
++nvk_GetSwapchainGrallocUsage2ANDROID(
++   VkDevice device, VkFormat format, VkImageUsageFlags imageUsage,
++   VkSwapchainImageUsageFlagsANDROID swapchainImageUsage,
++   uint64_t *grallocConsumerUsage, uint64_t *grallocProducerUsage)
++{
++   VK_FROM_HANDLE(nvk_device, dev, device);
++
++   VkResult result = vk_common_GetSwapchainGrallocUsage2ANDROID(
++      device, format, imageUsage, swapchainImageUsage,
++      grallocConsumerUsage, grallocProducerUsage);
++   /* libvulkan's convertGralloc1ToBufferUsage() keeps this bit as
++    * BufferUsage::CPU_WRITE_RARELY (= GRALLOC_USAGE_SW_WRITE_RARELY).
++    */
++   if (result == VK_SUCCESS && nvk_device_physical(dev)->android_foreign_gralloc)
++      *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_CPU_WRITE;
++
++   return result;
++}
++#endif
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+ nvk_QueueSignalReleaseImageANDROID(VkQueue _queue,

@@ -22,6 +22,7 @@ image files (see [Test harness](#test-harness)).
 | `build_internal.py` | Exports the partition set for the internal install (`<out>\*.img` + `manifest.json`). Reads the workspace's `lapis.bin` (`GB_HOME`, default: the repository root) and does not write it. Imports `build_esp.py`/`build_usb.py` without changing them. |
 | `install_dualboot.ps1` | The installer: checks, backups, D: shrink, partitions, raw writes, boot entry. It also has two maintenance modes: `-UpdateEspOnly` and `-RepairBootEntry`. |
 | `uninstall_dualboot.ps1` | Removes the boot entry and the Googlebook partitions, then extends D: back to its original size. |
+| `Import-GooglebookIsoInstall.ps1` | Imports the state of an install made by the installer ISO (`\gbinstall\` on its ESP) into `C:\GB-backup`, so the scripts below work for it. See [Installed from the ISO](#installed-from-the-iso). |
 | `Restart-ToGooglebook.ps1` | One-time boot into Googlebook: `bcdedit /set {fwbootmgr} bootsequence {id}` + `shutdown /r /t 0`. |
 | `gbdisk.cs` / `gbdisk.exe` | C# helper (.NET 4, built by `build_gbdisk.ps1` with the in-box `csc.exe`). Handles the GPT through `IOCTL_DISK_GET/SET_DRIVE_LAYOUT_EX`, raw I/O, volume lock/dismount, and the image backend. |
 | `gb_common.ps1` | Shared PowerShell helpers. Every change goes through `Invoke-Change`, which only acts with `-Apply`. |
@@ -231,6 +232,44 @@ maximum. A Googlebook-named partition anywhere before D: (another Linux/Android 
 Manual alternative: Disk Management cannot delete these partition types. Use `diskpart` → `select disk 0` →
 `list partition`. Check offsets and sizes against `layout_pre_shrink.json`, never touch partitions 1-5, run
 `select partition N` → `delete partition override` for each one, and then **Extend Volume** on D:.
+
+## Installed from the ISO
+
+The installer ISO (`googlebook-sb3-installer.iso`, option 2 "install next to Windows") creates the same partitions
+as `install_dualboot.ps1`, in unallocated space you made with Disk Management (it never shrinks D: itself), and a
+firmware boot entry "Googlebook OS" after Windows Boot Manager. It writes its state to `\gbinstall\` on the new
+Googlebook ESP in the formats these scripts use (`install_state.json` with `mode` `iso`, `plan.json`,
+`layout_pre_install.json`, the `gpt_pre_install_*`/`gpt_post_install_*` copies, `manifest_installed.json`,
+`SHA256SUMS`).
+
+* `Restart-ToGooglebook.ps1` works without an import: it finds the entry by its name.
+* Before `uninstall_dualboot.ps1`, `install_dualboot.ps1 -UpdateEspOnly` or `-RepairBootEntry`, import the state
+  (elevated; it reads the ESP through its volume path, no drive letter, no mountvol, nothing written to the ESP):
+
+  ```powershell
+  .\Import-GooglebookIsoInstall.ps1 -EspId <ESP GUID shown by the installer>          # dry run
+  .\Import-GooglebookIsoInstall.ps1 -EspId <ESP GUID shown by the installer> -Apply
+  ```
+
+  It checks `SHA256SUMS`, that the state is an ISO state for this disk (disk GUID), that every planned partition is
+  on the disk as planned (only the vbmeta slot bits may differ) and that `gbdisk verify --layout-only` accepts the
+  plan, then copies the files to `C:\GB-backup\<yyyyMMdd-HHmmss>-iso\` and writes the pointer
+  `C:\GB-backup\googlebook_install.json`. An existing pointer is refused unless `-Force` (it is kept as
+  `.bak-<stamp>`).
+* If Windows gives the ESP no volume path, boot the installer, use tools `w` (it copies `\gbinstall\` to a USB
+  stick), then `.\Import-GooglebookIsoInstall.ps1 -From <stick>:\gbsb3-logs\<...>\gbinstall -Apply`.
+* `install_dualboot.ps1 -UpdateEspOnly` rewrites the ESP and drops `\gbinstall\`: import first.
+* `uninstall_dualboot.ps1` has two guards for ISO installs:
+  * **Guard A** (step 4): when D: already has its original size (an ISO install never shrank it), nothing is extended;
+    give the freed space back with Disk Management > Extend Volume.
+  * **Guard B** (before any change): if Googlebook partitions after D: are not in the plan of the state it uses
+    (e.g. a stale `C:\GB-backup` pointer from an older Windows install, while the partitions were made by the ISO),
+    it refuses with "... are not from ...": run `Import-GooglebookIsoInstall.ps1` first, or pass `-StateFile` with
+    the right `install_state.json`. (`-Force` alone does not bypass this guard while a pointer exists; it only
+    covers a lost state: removal by name + type + contiguity.)
+* The installer's option 3 removes an ISO install without Windows (boot entry first, then the partition table
+  entries; the data is not overwritten), and its tools `c` compares the disk with the post-install copy after the
+  first Googlebook boot (read-only).
 
 ## Recovery
 

@@ -206,6 +206,24 @@ native/*/analysis/acpi/
 native/*/analysis/winpkg/
 native/sensors/kernel/work/
 
+# --- installer ISO work/test folders, dGPU build outputs, caches and version snapshots
+iso/work/
+iso/test/work/
+iso/test/logs/
+cache/
+archive/
+native/*/out/
+native/*/evidence/
+native/dgpu/1b/evidence/
+kernel/patches/k14/evidence/
+native/*/native/v[0-9]*/
+native/*/test/v[0-9]*/
+*.v1.1
+*.v1.2r1
+*.gguf
+*.safetensors
+*.part
+
 # --- local tooling
 __pycache__/
 *.pyc

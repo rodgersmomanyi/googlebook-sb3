@@ -1,0 +1,27 @@
+# Googlebook SB3 installer: what BUILD copies into the initramfs besides busybox (DESIGN.md 3.2).
+# bin <abs path>                copy to the same path + every library from ldd (symlink chains kept)
+# lib <abs path>                a shared library (+ its ldd deps)
+# file <src> <dst>              plain file
+# link <dst> <target>           symlink
+# python3 /usr/bin/python3.12   interpreter + its ldd libraries + the pruned stdlib
+python3 /usr/bin/python3.12
+link /usr/bin/python3 python3.12
+lib  /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+bin  /usr/sbin/sgdisk
+bin  /usr/bin/efibootmgr
+bin  /usr/bin/zstd
+bin  /usr/sbin/blkid
+bin  /usr/bin/lsblk
+bin  /usr/sbin/losetup
+bin  /usr/sbin/blockdev
+bin  /usr/bin/partx
+bin  /usr/bin/kmod
+link /sbin/modprobe /usr/bin/kmod
+link /sbin/insmod /usr/bin/kmod
+link /sbin/lsmod /usr/bin/kmod
+link /sbin/modinfo /usr/bin/kmod
+bin  /usr/bin/setfont
+bin  /usr/sbin/fsck.vfat
+bin  /usr/bin/stty
+bin  /usr/bin/ntfsls
+bin  /usr/bin/ntfscat

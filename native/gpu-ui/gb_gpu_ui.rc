@@ -1,0 +1,13 @@
+service gb_gpu_ui_setup /system/bin/sh /vendor/bin/gb_gpu_ui_setup.sh
+    user shell
+    group shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+on post-fs-data
+    mkdir /data/vendor/gb 0751 root shell
+    mkdir /data/vendor/gb/ui 0700 shell shell
+
+on property:sys.boot_completed=1
+    start gb_gpu_ui_setup

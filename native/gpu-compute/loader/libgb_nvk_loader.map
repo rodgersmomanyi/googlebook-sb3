@@ -1,0 +1,7 @@
+/* libgb_nvk_loader.so: export only the Vulkan API (vk*), nothing else. */
+{
+  global:
+    vk*;
+  local:
+    *;
+};

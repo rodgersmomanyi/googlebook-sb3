@@ -1,12 +1,11 @@
 #!/bin/bash
 # Optional test helper (builder only, NOT shipped): Mesa's nouveau no-op drm-shim for Android, used by
 # 40_bionic_chroot_test.sh to give NVK a fake TU117 so device creation + NAK compilation can be exercised on bionic.
-# Needs the b-nvk build dir from 20_build_nvk_android.sh. Two test-only tweaks:
+# Needs the $B build dir of the same PATCHSET from 20_build_nvk_android.sh. Two test-only tweaks:
 #  - libdrm's nouveau/nvif headers (our libdrm.a was built with -Dnouveau=disabled; the shim only needs headers)
 #  - drm_shim.c: bionic declares ioctl(int, int, ...) (+ an overload unless BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD)
 set -euo pipefail
 . "$(dirname "$0")/00_env.sh"
-B=$W/b-nvk
 mkdir -p "$W/sys/include/libdrm/nouveau/nvif"
 cp "$W/src/libdrm/nouveau/nvif/"*.h "$W/sys/include/libdrm/nouveau/nvif/"
 cp "$W/src/libdrm/nouveau/nouveau.h" "$W/sys/include/libdrm/nouveau/"

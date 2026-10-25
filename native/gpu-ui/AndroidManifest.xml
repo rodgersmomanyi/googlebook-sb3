@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GbGpu (package gb.sb3.gpu): non-privileged system app in /odm/app/GbGpu (INTERFACES 13.2, v1.2 section 27).
+  versionCode / versionName are set by build_apk.sh through aapt2 link (minutes since the epoch).
+  Permissions (nothing privileged; checked by test/check_apk.py against the framework manifest in android.jar):
+    POST_NOTIFICATIONS   (dangerous, runtime; granted by gb_gpu_ui_setup.sh): the in-use and detach notifications.
+    QUERY_ALL_PACKAGES   (normal, granted at install; INTERFACES 13.2 v1.2, D3). Justification: (1) the app catalog
+                         of INTERFACES 24.3 must list every launchable app of the user, with ApplicationInfo.flags and
+                         category, so that gb_power can opt games and "Use NVIDIA" apps into the NVIDIA driver; (2) the
+                         holder names in the notifications and dialogs (12.3, 27.4) come from any package that holds
+                         the GPU, launchable or not. The app has no network access and sends the list only to the
+                         local gb_power socket, which re-checks every package against packages.list.
+  Every exported component is protected by a permission only the system, Settings or shell hold, except
+  SettingsActivity (Settings must be able to start it; it only shows state and every change is a user action).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="gb.sb3.gpu">
+
+    <uses-sdk
+        android:minSdkVersion="36"
+        android:targetSdkVersion="36" />
+
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@drawable/ic_gpu"
+        android:label="@string/app_label"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.GbGpu"
+        android:usesCleartextTraffic="false">
+
+        <!-- QS tile "Graphics": Intel / NVIDIA / NVIDIA (busy N) / Unavailable (base detached) / ... (INTERFACES 27.1) -->
+        <service
+            android:name=".GpuTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_gpu"
+            android:label="@string/tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+            <meta-data
+                android:name="android.service.quicksettings.ACTIVE_TILE"
+                android:value="true" />
+        </service>
+
+        <!-- Optional Detach tile: tap sends detach-request (LATCH_REQUEST through gb_power) -->
+        <service
+            android:name=".DetachTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_detach"
+            android:label="@string/detach_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!--
+          The Graphics page, injected into Settings > System (settingslib TileUtils: IA_SETTINGS activities of system
+          apps only; category ia.system verified on lapis 276.R4, 1b evidence E2) and opened by the tile's long-press.
+          summary_uri has no path: Settings appends /getDynamicSummary/<keyhint>. No switch_uri (v1.2: three modes).
+        -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_gpu"
+            android:label="@string/settings_title">
+            <intent-filter>
+                <action android:name="com.android.settings.action.IA_SETTINGS" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
+            <meta-data
+                android:name="com.android.settings.category"
+                android:value="com.android.settings.category.ia.system" />
+            <meta-data
+                android:name="com.android.settings.title"
+                android:value="Graphics" />
+            <meta-data
+                android:name="com.android.settings.icon"
+                android:resource="@drawable/ic_gpu" />
+            <meta-data
+                android:name="com.android.settings.keyhint"
+                android:value="graphics" />
+            <meta-data
+                android:name="com.android.settings.summary_uri"
+                android:value="content://gb.sb3.gpu.switches" />
+        </activity>
+
+        <activity
+            android:name=".HoldersActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:theme="@style/Theme.GbGpu.Translucent" />
+
+        <!-- Dynamic summary of the injected entry; only holders of WRITE_SECURE_SETTINGS (Settings, shell) may bind -->
+        <provider
+            android:name=".SwitchProvider"
+            android:authorities="gb.sb3.gpu.switches"
+            android:exported="true"
+            android:permission="android.permission.WRITE_SECURE_SETTINGS" />
+
+        <!-- gb_power's state broadcast, delivered by gb_notify as shell; DUMP keeps other apps out -->
+        <receiver
+            android:name=".StateReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="gb.sb3.gpu.action.STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- The detach notification's Cancel action (12.3): our own PendingIntent only, so not exported -->
+        <receiver
+            android:name=".ActionReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

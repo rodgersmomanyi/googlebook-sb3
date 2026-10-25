@@ -1,0 +1,10 @@
+source=https://github.com/ggml-org/llama.cpp
+tag=b11552
+commit=23b0202a189c44a54625aadcb37a946dd1d6278d
+commit_time=2026-10-10T21:25:38+02:00
+fetched=2026-10-25T06:35:33Z
+rule=newest bNNNN release tag whose (lightweight tag = commit) time is at least 14 days before the fetch time (INTERFACES 18.5)
+cutoff=2026-10-11T06:35:53Z
+checked=no tag numbered above b11552 is older than the cutoff (newest tag at fetch time: b11871, 2026-10-25)
+fetch=git clone --filter=blob:none --no-checkout + checkout of the tag (scripts/10_fetch_llama.sh verifies tag -> commit and a clean tree)
+used=ggml (CPU + Vulkan backends), libllama, vendor/nlohmann/json.hpp, gguf-py + models/ggml-vocab-llama-spm.gguf (tests only), tests/test-backend-ops.cpp (tests only); nothing from common/, tools/, server/

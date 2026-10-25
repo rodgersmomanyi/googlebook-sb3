@@ -8,6 +8,24 @@ LAPIS = os.path.join(HERE, "lapis.bin")
 ESP_OFFSET = 142606336          # EFI-SYSTEM partition start (bytes)
 ESP_BYTES  = 201326592          # 192 MiB (enlarged into unused KERN-A via grow_esp.py, for vulkan.pastel)
 
+def _lapis_write_refused():
+    """Why running this file must not write lapis.bin now (None = allowed). build_usb.py imports this module and builds
+    its own ESP; only `python build_esp.py` writes lapis.bin (the VM's disk), so that needs GB_WRITE_LAPIS=1 set on
+    purpose and is refused while VMware has the VM open (a lapis*.lck folder next to lapis.bin)."""
+    if os.environ.get("GB_WRITE_LAPIS") != "1":
+        return ("running build_esp.py rewrites the ESP inside lapis.bin (the VM's disk); set GB_WRITE_LAPIS=1 to do "
+                "that on purpose, with the VM powered off (build_usb.py builds the USB image without it)")
+    try:
+        lck = sorted(n for n in os.listdir(HERE) if n.lower().startswith("lapis") and n.lower().endswith(".lck"))
+    except OSError as e:
+        return f"cannot list {HERE} to check for VMware locks: {e}"
+    if lck:
+        return f"VMware has the VM open ({', '.join(lck)}); lapis.bin is never written while it runs"
+    return None
+
+if __name__ == "__main__" and _lapis_write_refused():      # refuse before reading anything
+    sys.exit(f"build_esp.py: refused: {_lapis_write_refused()}")
+
 SDBOOT  = open(os.path.join(HERE, "debs", "systemd-bootx64.efi"), "rb").read()
 KERNEL  = open(os.path.join(BOOT, "kernel.bin"), "rb").read()
 # A/B slot to boot. An OTA writes the inactive slot and the boot_control HAL marks it in the GPT; after it has booted
@@ -908,7 +926,16 @@ def _tree(root):
     return sorted(out)
 
 NATIVE_FW = _tree(NATIVE_FW_DIR)
-NATIVE_MODS = _tree(NATIVE_MOD_DIR)
+# Only kernel modules and their two load lists are packed (W2-13): stage_kernel.py keeps its backups in
+# archive\module-backups, and any other file left in the directory (an old *.pre-<tag>, an editor backup) must never
+# reach the initrd. The opt-in dGPU modules (stage_kernel.NATIVE_OPTIN) go into the payload, not the cpio (A-06).
+_NATIVE_MODS_ALL = _tree(NATIVE_MOD_DIR)
+assert all("/" not in _n for _n, _ in _NATIVE_MODS_ALL), "inject\\native\\modules must be flat"
+_is_mod = lambda n: n.endswith(".ko") or n in ("modules.load", "modules.load.late")
+NATIVE_MODS = [(_n, _d) for _n, _d in _NATIVE_MODS_ALL if _is_mod(_n)]
+_stray = [_n for _n, _ in _NATIVE_MODS_ALL if not _is_mod(_n)]
+print(f"native modules: {len(NATIVE_MODS)} files, {len(_stray)} other file(s) ignored"
+      + (f" (e.g. {', '.join(_stray[:3])})" if _stray else ""), flush=True)
 
 # Second-stage module pass (exec_start at early-init, before the composer starts). gbinit already loaded
 # modules.load before Android init; this retries anything it could not load and then loads modules.load.late: modules
@@ -933,38 +960,143 @@ GB_MODULES_SH = (b"#!/system/bin/sh\n"
                  b"echo \"GB_MODULES: loaded $ok, failed $bad\"\n")
 
 # Native boot log: there is no serial console on real hardware, so kernel + Android logs are written to the boot
-# partition (FAT32), readable from Windows: <boot partition>\gblog\bootN-tSECONDS.txt.
-GB_BOOTLOG_SH = (b"#!/system/bin/sh\n"
-                 b"P=EFI-SYSTEM\n"
-                 b"for a in $(cat /proc/cmdline); do case $a in gb.logpart=*) P=${a#gb.logpart=};; esac; done\n"
-                 b"D=/dev/block/by-name/$P; M=/mnt/gb_esp; N=\n"
-                 b"mkdir -p $M\n"
-                 b"for t in 40 90 180 420; do\n"
-                 b"  while [ $(cut -d. -f1 /proc/uptime) -lt $t ]; do sleep 5; done\n"
-                 b"  mount -t vfat -o rw,nosuid,nodev,noexec $D $M || { echo \"gb_bootlog: cannot mount $D\" > /dev/kmsg; exit 1; }\n"
-                 b"  mkdir -p $M/gblog\n"
-                 b"  if [ -z \"$N\" ]; then N=$(( $(cat $M/gblog/bootcount 2>/dev/null || echo 0) + 1 )); echo $N > $M/gblog/bootcount; fi\n"
-                 b"  F=$M/gblog/boot$N-t$t.txt\n"
-                 b"  { echo \"== uptime $(cat /proc/uptime) boot_completed=$(getprop sys.boot_completed) hw=$(cat /odm/etc/gb_hw)\"\n"
-                 b"    echo '== cmdline'; cat /proc/cmdline\n"
-                 b"    echo '== gbinit module loading'; cat /odm/gbinit_modules.log\n"
-                 b"    echo '== dmi'; cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name\n"
-                 b"    echo '== block'; ls -l /sys/block; ls -l /dev/block/by-name\n"
-                 b"    echo '== input devices'; cat /proc/bus/input/devices\n"
-                 b"    echo '== iio'; for i in /sys/bus/iio/devices/*/name; do echo \"$i $(cat $i)\"; done\n"
-                 b"    echo '== asound'; cat /proc/asound/cards /proc/asound/pcm; tinymix -D 0 2>&1 | head -n 80\n"
-                 b"    echo '== gpu'; dumpsys gpu 2>&1 | head -n 60; cmd gpu vkjson 2>&1 | head -c 4000\n"
-                 b"    echo '== modules'; cat /proc/modules\n"
-                 b"    echo '== drm/input/power'; ls -l /dev/dri /dev/input; for u in /sys/class/power_supply/*/uevent; do echo $u; cat $u; done\n"
-                 b"    echo '== pci'; for d in /sys/bus/pci/devices/*; do echo \"$d $(cat $d/vendor):$(cat $d/device) driver=$(basename $(readlink $d/driver) 2>/dev/null)\"; done\n"
-                 b"    echo '== getprop'; getprop\n"
-                 b"    echo '== dmesg'; dmesg\n"
-                 b"    echo '== logcat'; logcat -d -b all -v threadtime | tail -n 6000\n"
-                 b"    echo '== dumpsys SurfaceFlinger'; dumpsys SurfaceFlinger | head -n 120\n"
-                 b"    echo '== dumpsys input'; dumpsys input | head -n 200\n"
-                 b"  } > $F 2>&1\n"
-                 b"  sync; umount $M\n"
-                 b"done\n")
+# partition (FAT32), readable from Windows: <boot partition>\gblog\boot<N>-t<T>.txt (T = 40, 90, 180, 420, 900 s).
+# Each snapshot is collected in /dev first; the ESP is taken with the INTERFACES 5.4 lock and mounted rw,flush only for
+# the copy; the newest 8 boots are kept and nothing is written below 128 MiB free. The dgpu section is read-only
+# (cached sysfs attributes, node metadata, gb_power hello/status/get-mode). The text between #@@functions-begin and
+# #@@functions-end is sourced by the test harness (tests\w2a), with the GB_BOOTLOG_* overrides init never sets.
+GB_BOOTLOG_SH = rb"""#!/system/bin/sh
+# gb_bootlog (native): kernel + Android logs to <boot partition>\gblog\boot<N>-t<T>.txt at T = 40, 90, 180, 420, 900 s.
+# Each snapshot is collected in /dev first; the ESP is locked (INTERFACES 5.4) and mounted rw,flush only for the copy.
+# Retention: the newest 8 boots of boot*/audio-b* files; nothing is written while the ESP has less than 128 MiB free.
+# The dgpu section reads cached sysfs attributes and node metadata only (PLAN invariant 12) and sends only the
+# read-only socket commands hello, status and get-mode. GB_BOOTLOG_* overrides exist for the test harness only.
+P=EFI-SYSTEM
+# shellcheck disable=SC2013  # /proc/cmdline is one line of blank-separated tokens: words are wanted
+for a in $(cat /proc/cmdline); do case $a in gb.logpart=*) P=${a#gb.logpart=};; esac; done
+D=/dev/block/by-name/$P; M=${GB_BOOTLOG_MNT:-/mnt/gb_esp}; L=${GB_BOOTLOG_LOCK:-/dev/gb_esp.lock}
+T=${GB_BOOTLOG_TMP:-/dev/gb_bootlog.txt}; G=/data/vendor/gb; N=; OWN=; KEEP=8; FLOOR_KB=131072
+mkdir -p "$M"
+#@@functions-begin
+steal() {   # $1 = owner line seen, $2 = inode seen (gb_nouveau.sh steal_lock)
+  s=$L.stale.$$; rm -rf "$s" 2>/dev/null
+  mv -T "$L" "$s" 2>/dev/null || return 1
+  o2=; [ -r "$s/owner" ] && IFS= read -r o2 < "$s/owner"
+  if [ "$(stat -c %i "$s" 2>/dev/null)" = "$2" ] && [ "$o2" = "$1" ]; then rm -f "$s/owner"; rmdir "$s" 2>/dev/null; return 0; fi
+  mv -T "$s" "$L" 2>/dev/null || echo "gb_bootlog: ESP lock changed while stealing it, left as ${s##*/}" > /dev/kmsg
+  return 1
+}
+lock() {    # 1 s polls; stale = dead or non-numeric owner, or 5 polls without an owner file; after 600 s: no lock
+  w=0; miss=0; OWN=
+  while ! mkdir "$L" 2>/dev/null; do
+    i=$(stat -c %i "$L" 2>/dev/null); ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"; o=${ol%% *}; st=0
+    if [ -n "$ol" ]; then miss=0; case $o in ''|*[!0-9]*) st=1;; *) [ -d "/proc/$o" ] || st=1;; esac
+    else miss=$((miss+1)); [ $miss -ge 5 ] && st=1; fi
+    if [ $st = 1 ] && [ -n "$i" ]; then miss=0; steal "$ol" "$i" && continue; fi
+    if [ $w -ge 600 ]; then echo "gb_bootlog: ESP lock held over 600 s ($ol), proceeding without it" > /dev/kmsg; return 0; fi
+    sleep 1; w=$((w+1))
+  done
+  OWN="$$ gb_bootlog $(cut -d. -f1 /proc/uptime)"; echo "$OWN" > "$L/owner"
+}
+unlock() {  # only our own lock (a lock stolen from us belongs to someone else now)
+  [ -n "$OWN" ] || return 0
+  ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"
+  [ "$ol" = "$OWN" ] && { rm -f "$L/owner"; rmdir "$L" 2>/dev/null; }
+  OWN=
+}
+prune() {   # once per boot, right after N is known
+  for f in "$M"/gblog/boot*-t*.txt "$M"/gblog/audio-b*; do
+    [ -f "$f" ] || continue
+    b=${f##*/}; b=${b#boot}; b=${b#audio-b}; b=${b%%[!0-9]*}
+    case $b in ''|*[!0-9]*) continue;; esac
+    [ "$b" -le $((N-KEEP)) ] && rm -f "$f"
+  done
+}
+rdf() { v=-; [ -r "$1" ] && v=$(head -c 600 "$1"); echo "$v"; }
+snapshot() {
+  echo "== uptime $(cat /proc/uptime) boot_completed=$(getprop sys.boot_completed) hw=$(cat /odm/etc/gb_hw)"
+  echo '== cmdline'; cat /proc/cmdline
+  echo '== gbinit module loading'; cat /odm/gbinit_modules.log
+  echo '== dmi'; cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name
+  echo '== block'; ls -l /sys/block; ls -l /dev/block/by-name
+  echo '== input devices'; cat /proc/bus/input/devices
+  echo '== iio'; for i in /sys/bus/iio/devices/*/name; do echo "$i $(cat "$i")"; done
+  echo '== asound'; cat /proc/asound/cards /proc/asound/pcm; timeout 10 tinymix -D 0 2>&1 | head -n 80
+  echo '== gpu'; timeout 20 dumpsys gpu 2>&1 | head -n 60; timeout 20 cmd gpu vkjson 2>&1 | head -c 4000
+  echo '== modules'; cat /proc/modules
+  echo '== drm/input/power'; ls -l /dev/dri /dev/input; for u in /sys/class/power_supply/*/uevent; do echo "$u"; cat "$u"; done
+  echo '== pci'; for d in /sys/bus/pci/devices/*; do echo "$d $(cat "$d/vendor"):$(cat "$d/device") driver=$(basename "$(readlink "$d/driver")" 2>/dev/null)"; done
+  echo '== getprop'; getprop
+  echo '== dgpu'
+  for d in /sys/bus/pci/devices/*; do
+    v=$(cat "$d/vendor")
+    [ "$v" = 0x10de ] || [ "${d##*/}" = 0000:00:1d.4 ] || continue
+    # shellcheck disable=SC2012  # iommu_group/devices holds PCI addresses (dddd:bb:dd.f) only
+    echo "${d##*/} $v:$(cat "$d/device") class=$(cat "$d/class") driver=$(basename "$(readlink "$d/driver")" 2>/dev/null)" \
+         "control=$(cat "$d/power/control") runtime=$(cat "$d/power/runtime_status") state=$(cat "$d/power_state")" \
+         "active_ms=$(cat "$d/power/runtime_active_time") suspended_ms=$(cat "$d/power/runtime_suspended_time")" \
+         "iommu_group=$(ls "$d/iommu_group/devices" 2>/dev/null | tr '\n' ' ')"
+  done
+  echo "nouveau refcnt=$(cat /sys/module/nouveau/refcnt 2>/dev/null || echo -)"
+  for r in /sys/class/drm/card[0-9]* /sys/class/drm/renderD*; do
+    [ -e "$r/device/vendor" ] && echo "${r##*/} -> $(cat "$r/device/vendor") $(basename "$(readlink "$r/device/driver")") $(stat -c '%a %U:%G' "/dev/dri/${r##*/}" 2>/dev/null)"
+  done
+  echo '-- gb_dgpu_check'; timeout 30 sh /vendor/bin/gb_dgpu_check.sh 2>&1 | head -n 150
+  echo '-- properties'; getprop | grep -E 'vendor\.gb\.|persist\.vendor\.gb\.|init\.svc\.gb_|ro\.gfx\.driver|ro\.hardware\.(vulkan|egl)|hwui'
+  echo '-- gb_power (read-only: hello, status, get-mode)'
+  printf 'hello\nstatus\nget-mode\n' | timeout 5 toybox nc -q 1 -U /dev/socket/gb_power 2>&1 | head -c 8192; echo
+  echo '-- settings'
+  for k in all_apps production_opt_in_apps production_opt_out_apps production_allowlist production_denylist; do
+    echo "updatable_driver_$k=$(timeout 10 settings get global updatable_driver_$k 2>&1 | head -c 600)"
+  done
+  for p in gb.sb3.gpu gb.sb3.gfxdriver; do echo "pkg $p:"; timeout 10 dumpsys package $p 2>&1 | grep -E 'codePath|pkgFlags|privateFlags|versionCode' | head -n 8; done
+  echo '-- state'; ls -la /dev/gb_dgpu "$L" $G/notify 2>&1
+  for s in nouveau.clean_boots gfx_unclean dgpu_unclean selftest/result; do echo "$s: $(rdf $G/$s)"; done
+  for s in gfx_session dgpu_session nouveau.loading selftest/running; do
+    if [ -e $G/$s ]; then echo "$s: present $(rdf $G/$s)"; else echo "$s: absent"; fi
+  done
+  grep -E ' /odm/dgpu | /odm/firmware/nvidia | /mnt/gb_' /proc/mounts
+  dmesg | grep -iE 'nouveau|gsp|pciehp|_OSC|sdtx|surface_hotplug|acpiphp|firmware|gb_nouveau|gb_power|gb_notify|gb_slotsync|gb_audiodiag|runtime PM through ACPI _PR3|no longer present on the bus|runtime suspend failed|failed to evict VRAM|Do not have permissions to set'
+  logcat -d -s gb_notify gb_gpu_ui_setup gb_gpu_compute gb_gfxdriver GbGpu 2>/dev/null | tail -n 60
+  getenforce
+  for k in dgpu load bind test selftest; do
+    # shellcheck disable=SC2012  # newest of the fixed report names <prefix>-<N>.txt (INTERFACES 5.1)
+    f=$(ls -t $G/report/$k-*.txt 2>/dev/null | head -n 1); [ -n "$f" ] && { echo "== $f"; cat "$f"; }
+  done
+  echo '== dmesg-live (tail)'; tail -c 262144 $G/report/dmesg-live.txt 2>/dev/null
+  echo '== dmesg-live.prev (tail)'; tail -c 262144 $G/report/dmesg-live.prev.txt 2>/dev/null
+  echo '== gb_nouveau.log (tail)'; tail -c 32768 $G/report/gb_nouveau.log.1 2>/dev/null; tail -c 65536 $G/report/gb_nouveau.log 2>/dev/null
+  echo '== dmesg'; dmesg
+  echo '== logcat'; logcat -d -b all -v threadtime | tail -n 6000
+  echo '== dumpsys SurfaceFlinger'; timeout 20 dumpsys SurfaceFlinger | head -n 120
+  echo '== dumpsys input'; timeout 20 dumpsys input | head -n 200
+}
+#@@functions-end
+for t in 40 90 180 420 900; do
+  while [ "$(cut -d. -f1 /proc/uptime)" -lt $t ]; do sleep 5; done
+  [ $t = 40 ] && setprop vendor.gb.dgpu_report 1
+  snapshot > "$T" 2>&1
+  lock
+  if ! mount -t vfat -o rw,flush,nosuid,nodev,noexec "$D" "$M"; then
+    unlock; rm -f "$T"; echo "gb_bootlog: cannot mount $D, t=$t skipped" > /dev/kmsg; continue
+  fi
+  mkdir -p "$M/gblog"
+  if [ -z "$N" ]; then
+    c=$(cat "$M/gblog/bootcount" 2>/dev/null); case $c in ''|*[!0-9]*) c=0;; esac
+    N=$((c+1)); echo $N > "$M/gblog/bootcount"; prune
+  fi
+  # shellcheck disable=SC2046  # df's output line is split into its fields on purpose
+  set -- $(df -k "$M" 2>/dev/null | tail -n 1); fr=$4
+  case $fr in ''|*[!0-9]*) fr=;; esac
+  if [ -n "$fr" ] && [ "$fr" -lt $FLOOR_KB ]; then
+    echo "gb_bootlog: ESP free ${fr} KiB below the 128 MiB floor, t=$t not written" > /dev/kmsg
+  else
+    cp "$T" "$M/gblog/boot$N-t$t.txt"
+  fi
+  sync; umount "$M"; unlock; rm -f "$T"
+done
+"""
+assert b"\r" not in GB_BOOTLOG_SH
 
 GB_RC_NATIVE = (
          b"service gb_keymint /vendor/bin/hw/android.hardware.security.keymint-service\n"
@@ -1236,42 +1368,108 @@ if VMADB:
                  ('gbstage/adb_keys', 0o100644, open(os.path.join(ADB_DIR, "adb_keys"), "rb").read()),
                  ('gbstage/gb_netwatch.sh', 0o100755, open(os.path.join(ADB_DIR, "gb_netwatch.sh"), "rb").read())]
 # ---- native tree (/gbnative -> /odm when gb.hw=native) ----
-def _add_native(path, data, mode=0o100644):
-    """Add gbnative/<path>, creating every parent directory entry first (the initramfs unpacker needs them)."""
-    full = "gbnative/" + path
-    have = {p for p, _, _ in _entries}
+def _add_entry(lst, full, data, mode=0o100644):
+    """Append (full, mode, data) to the cpio entry list lst, creating every parent directory entry first (the
+    initramfs unpacker needs them). data None = a directory (added once)."""
+    have = {p for p, _, _ in lst}
     parts = full.split("/")
     for i in range(1, len(parts)):
         d = "/".join(parts[:i])
         if d not in have:
-            _entries.append((d, 0o040755, None)); have.add(d)
+            lst.append((d, 0o040755, None)); have.add(d)
     if data is None:
         if full not in have:
-            _entries.append((full, 0o040755, None))
+            lst.append((full, 0o040755, None))
     else:
-        _entries.append((full, mode, data))
+        lst.append((full, mode, data))
+
+def _add_native(path, data, mode=0o100644):
+    """Add gbnative/<path> (see _add_entry)."""
+    _add_entry(_entries, "gbnative/" + path, data, mode)
+
+def _mode_of(e):
+    """Manifest mode ("0755", "0644", "0o100755") -> full cpio mode (regular file unless the type bits are given)."""
+    m = int(str(e["mode"]).replace("0o", ""), 8)
+    return m if m > 0o7777 else 0o100000 | m
 
 # Native components built and reviewed separately under native/<name> (GB_BUILD) (iptsd touch/pen, gb_power battery/
-# detach/dGPU/profile, audio, ...). Each manifest inject\native\components\<name>.json lists its files for the native
-# tree ({src, dest, mode}) and its rc fragments, appended to the native gb.rc. Their kernel modules go through
-# stage_kernel.py (inject\native\modules), not through the manifests.
+# detach/dGPU/profile, audio, nouveau policy, NVK, compute, the GPU UI and the per-app graphics driver package). Each
+# manifest inject\native\components\<name>.json lists
+#   files      {src, dest, mode}: native tree files (dest relative to /odm)
+#   payload    {src, dest, mode 0644}: files of the dGPU erofs payload (dest relative to the erofs root, INTERFACES 6.2)
+#   symlinks   {dest, target}: native tree symlinks into the payload mount /odm/dgpu
+#   rc_files / rc_text: fragments appended to the native gb.rc;  build_prop: lines of the native /odm/etc/build.prop
+# Their kernel modules go through stage_kernel.py (inject\native\modules), not through the manifests.
+# GB_GFXDRIVER=0 (bisect opt-out only) skips gfxdriver.json: no GbGfxDriver.apk, no ro.gfx.driver.0, no gfx_build_id.
 import json as _json, glob as _glob
-NATIVE_COMPONENTS, _COMP_FILES, _COMP_RC = [], [], b""
+NATIVE_COMPONENTS, _COMP_FILES, _COMP_RC, PAYLOAD_FILES, _COMP_LINKS = [], [], b"", [], []
+_KNOWN = {"name", "source", "comment", "files", "payload", "symlinks", "rc_files", "rc_text", "build_prop"}
+# never in any build.prop line of a component (PLAN invariant 1, INTERFACES 4 and 14, W2G-03: no build-time default)
+_BAD_PROP = ("ro.hardware.vulkan", "ro.hardware.egl", "ro.hwui.use_vulkan", "debug.hwui.renderer",
+             "ro.vendor.gb.gfx_default", "persist.vendor.gb.gfx_mode", "persist.vendor.gb.nouveau")
+def _xv(o):
+    """Repository: expand ${GB_HOME} / ${GB_BUILD} in every string of a component manifest."""
+    if isinstance(o, str):
+        return os.path.expandvars(o)
+    if isinstance(o, list):
+        return [_xv(x) for x in o]
+    if isinstance(o, dict):
+        return {k: _xv(v) for k, v in o.items()}
+    return o
+
+def _rel_ok(p):
+    return bool(p) and not p.startswith("/") and "\\" not in p and ".." not in p.split("/")
+
+def _load_manifest(m, mf):
+    """Check one component manifest m (from file mf) and read its inputs:
+    (files [(dest, bytes, mode)], payload [(dest, bytes)], symlinks [(dest, target, mode)], rc bytes, build.prop bytes)."""
+    assert not set(m) - _KNOWN, f"{mf}: unknown keys {sorted(set(m) - _KNOWN)} (gfxtest_entry is retired)"
+    files, payload, links, rc, prop = [], [], [], b"", b""
+    for e in m.get("files", []):
+        assert _rel_ok(e["dest"]), f"{mf}: bad dest {e['dest']!r}"
+        assert "gb_gfxdriver" not in e["dest"], f"{mf}: gb_gfxdriver.* is retired (v1.2)"
+        files.append((e["dest"], open(e["src"], "rb").read(), _mode_of(e)))
+    for e in m.get("payload", []):
+        assert (int(str(e["mode"]).replace("0o", ""), 8) & 0o7777) == 0o644, f"{mf}: payload files are 0644 (6.2)"
+        assert _rel_ok(e["dest"]) and e["dest"].startswith(("lib64/hw/", "lib64/gpu-compute/")), e
+        payload.append((e["dest"], open(e["src"], "rb").read()))
+    for s in m.get("symlinks", []):
+        assert _rel_ok(s["dest"]) and s["target"].startswith("/odm/dgpu/") and ".." not in s["target"], s
+        links.append((s["dest"], s["target"].encode(), 0o120777))      # newc symlink: data = target
+    for r in m.get("rc_files", []):
+        rc += b"\n# ---- component " + m["name"].encode() + b" ----\n" + open(r, "rb").read()
+    if m.get("rc_text"):
+        rc += b"\n# ---- component " + m["name"].encode() + b" ----\n" + m["rc_text"].encode() + b"\n"
+    for l in m.get("build_prop", []):            # native /odm/etc/build.prop additions
+        assert not l.startswith(_BAD_PROP), f"{mf}: {l} is not allowed (invariant 1, W2G-03)"
+        prop += l.encode() + b"\n"
+    return files, payload, links, rc, prop
+
 os.environ.setdefault("GB_HOME", HERE)   # manifest paths may use ${GB_HOME} and ${GB_BUILD}
 os.environ.setdefault("GB_BUILD", HERE if os.path.isdir(os.path.join(HERE, "native")) else r"C:\GB-build")
 for _mf in sorted(_glob.glob(os.path.join(NATIVE_DIR, "components", "*.json"))):
-    _m = _json.load(open(_mf, encoding="utf-8"))
-    for _e in _m.get("files", []):
-        _mode = int(str(_e["mode"]).replace("0o", ""), 8)
-        _COMP_FILES.append((_e["dest"], open(os.path.expandvars(_e["src"]), "rb").read(), _mode if _mode > 0o7777 else 0o100000 | _mode))
-    for _r in _m.get("rc_files", []):
-        _COMP_RC += b"\n# ---- component " + _m["name"].encode() + b" ----\n" + open(os.path.expandvars(_r), "rb").read()
-    if _m.get("rc_text"):
-        _COMP_RC += b"\n# ---- component " + _m["name"].encode() + b" ----\n" + _m["rc_text"].encode() + b"\n"
-    for _l in _m.get("build_prop", []):           # native /odm/etc/build.prop additions
-        ODM_BUILD_PROP_NATIVE += _l.encode() + b"\n"
+    with open(_mf, encoding="utf-8") as _fh:
+        _m = _xv(_json.load(_fh))
+    if _m["name"] == "gfxdriver" and os.environ.get("GB_GFXDRIVER") == "0":
+        print("native component gfxdriver: skipped (GB_GFXDRIVER=0)", flush=True); continue
+    assert _m["name"] not in NATIVE_COMPONENTS, f"{_mf}: component {_m['name']} twice"
+    _f, _p, _s, _r, _l = _load_manifest(_m, _mf)
+    for _d, _ in _p:
+        assert _d not in dict(PAYLOAD_FILES), f"{_mf}: payload {_d} twice"
+    _COMP_FILES += _f; PAYLOAD_FILES += _p; _COMP_LINKS += _s; _COMP_RC += _r; ODM_BUILD_PROP_NATIVE += _l
     NATIVE_COMPONENTS.append(_m["name"])
-print(f"native components: {', '.join(NATIVE_COMPONENTS) or 'none'} ({len(_COMP_FILES)} files)", flush=True)
+# ro.gfx.driver.0 comes from the native build.prop exactly when the driver package ships (INTERFACES 4, W2G-01)
+assert ODM_BUILD_PROP_NATIVE.count(b"ro.gfx.driver.0=") == (1 if "gfxdriver" in NATIVE_COMPONENTS else 0), \
+    "ro.gfx.driver.0 must be set exactly once, and only with the gfxdriver component"
+for _l in ODM_BUILD_PROP_NATIVE.decode().splitlines():
+    assert not _l.startswith(_BAD_PROP), f"native build.prop: {_l} is not allowed (invariant 1, W2G-03)"
+# HWUI and the retired v1.1 graphics/opt-in switches (INTERFACES 3, 4, 14, 16): never in the native rc. The
+# persist.vendor.gb.nouveau= trigger is the v1.1 one; finding it means a half-integrated manifest set.
+for _bad in (b"debug.hwui.renderer", b"gb.gfxdriver", b"gb_gfxdriver"):
+    assert _bad not in GB_RC_NATIVE + GB_SLOTSYNC_RC + _COMP_RC, f"native gb.rc must not contain {_bad.decode()}"
+assert b"persist.vendor.gb.nouveau=" not in _COMP_RC, "native gb.rc: the v1.1 persist.vendor.gb.nouveau trigger"
+print(f"native components: {', '.join(NATIVE_COMPONENTS) or 'none'} ({len(_COMP_FILES)} files, "
+      f"{len(PAYLOAD_FILES)} payload files, {len(_COMP_LINKS)} symlinks)", flush=True)
 
 for _p, _d, _m in [
         ("gb_modules.sh", GB_MODULES_SH, 0o100755), ("gb_bootlog.sh", GB_BOOTLOG_SH, 0o100755),
@@ -1300,17 +1498,376 @@ for _p, _d, _m in [
 _add_native("vup/etc", None)
 for _n, _d in KMLIBS:
     _add_native("vup/lib64/" + _n, _d)
+# ---- dGPU payload (INTERFACES 6; W2-08): ESP:/gb/dgpu-<krel>.erofs ----
+# The TU117 firmware (+ WHENCE/LICENCE), the 5 opt-in modules, the NVK ICD and the compute libraries live in one erofs
+# image on the ESP instead of the /odm tmpfs; gb_nouveau.sh copies, verifies and mounts it at /odm/dgpu before any
+# insmod. Built once on the builder (make_dgpu_payload.sh needs mkfs.erofs) and cached in cache\dgpu by input hash, so
+# every later build is byte-identical without the builder. Only native builds ever need it (native_cpio / slot_files
+# native=True); a VM build never does.
+import hashlib as _hl, io as _io, subprocess as _sp, tarfile as _tar, zipfile as _zip
+_sk_spec = _ilu.spec_from_file_location("stage_kernel", os.path.join(HERE, "stage_kernel.py"))
+SK = _ilu.module_from_spec(_sk_spec); _sk_spec.loader.exec_module(SK)    # constants only (main() is __main__-guarded)
+OPTIN = [m + ".ko" for m in SK.NATIVE_OPTIN]                    # drm_exec drm_gpuvm gpu-sched drm_ttm_helper nouveau
+NK = os.path.join(os.environ["GB_BUILD"], "native", "nouveau-kernel")   # set above (GB_BUILD)
+DGPU_TOOL = os.path.join(NK, "payload", "make_dgpu_payload.sh")
+DGPU_FWSHA = os.path.join(NK, "firmware_staged_sha256.txt")
+DGPU_TEXTS = [("firmware/nvidia/WHENCE.tu117", os.path.join(NK, "firmware", "WHENCE.tu117")),
+              ("firmware/nvidia/LICENCE.nvidia", os.path.join(NK, "firmware", "LICENCE.nvidia"))]
+DGPU_CACHE = os.path.join(HERE, "cache", "dgpu")
+DGPU_STAGE = "/build/native/dgpu/payload-stage"                  # builder scratch (/build, never /)
+DGPU_MIN_FREE = 6 * 10**9                                         # builder / and /build must keep this much free
+SIG_TRAILER = b"~Module signature appended~\n"
+_sha = lambda b: _hl.sha256(b).hexdigest()
+
+def kernel_release(bz=KERNEL):
+    """krel from the bzImage setup header (kernel_version string at u16@0x20E + 0x200), first token (C-08)."""
+    assert bz[0x202:0x206] == b"HdrS", "vmlinuz: no bzImage setup header"
+    off = struct.unpack_from("<H", bz, 0x20E)[0] + 0x200
+    return bz[off:off + 256].split(b"\0")[0].split()[0].decode()
+
+def _vermagic(ko):
+    m = re.search(rb"(?:^|\0)vermagic=([^\0]*)\0", ko)
+    assert m, "module without vermagic"
+    return m.group(1).decode()
+
+def _det_tar(files, prefix=""):
+    """Deterministic tar of {path: bytes}: sorted, mtime 0, uid/gid 0, directories 0755, files 0644."""
+    dirs = set()
+    for p in files:
+        parts = p.split("/")
+        dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
+    bio = _io.BytesIO()
+    with _tar.open(fileobj=bio, mode="w", format=_tar.GNU_FORMAT) as tf:
+        for name in sorted(dirs | set(files)):
+            ti = _tar.TarInfo(prefix + name); ti.mtime = 0; ti.uid = ti.gid = 0; ti.uname = ti.gname = ""
+            if name in dirs:
+                ti.type, ti.mode = _tar.DIRTYPE, 0o755
+                tf.addfile(ti)
+            else:
+                ti.mode, ti.size = 0o644, len(files[name])
+                tf.addfile(ti, _io.BytesIO(files[name]))
+    return bio.getvalue()
+
+def _builder(cmd, data=None):
+    """One ssh call to the builder (stage_kernel's constants). GB_NO_BUILDER=1 makes every call fail."""
+    if os.environ.get("GB_NO_BUILDER") == "1":
+        raise RuntimeError("GB_NO_BUILDER")
+    r = _sp.run(SK.SSH + [cmd], input=data, capture_output=True)
+    return r.returncode, r.stdout, r.stderr.decode(errors="replace")
+
+def _payload_inputs():
+    """(krel, {erofs path: bytes}) of the payload tree (INTERFACES 6.2), checked against the staged inputs."""
+    krel = kernel_release()
+    assert re.fullmatch(r"[A-Za-z0-9._+-]+", krel), krel
+    files = {}
+    want = {}
+    for _l in open(DGPU_FWSHA, "rb").read().decode("ascii").splitlines():
+        if _l.strip():
+            h, p = _l.split(None, 1)
+            want[p.strip().lstrip("*")] = h.lower()
+    assert len(want) == 30 and all(p.startswith("nvidia/tu117/") for p in want), "firmware_staged_sha256.txt: 30 tu117 files"
+    fw = {n: d for n, d in NATIVE_FW if n.startswith("nvidia/")}
+    assert set(fw) == set(want), f"inject\\native\\firmware\\nvidia != firmware_staged_sha256.txt: {sorted(set(fw) ^ set(want))}"
+    for p, h in sorted(want.items()):
+        assert _sha(fw[p]) == h, f"firmware sha256 mismatch: {p}"
+        files["firmware/" + p] = fw[p]
+    for dest, src in DGPU_TEXTS:
+        assert os.path.isfile(src), f"missing {src} (INTERFACES 6.2, invariant 16)"
+        files[dest] = open(src, "rb").read()
+    mods = dict(_NATIVE_MODS_ALL)
+    for m in OPTIN:
+        assert m in mods, f"inject\\native\\modules\\{m} missing (stage_kernel.py stages it)"
+        assert _vermagic(mods[m]).split()[0] == krel, f"{m}: vermagic {_vermagic(mods[m]).split()[0]} != vmlinuz {krel}"
+        assert mods[m].endswith(SIG_TRAILER), f"{m} is not signed"
+        files["lib/modules/" + m] = mods[m]
+    files["lib/modules/modules.dgpu"] = "".join(m + "\n" for m in OPTIN).encode()
+    assert files["lib/modules/modules.dgpu"] == b"drm_exec.ko\ndrm_gpuvm.ko\ngpu-sched.ko\ndrm_ttm_helper.ko\nnouveau.ko\n"
+    for dest, data in PAYLOAD_FILES:
+        assert dest not in files, dest
+        files[dest] = data
+    assert "lib64/hw/vulkan.nouveau.so" in files, "nvk.json must list the ICD in 'payload'"
+    assert {p.split("/")[0] for p in files} <= {"firmware", "lib", "lib64"}, sorted({p.split("/")[0] for p in files})
+    return krel, files
+
+_DGPU = {}
+def dgpu_payload():
+    """{"name": "dgpu-<krel>.erofs", "image": bytes, "sha_name": "dgpu-<krel>.sha256", "sha_line": "<hex>  <name>\\n"}
+    (memoized): from cache\\dgpu when the inputs are unchanged, else built and content-checked on the builder."""
+    if _DGPU:
+        return _DGPU
+    krel, files = _payload_inputs()
+    tool, fwsha = open(DGPU_TOOL, "rb").read(), open(DGPU_FWSHA, "rb").read()
+    assert b"\r" not in tool, "make_dgpu_payload.sh has CR bytes"
+    name, sha_name = f"dgpu-{krel}.erofs", f"dgpu-{krel}.sha256"
+    h = _hl.sha256(b"gb-dgpu-cache-1\0")
+    h.update(krel.encode() + b"\0" + _sha(tool).encode() + b"\0" + _sha(fwsha).encode() + b"\0")
+    for p in sorted(files):
+        h.update(p.encode() + b"\0" + _sha(files[p]).encode() + b"\n")
+    key = h.hexdigest()
+    cdir = os.path.join(DGPU_CACHE, key[:16])
+    cimg, csha = os.path.join(cdir, name), os.path.join(cdir, sha_name)
+    cinp = os.path.join(cdir, "inputs.json")
+    if os.path.isfile(cimg) and os.path.isfile(csha) and os.path.isfile(cinp):
+        img, line = open(cimg, "rb").read(), open(csha, "rb").read().decode("ascii", "replace")
+        with open(cinp, encoding="utf-8") as fh:
+            ckey = _json.load(fh).get("key")
+        if ckey == key and line == f"{_sha(img)}  {name}\n" and img[1024:1028] == struct.pack("<I", 0xE0F5E1E2):
+            print(f"dgpu payload: cache hit {cdir}: {name} size={len(img)} sha256={_sha(img)}", flush=True)
+            _DGPU.update(name=name, image=img, sha_name=sha_name, sha_line=line)
+            return _DGPU
+        print(f"dgpu payload: cache entry {cdir} does not verify, rebuilding", flush=True)
+    total = sum(len(v) for v in files.values())
+    print(f"dgpu payload: cache miss (key {key[:16]}): {len(files)} files, {total:,} B -> builder", flush=True)
+    # builder space (never below 6 GB on / or /build) and etiquette (INTERFACES 1.4: warn, do not block, on load)
+    rc, out, err = _builder("df -B1 --output=avail / /build | tail -n 2; cut -d' ' -f1 /proc/loadavg; "
+                            "pgrep -fa '[/]var/tmp/gbiso/[0-9]' | wc -l")
+    assert rc == 0, f"builder preflight failed: {err.strip()}"
+    v = out.decode().split()
+    root_free, build_free, load1, iso_jobs = int(v[0]), int(v[1]), float(v[2]), int(v[3])
+    need = 5 * total + 64 * 2**20          # tree + tool copy + image + two extractions, all on /build
+    if root_free < DGPU_MIN_FREE or build_free - need < DGPU_MIN_FREE:
+        raise RuntimeError(f"builder free space too low for the payload build: / {root_free:,} B, /build {build_free:,} B "
+                           f"(needs {need:,} B and must keep {DGPU_MIN_FREE:,} B)")
+    if iso_jobs or load1 >= 2:
+        print(f"dgpu payload: WARNING builder busy (load {load1}, ISO jobs {iso_jobs}); continuing at nice 19 / idle I/O",
+              flush=True)
+    S = f"{DGPU_STAGE}/{krel}-{key[:12]}"
+    tarb = _det_tar(files, "tree/")
+    stage = _det_tar({"make_dgpu_payload.sh": tool, "firmware_staged_sha256.txt": fwsha})
+    try:
+        rc, out, err = _builder(f"set -e; rm -rf '{S}'; mkdir -p '{S}/tree' '{S}/out' '{S}/tmp'; tar -x -C '{S}'", tarb)
+        assert rc == 0, f"builder: staging the tree failed: {err.strip()}"
+        rc, out, err = _builder(f"set -e; tar -x -C '{S}'", stage)
+        assert rc == 0, f"builder: copying the tool failed: {err.strip()}"
+        rc, out, err = _builder(f"cd '{S}' && TMPDIR='{S}/tmp' nice -n 19 ionice -c3 sh ./make_dgpu_payload.sh tree "
+                                f"out/{name} {krel} firmware_staged_sha256.txt")
+        last = (out.decode(errors="replace").strip().splitlines() or [""])[-1]
+        print(f"dgpu payload: {last}", flush=True)
+        m = re.fullmatch(r"PAYLOAD ok size=(\d+) sha256=([0-9a-f]{64}) files=(\d+)", last)
+        assert rc == 0 and m, f"make_dgpu_payload.sh failed (rc {rc}): {last} {err.strip()[-400:]}"
+        # content proof: the image extracts to exactly the staged tree (+ VERSION, MANIFEST.sha256), which verifies
+        rc, out, err = _builder(f"cd '{S}' && mkdir x && nice -n 19 ionice -c3 fsck.erofs --extract='{S}/x' out/{name} "
+                                f"> /dev/null && diff -r -x VERSION -x MANIFEST.sha256 tree x && "
+                                f"(cd x && sha256sum -c --quiet MANIFEST.sha256) && echo CONTENT-OK")
+        res = out.decode(errors="replace").strip()
+        print(f"dgpu payload: {res.splitlines()[-1] if res else '(no output)'}", flush=True)
+        assert rc == 0 and res.endswith("CONTENT-OK"), f"payload content check failed (rc {rc}): {res[-400:]} {err.strip()[-400:]}"
+        rc, img, err = _builder(f"cat '{S}/out/{name}'")
+        assert rc == 0, f"fetching the payload failed: {err.strip()}"
+        rc, line, err = _builder(f"cat '{S}/out/{name}.sha256'")
+        assert rc == 0, f"fetching the payload sha256 failed: {err.strip()}"
+        line = line.decode("ascii")
+    finally:
+        try:
+            _builder(f"rm -rf '{S}'")
+        except RuntimeError:
+            pass
+    assert len(img) == int(m.group(1)) and _sha(img) == m.group(2), "fetched payload != PAYLOAD ok line"
+    assert line == f"{_sha(img)}  {name}\n", f"payload .sha256 line {line!r}"
+    assert img[1024:1028] == struct.pack("<I", 0xE0F5E1E2), "not an erofs image"
+    os.makedirs(cdir, exist_ok=True)
+    inputs = {"key": key, "krel": krel, "tool": {"path": DGPU_TOOL, "sha256": _sha(tool)},
+              "fw_sha_list": {"path": DGPU_FWSHA, "sha256": _sha(fwsha)},
+              "files": [{"path": p, "size": len(files[p]), "sha256": _sha(files[p])} for p in sorted(files)],
+              "payload": {"name": name, "size": len(img), "sha256": _sha(img), "files": int(m.group(3))}}
+    for path, data in ((cimg, img), (os.path.join(cdir, "inputs.json"),
+                                     (_json.dumps(inputs, indent=1, sort_keys=True) + "\n").encode()), (csha, line.encode())):
+        with open(path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(path + ".tmp", path)
+    print(f"dgpu payload: built and cached in {cdir}", flush=True)
+    _DGPU.update(name=name, image=img, sha_name=sha_name, sha_line=line)
+    return _DGPU
+
+# Native tree, payload layout: the NVIDIA firmware and the opt-in modules stay out of the cpio (they are in the payload);
+# /odm/dgpu (erofs mount point) and /odm/firmware/nvidia (bind target) are empty directories; the manifest symlinks
+# (vulkan.nouveau.so -> /odm/dgpu/...) point into the mount.
+_n_nv = 0
 for _n, _d in NATIVE_FW:
+    if _n.startswith("nvidia/"):
+        _n_nv += 1; continue
     _add_native("firmware/" + _n, _d)
 _add_native("lib/modules", None)
 for _n, _d in NATIVE_MODS:
+    if _n in OPTIN:
+        continue
     _add_native("lib/modules/" + _n, _d)
-print(f"native tree: {len(NATIVE_FW)} firmware files, {len([n for n, _ in NATIVE_MODS if n.endswith('.ko')])} modules", flush=True)
+_add_native("dgpu", None)
+_add_native("firmware/nvidia", None)
+for _p, _t, _md in _COMP_LINKS:
+    _add_native(_p, _t, _md)
+print(f"native tree: {len(NATIVE_FW) - _n_nv} firmware files (+{_n_nv} NVIDIA files in the payload), "
+      f"{len([n for n, _ in NATIVE_MODS if n.endswith('.ko') and n not in OPTIN])} modules (+{len(OPTIN)} in the payload)",
+      flush=True)
 
-# One initrd per target: the VM boot carries only /gbstage, native boots only /gbnative (67 MB of Surface firmware the
-# VM never needs). gbinit falls back to /gbstage if /gbnative is missing.
-INJECT_CPIO = cpio_newc([e for e in _entries if not e[0].startswith("gbnative")])
-INJECT_CPIO_NATIVE = cpio_newc([e for e in _entries if not e[0].startswith("gbstage")])
+# ---- cpio hygiene and tree asserts (W2-10, W2-13, PLAN invariants 1, 17, 19) ----
+def _dedupe(ents, label):
+    """Drop later copies of a path with the same mode and bytes (logged); any other duplicate is a build error."""
+    seen, out, dropped = {}, [], []
+    for path, mode, data in ents:
+        if path in seen:
+            if seen[path] == (mode, data):
+                dropped.append(path); continue
+            raise AssertionError(f"{label}: duplicate path {path} with different mode or content")
+        seen[path] = (mode, data); out.append((path, mode, data))
+    if dropped:
+        print(f"{label}: {len(dropped)} identical duplicate path(s) dropped (e.g. {', '.join(dropped[:4])}"
+              f"{', ...' if len(dropped) > 4 else ''})", flush=True)
+    return out
+
+_BAD_NAME = re.compile(r"\.pre-|\.merged|\.orig|\.v1\.1|\.v1\.2r1|superseded/|\.bak$|\.part$")
+_VM_FORBIDDEN = ("nouveau.ko", "firmware/nvidia", "vulkan.nouveau.so", "gb_nouveau", "nvk_probe", "gb_gpu_compute",
+                 "app/GbGpu", "GbGfxDriver", "gb_gfxdriver", "gfx_build_id", "gfx_app_prefs.default",
+                 "gb_gfx_selftest", "dgpu")
+
+def _check_common(ents, label):
+    for path, mode, data in ents:
+        assert not path.startswith(("gbnative/priv-app", "gbstage/priv-app")), f"{label}: {path} (no priv-app, W2-10)"
+        assert not _BAD_NAME.search(path), f"{label}: {path} looks like a backup or a superseded file (W2-13)"
+
+def _check_vm(ents, label="VM tree"):
+    """The gbstage (VMware) tree carries no part of the dGPU stack (invariant 19, VM-1B-01)."""
+    _check_common(ents, label)
+    for path, mode, data in ents:
+        assert not any(s in path for s in _VM_FORBIDDEN), f"{label}: {path} (no dGPU stack in the VM tree)"
+    d = {p: x for p, _, x in ents}
+    assert b"ro.gfx.driver." not in d["gbstage/etc/build.prop"], f"{label}: build.prop has ro.gfx.driver."
+    for s in (b"gb_nouveau", b"gb_gfx_selftest", b"nvk_probe", b"gb_gpu_compute", b"gb_gfxdriver"):
+        assert s not in d["gbstage/etc/init/gb.rc"], f"{label}: gb.rc mentions {s.decode()}"
+
+def _check_native(ents, label="native tree"):
+    _check_common(ents, label)
+    d = {p: (m, x) for p, m, x in ents}
+    optin = {m.replace("-", "_") for m in OPTIN}
+    for path, mode, data in ents:
+        base = path.rsplit("/", 1)[-1]
+        if path.startswith("gbstage"):
+            raise AssertionError(f"{label}: {path}")
+        if data is not None and base.replace("-", "_") in optin:
+            raise AssertionError(f"{label}: {path} belongs in the dGPU payload")
+        if data is not None and path.startswith("gbnative/firmware/nvidia/"):
+            raise AssertionError(f"{label}: {path}: NVIDIA firmware ships only in the payload (invariant 16)")
+        if path.startswith("gbnative/dgpu/"):
+            raise AssertionError(f"{label}: {path}: /odm/dgpu is the payload mount point")
+        if path.startswith("gbnative/app/") and data is not None:
+            parts = path.split("/")
+            assert len(parts) == 4 and parts[3] == parts[2] + ".apk", f"{label}: {path} (app/<D>/<D>.apk only)"
+            assert mode == 0o100644 and data[:4] == b"PK\x03\x04", f"{label}: {path} must be a 0644 zip"
+            z = _zip.ZipFile(_io.BytesIO(data))
+            assert z.testzip() is None, f"{label}: {path}: bad zip"
+            if parts[2] == "GbGfxDriver":
+                names = z.namelist()
+                assert not any(n.rsplit("/", 1)[-1] == "allowlist.txt" for n in names), f"{path}: allowlist.txt (24.5)"
+                assert "assets/sphal_libraries.txt" in names, f"{path}: no assets/sphal_libraries.txt"
+                libs = [i for i in z.infolist() if re.fullmatch(r"lib/x86_64/[^/]+\.so", i.filename)]
+                assert len(libs) == 2 and all(i.compress_type == _zip.ZIP_STORED for i in libs), \
+                    f"{path}: the two lib/x86_64/*.so members must be STORED"
+    for p in ("gbnative/dgpu", "gbnative/firmware/nvidia"):
+        assert d.get(p) == (0o040755, None), f"{label}: {p} must be an empty directory"
+    for p, t, md in _COMP_LINKS:
+        assert d.get("gbnative/" + p) == (md, t), f"{label}: symlink gbnative/{p}"
+    for p in ("gbnative/etc/gb/dgpu_payload.sha256",) + (("gbnative/etc/gb/gfx_build_id",)
+                                                          if "gfxdriver" in NATIVE_COMPONENTS else ()):
+        assert p in d and d[p][0] == 0o100644, f"{label}: {p} missing"
+    if "gfxdriver" not in NATIVE_COMPONENTS:
+        assert "gbnative/etc/gb/gfx_build_id" not in d and "gbnative/app/GbGfxDriver" not in d, f"{label}: GB_GFXDRIVER=0"
+    for ll in ("gbnative/lib/modules/modules.load", "gbnative/lib/modules/modules.load.late"):
+        for line in d[ll][1].decode().splitlines():
+            w = line.split()
+            if w and not w[0].startswith("#"):
+                assert w[0].replace("-", "_") not in optin, f"{label}: {ll} names {w[0]} (opt-in only)"
+    prop = d["gbnative/etc/build.prop"][1]
+    assert prop.count(b"ro.gfx.driver.0=") == (1 if "gfxdriver" in NATIVE_COMPONENTS else 0), f"{label}: ro.gfx.driver.0"
+    for line in prop.decode().splitlines():
+        assert not line.startswith(_BAD_PROP), f"{label}: build.prop {line}"
+
+def _gfx_build_id(ents, payload):
+    """/odm/etc/gb/gfx_build_id (INTERFACES 5.3, 25.1): one line from the bytes that go into this tree."""
+    d = {p: x for p, _, x in ents if x is not None}
+    apk = d.get("gbnative/app/GbGfxDriver/GbGfxDriver.apk")
+    probe = d.get("gbnative/vup/bin/nvk_probe")
+    icd = dict(PAYLOAD_FILES).get("lib64/hw/vulkan.nouveau.so")
+    assert apk and probe and icd, "gfx_build_id: GbGfxDriver.apk, nvk_probe and the payload ICD are all required"
+    z = _zip.ZipFile(_io.BytesIO(apk))
+    info = z.getinfo("lib/x86_64/libgb_nvk.so")
+    assert info.compress_type == _zip.ZIP_STORED, "GbGfxDriver.apk: lib/x86_64/libgb_nvk.so must be STORED"
+    pay = payload["sha_line"].split()[0]
+    line = f"apk={_sha(apk)} icd={_sha(icd)} nvk={_sha(z.read(info))} probe={_sha(probe)} pay={pay}\n"
+    assert re.fullmatch(r"apk=[0-9a-f]{64} icd=[0-9a-f]{64} nvk=[0-9a-f]{64} probe=[0-9a-f]{64} pay=[0-9a-f]{64}\n", line)
+    return line.encode()
+
+# One initrd per target: the VM boot carries only /gbstage, native boots only /gbnative (the Surface firmware the VM
+# never needs). gbinit falls back to /gbstage if /gbnative is missing.
+_VM_ENTRIES = _dedupe([e for e in _entries if not e[0].startswith("gbnative")], "VM tree")
+_check_vm(_VM_ENTRIES)
+INJECT_CPIO = cpio_newc(_VM_ENTRIES)
+
+_NATIVE = []
+def native_cpio():
+    """The native (gbnative) cpio, memoized: needs the dGPU payload (its sha line goes into /odm/etc/gb), so the first
+    call may build it. Module attribute INJECT_CPIO_NATIVE returns this (PEP 562)."""
+    if not _NATIVE:
+        ents = [e for e in _entries if not e[0].startswith("gbstage")]
+        p = dgpu_payload()
+        _add_entry(ents, "gbnative/etc/gb/dgpu_payload.sha256", p["sha_line"].encode(), 0o100644)
+        if "gfxdriver" in NATIVE_COMPONENTS:
+            _add_entry(ents, "gbnative/etc/gb/gfx_build_id", _gfx_build_id(ents, p), 0o100644)
+        ents = _dedupe(ents, "native tree")
+        _check_native(ents)
+        _NATIVE.append(cpio_newc(ents))
+        print(f"native cpio: {len(ents)} entries, {len(_NATIVE[0]):,} B", flush=True)
+    return _NATIVE[0]
+
+def __getattr__(name):
+    if name == "INJECT_CPIO_NATIVE":
+        return native_cpio()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+_VMGFX = []
+def vm_test_gfx_cpio():
+    """Test-only VM tree (plan 3.5): the gbstage cpio plus GbGpu.apk, GbGfxDriver.apk, gfx_app_prefs.default,
+    gb_gpu_ui_setup.sh, the gb_gpu_ui.rc fragment and ro.gfx.driver.0 -- nothing else of the dGPU stack. For a throwaway
+    VMware check of the two packages only; never used by build_esp.py itself, never written to lapis.bin."""
+    if _VMGFX:
+        return _VMGFX[0]
+    comp = os.path.join(NATIVE_DIR, "components")
+    with open(os.path.join(comp, "gpu_ui.json"), encoding="utf-8") as fh:
+        ui = _xv(_json.load(fh))
+    with open(os.path.join(comp, "gfxdriver.json"), encoding="utf-8") as fh:
+        gd = _xv(_json.load(fh))
+    add = {"gbstage/" + e["dest"]: (_mode_of(e), open(e["src"], "rb").read()) for e in ui["files"] + gd["files"]}
+    want = {"gbstage/app/GbGpu/GbGpu.apk": 0o100644, "gbstage/app/GbGfxDriver/GbGfxDriver.apk": 0o100644,
+            "gbstage/etc/gb/gfx_app_prefs.default": 0o100644, "gbstage/vup/bin/gb_gpu_ui_setup.sh": 0o100755}
+    assert {k: m for k, (m, _) in add.items()} == want, sorted(add)
+    rc = b"".join(b"\n# ---- component gpu_ui (VM test) ----\n" + open(r, "rb").read() for r in ui["rc_files"])
+    assert gd["build_prop"] == ["ro.gfx.driver.0=gb.sb3.gfxdriver"], gd["build_prop"]
+    ents = []
+    for path, mode, data in _VM_ENTRIES:
+        if path == "gbstage/etc/init/gb.rc":
+            data = data + rc
+        elif path == "gbstage/etc/build.prop":
+            data = data + b"ro.gfx.driver.0=gb.sb3.gfxdriver\n"
+        ents.append((path, mode, data))
+    for path in sorted(add):
+        _add_entry(ents, path, add[path][1], add[path][0])
+    ents = _dedupe(ents, "VM test gfx tree")
+    _check_common(ents, "VM test gfx tree")
+    old, new = {p: (m, x) for p, m, x in _VM_ENTRIES}, {p: (m, x) for p, m, x in ents}
+    extra = set(new) - set(old)
+    assert not set(old) - set(new) and {p for p in extra if new[p][1] is not None} == set(want), sorted(extra)
+    assert all(new[p] == (0o040755, None) for p in extra if p not in want), sorted(extra)
+    for p in old:
+        if p == "gbstage/etc/init/gb.rc":
+            assert new[p][1] == old[p][1] + rc
+        elif p == "gbstage/etc/build.prop":
+            assert new[p][1] == old[p][1] + b"ro.gfx.driver.0=gb.sb3.gfxdriver\n"
+        else:
+            assert new[p] == old[p], p
+    for s in (b"gb_nouveau", b"gb_power", b"nvk_probe", b"gb_gpu_compute", b"gfx_build_id", b"nouveau.ko", b"dgpu"):
+        assert not any(s.decode() in p for p in extra), s
+    _VMGFX.append(cpio_newc(ents))
+    print(f"VM test gfx tree: {len(extra)} entries added to the VM tree", flush=True)
+    return _VMGFX[0]
 
 BOOTCONFIG_EXTRA = (
  'androidboot.force_normal_boot = "1"\n'
@@ -1372,10 +1929,13 @@ CMDLINE = ("rdinit=/gbinit root=/dev/ram0 kvm-intel.pkvm=0 kvm.enable_virt_at_lo
 VM_BOOT_DEVICES = "pci0000:00/0000:00:15.2"            # VMware virtual NVMe
 CMDLINE_VM = CMDLINE + " gb.hw=vm androidboot.boot_devices=" + VM_BOOT_DEVICES
 
-def slot_files(cmdline, inject_cpio, title, default=None, timeout=3):
+def slot_files(cmdline, inject_cpio, title, default=None, timeout=3, native=False):
     """ESP files for systemd-boot: entry gb-<slot> + initrd-<slot>.img for the boot slot (the default). The other
     slot's entry is created in the guest by gb_slotsync when an OTA completes into it (from /gb/inject.gz,
-    /gb/bootconfig_extra and that slot's partitions); a stale entry for a slot that was never booted is not offered."""
+    /gb/bootconfig_extra and that slot's partitions); a stale entry for a slot that was never booted is not offered.
+    native=True (USB stick, internal/dual-boot, ISO objects): also the NVIDIA test entry gb-<slot>-nvtest
+    (INTERFACES 16; never the default) and the dGPU payload ESP:/gb/dgpu-<krel>.erofs + .sha256 (INTERFACES 6.1)."""
+    assert "gb.nouveau=" not in cmdline and "gb.gfxdriver=" not in cmdline, "the default entry never selects NVIDIA"
     default = default or SLOT
     slots = [default]
     gz = inject_gz(inject_cpio)
@@ -1386,12 +1946,27 @@ def slot_files(cmdline, inject_cpio, title, default=None, timeout=3):
         "gb/inject.gz": gz,
         "gb/bootconfig_extra": BOOTCONFIG_EXTRA,
     }
+    def entry(x, suffix, opts):     # the title keeps "(slot X)" before the suffix: gb_slotsync's rewrite keys on it
+        return (f"title   {title} (slot {x.upper()}){suffix}\nlinux   /vmlinuz\n"
+                f"initrd  /initrd-{x}.img\noptions {opts}\n").encode()
     for x in slots:
-        files[f"loader/entries/gb-{x}.conf"] = (f"title   {title} (slot {x.upper()})\nlinux   /vmlinuz\n"
-                                               f"initrd  /initrd-{x}.img\noptions {cmdline}\n").encode()
+        files[f"loader/entries/gb-{x}.conf"] = entry(x, "", cmdline)
+        if native:
+            files[f"loader/entries/gb-{x}-nvtest.conf"] = entry(x, " [NVIDIA test]", cmdline + " gb.nouveau=test")
         files[f"initrd-{x}.img"] = make_initrd(inject_cpio, x)
         files[f"gb/slot_{x}.stamp"] = slot_stamp(gz, x)
+    if native:
+        p = dgpu_payload()
+        assert p["sha_line"].encode() in inject_cpio, "native=True needs the native cpio of this payload"
+        files["gb/" + p["name"]] = p["image"]
+        files["gb/" + p["sha_name"]] = p["sha_line"].encode()
     return files
+
+MiB = 1 << 20
+def native_min_free(files):
+    """Free ESP space a native ESP must keep: the other slot's initrd (gb_slotsync builds it after an OTA, + 16 MiB
+    margin) plus gb_bootlog's 128 MiB floor."""
+    return max(len(v) for k, v in files.items() if k.startswith("initrd-")) + 144 * MiB
 
 # ---------------- FAT32 writer (from tools/build_iso.py) ----------------
 class Node:
@@ -1500,13 +2075,15 @@ class Fat32:
         out = bytes(res) + fatb * self.nf + bytes(self.data)
         return out.ljust(self.total * 512, b'\0')[:self.total * 512]
 
-def make_esp(files, size=ESP_BYTES):
-    """FAT32 image of `size` bytes holding `files` (path -> bytes)."""
+def make_esp(files, size=ESP_BYTES, min_free=0):
+    """FAT32 image of `size` bytes holding `files` (path -> bytes), with at least `min_free` bytes left free."""
     fat = Fat32(size, spc=1)
     fat.write_tree(build_tree(files))
     img = fat.image()
-    assert len(img) == size, (len(img), size)
-    print(f"ESP built: used={(fat.nxt-2)*fat.csize/2**20:.1f} MiB of {size/2**20:.0f} MiB, {fat.clusters:,} clusters", flush=True)
+    free = (fat.clusters - (fat.nxt - 2)) * fat.csize
+    assert len(img) == size and free >= min_free, (len(img), size, free, min_free)
+    print(f"ESP built: used={(fat.nxt-2)*fat.csize/2**20:.1f} MiB free={free/2**20:.1f} MiB of {size/2**20:.0f} MiB, "
+          f"{fat.clusters:,} clusters" + (f" (min_free {min_free/2**20:.1f} MiB)" if min_free else ""), flush=True)
     return img
 
 if __name__ == "__main__":       # build_usb.py imports this module for the shared pieces and builds its own ESP
@@ -1524,12 +2101,14 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
                  "loader/loader.conf": b"default gb-ntest\ntimeout 3\nconsole-mode max\neditor yes\n",
                  "loader/entries/gb-ntest.conf": (f"title   Googlebook native tree (VM test)\nlinux   /vmlinuz\n"
                                                   f"initrd  /initrd-ntest.img\noptions {ntest}\n").encode(),
-                 "initrd-ntest.img": make_initrd(INJECT_CPIO_NATIVE, SLOT)}
+                 "initrd-ntest.img": make_initrd(native_cpio(), SLOT)}
         print("NATIVE TEST entry is the default for this build", flush=True)
     ESP = make_esp(FILES)
     print("CMDLINE:", CMDLINE_VM, flush=True)
     print(f"boot slot: {SLOT}; entries: {sorted(k for k in FILES if k.startswith('loader/entries'))}", flush=True)
-    # write ESP into lapis.bin's EFI-SYSTEM partition (only that region)
+    # write ESP into lapis.bin's EFI-SYSTEM partition (only that region); the guard is checked again right before it
+    if _lapis_write_refused():
+        sys.exit(f"build_esp.py: refused: {_lapis_write_refused()}")
     with open(LAPIS, "r+b") as f:
         f.seek(ESP_OFFSET)
         f.write(ESP)

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Labels fixed by INTERFACES 13.2 (v1.2: tile and Settings entry "Graphics") -->
+    <string name="app_label">NVIDIA GPU</string>
+    <string name="tile_label">Graphics</string>
+    <string name="detach_label">Detach screen</string>
+    <string name="settings_title">Graphics</string>
+
+    <!-- Graphics page (the exact INTERFACES 27.2 texts are in core/Texts.java) -->
+    <string name="unavailable_help">Graphics switching is not available. This is expected in the virtual machine and on a system image without the NVIDIA graphics package.</string>
+    <string name="apps_loading">Loading apps…</string>
+    <string name="apps_none">You have not installed any apps yet.</string>
+    <string name="choices_failed">The per-app choices could not be read. Open this page again to retry.</string>
+    <string name="compute_help">These apps may use the NVIDIA compute service. Enter a package name to add one.</string>
+    <string name="package_hint">Package name, for example com.example.app</string>
+    <string name="package_invalid">Not a valid package name</string>
+    <string name="allow_button">Allow</string>
+    <string name="remove_button">Remove</string>
+    <string name="diagnostics_heading">Diagnostics</string>
+    <string name="report_button">Save a diagnostic report</string>
+    <string name="recovery_help">If the computer does not start properly with the NVIDIA GPU: in the boot menu press e, add gb.nouveau=0 at the end of the line and press Enter. The NVIDIA GPU then stays off for that start. Choose Intel only above to keep it off.</string>
+</resources>

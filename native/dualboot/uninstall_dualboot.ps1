@@ -97,6 +97,11 @@ if ($Force) { $removeArgs += '--force' }
 Write-Step 'Partitions to remove (gbdisk remove, dry run)'
 Invoke-GbDisk -Arguments $removeArgs | Out-Null
 $gbLeft = @($layout.partitions | Where-Object { $script:GbNames -contains $_.name -and [int64]$_.offset -ge ([int64]$anchor.offset + [int64]$anchor.length) })
+if ($state -and $state.plan -and (Test-Path $state.plan) -and $gbLeft.Count) {
+    $ids = @((Read-Json $state.plan).partitions | ForEach-Object { [string]$_.id })
+    $alien = @($gbLeft | Where-Object { $ids -notcontains [string]$_.id })
+    if ($alien.Count) { Write-Bad "$($alien.Count) Googlebook partition(s) after #$($anchor.number) are not from $StateFile (made elsewhere, e.g. the ISO): run Import-GooglebookIsoInstall.ps1 first, or -StateFile/-Force" }
+}
 # D: still smaller than before the install (e.g. the install stopped after the shrink): extend it even if no
 # Googlebook partitions are left
 $stillShrunk = [bool]($targetLen -and [int64]$anchor.length -lt $targetLen)
@@ -165,6 +170,9 @@ else {
 
 Write-Step '4. Give the space back'
 if ($NoExtend -or -not $anchor) { Write-Info 'skipped' }
+elseif ($targetLen -and [int64](@((Get-GbLayout $target).partitions | Where-Object { $_.id -eq $anchor.id })[0].length) -ge $targetLen) {
+    Write-Info "$($ExtendDriveLetter): (partition #$($anchor.number)) already has its original size $(Format-MiB $targetLen): nothing to extend (an ISO-made install did not shrink it; Disk Management > Extend Volume gives the freed space back)"
+}
 elseif ($ImageMode) {
     if (-not $targetLen) { Write-Bad 'original length unknown in image mode'; exit 1 }
     Invoke-Change "simulate extending #$($anchor.number) back to $(Format-MiB $targetLen)" "gbdisk resize-image --number $($anchor.number) --length $targetLen --apply" {

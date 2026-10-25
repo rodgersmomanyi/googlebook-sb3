@@ -1,0 +1,20 @@
+set gb_marker=/gbsb3/GBSB3-@BUILD_ID@.marker
+insmod part_gpt
+insmod part_msdos
+insmod iso9660
+insmod fat
+insmod exfat
+insmod ntfs
+insmod search_fs_file
+if search --no-floppy --file --set=gbroot "$gb_marker"; then
+  set root="$gbroot"
+  configfile "($gbroot)/boot/grub/grub.cfg"
+else
+  echo "Googlebook installer: $gb_marker was not found on any disk."
+  echo "The installer files are incomplete (the gbsb3 folder must be copied too)."
+  echo "Firmware setup in 60 seconds; press Esc for the GRUB command line."
+  if sleep --interruptible 60; then
+    insmod efifwsetup
+    fwsetup
+  fi
+fi

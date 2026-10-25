@@ -1,20 +1,14 @@
 {
  "name": "nouveau",
+ "source": "${GB_BUILD}\\native\\nouveau-kernel",
  "files": [
-  {
-   "src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_nouveau.sh",
-   "dest": "vup/bin/gb_nouveau.sh",
-   "mode": "0755"
-  },
-  {
-   "src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_dgpu_check.sh",
-   "dest": "vup/bin/gb_dgpu_check.sh",
-   "mode": "0755"
-  }
+  {"src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_nouveau.sh", "dest": "vup/bin/gb_nouveau.sh", "mode": "0755"},
+  {"src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_dgpu_check.sh", "dest": "vup/bin/gb_dgpu_check.sh", "mode": "0755"},
+  {"src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_dgpu_report.sh", "dest": "vup/bin/gb_dgpu_report.sh", "mode": "0755"},
+  {"src": "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_notify.sh", "dest": "vup/bin/gb_notify.sh", "mode": "0755"},
+  {"src": "${GB_BUILD}\\native\\nouveau-kernel\\firmware_staged_sha256.txt", "dest": "etc/gb/tu117.sha256", "mode": "0644"}
  ],
- "rc_files": [
-  "${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_nouveau.rc"
- ],
+ "rc_files": ["${GB_BUILD}\\native\\nouveau-kernel\\native\\gb_nouveau.rc"],
  "rc_text": "",
  "build_prop": []
 }

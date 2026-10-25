@@ -9,15 +9,15 @@ set -euo pipefail
 B=$W/b-host-clc
 rm -rf "$B"
 CC=gcc CXX=g++ meson setup "$B" "$MESA_SRC" \
-  -Dprefix="$W/host-clc" -Dbuildtype=release -Dstrip=true \
+  -Dprefix="$HOST_CLC" -Dbuildtype=release -Dstrip=true \
   -Dplatforms= -Dgallium-drivers= -Dvulkan-drivers= -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
   -Dopengl=false -Dglx=disabled -Dgbm=disabled -Dllvm=enabled -Dshared-llvm=enabled \
   -Dmesa-clc=enabled -Dinstall-mesa-clc=true -Dmesa-clc-bundle-headers=enabled \
   -Dxmlconfig=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dzstd=disabled \
   -Dvideo-codecs= -Dtools= -Dbuild-tests=false -Dperfetto=false
 nice -n 10 meson compile -C "$B" -j "$JOBS" src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2
-mkdir -p "$W/host-clc/bin"
-install -m755 "$B/src/compiler/clc/mesa_clc" "$B/src/compiler/spirv/vtn_bindgen2" "$W/host-clc/bin/"
-"$W/host-clc/bin/mesa_clc" --help >/dev/null 2>&1 || true
-ls -la "$W/host-clc/bin"
+mkdir -p "$HOST_CLC/bin"
+install -m755 "$B/src/compiler/clc/mesa_clc" "$B/src/compiler/spirv/vtn_bindgen2" "$HOST_CLC/bin/"
+"$HOST_CLC/bin/mesa_clc" --help >/dev/null 2>&1 || true
+ls -la "$HOST_CLC/bin"
 rm -rf "$B"          # ~0.5 GB of objects, not needed any more

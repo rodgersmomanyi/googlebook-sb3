@@ -1,0 +1,188 @@
+From 84247e02bacb3e5a5ec7b699785c48ac1c89f49c Mon Sep 17 00:00:00 2001
+From: GB-build k14 <k14@builder.invalid>
+Date: Sun, 25 Oct 2026 12:00:00 +0000
+Subject: [PATCH 102/103] drm/nouveau: presence guards for a GPU that has left
+ the bus
+
+nouveau has no hot-unplug support.  If the GPU disappears while it is
+runtime suspended (Surface Book base detached, link lost), the next
+runtime resume tries to boot GSP-RM on hardware that is not there, and
+the remove path waits on GSP-RM replies that can never come: every
+message-queue wait spins up to 4000000 iterations and ends in a WARN.
+
+Add nouveau_drm_device_gone(): if pci_device_is_present() says the
+function is gone, set a new nvkm_device.gone flag and report it.  Use it
+
+ - in nouveau_pmops_runtime_resume() and nouveau_pmops_resume(): return
+   -ENODEV before any PCI or GSP access;
+ - in nouveau_drm_remove(): mark the device gone before
+   nouveau_drm_device_remove(), which already calls drm_dev_unplug()
+   before the teardown;
+ - in nouveau_drm_device_fini(): take the runtime PM reference without
+   resuming the device.
+
+With the flag set, r535_gsp_msgq_wait() and the command-queue space wait
+in r535_gsp_cmdq_push() return -ENODEV at once, and nvkm_gsp_fini()
+skips the unload sequence.
+
+drm_dev_unplug() is not called from the resume callbacks: runtime resume
+can run inside a drm_dev_enter() section (nouveau_drm_postclose()),
+where its synchronize_srcu() would deadlock.
+
+Local patch N2 for the Googlebook SB3 k14 kernel (not upstream).
+---
+ .../drm/nouveau/include/nvkm/core/device.h    |  7 +++
+ drivers/gpu/drm/nouveau/nouveau_drm.c         | 49 ++++++++++++++++++-
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/base.c    |  6 +++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c |  8 +++
+ 4 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+index 954a89d..0d04e81 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+@@ -29,6 +29,13 @@ struct nvkm_device {
+ 
+ 	void __iomem *pri;
+ 
++	/*
++	 * Set by the DRM layer once the PCI device has been found absent from
++	 * the bus (surprise removal).  GSP-RM message waits bail out instead of
++	 * spinning for their full timeout, and GSP fini is skipped.
++	 */
++	bool gone;
++
+ 	u32 debug;
+ 
+ 	const struct nvkm_device_chip *chip;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index 65ae3b8..eedfc6d 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -575,6 +575,30 @@ nouveau_parent = {
+ 	.errorf = nouveau_drm_errorf,
+ };
+ 
++/*
++ * Presence guard.  nouveau has no real hot-unplug support: once the GPU has
++ * fallen off the bus (for example a Surface Book base removed while the GPU
++ * was in D3cold) every hardware access is pointless and GSP-RM message waits
++ * would spin for their full timeout.  Returns true, and marks the nvkm device
++ * gone, if the PCI device is no longer present.
++ */
++static bool
++nouveau_drm_device_gone(struct nouveau_drm *drm)
++{
++	struct device *dev = drm->dev->dev;
++
++	if (!dev_is_pci(dev))
++		return false;
++	if (READ_ONCE(drm->nvkm->gone))
++		return true;
++	if (pci_device_is_present(to_pci_dev(dev)))
++		return false;
++
++	WRITE_ONCE(drm->nvkm->gone, true);
++	NV_ERROR(drm, "GPU is no longer present on the bus\n");
++	return true;
++}
++
+ static void
+ nouveau_drm_device_fini(struct nouveau_drm *drm)
+ {
+@@ -582,7 +606,11 @@ nouveau_drm_device_fini(struct nouveau_drm *drm)
+ 	struct nouveau_cli *cli, *temp_cli;
+ 
+ 	if (nouveau_pmops_runtime()) {
+-		pm_runtime_get_sync(dev->dev);
++		/* never try to power up a device that is gone */
++		if (nouveau_drm_device_gone(drm))
++			pm_runtime_get_noresume(dev->dev);
++		else
++			pm_runtime_get_sync(dev->dev);
+ 		pm_runtime_forbid(dev->dev);
+ 		pm_runtime_dont_use_autosuspend(dev->dev);
+ 	}
+@@ -935,6 +963,12 @@ nouveau_drm_remove(struct pci_dev *pdev)
+ 	/* revert our workaround */
+ 	if (drm->old_pm_cap)
+ 		pdev->pm_cap = drm->old_pm_cap;
++	/*
++	 * Surprise removal: mark the device gone before teardown, so that
++	 * nouveau_drm_device_remove() (drm_dev_unplug() first, then fini) does
++	 * not wait on GSP-RM replies that can never come.
++	 */
++	nouveau_drm_device_gone(drm);
+ 	nouveau_drm_device_remove(drm);
+ 	pci_disable_device(pdev);
+ }
+@@ -1065,6 +1099,9 @@ nouveau_pmops_resume(struct device *dev)
+ 	    drm->dev->switch_power_state == DRM_SWITCH_POWER_DYNAMIC_OFF)
+ 		return 0;
+ 
++	if (nouveau_drm_device_gone(drm))
++		return -ENODEV;
++
+ 	pci_set_power_state(pdev, PCI_D0);
+ 	pci_restore_state(pdev);
+ 	ret = pci_enable_device(pdev);
+@@ -1185,6 +1222,16 @@ nouveau_pmops_runtime_resume(struct device *dev)
+ 		return -EBUSY;
+ 	}
+ 
++	/*
++	 * No hardware or GSP access to a GPU that is gone.  drm_dev_unplug()
++	 * is deliberately not called here: runtime resume can run inside a
++	 * drm_dev_enter() section (nouveau_drm_postclose()), where its
++	 * synchronize_srcu() would deadlock.  The PCI remove path that follows
++	 * a removal unplugs the device first thing.
++	 */
++	if (nouveau_drm_device_gone(drm))
++		return -ENODEV;
++
+ 	pci_set_power_state(pdev, PCI_D0);
+ 	pci_restore_state(pdev);
+ 	ret = pci_enable_device(pdev);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c
+index 30cb843..e66b227 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c
+@@ -55,6 +55,12 @@ nvkm_gsp_fini(struct nvkm_subdev *subdev, enum nvkm_suspend_state suspend)
+ 	if (!gsp->func->fini || !gsp->running)
+ 		return 0;
+ 
++	/* GPU no longer on the bus: nothing can answer the unload RPC. */
++	if (READ_ONCE(subdev->device->gone)) {
++		gsp->running = false;
++		return 0;
++	}
++
+ 	return gsp->func->fini(gsp, suspend);
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c
+index 3ca3de8..205e9b7 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c
+@@ -158,6 +158,9 @@ r535_gsp_msgq_wait(struct nvkm_gsp *gsp, u32 gsp_rpc_len, int *ptime)
+ 		if (used >= size)
+ 			break;
+ 
++		if (unlikely(READ_ONCE(gsp->subdev.device->gone)))
++			return -ENODEV;
++
+ 		usleep_range(1, 2);
+ 	} while (--(*ptime));
+ 
+@@ -383,6 +386,11 @@ r535_gsp_cmdq_push(struct nvkm_gsp *gsp, void *rpc)
+ 			if (free >= 1)
+ 				break;
+ 
++			if (unlikely(READ_ONCE(gsp->subdev.device->gone))) {
++				kvfree(msg);
++				return -ENODEV;
++			}
++
+ 			usleep_range(1, 2);
+ 		} while(--time);
+ 
