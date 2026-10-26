@@ -9,8 +9,9 @@ modules. Built with Kleaf on the Linux builder ([builder/README.md](../builder/R
 | File | What | Used by |
 |---|---|---|
 | [patches/0001-drm-vmwgfx-...](patches/) | vmwgfx fixes for Android (GB_RGBA_DUMB, GB_HWCURSOR, GB_DUMB_IMPORT, GB_PRIME_LEAK, GB_PRIME_NOHANDLE, GB_DUMB_BASE_OWNS, GB_DUMB_DETACH) | VM |
-| [patches/0002-x86-traps-...](patches/) | #UD emulation of VEX AVX-VNNI (GB_VNNI_EMULATION) | VM + native |
+| [patches/0002-x86-traps-...](patches/) | #UD emulation of VEX AVX-VNNI (GB_VNNI_EMULATION); **v4 in build #15** (IRQs on, xstate init state, MAXVL, `/sys/kernel/gb_vnni` counter; adds `arch/x86/kernel/gb_vnni_core.h`) | VM + native |
 | [patches/0003-mei-me-...](patches/) | MEI device ID 8086:34E4 (IPTS) | native |
+| [patches/0005-i915-optional-ignore-user-gamma.patch](patches/) | i915 display param `gb_ignore_user_gamma` (default 0; the "white veil" switch), build #15 | native |
 | linux-surface `patches/6.18/0005-ipts.patch`, **drivers/hid part only**: `git apply --include='drivers/hid/*' 0005-ipts.patch` (not included here; GPL-2.0, md5 `5af0a1a8bbfb9d7038a43674508e5938`) | IPTS touch/pen driver `drivers/hid/ipts` + its Kconfig/Makefile hooks ([patches/0004](patches/) records the hooks; do not apply it as well) | native |
 | [../native/power/patches/0001-0003](../native/power/patches/) | `surface_battery scope_device`, `test_power charge_full/temp`, `surface_dtx` latch event fix | native (`test_power` also VM) |
 | [../native/sensors/patches/0001-0002](../native/sensors/patches/) | HID sensors / APDS-9960 registered as `cros-ec-accel`/`-gyro`/`-light`, the form lapis's IIO sensors HAL accepts | native (build #13) |
@@ -68,6 +69,29 @@ symbols, module signatures, lapis CRCs, kernel release, k13 tree restored). The 
 own test (`tools/test_kbuild14_state.sh`). Staging: `python -I stage_kernel.py k14 --dist /build/dist14` (from
 PowerShell; Git Bash would rewrite `/build/dist14` unless `MSYS_NO_PATHCONV=1`). Hardware checks (D3cold residency,
 suspend/resume and reboot cycles with nouveau bound, the N1 hot-plug behaviour) are listed in the patch README.
+
+## Build #15 (k15): the VNNI emulator rework and the i915 "white veil" switch
+
+Native images run **build #15**: build #14 plus two patches applied on top of `k14-nouveau`, so the nouveau result
+is byte-for-byte unchanged (review notes and the acceptance table in [K15.md](K15.md)).
+
+* `0110` **x86/traps v4** (regenerated repo patch [patches/0002](patches/)): the VEX AVX-VNNI #UD emulator, with
+  three k14 defects fixed -- the instruction and memory-operand copies now run with IRQs on (the `do_error_trap`
+  idiom) and always before `kernel_fpu_begin()`; the SSE/YMM/ZMM_Hi256 init state is honoured (a component is read
+  or written only when its `XSTATE_BV` bit is set, and the YMM/ZMM_Hi256 bits are never set); the destination is
+  zeroed up to MAXVL. `insn_fetch_from_user()` replaces the fixed over-fetch, and a sysfs counter
+  `/sys/kernel/gb_vnni/{summary,reset}` is added. Decode, lanes and the xstate merge move to the new
+  `arch/x86/kernel/gb_vnni_core.h`, host-unit-tested by `tools/test_gb_vnni_core.c`. Generator:
+  [scripts/apply_vnni4.py](scripts/apply_vnni4.py).
+* `0111` **drm/i915/display** ([patches/0005](patches/)): the display parameter `i915.gb_ignore_user_gamma`
+  (bitmask 1 = gamma, 2 = degamma, 4 = CTM; default 0, mode 0400). A set bit makes
+  `intel_crtc_copy_uapi_to_hw_state_nomodeset()` use a linear (NULL) blob, a fix for the grey "white veil" some
+  panels show. Default-off and module-internal; applicability to the SB3 panel is inferred.
+
+`.config` and `vmlinux.symvers` stay identical to k14 (the counter is a sysfs kobject, no new export; i915 is `=m`).
+Build script [scripts/kbuild15_native.sh](scripts/kbuild15_native.sh); acceptance K-01..K-14
+`patches/k15/tools/k15_accept.sh`; state-handling test `patches/k15/tools/test_kbuild15_state.sh`. The KAT
+(`tools/vnni_kat.c`, the static test binary) and its host self-check are described in [K15.md](K15.md).
 
 ## Build
 

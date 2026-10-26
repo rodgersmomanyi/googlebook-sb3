@@ -191,3 +191,36 @@ function Save-Json($Object, [string]$Path) {
 function Read-Json([string]$Path) { return ((Get-Content -Raw -Path $Path) | ConvertFrom-Json) }
 
 function Format-MiB([double]$Bytes) { return ('{0:N0} MiB' -f ($Bytes / 1MB)) }
+
+# GPT attribute string as gbdisk prints it ('0x010f000000000000') -> UInt64
+function ConvertFrom-GbHex([string]$Hex) {
+    $h = $Hex.Trim()
+    if ($h -match '^0[xX]') { $h = $h.Substring(2) }
+    if ($h -notmatch '^[0-9a-fA-F]{1,16}$') { throw "not a 64-bit hex value: '$Hex'" }
+    return [Convert]::ToUInt64($h, 16)
+}
+
+# (wave 3, item 7) The slot that depthcharge - and gb_slotsync's wanted_slot() (gb_slotsync.c) - boots from the
+# vbmeta_a/vbmeta_b GPT attributes: the highest priority (bits 48-51) among slots that are successful (bit 56) or have
+# tries left (bits 52-55); the first slot wins a tie. Bit for bit the same as gb_slotsync: both test suites run one truth
+# table (test_gb_slotsync.sh, block "wanted_slot-vectors"; test\test_wanted_slot.ps1). 0 = a, 1 = b, -1 = none.
+function Get-GbWantedSlot([UInt64]$AttrA, [UInt64]$AttrB) {
+    $best = -1; $bestp = 0
+    $attrs = @($AttrA, $AttrB)
+    for ($s = 0; $s -lt 2; $s++) {
+        $a = [UInt64]$attrs[$s]
+        $prio = [int](($a -shr 48) -band 15); $tries = [int](($a -shr 52) -band 15); $ok = [int](($a -shr 56) -band 1)
+        if ($prio -gt 0 -and ($ok -eq 1 -or $tries -gt 0) -and $prio -gt $bestp) { $best = $s; $bestp = $prio }
+    }
+    return $best
+}
+
+# $true when both slots are bootable with the same priority: gb_slotsync would take slot a, but which build the
+# device last ran is unknown, so install_dualboot.ps1 -UpdateEspOnly refuses (fail closed)
+function Test-GbSlotAmbiguous([UInt64]$AttrA, [UInt64]$AttrB) {
+    $p = @(); foreach ($a in @($AttrA, $AttrB)) {
+        $prio = [int](($a -shr 48) -band 15); $tries = [int](($a -shr 52) -band 15); $ok = [int](($a -shr 56) -band 1)
+        $p += $(if ($prio -gt 0 -and ($ok -eq 1 -or $tries -gt 0)) { $prio } else { -1 })
+    }
+    return ($p[0] -gt 0 -and $p[0] -eq $p[1])
+}

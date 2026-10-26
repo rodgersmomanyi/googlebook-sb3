@@ -62,6 +62,14 @@ w setprop <<'EOF'
 case $1 in '' | *[!A-Za-z0-9._-]*) exit 1 ;; esac
 if [ ${#2} -gt 91 ]; then printf 'TOOLONG %s\n' "$1" >> "$GBT/log/setprop.log"; exit 1; fi
 printf '%s=%s\n' "$1" "$2" >> "$GBT/log/setprop.log"
+# (Wave 2b) ctl/displace_at_release: when the load window closes (loading=0, right before the ESP lock is released) a
+# stealer (pid 4246) moves the lock away; it puts it back 2 fake s later (ctl/at "unsteal 4246")
+if [ "$1 $2" = "vendor.gb.nouveau.loading 0" ] && [ -e "$GBT/ctl/displace_at_release" ] && [ -d "$GB_ROOT/dev/gb_esp.lock" ]; then
+  rm -f "$GBT/ctl/displace_at_release"
+  /bin/mv -T "$GB_ROOT/dev/gb_esp.lock" "$GB_ROOT/dev/gb_esp.lock.stale.4246"
+  read -r _u _ < "$GB_ROOT/proc/uptime"
+  printf '%s unsteal 4246\n' "$(awk -v u="$_u" 'BEGIN { printf "%.2f", u + 2 }')" >> "$GBT/ctl/at"
+fi
 if [ "$1" = persist.vendor.gb.gfx_mode ]; then           # ordered evidence: which root-only flags exist at this set
   f=$GB_ROOT/dev/gb_dgpu
   k=0; n=0; x=0
@@ -224,6 +232,10 @@ if [ -f "$GBT/ctl/at" ]; then                          # lines "<uptime> touch|r
         node)                                          # ueventd re-creates /dev/dri/<arg>: a new inode, 0666
           rm -f "$GB_ROOT/dev/dri/$arg"; : > "$GB_ROOT/dev/dri/$arg"; /bin/chmod 0666 "$GB_ROOT/dev/dri/$arg" ;;
         copy) cp "$GBT/ctl/copy_src" "$GB_ROOT/$arg" ;;  # another writer replaces a file (e.g. the marker)
+        save) cat "$GB_ROOT/$arg" >> "$GBT/log/save.log" 2>/dev/null ;;   # (Wave 2b) record a file's content now
+        unsteal)                                       # (Wave 2b) the stealer <arg> puts the moved lock back
+          echo "unsteal $arg at $n" >> "$GBT/log/at.log"
+          /bin/mv -T "$GB_ROOT/dev/gb_esp.lock.stale.$arg" "$GB_ROOT/dev/gb_esp.lock" ;;
       esac
     else
       printf '%s %s %s\n' "$at" "$op" "$arg" >> "$GBT/ctl/at.new"
@@ -281,6 +293,16 @@ fi
 /bin/sleep 0.01
 EOF
 
+w logcat <<'EOF'
+#!/bin/sh
+# logcat (wave 3, item 18): with -d prints ctl/logcat (if any) and exits; without -d a real logcat streams forever,
+# so the shim logs the call and fails (a test can see that every call used -d)
+printf '%s
+' "$*" >> "$GBT/log/logcat.log"
+case " $* " in *" -d "*) [ -f "$GBT/ctl/logcat" ] && cat "$GBT/ctl/logcat"; exit 0 ;; esac
+exit 3
+EOF
+
 w pgrep <<'EOF'
 #!/bin/sh
 # pgrep: logs its arguments; "found" (exit 0) while ctl/pgrep_n counts down from its value, then "none" (exit 1)
@@ -298,15 +320,43 @@ EOF
 w mv <<'EOF'
 #!/bin/sh
 # The real mv (next in PATH after the shims). Failure injection ctl/steal_race: a live holder (pid 4243) re-creates
-# the ESP lock right before a stealer's rename of it (one shot).
-if [ -e "$GBT/ctl/steal_race" ] && [ "$1" = -T ] && [ "$2" = "$GB_ROOT/dev/gb_esp.lock" ]; then
-  rm -f "$GBT/ctl/steal_race"
-  rm -rf "$2"
-  mkdir "$2"
-  echo "4243 gb_bootlog 30" > "$2/owner"
+# the ESP lock right before a stealer's rename of it (one shot); ctl/steal_race_noowner: the same without an owner
+# file yet (Wave 2b); ctl/steal_intrude (Wave 2b): right after that rename a newcomer's empty directory takes the
+# lock path (ctl/at "rm dev/gb_esp.lock" makes it back off).
+if [ "$1" = -T ] && [ "$2" = "$GB_ROOT/dev/gb_esp.lock" ]; then
+  if [ -e "$GBT/ctl/steal_race" ] || [ -e "$GBT/ctl/steal_race_noowner" ]; then
+    rm -rf "$2"
+    mkdir "$2"
+    [ -e "$GBT/ctl/steal_race" ] && echo "4243 gb_bootlog 30" > "$2/owner"
+    rm -f "$GBT/ctl/steal_race" "$GBT/ctl/steal_race_noowner"
+  fi
+  if [ -e "$GBT/ctl/steal_intrude" ]; then
+    rm -f "$GBT/ctl/steal_intrude"
+    PATH=${PATH#*:} mv "$@" || exit 1
+    mkdir "$2"
+    exit 0
+  fi
 fi
 PATH=${PATH#*:}
 exec mv "$@"
+EOF
+
+w mkdir <<'EOF'
+#!/bin/sh
+# The real mkdir (next in PATH after the shims). Failure injection (Wave 2b) ctl/mkdir_race: right after the script's
+# mkdir of the ESP lock, an owner file with the ctl file's line appears in it (a lock put back in its place; one shot;
+# (wave 3) the line "SELF" stands for "<pid of the calling script> gb_nouveau 3": a late put-back of its own lock).
+# (wave 3) Every mkdir of the ESP lock is logged to log/lockmkdir.log (INTERFACES 5.4 r4: none while a steal is busy).
+[ "$1" = "$GB_ROOT/dev/gb_esp.lock" ] && echo "mkdir lock" >> "$GBT/log/lockmkdir.log"
+if [ -f "$GBT/ctl/mkdir_race" ] && [ "$1" = "$GB_ROOT/dev/gb_esp.lock" ]; then
+  PATH=${PATH#*:} mkdir "$@" || exit 1
+  if [ "$(cat "$GBT/ctl/mkdir_race")" = SELF ]; then echo "$PPID gb_nouveau 3" > "$1/owner"
+  else cat "$GBT/ctl/mkdir_race" > "$1/owner"; fi
+  rm -f "$GBT/ctl/mkdir_race"
+  exit 0
+fi
+PATH=${PATH#*:}
+exec mkdir "$@"
 EOF
 
 w sync <<'EOF'

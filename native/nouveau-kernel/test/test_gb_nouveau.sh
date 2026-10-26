@@ -1960,6 +1960,33 @@ if want NP-1B-18; then
   check "N17 posted under gb_gfx" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-t|Tablet mode - Intel graphics|gb_gfx|Apps use Intel graphics while the keyboard base is detached. Reattach it to use NVIDIA graphics again.|"
 fi
 
+if want NP-W3-01; then                            # wave 3 (lead decision D-a): tag gb_update, gb_slotsync's N22/N23
+  new_case NP-W3-01
+  Q=$R/data/vendor/gb/notify
+  printf 'kind=notify
+tag=gb_update
+title=System update held
+text=Kernel mismatch: the update (slot B) needs kernel 6.18-android17-6, this system runs 6.18-android17-5. Startup stays on slot A; (slot B) is in the boot menu.
+' > "$Q/1792900000001-40-1.msg"
+  printf 'kind=notify
+tag=gb_update
+title=System update held
+text=Kernel check failed: the kernel version of the update (slot B) could not be checked. Startup stays on slot A; (slot B) is in the boot menu.
+' > "$Q/1792900000002-40-2.msg"
+  printf 'kind=notify
+tag=gb_updates
+title=System update held
+text=x
+' > "$Q/1792900000003-40-3.msg"
+  run gb_notify.sh
+  check "exit 0" eq "$RC" 0
+  check "N22 posted under gb_update" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-t|System update held|gb_update|Kernel mismatch: the update (slot B) needs kernel 6.18-android17-6, this system runs 6.18-android17-5. Startup stays on slot A; (slot B) is in the boot menu.|"
+  check "N23 posted under gb_update" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-t|System update held|gb_update|Kernel check failed: the kernel version of the update (slot B) could not be checked. Startup stays on slot A; (slot B) is in the boot menu.|"
+  check "exactly 2 posts (gb_updates is not a tag)" eq "$(nlines "$T/log/cmd.log")" 2
+  check "the near-miss tag is dropped and logged" has "$R/dev/kmsg" "1792900000003-40-3.msg: bad tag"
+  check "no .msg left" eq "$(nmsg)" 0
+fi
+
 if want NP-1B-19; then
   new_case NP-1B-19
   st_setup
@@ -1990,6 +2017,21 @@ if want NP-1B-19; then
   check "no sysfs writes" eq "$(fp_tree "$R/sys")" "$_fp"
   st
   check "second run, same identity: attempts=2" eq "$(recv attempts)" 2
+fi
+
+if want NP-W3-02; then                            # wave 3 item 18: the HWUI-on-Vulkan abort count in the self-test report
+  new_case NP-W3-02
+  st_setup
+  printf '%s
+' '10-26 01:02:03.456  1234  1250 F HWUI    : queueFamilyProperties.queueCount < kRequestedQueueCount'     'unrelated line' '10-26 01:02:04.000  1300  1301 F HWUI    : queueFamilyProperties.queueCount < kRequestedQueueCount'     > "$T/ctl/logcat"
+  st
+  F=$R/data/vendor/gb/report/selftest-1.txt
+  check "exit 0, verdict pass (the count never changes the verdict)" eq "$RC/$(recv verdict)" 0/pass
+  check "report: section and count 2" eq "$(grep -A1 -x '== hwui_vulkan (0 expected; non-zero: HWUI on a one-queue-per-family Vulkan device, report it)' "$F" | tail -n 1)" "queueCount_abort=2"
+  check "logcat called once, as a dump (-d -b all)" eq "$(tr '
+' '|' < "$T/log/logcat.log")" "-d -b all|"
+  check "section placed before == end" eq "$(awk '/^== hwui_vulkan/{h=NR} /^== end /{e=NR} END {print (h && e > h)}' "$F")" 1
+  check "no HWUI/renderer property written" eq "$(grep -c -E 'hwui|renderer' "$T/log/setprop.log" 2>/dev/null)" 0
 fi
 
 if want NP-1B-20; then
@@ -2290,7 +2332,123 @@ if want NP-R11; then                              # R-11: teardown deadlines
   check "released at the end" eq "$(wake_state)/$(recv verdict)" gb_gfx_selftest/gb_gfx_selftest/pass
 fi
 
+# ================================================================= NP-W2B: the ESP lock r3 (INTERFACES 5.4, Wave 2b)
+
+nstale() { find "$R/dev" -maxdepth 1 -name 'gb_esp.lock.stale.*' | wc -l | tr -d ' '; }
+
+if want NP-W2B; then
+  new_case NP-W2B-busy                            # a steal in progress (live .stale.<pid>): back off, then the load
+  cmdline gb.nouveau=once
+  mkdir -p "$R/dev/gb_esp.lock.stale.4245" "$R/proc/4245"
+  np auto
+  check "steal in progress: backed off (logged once), then the load ran" \
+    eq "$(prop vendor.gb.nouveau.result)/$(grep -c 'a steal is in progress: backing off' "$R/dev/kmsg")" clean/1
+  check "the stealer's directory untouched, the lock released" eq "$(nstale)$(test -e "$R/dev/gb_esp.lock" && echo L)" 1
+
+  new_case NP-W2B-busy-dead                       # a leftover of a dead stealer is no steal in progress
+  cmdline gb.nouveau=once
+  mkdir -p "$R/dev/gb_esp.lock.stale.4247"
+  np auto
+  check "dead stealer's leftover: no back-off, the load ran" \
+    eq "$(prop vendor.gb.nouveau.result)/$(grep -c 'backing off' "$R/dev/kmsg")" clean/0
+
+  new_case NP-W2B-excl                            # an owner file in our new lock directory is never overwritten
+  cmdline gb.nouveau=once
+  mkdir -p "$R/proc/4244"
+  echo "4244 gb_bootlog 31" > "$T/ctl/mkdir_race"
+  printf '%s save dev/gb_esp.lock/owner\n%s rm dev/gb_esp.lock\n' "$(rel 3)" "$(rel 4)" > "$T/ctl/at"
+  np auto
+  check "logged: another lock took our directory's place" has "$R/dev/kmsg" "another lock took the place of ours"
+  check "the other holder's owner line kept while it held the lock" eq "$(cat "$T/log/save.log" 2>/dev/null)" "4244 gb_bootlog 31"
+  check "after its release the load ran, lock released" eq "$(prop vendor.gb.nouveau.result)$(test -e "$R/dev/gb_esp.lock" && echo L)" clean
+
+  new_case NP-W2B-relwait                         # at release our lock is moved away by a stealer: wait for the put-back
+  cmdline gb.nouveau=once
+  mkdir -p "$R/proc/4246"
+  : > "$T/ctl/displace_at_release"
+  np auto
+  check "the load ran" eq "$(prop vendor.gb.nouveau.result)" clean
+  check "the stealer put it back during the release wait" has "$T/log/at.log" "unsteal 4246"
+  check "then released: no lock, no stale directory, no 'not ours'" \
+    eq "$(test -e "$R/dev/gb_esp.lock" && echo L)$(nstale)$(grep -c 'not ours any more at release' "$R/dev/kmsg")" 00
+
+  new_case NP-W2B-race-intrude                    # the steal moved a live lock; a newcomer in the way of the put-back
+  cmdline gb.nouveau=once
+  mkdir -p "$R/dev/gb_esp.lock" "$R/proc/4243"
+  echo "999999 gb_bootlog 20" > "$R/dev/gb_esp.lock/owner"
+  : > "$T/ctl/steal_race"
+  : > "$T/ctl/steal_intrude"
+  echo "$(rel 2) rm dev/gb_esp.lock" > "$T/ctl/at"
+  np auto
+  check "put back after the newcomer left, never over it" eq "$(cat "$R/dev/gb_esp.lock/owner" 2>/dev/null)" "4243 gb_bootlog 30"
+  check "logged" has "$R/dev/kmsg" "the lock changed while stealing it (owner '4243 gb_bootlog 30'): put back"
+  check "then the live holder is waited for: refused:esp, no insmod" eq "$(prop vendor.gb.nouveau.result)/$(nins)" refused:esp/0
+  check "no stale directory left" eq "$(nstale)" 0
+
+  new_case NP-W2B-race-ownerless                  # an ownerless moved directory that cannot go back is removed
+  cmdline gb.nouveau=once
+  mkdir -p "$R/dev/gb_esp.lock"
+  echo "999999 gb_bootlog 20" > "$R/dev/gb_esp.lock/owner"
+  : > "$T/ctl/steal_race_noowner"
+  : > "$T/ctl/steal_intrude"
+  np auto
+  check "logged: removed" has "$R/dev/kmsg" "the moved directory had no owner and another is in place: removed"
+  check "the newcomer's ownerless lock is stolen after 5 polls, the load ran" \
+    eq "$(prop vendor.gb.nouveau.result)/$(grep -c 'stealing a stale lock' "$R/dev/kmsg")" clean/1
+  check "no stale directory, no lock left" eq "$(nstale)$(test -e "$R/dev/gb_esp.lock" && echo L)" 0
+
+  new_case NP-W2B-report-busy                     # gb_dgpu_report.sh selftest: the same back-off
+  st_setup
+  : > "$R/dev/kmsg"
+  mkdir -p "$R/dev/gb_esp.lock.stale.4248" "$R/proc/4248"
+  st
+  check "selftest: backed off (logged once), then passed and released" \
+    eq "$(grep -c 'gb_dgpu_report: ESP lock: a steal is in progress: backing off' "$R/dev/kmsg")/$(recv verdict)$(test -e "$R/dev/gb_esp.lock" && echo L)" 1/pass
+
+  new_case NP-W2B-report-excl                     # gb_dgpu_report.sh: an owner file in our new directory stays
+  st_setup
+  : > "$R/dev/kmsg"
+  mkdir -p "$R/proc/4249"
+  echo "4249 gb_bootlog 31" > "$T/ctl/mkdir_race"
+  printf '%s save dev/gb_esp.lock/owner\n%s rm dev/gb_esp.lock\n' "$(rel 3)" "$(rel 4)" > "$T/ctl/at"
+  st
+  check "selftest: the other owner line kept, then passed" \
+    eq "$(cat "$T/log/save.log" 2>/dev/null)/$(recv verdict)" "4249 gb_bootlog 31/pass"
+  check "logged" has "$R/dev/kmsg" "gb_dgpu_report: ESP lock: another lock took the place of ours"
+fi
+
 # ================================================================= NP-24 rc lint
+
+if want NP-W3-03; then                            # wave 3: ESP lock r4 (INTERFACES 5.4 r4; wave 2b review L1/L2)
+  new_case NP-W3-03-busy                          # a steal in progress: no mkdir at all during the back-off
+  cmdline gb.nouveau=once
+  mkdir -p "$R/dev/gb_esp.lock.stale.4251" "$R/proc/4251"
+  np auto
+  check "backed off (logged once), then the load ran"     eq "$(prop vendor.gb.nouveau.result)/$(grep -c 'a steal is in progress: backing off' "$R/dev/kmsg")" clean/1
+  check "exactly one mkdir of the lock (after the 5 back-offs), none while busy" eq "$(nlines "$T/log/lockmkdir.log")" 1
+
+  new_case NP-W3-03-self                          # a lock naming our own pid while we hold nothing is stale (L2)
+  cmdline gb.nouveau=once
+  echo SELF > "$T/ctl/mkdir_race"
+  np auto
+  check "our own pid in a lock we do not hold: stolen once as stale, the load ran"     eq "$(prop vendor.gb.nouveau.result)/$(grep -c 'stealing a stale lock' "$R/dev/kmsg")" clean/1
+  check "no lock left" absent "$R/dev/gb_esp.lock"
+
+  new_case NP-W3-03-report-self                   # gb_dgpu_report.sh: the same own-pid rule
+  st_setup
+  : > "$R/dev/kmsg"
+  echo SELF > "$T/ctl/mkdir_race"
+  st
+  check "selftest: own-pid lock stolen once, then passed"     eq "$(grep -c 'gb_dgpu_report: ESP lock: stealing a stale lock' "$R/dev/kmsg")/$(recv verdict)" 1/pass
+
+  new_case NP-W3-03-report-busy                   # gb_dgpu_report.sh: no mkdir while busy
+  st_setup
+  : > "$R/dev/kmsg"
+  : > "$T/log/lockmkdir.log"                      # (st_setup's auto load took the lock once already)
+  mkdir -p "$R/dev/gb_esp.lock.stale.4252" "$R/proc/4252"
+  st
+  check "selftest: one lock mkdir after the back-offs, passed" eq "$(nlines "$T/log/lockmkdir.log")/$(recv verdict)" 1/pass
+fi
 
 if want NP-24; then
   CASE=NP-24

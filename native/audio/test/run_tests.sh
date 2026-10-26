@@ -16,6 +16,11 @@
 #   A9 the collection base has the wrong mode (or is a file): removed and re-created 0700, planted files gone
 #   A10 a symlink inside the collection directory is never copied to the ESP (its target untouched)
 #   A11 the collection base cannot be created (missing parent): nothing collected, no ESP mount, exit 0
+#   Wave 2b (INTERFACES 5.4 r3): A12 a steal in progress -> back-off, A13 an owner file in our new lock directory is
+#   never overwritten, A14 df without a number -> fail closed, A15 a CRLF bootcount; A6 also the legacy load with
+#   PCI autoprobe off (variants: another driver registered meanwhile, no autoprobe switch)
+#   Wave 3: A16 r4 no mkdir while a steal is in progress, A17 r4 a lock naming our own pid is stale (INTERFACES 5.4
+#   r4); X1-X3 (item 2) the DRAS files: <soundcard> = the card id, the sof-soundwire field set, CaptureMixerElem
 # Prints PASS/FAIL lines and "TB-2 RESULT: OK" or "TB-2 RESULT: <n> failure(s)" (exit 0 / 1).
 set -u
 SRC=$(cd "$1" && pwd); W=$2
@@ -55,9 +60,24 @@ echo "SYNC" >> "$GBT/events"
 EOF
 w df <<'EOF'
 #!/bin/sh
+[ -e "$GBT/ctl/df_garbage" ] && { echo "df: no such mount"; exit 0; }
 f=$(cat "$GBT/ctl/df_free" 2>/dev/null || echo 400000)
 echo "Filesystem 1K-blocks Used Available Use% Mounted on"
 echo "/dev/block/by-name/EFI-SYSTEM 516080 100000 $f 20% ${2:-/}"
+EOF
+# mkdir: the real tool; ctl/mkdir_race (one shot): right after the script's mkdir of the lock, an owner file with the
+# ctl file's line appears in it (a lock put back in place of the new directory, INTERFACES 5.4 r3; wave 3: the line
+# SELF stands for the calling script's own pid). Every mkdir of the lock is counted in $GBT/lockmkdir (wave 3, r4).
+w mkdir <<'EOF'
+#!/bin/sh
+[ "$1" = "$GBT/gb_esp.lock" ] && echo "mkdir lock" >> "$GBT/lockmkdir"
+if [ -f "$GBT/ctl/mkdir_race" ] && [ "$1" = "$GBT/gb_esp.lock" ]; then
+  "$GB_REAL_MKDIR" "$@" || exit 1
+  if [ "$(cat "$GBT/ctl/mkdir_race")" = SELF ]; then echo "$PPID gb_audiodiag 3" > "$1/owner"
+  else cat "$GBT/ctl/mkdir_race" > "$1/owner"; fi
+  rm -f "$GBT/ctl/mkdir_race"; exit 0
+fi
+exec "$GB_REAL_MKDIR" "$@"
 EOF
 for c in getprop dmesg logcat dumpsys; do
   # shellcheck disable=SC2016  # the shim's own variables expand when the shim runs
@@ -202,11 +222,60 @@ suite() {     # suite LABEL: every case once, PATH already set
     grep -q 'cannot create a root-only' "$GBT/kmsg"
   ok $? "$1 A11 base not creatable: nothing collected, no ESP mount, kmsg line, exit 0"
 
-  # A6: gb_audio.sh on a fake sysfs
-  for dsp in 1 3; do
-    GBT=$P/a6-$dsp; export GBT; rm -rf "$GBT"; mkdir -p "$GBT/ctl"; : > "$GBT/events"; echo 0 > "$GBT/clock"
-    R=$GBT/root; mkdir -p "$R/dev" "$R/sys/module/snd_intel_dspcfg/parameters" "$R/sys/bus/pci/drivers"
+  # ---- Wave 2b (INTERFACES 5.4 r3, safety findings 4 and 8)
+  # A12: a steal in progress (a .stale.<pid> directory of a live pid): 5 back-offs, then the lock and the copy
+  newcase a12; "$REALSLEEP" 300 & SP=$!; mkdir "$GBT/gb_esp.lock.stale.$SP"
+  adiag; rc=$?
+  [ $rc = 0 ] && [ "$(cat "$GBT/clock")" -ge 5 ] && [ "$(copied)" = 1 ] && [ -d "$GBT/gb_esp.lock.stale.$SP" ] &&
+    [ ! -e "$GBT/gb_esp.lock" ] && ! grep -q 'stealing' "$GBT/kmsg"
+  ok $? "$1 A12 steal in progress: backed off (clock $(cat "$GBT/clock") fake s), then copied; the stealer's directory untouched"
+  kill "$SP" 2> /dev/null; wait "$SP" 2> /dev/null
+  # A13: an owner file appears in the new lock directory before ours (dead pid): never overwritten, stolen as stale
+  newcase a13; sh -c 'exit 0' & dp=$!; wait "$dp"; echo "$dp gb_bootlog 3" > "$GBT/ctl/mkdir_race"
+  adiag; rc=$?
+  [ $rc = 0 ] && [ "$(copied)" = 1 ] && [ "$(grep -c 'stealing a stale ESP lock' "$GBT/kmsg")" = 1 ] &&
+    [ "$(cat "$GBT/clock")" -ge 1 ] && [ ! -e "$GBT/gb_esp.lock" ]
+  ok $? "$1 A13 an owner file appeared after our mkdir: not overwritten (stolen once as stale at the next poll), copied"
+  # A14: df gives no free-space number: fail closed
+  newcase a14; : > "$GBT/ctl/df_garbage"
+  adiag; rc=$?
+  [ $rc = 0 ] && [ "$(copied)" = 0 ] && [ "$(kept)" = 1 ] && grep -q 'cannot read the ESP free space' "$GBT/kmsg" &&
+    grep -q '^UMOUNT' "$GBT/events" && [ ! -e "$GBT/gb_esp.lock" ] && [ "$(ls "$GBT/esp/gblog")" = bootcount ]
+  ok $? "$1 A14 df without a number: nothing written to gblog/, files kept, kmsg line, unmounted and unlocked"
+  # A15: a bootcount edited on Windows (CRLF) keeps its number
+  newcase a15; printf '7\r\n' > "$GBT/esp/gblog/bootcount"
+  adiag; rc=$?
+  [ $rc = 0 ] && [ "$(copied)" = 1 ]; ok $? "$1 A15 CRLF bootcount 7: copied as audio-b7-*"
+
+  # ---- Wave 3 (INTERFACES 5.4 r4, wave 2b review L1/L2)
+  # A16: a steal in progress: no mkdir of the lock at all during the 5 back-offs, then one, copied
+  newcase a16; "$REALSLEEP" 300 & SP=$!; mkdir "$GBT/gb_esp.lock.stale.$SP"
+  adiag; rc=$?
+  nm=$(grep -c . "$GBT/lockmkdir" 2> /dev/null)
+  [ $rc = 0 ] && [ "$(copied)" = 1 ] && [ "${nm:-0}" = 1 ] && [ "$(cat "$GBT/clock")" -ge 5 ]
+  ok $? "$1 A16 r4 steal in progress: no mkdir while busy (lock mkdirs: ${nm:-0}), then copied"
+  kill "$SP" 2> /dev/null; wait "$SP" 2> /dev/null
+  # A17: a lock naming our own pid while we hold nothing (a late put-back) is stale: stolen once, copied
+  newcase a17; echo SELF > "$GBT/ctl/mkdir_race"
+  adiag; rc=$?
+  [ $rc = 0 ] && [ "$(copied)" = 1 ] && [ "$(grep -c 'stealing a stale ESP lock' "$GBT/kmsg")" = 1 ] && [ ! -e "$GBT/gb_esp.lock" ]
+  ok $? "$1 A17 r4 own pid in a lock we do not hold: stolen once as stale, copied"
+
+  # A6: gb_audio.sh on a fake sysfs. v = dsp_driver value + variant: n = another PCI driver registers while
+  # autoprobe is off, u = no drivers_autoprobe attribute (cannot switch it off: no legacy load)
+  for v in 1 1n 1u 3; do
+    dsp=${v%[nu]}
+    GBT=$P/a6-$v; export GBT; rm -rf "$GBT"; mkdir -p "$GBT/ctl"; : > "$GBT/events"; echo 0 > "$GBT/clock"
+    R=$GBT/root; mkdir -p "$R/dev" "$R/sys/module/snd_intel_dspcfg/parameters" "$R/sys/bus/pci/drivers" "$R/vendor/bin"
     : > "$R/dev/kmsg"; : > "$R/sys/bus/pci/drivers_probe"; echo $dsp > "$R/sys/module/snd_intel_dspcfg/parameters/dsp_driver"
+    [ "$v" = 1u ] || echo 1 > "$R/sys/bus/pci/drivers_autoprobe"
+    [ "$v" = 1n ] && : > "$GBT/ctl/newdrv"
+    # shellcheck disable=SC2016  # the shim's own variables expand when the shim runs
+    printf '%s\n' '#!/bin/sh' \
+      'echo "MODPROBE $* autoprobe=$(cat "$GB_ROOT/sys/bus/pci/drivers_autoprobe" 2>/dev/null)" >> "$GBT/events"' \
+      'for a in "$@"; do [ "$a" = snd_hda_intel ] || continue; mkdir -p "$GB_ROOT/sys/bus/pci/drivers/snd_hda_intel"' \
+      '  [ -e "$GBT/ctl/newdrv" ] && mkdir -p "$GB_ROOT/sys/bus/pci/drivers/fake_new"; done' 'exit 0' > "$R/vendor/bin/modprobe"
+    chmod 0755 "$R/vendor/bin/modprobe"
     mkpci() { d=$R/sys/bus/pci/devices/$1; mkdir -p "$d"; echo "$2" > "$d/vendor"; echo "$3" > "$d/device"; echo "$4" > "$d/class"
               echo '(null)' > "$d/driver_override"; }
     mkpci 0000:00:1f.3 0x8086 0x34c8 0x040380
@@ -218,24 +287,71 @@ suite() {     # suite LABEL: every case once, PATH already set
     GB_ROOT=$R mksh "$SRC/gb_audio.sh" > "$GBT/out" 2>&1
     hda=$(cat "$R/sys/bus/pci/devices/0000:00:1f.3/driver_override")
     [ "$(tree_sum "$R/sys/bus/pci/devices/0000:02:00.1")" = "$nv0" ] && [ "$(tree_sum "$R/sys/bus/pci/devices/0000:02:00.0")" = "$nv00" ] &&
-      [ "$(tree_sum "$R/sys/bus/pci/devices/0000:00:02.0")" = "$gpu0" ]
+      [ "$(tree_sum "$R/sys/bus/pci/devices/0000:00:02.0")" = "$gpu0" ] && ! grep -q 'probe 0000:02:00' "$R/dev/kmsg"
     untouched=$?
-    if [ $dsp = 1 ]; then
-      [ "$hda" = snd_hda_intel ] && [ $untouched = 0 ] && grep -q 'driver_override 0000:00:1f.3 = snd_hda_intel' "$R/dev/kmsg" &&
-        [ "$(grep -c 'driver_override' "$R/dev/kmsg")" = 1 ]
-      ok $? "$1 A6 dsp_driver=1: only 00:1f.3 driver_override = snd_hda_intel; 02:00.0/02:00.1 (0x10de) and 00:02.0 untouched"
-    else
-      [ "$hda" = '(null)' ] && [ $untouched = 0 ] && ! grep -q 'driver_override' "$R/dev/kmsg"
-      ok $? "$1 A6 dsp_driver=3: no driver_override write"
-    fi
+    ap=$(cat "$R/sys/bus/pci/drivers_autoprobe" 2>/dev/null)
+    case $v in
+      1)
+        [ "$hda" = snd_hda_intel ] && [ $untouched = 0 ] && grep -q 'driver_override 0000:00:1f.3 = snd_hda_intel' "$R/dev/kmsg" &&
+          [ "$(grep -c 'driver_override' "$R/dev/kmsg")" = 1 ]
+        ok $? "$1 A6 dsp_driver=1: only 00:1f.3 driver_override = snd_hda_intel; 02:00.0/02:00.1 (0x10de) and 00:02.0 untouched"
+        grep -q '^MODPROBE -d /vendor/lib/modules snd_hda_intel autoprobe=0$' "$GBT/events" && [ "$ap" = 1 ] &&
+          grep -q 'probe 0000:00:1f.3 (snd_hda_intel)' "$R/dev/kmsg" && [ "$(grep -c 'GB_AUDIO: probe ' "$R/dev/kmsg")" = 1 ]
+        ok $? "$1 A6 dsp_driver=1: snd_hda_intel loaded with PCI autoprobe 0, restored to 1, only 00:1f.3 probed by name" ;;
+      1n)
+        [ $untouched = 0 ] && grep -q 'registered while autoprobe was off: fake_new' "$R/dev/kmsg" &&
+          grep -q 'GB_AUDIO: probe 0000:00:02.0$' "$R/dev/kmsg" && [ "$ap" = 1 ]
+        ok $? "$1 A6 dsp_driver=1, another PCI driver registered meanwhile: driverless non-NVIDIA functions probed, NVIDIA never" ;;
+      1u)
+        [ $untouched = 0 ] && ! grep -q 'MODPROBE .*snd_hda_intel' "$GBT/events" && grep -q 'snd_hda_intel not loaded' "$R/dev/kmsg"
+        ok $? "$1 A6 dsp_driver=1 without a drivers_autoprobe switch: snd_hda_intel not loaded (fail closed)" ;;
+      3)
+        [ "$hda" = '(null)' ] && [ $untouched = 0 ] && ! grep -q 'driver_override' "$R/dev/kmsg" && [ "$ap" = 1 ] &&
+          ! grep -q 'MODPROBE .*snd_hda_intel' "$GBT/events"
+        ok $? "$1 A6 dsp_driver=3: no driver_override write, autoprobe untouched, no snd_hda_intel" ;;
+    esac
   done
 }
 
+# ---- Wave 3 item 2 (WAVE3_PLAN 5.1): the DRAS configuration files of the native tree (TREE_DIR/vup/etc/...)
+# X1: <soundcard> in hal_configs/audio_default.xml is the ALSA card id that gb_audio.sh uses (ID=), not the name
+SC=$(sed -n 's:^[[:space:]]*<soundcard>\([^<]*\)</soundcard>[[:space:]]*$:\1:p' "$SRC/vup/etc/data/hal_configs/audio_default.xml")
+GID=$(sed -n 's/^ID=\([A-Za-z0-9]*\).*/\1/p' "$SRC/gb_audio.sh" | head -n 1)
+[ -n "$SC" ] && [ "$SC" = "$GID" ] && [ "$SC" = sofhdadsp ] &&
+  grep -q '<SoundCardName>hw:'"$GID"'</SoundCardName>' "$SRC/vup/etc/audio/sof-hda-dsp_sb3/audio_config.xml"
+ok $? "X1 audio_default.xml <soundcard> '$SC' == gb_audio.sh ID '$GID' == audio_config.xml hw:<id> (the card id)"
+# X2: every non-HDMI section is a superset of the fields of lapis's sof-soundwire section of the same name. Reference
+# (hard-coded field names only): lapis vendor_a CL3B.260622.271.R1 (/build/vendor_a.img sha256 774cf8d9...),
+# /vendor/etc/audio/sof-soundwire_cs42l43_cs35l56/audio_config.xml, read 2026-10-26.
+fields() {   # fields FILE SECTION -> the child element names of <SECTION> (one per line, sorted)
+  awk -v s="$2" '$0 ~ "<" s ">" {f=1; next} $0 ~ "</" s ">" {f=0} f && /<[A-Za-z]/ {
+    l=$0; sub(/^[ \t]*</, "", l); sub(/>.*/, "", l); if (l !~ /^!/) print l }' "$1" | sort -u
+}
+bad=0
+for ref in 'Speaker:PlaybackPCM' 'Headphone:PlaybackPCM JackDev JackSwitch' \
+           'InternalMic:CapturePCM IntrinsicSensitivity RampUpMs' 'Mic:CapturePCM CaptureMixerElem JackDev'; do
+  sec=${ref%%:*}
+  for cfg in sof-hda-dsp_sb3 PCH_sb3_legacy; do
+    F=$SRC/vup/etc/audio/$cfg/audio_config.xml
+    have=$(fields "$F" "$sec")
+    [ -z "$have" ] && [ "$cfg" = PCH_sb3_legacy ] && continue      # the legacy fallback declares only Speaker + Mic
+    for f in ${ref#*:}; do
+      printf '%s\n' "$have" | grep -q -x "$f" || { echo "  $cfg $sec lacks $f (has: $(echo $have))"; bad=$((bad + 1)); }
+    done
+  done
+done
+[ -n "$(fields "$SRC/vup/etc/audio/sof-hda-dsp_sb3/audio_config.xml" InternalMic)" ]; bad=$((bad + $?))
+ok $bad "X2 sof-hda-dsp_sb3 (and the PCH fallback's sections) carry every field of lapis's sof-soundwire sections"
+grep -q '<CaptureMixerElem>Capture</CaptureMixerElem>' "$SRC/vup/etc/audio/PCH_sb3_legacy/audio_config.xml" &&
+  grep -q '<CaptureMixerElem>Capture</CaptureMixerElem>' "$SRC/vup/etc/audio/sof-hda-dsp_sb3/audio_config.xml"
+ok $? "X3 both Mic sections carry CaptureMixerElem Capture"
+
 PATH0=$PATH
+GB_REAL_MKDIR=$(command -v mkdir); export GB_REAL_MKDIR
 GB_REAL_CP=$REALCP; export GB_REAL_CP; PATH=$SH:$PATH0; export PATH
 suite gnu
 if [ -n "$TBX" ]; then
-  GB_REAL_CP=$TBX/cp; PATH=$SH:$TBX:$PATH0
+  GB_REAL_CP=$TBX/cp; GB_REAL_MKDIR=$TBX/mkdir; PATH=$SH:$TBX:$PATH0
   suite toybox
 else
   fail "toybox pass skipped (toybox or busybox missing)"

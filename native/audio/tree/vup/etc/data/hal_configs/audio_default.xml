@@ -1,4 +1,12 @@
 <AudioConfiguration>
-  <soundcard>sof-hda-dsp</soundcard>
+  <!--
+GB native (wave 3, item 2): <soundcard> is the ALSA card id "sofhdadsp" (/proc/asound/cards; gb_audio.sh ID=,
+audio_config.xml hw:sofhdadsp), not the card name "sof-hda-dsp". gbOS86 saw DRAS fail with the card short name
+("HDA Intel PCH") and work with the id ("PCH"), which rules out exact short-name matching; the two rules still
+consistent with lapis shipping "sof-soundwire" (id sofsoundwire) are an exact id match or a match after dropping
+non-alphanumerics, and "sofhdadsp" passes both. Finding credit: gbOS86, github.com/linuxkid473/gbos-x86 @f8a5c1a
+(AGENTS.md:33-34, HANDOFF.md:96-104,413-416); this file is ours. Confirmed by the first native boot's DRAS logcat.
+-->
+  <soundcard>sofhdadsp</soundcard>
   <audio-config-dir>sof-hda-dsp_sb3</audio-config-dir>
 </AudioConfiguration>

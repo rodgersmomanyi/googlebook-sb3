@@ -39,9 +39,11 @@ GPU under Windows ([VMWARE.md](VMWARE.md)).
  NVK (libgb_nvk.so) -> nouveau render node -> TU117     frames: LINEAR buffers from minigbm/i915, sync_fd release
 ```
 
-* **Kernel:** native images run kernel build #14 ([kernel/README.md](../kernel/README.md)), which is k13 plus 40
-  nouveau-only patches. nouveau and its helpers (`drm_exec`, `drm_gpuvm`, `gpu-sched`, `drm_ttm_helper`) are in no
-  boot-time load list.
+* **Kernel:** native images run kernel build #15 since wave 3 ([kernel/README.md](../kernel/README.md)): build #14
+  (k13 plus 40 nouveau-only patches) plus two patches that do not touch nouveau (the AVX-VNNI emulator rework and the
+  opt-in i915 gamma switch), so the nouveau source is the same as in #14 ([kernel/K15.md](../kernel/K15.md)). The
+  payload file name carries the build #15 kernel release. nouveau and its helpers (`drm_exec`, `drm_gpuvm`,
+  `gpu-sched`, `drm_ttm_helper`) are in no boot-time load list.
 * **Payload:** the NVIDIA firmware (30 `nvidia/tu117` files with their WHENCE excerpt and `LICENCE.nvidia`), the five
   modules, the NVK ICD and the compute libraries live in one erofs image on the boot partition,
   `gb/dgpu-<kernel release>.erofs` (about 60 MB) plus `.sha256`. Before the first load, `gb_nouveau.sh` copies the
@@ -238,6 +240,10 @@ Built and tested off-device (counts from the last runs, 2026-10-25):
   with the real gb_power;
 * k14: 9 acceptance checks (config/symvers identical to k13, signatures, CRCs against lapis's modules).
 
+Wave 3 re-runs (2026-10-26, after the ESP lock r4 changes and the HWUI check): the nouveau policy 1119/1119
+assertions, gb_power 1019 unit checks with 0 failures, and kernel build #15's acceptance checks K-01 to K-14 (among
+them: `.config` and `vmlinux.symvers` identical to k14, nouveau source unchanged, every module signed).
+
 The native image boots in VMware with all of this inert (`refused:i915`, tile `Unavailable`). Details:
 [native/dgpu/integration/](../native/dgpu/integration/).
 
@@ -256,6 +262,15 @@ Hardware checks for the first sessions with the base attached:
 5. Intel only: the dGPU stays in D3cold (`gb_dgpu_check.sh`). Compare battery drain with Auto, both idle.
 6. Boot the `[NVIDIA test]` entry once and keep its `gblog` reports.
 7. Compute: push a 1-3B Q4 GGUF model and run a chat completion. Note the tokens/s.
+8. (Wave 3) HWUI: the self-test report (`report/selftest-<N>.txt`, section `== hwui_vulkan`) and the boot-log
+   summary count the logcat line `queueFamilyProperties.queueCount < kRequestedQueueCount`. It must stay 0. A hit
+   means HWUI landed on a Vulkan backend with one queue per family, which on this stack must never happen (HWUI
+   never gets NVK): report it with the `gblog\` folder. Do not set `ro.hwui.use_vulkan` or `debug.hwui.renderer`
+   yourself (the image must not override them, and the bring-up config refuses them); the supported workaround is
+   **Intel only**. Signature: gbOS86 (github.com/linuxkid473/gbos-x86 @f8a5c1a, usb/hook.sh:489-492).
+9. (Wave 3) Colours: the screen is always driven by Intel, also in NVIDIA mode. A grey, washed-out picture ("white
+   veil") is therefore an i915 matter, not an NVIDIA one; kernel build #15 has an opt-in switch for it
+   ([FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)).
 
 Diagnostics: `adb shell gb_dgpu_check.sh` (read-only snapshot, works as the shell user),
 `getprop | grep -E 'vendor.gb.(gfx|nouveau|dgpu|compute)'`, and the `gblog\` boot reports (with the nouveau load
@@ -267,6 +282,7 @@ above works as the shell user, for example over Wireless debugging in Developer 
 | Path | What |
 |---|---|
 | [kernel/patches/k14/](../kernel/patches/k14/), [kernel/K14.md](../kernel/K14.md) | 37 linux-6.18.y nouveau backports and the hardening patches N1-N3 |
+| [kernel/patches/k15/](../kernel/patches/k15/), [kernel/K15.md](../kernel/K15.md) | build #15 on top of k14 (no nouveau change): the AVX-VNNI emulator rework and the i915 gamma switch |
 | [native/nouveau-kernel/](../native/nouveau-kernel/) | `gb_nouveau.sh` (auto/off/bind path), `gb_nouveau.rc`, `gb_dgpu_report.sh` (report, test sequence, self-test), `gb_notify.sh`, `gb_dgpu_check.sh`, the payload builder, the TU117 firmware fetcher with WHENCE/licence |
 | [native/power/](../native/power/) | `gb_power` (batteries, DTX detach, dGPU hot-plug, graphics derivation, control socket) |
 | [native/nvk-android/](../native/nvk-android/) | Mesa NVK for Android (patch set 8a), `nvk_probe`, chroot/ELF checks |

@@ -15,3 +15,8 @@ touch.deviceType = touchPad
 # No pressure/size calibration on purpose: the lapis Elan/Synaptics IDCs tune pressure for touchpads that report
 # ABS_MT_PRESSURE; a Windows PTP usually reports none. Tune gestureProp.* only after reading getevent -lp output
 # from the real device.
+
+# Android holds motion for gestureProp.Change_Timeout (200 ms default) after touchdown, so quick flicks never move the
+# cursor. gbos-x86 issue #17 confirmed 0.02 fixes it on lapis (Android 17). Credit: github.com/linuxkid473/gbos-x86 #17.
+# Only this property: the reporter found Drumroll_Suppression_Enable unnecessary, so it is not set (wave 3, item 9).
+gestureProp.Change_Timeout = 0.02

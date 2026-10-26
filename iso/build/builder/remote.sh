@@ -7,7 +7,8 @@
 #   remote.sh put <file>                      stdin -> <file> (atomic)
 #   remote.sh cache-clean <cache_dir> <keep-list-file>   delete parts/*.zst not listed, and parts/*.tmp.*
 #   remote.sh link-chunks <cache_dir> <build_id> <list-file>   hard-link listed chunks into the ISO tree
-#   remote.sh kernel <build_id> <clear|keep>  System.map initcall check, copy vmlinuz, clear NX_COMPAT
+#   remote.sh kernel <build_id> <clear|keep>  System.map initcall check, the 8250 runtime-UART check of
+#                                             /boot/config-$KREL (WAVE3 item 1), copy vmlinuz, clear NX_COMPAT
 #   remote.sh assemble <build_id>             copy BOOTX64.EFI, vmlinuz, initrd.img into the ISO tree
 #   remote.sh finish <build_id> <real|test> <keep|delete>   update last/ (real), delete the work dir (delete)
 #   remote.sh prune-builds <build_id>         delete other /var/tmp/gbiso/<build_id> work dirs
@@ -86,6 +87,11 @@ kernel)
   for s in init_tis crb_acpi_driver_init; do
     sudo grep -q -w -- "$s" /boot/System.map-$KREL || die "initcall $s not in System.map-$KREL (renamed? the TPM blacklist would be void)"
   done
+  # WAVE3 item 1: the installer reaches the Surface Book 3 base keyboard over the Surface Aggregator UART only if the
+  # 8250 driver registers without a cmdline token, i.e. CONFIG_SERIAL_8250_RUNTIME_UARTS >= 1 (Ubuntu: 32; our native
+  # GKI has 0 and gets 8250.nr_uarts=4 instead). A kernel swap to a 0 config must stop the build.
+  ru=$(sudo sed -n 's/^CONFIG_SERIAL_8250_RUNTIME_UARTS=//p' /boot/config-$KREL)
+  [[ "$ru" =~ ^[0-9]+$ ]] && [ "$ru" -ge 1 ] || die "CONFIG_SERIAL_8250_RUNTIME_UARTS='$ru' in /boot/config-$KREL: the installer would need 8250.nr_uarts"
   sudo cat /boot/vmlinuz-$KREL > "$W/vmlinuz.orig"
   before=$(python3 -I -B "$HERE/pe_tool.py" get "$W/vmlinuz.orig")
   if [ "$mode" = clear ]; then
@@ -97,7 +103,7 @@ kernel)
   fi
   after=$(python3 -I -B "$HERE/pe_tool.py" get "$W/vmlinuz")
   rm -f "$W/vmlinuz.orig"
-  echo "KERNEL-JSON {\"krel\": \"$KREL\", \"before\": \"$before\", \"after\": \"$after\", \"size\": $(stat -c %s "$W/vmlinuz"), \"sha256\": \"$(sha256sum "$W/vmlinuz" | cut -d' ' -f1)\"}"
+  echo "KERNEL-JSON {\"krel\": \"$KREL\", \"before\": \"$before\", \"after\": \"$after\", \"size\": $(stat -c %s "$W/vmlinuz"), \"sha256\": \"$(sha256sum "$W/vmlinuz" | cut -d' ' -f1)\", \"runtime_uarts\": $ru}"
   ;;
 assemble)
   bid=$1; idok "$bid"

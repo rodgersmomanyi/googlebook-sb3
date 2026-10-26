@@ -31,7 +31,7 @@ integration: `C:\GB-build\native\dgpu\integration\nouveau-policy.md` (section 7 
 | `native/gb_nouveau.sh` | `/vendor/bin/gb_nouveau.sh` (cpio `vup/bin/`, 0755) | `auto` (insmod path and, v1.2, the bind path), `off`, `dmesg-stream` (INTERFACES 7.1-7.8). |
 | `native/gb_nouveau.rc` | appended to the native `gb.rc` | Services and triggers, exactly INTERFACES 15.1-v12 (7 services). |
 | `native/gb_dgpu_report.sh` | `/vendor/bin/gb_dgpu_report.sh` | `report`: read-only report (every boot from gb_bootlog). `test`: the Phase 2B test sequence (`gb.nouveau=test` boots only). `selftest` (v1.2): the automatic NVIDIA app-graphics self-test (INTERFACES 25.3). |
-| `native/gb_notify.sh` | `/vendor/bin/gb_notify.sh` | Delivers the queue as user shell (INTERFACES 12.1): notifications (tags `gb_dgpu`, `gb_dtx`, `gb_dgpu_test`, v1.2 `gb_gfx`), the GbGpu broadcast, force-stops, and (v1.2) the three whitelisted Settings.Global writes. |
+| `native/gb_notify.sh` | `/vendor/bin/gb_notify.sh` | Delivers the queue as user shell (INTERFACES 12.1): notifications (tags `gb_dgpu`, `gb_dtx`, `gb_dgpu_test`, v1.2 `gb_gfx`, wave 3 `gb_update` from gb_slotsync), the GbGpu broadcast, force-stops, and (v1.2) the three whitelisted Settings.Global writes. |
 | `native/gb_dgpu_check.sh` | `/vendor/bin/gb_dgpu_check.sh` | Read-only snapshot for the shell user (v1.2 lists the graphics properties). |
 | `native/modules.nouveau` | (not installed) | Documentation of the module set. |
 | `firmware_staged_sha256.txt` | `/odm/etc/gb/tu117.sha256` | sha256 of the 30 TU117 firmware files. Unchanged. |
@@ -247,6 +247,21 @@ v1.2 (`TASKS_1B.md` 1.2):
 | NP-1B-17, -18 | gb_notify `kind=settings` (values, pairings, file checks, limits) and the `gb_gfx` tag. |
 | NP-1B-19 .. -22 | Self-test: pass record and order of lock/marker/foreign, verdict mapping and attempts, refusals and ESP busy, TERM and detach interruptions. |
 | NP-1B-VM | D8: the native-smoke image in VMware: `refused:i915`, nothing queued, self-test refused. |
+| NP-W2B | (Wave 2b, INTERFACES 5.4 r3) the ESP lock in both scripts: back-off while a steal is in progress (live / dead `.stale.<pid>`), an owner file in our new directory never overwritten, the release waits for a stealer's put-back, a put-back never over a newcomer's directory, an ownerless moved directory removed; `gb_dgpu_report.sh selftest` busy and owner cases. |
+| NP-W3-01 | (Wave 3, lead decision D-a, INTERFACES 12.1/12.2) gb_notify accepts the tag `gb_update` (N22/N23 from gb_slotsync) and still drops a near-miss tag. |
+| NP-W3-02 | (Wave 3 item 18) the self-test report's `== hwui_vulkan` section counts the HWUI-on-Vulkan abort signature with `logcat -d` only, after the ESP lock is released; the verdict and no HWUI property are affected. |
+| NP-W3-03 | (Wave 3, INTERFACES 5.4 r4, wave 2b review L1/L2) no `mkdir` of the lock while a steal is in progress, and a lock naming the script's own pid is stale, in both scripts. |
+
+Wave 2b (2026-10-26, INTERFACES section 30 E-1): 1102/1102 assertions with GNU coreutils and 1102/1102 with toybox +
+BWK awk (19 new NP-W2B assertions); shellcheck 0; rc lint 0 findings; rc body byte-identical to 15.1-v12
+(`test/last_run.log`). The NP-W2B cases fail on the pre-Wave-2b scripts (10 failures; evidence
+`C:\GB-build\native\dgpu\1b\evidence\w2b\np_w2b_negative_old_scripts.log`).
+
+Wave 3 (2026-10-26, INTERFACES section 31 E-10, E-13; WAVE3 item 18): 1119/1119 assertions with GNU coreutils and
+1119/1119 with toybox + BWK awk (17 new NP-W3 assertions: the `gb_update` tag, the self-test report's HWUI-on-Vulkan
+count, lock r4 in both scripts); shellcheck 0; rc lint 0 findings; rc body byte-identical to 15.1-v12 (evidence
+`C:\GB-build\native\dgpu\w3\evidence\aux\np_run_tests_w3.log`). The test shims gained `logcat` (prints `ctl/logcat`
+only for `-d`) and a lock-`mkdir` log; `ctl/mkdir_race` accepts `SELF` (the calling script's own pid).
 
 Last results (2026-10-25, v1.2): 1028/1028 assertions with GNU coreutils and 1028/1028 with toybox + BWK awk
 (640 wave-1 + 388 v1.2 per pass); shellcheck 0; rc lint 7 services, 0 findings; rc body byte-identical to

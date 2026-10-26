@@ -24,6 +24,16 @@
   -TargetImage <raw disk image>: TEST HARNESS. The same partitioning/naming/attribute/raw-write logic runs against an
   image file (no admin needed); "shrink" is simulated on partition -ImageShrinkPartition, bcdedit is never run.
 
+  -UpdateEspOnly (kernel/initrd refresh from Windows, wave 3 item 7): rewrites only EFI-SYSTEM, after these checks
+  (each refusal is exit 2, nothing written): the export GUIDs are the installed set's; the active slot decoded from the
+  installed vbmeta_a/b GPT attributes (bit for bit as gb_slotsync) is unambiguous and equals the export's slot; the
+  installed boot/init_boot/vendor_boot/vbmeta of that slot are byte-identical to the export (gbdisk verify, read-only:
+  a slot updated on the device is refused); the installed loader.conf default is gb-<slot>. Before the write the whole
+  installed EFI-SYSTEM is saved raw into the run folder (esp-before-<stamp>.img + sha256, the rollback image) and
+  gblog\, gbinstall\, gb\gb.cfg and gb\overlay\ are copied out as files (gblog-preserved-<stamp>\). -NoEspBackup
+  goes on when that raw save fails (an unreadable ESP). Idea: the gbOS86 update flow (gbos86.com/docs/updating,
+  github.com/linuxkid473/gbos-x86 install.sh; no code taken).
+
 .EXAMPLE
   .\install_dualboot.ps1                              # dry run against disk 0 (no elevation needed for most checks)
   .\install_dualboot.ps1 -ShrinkGB 40 -Apply           # real install (elevated PowerShell)
@@ -47,6 +57,7 @@ param(
     [switch]$UpdateEspOnly,
     [switch]$RepairBootEntry,
     [switch]$VerifySources,
+    [switch]$NoEspBackup,
     [switch]$Apply
 )
 $ErrorActionPreference = 'Stop'
@@ -198,13 +209,157 @@ if ($UpdateEspOnly -or $RepairBootEntry) {
             Write-Bad "export GUIDs (ESP $($espM.guid), super $($superM.guid)) differ from the installed set (ESP $($state.esp_id), super $($state.super_id)): rebuild with build_internal.py --reuse-guids <installed manifest>"
             exit 2
         }
-        Write-Step 'Rewrite only EFI-SYSTEM (kernel/initrd update; userdata and system untouched)'
-        $planEsp = if ($Apply) { Join-Path $state.run_dir "plan_esp_$stamp.json" } else { '-' }
-        $planArgs = @('plan', '--manifest', $manifestPath, '--existing', '--out', $planEsp) + $target
-        if ($ImageMode) { $planArgs += '--allow-truncated' }
-        if ($Apply) { Invoke-GbDisk -Arguments $planArgs | Out-Null } else { Invoke-GbDisk -Arguments $planArgs -Quiet | Out-Null }
-        Invoke-Change 'write the new EFI-SYSTEM image and verify it' "gbdisk write --plan $planEsp --only EFI-SYSTEM --source-dir $ExportDir --apply" {
-            Invoke-GbDisk -Arguments (@('write', '--plan', $planEsp, '--only', 'EFI-SYSTEM', '--source-dir', $ExportDir, '--apply') + $target) | Out-Null
+        # ---- (wave 3, item 7) slot, content and loader checks; the installed ESP is saved before it is rewritten.
+        # A partial update (only vmlinuz + gb\inject.gz) is never offered: initrd-<x>.img embeds inject.gz, so the new
+        # kernel would boot the old initrd's modules (README_DUALBOOT.md, "Updating the ESP from Windows").
+        Write-Step 'Slot check: the installed active slot must be the slot this export was made for'
+        $slot = [string]$manifest.slot
+        if (@('a', 'b') -notcontains $slot) { Write-Bad "the export manifest names no slot ('$slot')"; exit 2 }
+        $vbm = @{}
+        foreach ($x in @('a', 'b')) {
+            $mp = $manifest.partitions | Where-Object { $_.name -eq "vbmeta_$x" } | Select-Object -First 1
+            $lp = if ($mp) { $layout.partitions | Where-Object { $_.id -eq $mp.guid -and $_.name -eq "vbmeta_$x" } | Select-Object -First 1 }
+            if (-not $lp) { Write-Bad "the installed set has no vbmeta_$x partition with the export's GUID"; exit 2 }
+            $vbm[$x] = ConvertFrom-GbHex ([string]$lp.attributes)
+        }
+        $want = Get-GbWantedSlot $vbm['a'] $vbm['b']
+        Write-Info ('vbmeta_a attributes 0x{0:x16}, vbmeta_b 0x{1:x16} -> active slot {2}' -f $vbm['a'], $vbm['b'], $(if ($want -lt 0) { 'none' } else { @('a', 'b')[$want] }))
+        if ($want -lt 0) { Write-Bad 'no slot is bootable in the installed vbmeta_a/b attributes: refusing (fail closed)'; exit 2 }
+        if (Test-GbSlotAmbiguous $vbm['a'] $vbm['b']) { Write-Bad 'both slots are bootable with the same priority: the active slot is ambiguous - refusing (fail closed)'; exit 2 }
+        $active = @('a', 'b')[$want]
+        if ($active -ne $slot) {
+            Write-Bad "the installed active slot is $active, this export was made for slot ${slot}: refusing. Rewriting the ESP would point the default entry at slot $slot over a /data that slot $active has already used. Boot Googlebook instead (gb_slotsync manages slot changes), or build the export for slot $active (GB_SLOT=$active + build_internal.py --reuse-guids <installed manifest>)."
+            exit 2
+        }
+        Write-Ok "installed active slot $active = export slot $slot"
+
+        $tmpPlan = $null
+        if ($Apply) { $planEsp = Join-Path $state.run_dir "plan_esp_$stamp.json" }
+        else { $tmpPlan = Join-Path ([IO.Path]::GetTempPath()) "gb_plan_esp_$stamp.json"; $planEsp = $tmpPlan }   # dry run: a temp file, removed below
+        try {
+            $planArgs = @('plan', '--manifest', $manifestPath, '--existing', '--out', $planEsp) + $target
+            if ($ImageMode) { $planArgs += '--allow-truncated' }
+            Invoke-GbDisk -Arguments $planArgs -Quiet | Out-Null
+
+            Write-Step "Content check: slot $slot on the disk must be the build this export was made from"
+            $only = "boot_$slot,init_boot_$slot,vendor_boot_$slot,vbmeta_$slot"
+            if (-not $ImageMode -and -not (Test-Admin)) {
+                Write-Warn2 'not elevated: the content check (gbdisk verify reads the partitions) runs with -Apply from an elevated PowerShell'
+            } else {
+                Invoke-GbDisk -Arguments (@('verify', '--plan', $planEsp, '--only', $only, '--source-dir', $ExportDir) + $target) -AllowFail | Out-Null
+                if ($global:GbLastExit -ne 0) {
+                    Write-Bad "slot $slot on the disk is not the build this export was made from (it was updated on the device). Boot Googlebook instead (gb_slotsync manages slot changes), or rebuild the export from a source whose slot $slot holds that same build (GB_SLOT=$slot + build_internal.py --reuse-guids <installed manifest>), then retry."
+                    exit 2
+                }
+                Write-Ok "$only on the disk = the export (sha256)"
+            }
+
+            Write-Step 'Save the installed EFI-SYSTEM (rollback image) and the files a rewrite removes'
+            $espPart = $layout.partitions | Where-Object { $_.id -eq $espM.guid } | Select-Object -First 1
+            if (-not $espPart) { Write-Bad "no installed EFI-SYSTEM with GUID $($espM.guid)"; exit 2 }
+            $raw = Join-Path $state.run_dir "esp-before-$stamp.img"
+            $pres = Join-Path $state.run_dir "gblog-preserved-$stamp"
+            $rbMan = Join-Path $state.run_dir "manifest_esp_rollback_$stamp.json"
+            $script:EspSha = $null; $script:EspInfo = $null
+            Invoke-Change "save the whole installed EFI-SYSTEM raw ($(Format-MiB $espPart.length)) and read it back once" "gbdisk dump --id $($espM.guid) --out $raw $($target -join ' ')" {
+                try {
+                    $q = Split-Path -Qualifier $raw
+                    $free = [int64](Get-PSDrive -Name $q.TrimEnd(':')).Free
+                    if ($free -lt [int64]$espPart.length + 256MB) { throw ("{0} has {1} free, the backup needs {2} + 256 MiB" -f $q, (Format-MiB $free), (Format-MiB $espPart.length)) }
+                    $o = Invoke-GbDisk -Arguments (@('dump', '--id', $espM.guid, '--out', $raw) + $target)
+                    $script:EspSha = [string](@($o | Where-Object { [string]$_ -match '^sha256 [0-9a-f]{64}$' })[0]) -replace '^sha256 ', ''
+                    if ($script:EspSha -notmatch '^[0-9a-f]{64}$') { throw 'gbdisk dump printed no sha256' }
+                    "$($script:EspSha)  esp-before-$stamp.img" | Out-File -Encoding ascii "$raw.sha256"
+                    $rb = Read-Json $manifestPath
+                    $re = $rb.partitions | Where-Object { $_.name -eq 'EFI-SYSTEM' } | Select-Object -First 1
+                    $re.file = "esp-before-$stamp.img"; $re.sha256 = $script:EspSha; $re.file_size = [int64]$espPart.length
+                    Save-Json $rb $rbMan
+                    Write-Ok "raw ESP saved: $raw (sha256 $($script:EspSha.Substring(0, 16))...); rollback manifest $rbMan"
+                } catch {
+                    if ($NoEspBackup) { Write-Warn2 "the raw ESP backup failed ($($_.Exception.Message)): going on without it (-NoEspBackup)" }
+                    else { Write-Bad "the raw ESP backup failed: $($_.Exception.Message) - refusing (-NoEspBackup goes on without it, for an unreadable ESP)"; exit 2 }
+                }
+            }
+            # the files gblog\, gbinstall\, gb\gb.cfg, gb\overlay\ and the loader.conf default: image mode reads the
+            # saved raw image (dry run: the target image in place) with tools\esp_extract.py; a real disk is read
+            # through a temporary drive letter, removed again before the write
+            $info = $null
+            if ($ImageMode) {
+                $py = Get-Command python -ErrorAction SilentlyContinue
+                $ex = Join-Path $PSScriptRoot 'tools\esp_extract.py'
+                if (-not $py) { Write-Bad 'image mode needs python for the ESP file copy (tools\esp_extract.py)'; exit 2 }
+                if ($Apply -and $script:EspSha) { $exArgs = @('--src', $raw, '--out', $pres) }
+                elseif ($Apply) { $exArgs = $null }
+                else { $exArgs = @('--src', $TargetImage, '--offset', "$([int64]$espPart.offset)", '--length', "$([int64]$espPart.length)") }
+                if ($exArgs) {
+                    $j = & $py.Source -I -B $ex @exArgs
+                    if ($LASTEXITCODE -eq 0) { $info = (($j -join "`n") | ConvertFrom-Json) }
+                    else { Write-Warn2 "the installed ESP is not readable as FAT32 ($j)" }
+                }
+            } elseif ($Apply -and $script:EspSha) {
+                $info = [pscustomobject]@{ loader_conf = $false; loader_defaults = @(); preserved = @(); skipped = @(); gb_cfg = $false; gb_overlay = $false }
+                $vd = Invoke-GbDisk -Arguments @('voldev', '--disk', "$DiskNumber", '--id', $espM.guid) -Quiet -AllowFail
+                $L = [char[]]([int][char]'S'..[int][char]'Z') | Where-Object { -not (Test-Path "$($_):\") } | Select-Object -First 1
+                if ($global:GbLastExit -ne 0 -or -not $L) { Write-Warn2 'the installed ESP has no Windows volume or no free drive letter: files not copied out (the raw backup holds them)'; $info = $null }
+                else {
+                    Invoke-Native 'mountvol.exe' @("$($L):", [string]$vd[1]) | Out-Null
+                    try {
+                        $lc = "$($L):\loader\loader.conf"
+                        if (Test-Path -LiteralPath $lc) {
+                            $info.loader_conf = $true
+                            $info.loader_defaults = @(Get-Content -LiteralPath $lc | ForEach-Object { if ($_ -match '^default(?:[ \t]+(.*?))?[ \t\r]*$') { [string]$Matches[1] } })
+                        }
+                        $sums = New-Object System.Collections.ArrayList
+                        foreach ($rel in @('gblog', 'gbinstall', 'gb\overlay', 'gb\gb.cfg')) {
+                            $srcp = "$($L):\$rel"
+                            if (-not (Test-Path -LiteralPath $srcp)) { continue }
+                            if ($rel -eq 'gb\gb.cfg') { $info.gb_cfg = $true }
+                            if ($rel -eq 'gb\overlay') { $info.gb_overlay = $true }
+                            $items = if ((Get-Item -LiteralPath $srcp).PSIsContainer) { @(Get-ChildItem -LiteralPath $srcp -Recurse -File) } else { @(Get-Item -LiteralPath $srcp) }
+                            foreach ($it in $items) {
+                                $relp = $it.FullName.Substring(3)
+                                $dst = Join-Path $pres $relp
+                                New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+                                Copy-Item -LiteralPath $it.FullName -Destination $dst
+                                $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant()
+                                [void]$sums.Add("$h  $($relp -replace '\\', '/')")
+                                $info.preserved += [pscustomobject]@{ path = ($relp -replace '\\', '/'); size = $it.Length; sha256 = $h }
+                            }
+                        }
+                        if ($sums.Count) { $sums | Out-File -Encoding ascii (Join-Path $pres 'SHA256SUMS.txt') }
+                    } finally { Invoke-Native 'mountvol.exe' @("$($L):", '/D') | Out-Null }   # before gbdisk write locks the volume
+                }
+            } elseif (-not $ImageMode) {
+                Write-Info "would copy gblog\, gbinstall\, gb\gb.cfg and gb\overlay\ to $pres and check the loader.conf default (with -Apply)"
+            }
+            if ($info) {
+                $n = @($info.preserved).Count
+                if ($Apply) { Write-Ok "$n file(s) copied out to $pres (SHA256SUMS.txt)" } else { Write-Info "$n file(s) would be copied out: $(@($info.preserved | ForEach-Object { $_.path }) -join ', ')" }
+                if (@($info.skipped).Count) { Write-Warn2 ("names not copied (not plain file names): " + (@($info.skipped) -join ', ')) }
+                if ($info.gb_cfg -or $info.gb_overlay) { Write-Warn2 "the update removes the bring-up files gb\gb.cfg / gb\overlay\ from the ESP; the copies are in $pres (put them back from Windows if you still need them)" }
+                $defs = @($info.loader_defaults)
+                if ($info.loader_conf) {
+                    $bad = @($defs | Where-Object { $_ -ne "gb-$slot" })
+                    if ($defs.Count -eq 0 -or $bad.Count) {
+                        Write-Bad ("the installed loader.conf default is '{0}', not gb-{1}: the ESP is set to boot another entry - refusing (the raw backup and copies stay in the run folder)" -f ($defs -join "', '"), $slot)
+                        exit 2
+                    }
+                    Write-Ok "installed loader.conf default gb-$slot"
+                }
+            }
+
+            Write-Step 'Rewrite only EFI-SYSTEM (kernel/initrd update; userdata and system untouched)'
+            Invoke-Change 'write the new EFI-SYSTEM image and verify it' "gbdisk write --plan $planEsp --only EFI-SYSTEM --source-dir $ExportDir --apply" {
+                Invoke-GbDisk -Arguments (@('write', '--plan', $planEsp, '--only', 'EFI-SYSTEM', '--source-dir', $ExportDir, '--apply') + $target) | Out-Null
+            }
+            if ($Apply -and $script:EspSha) {
+                $rbPlan = Join-Path $state.run_dir "plan_esp_rollback_$stamp.json"
+                Write-Info 'Rollback (writes the saved ESP back; README_DUALBOOT.md):'
+                Write-Info "  gbdisk plan --manifest `"$rbMan`" --existing $($target -join ' ') --out `"$rbPlan`"$(if ($ImageMode) { ' --allow-truncated' })"
+                Write-Info "  gbdisk write --plan `"$rbPlan`" --only EFI-SYSTEM --source-dir `"$($state.run_dir)`" $($target -join ' ') --apply"
+            }
+        } finally {
+            if ($tmpPlan -and (Test-Path -LiteralPath $tmpPlan)) { Remove-Item -LiteralPath $tmpPlan -Force }
         }
         exit 0
     }

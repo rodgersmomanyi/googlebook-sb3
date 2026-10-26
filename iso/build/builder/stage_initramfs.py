@@ -23,8 +23,11 @@ PY_PRUNE = {"test", "idlelib", "tkinter", "turtledemo", "ensurepip", "lib2to3", 
             "curses", "dbm", "unittest", "asyncio", "multiprocessing", "concurrent", "wsgiref", "xmlrpc", "ctypes",
             "config-3.12-x86_64-linux-gnu", "site-packages", "dist-packages", "__pycache__"}
 PY_DYNLOAD_KEEP = {"_hashlib", "_json", "_contextvars", "_queue", "mmap", "termios", "resource"}
+# DESIGN 13.1 / 13.9: the NVIDIA stack and every dGPU helper (nouveau's own helpers drm_gpuvm, drm_exec, gpu_sched,
+# drm_ttm_helper, mxm_wmi; the NVIDIA-only i2c_nvidia_gpu and the nova drivers; snd_hda_intel, whose ID table also
+# binds the NVIDIA HDA function) never enter the installer
 MODULE_DENY = ["spi_intel*", "mtd*", "efi_test", "efi_pstore", "tpm*", "nouveau", "nvidia*", "drm_gpuvm", "drm_exec",
-               "gpu_sched"]
+               "gpu_sched", "drm_ttm_helper", "mxm_wmi", "i2c_nvidia_gpu", "nova_core", "nova_drm", "snd_hda_intel"]
 FONT_DIR = "/usr/share/consolefonts"
 FONT_32x16 = "Lat15-TerminusBold32x16.psf.gz"
 FONT_8x16 = "Lat15-Terminus16.psf.gz"
@@ -466,7 +469,7 @@ def main():
             die(f"{d} is not a real directory")
     summary = {"files": st.files, "bytes": st.bytes, "links": st.links, "busybox_applets": applets,
                "installer_files": ninst, "initramfs_list": lst, "python": py, "modules": mods, "font": font,
-               "warnings": warnings}
+               "warnings": warnings, "module_deny": MODULE_DENY}   # (Wave 2b) the list that ran, in the build log
     print("STAGE-JSON " + json.dumps(summary, sort_keys=True), flush=True)
 
 

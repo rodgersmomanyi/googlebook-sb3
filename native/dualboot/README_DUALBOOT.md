@@ -199,10 +199,49 @@ python -I -B build_internal.py --out C:\gb-export2 --reuse-guids C:\GB-backup\<t
 The GUIDs must stay the same, because the boot entry names the installed super. Without `--reuse-guids` the
 installer refuses.
 
+**Checks before anything is written (wave 3).** Each refusal exits with code 2 and changes nothing on the disk:
+1. **Active slot.** The installer decodes the installed `vbmeta_a`/`vbmeta_b` GPT attributes exactly like
+   gb_slotsync does on the device (priority bits 48-51, tries 52-55, successful 56; the highest priority among
+   successful slots or slots with tries left). It refuses when that slot is not the export's `manifest.slot`, when no
+   slot is bootable, and when both slots are bootable with the same priority (ambiguous). An ESP for the wrong slot
+   would point the default entry at an old system over a `/data` that the other slot has already upgraded.
+2. **Same build.** `gbdisk verify` (read-only) compares `boot_<s>`, `init_boot_<s>`, `vendor_boot_<s>` and
+   `vbmeta_<s>` on the disk with the export (sha256). The export's `initrd-<s>.img` is made from those images, so if
+   the slot was updated on the device since the export (an OTA a->b->a, or b refreshed again) the letters still match
+   but the content does not, and the update is refused. Remedy: boot Googlebook instead (gb_slotsync rebuilds the ESP
+   for slot changes), or rebuild the export from a source whose slot `<s>` holds that same build (`GB_SLOT=<s>` +
+   `build_internal.py --reuse-guids <installed manifest>`), then retry. `--reuse-guids` alone would rebuild the same
+   stale content.
+3. **Loader default.** When the installed ESP is readable, its `loader\loader.conf` default must be `gb-<s>`.
+
+**What is saved first.** With `-Apply` the whole installed EFI-SYSTEM is saved raw before the rewrite (the
+installer's run folder, `esp-before-<stamp>.img` + `.sha256`, 512 MiB, read back once; `gbdisk dump`, read-only).
+`gblog\`, `gbinstall\`, `gb\gb.cfg` and `gb\overlay\` are copied out as files into `gblog-preserved-<stamp>\`
+with a `SHA256SUMS.txt` (on a real disk through a temporary drive letter that is removed again before the write; with
+`-TargetImage` from the saved image, `tools\esp_extract.py`, `python -I`). The rewrite removes `gb\gb.cfg` and
+`gb\overlay\` (the opt-in bring-up files) from the ESP; the installer says so and names the folder with the copies.
+If the raw save fails, the update is refused; `-NoEspBackup` goes on without it (only for an ESP that cannot be read).
+Keep 1 GiB free on the backup drive per update.
+
+**Rollback** (the installer prints both lines; the run folder also holds `manifest_esp_rollback_<stamp>.json`, a copy
+of the export manifest whose EFI-SYSTEM entry names the saved image and its sha256):
+
+```powershell
+.\gbdisk.exe plan --manifest C:\GB-backup\<ts>\manifest_esp_rollback_<stamp>.json --existing --disk 0 --out C:\GB-backup\<ts>\plan_esp_rollback.json
+.\gbdisk.exe write --plan C:\GB-backup\<ts>\plan_esp_rollback.json --only EFI-SYSTEM --source-dir C:\GB-backup\<ts> --disk 0 --apply
+```
+
 Notes:
 * `super` is not rewritten by `-UpdateEspOnly`. A new system build means uninstall + install, or an OTA inside
   Googlebook.
 * gb_slotsync handles OTA slot switches on the ESP.
+* **Not offered on purpose:** replacing only `vmlinuz` and `gb\inject.gz` (and invalidating the slot stamp).
+  `initrd-<x>.img` embeds `inject.gz` (it is `[inject | vendor | generic | bootconfig]`), so the first boot would run
+  the new kernel with the old initrd's modules (vermagic and signature mismatch) before gb_slotsync could rebuild
+  anything. Only the whole verified ESP image is written.
+* A later ISO "update" or "harvest gblog" tool should reuse the same three checks and the raw save.
+* Idea credit: the gbOS86 update flow (`gbos86.com/docs/updating`; github.com/linuxkid473/gbos-x86 @f8a5c1a,
+  `install.sh`); no code was taken.
 
 ## Uninstall
 
@@ -258,7 +297,8 @@ Googlebook ESP in the formats these scripts use (`install_state.json` with `mode
   `.bak-<stamp>`).
 * If Windows gives the ESP no volume path, boot the installer, use tools `w` (it copies `\gbinstall\` to a USB
   stick), then `.\Import-GooglebookIsoInstall.ps1 -From <stick>:\gbsb3-logs\<...>\gbinstall -Apply`.
-* `install_dualboot.ps1 -UpdateEspOnly` rewrites the ESP and drops `\gbinstall\`: import first.
+* `install_dualboot.ps1 -UpdateEspOnly` rewrites the ESP and drops `\gbinstall\` (since wave 3 it keeps a copy in
+  its run folder, `gblog-preserved-<stamp>\gbinstall\`): import first.
 * `uninstall_dualboot.ps1` has two guards for ISO installs:
   * **Guard A** (step 4): when D: already has its original size (an ISO install never shrank it), nothing is extended;
     give the freed space back with Disk Management > Extend Volume.
@@ -367,6 +407,14 @@ The cycle runs these steps:
    refused, remove without state is refused, and growing D: into Googlebook is refused. The image must still be
    unchanged afterwards.
 6. `-UpdateEspOnly`.
+6b. (wave 3) `-UpdateEspOnly` refusals and the backup, using the test helpers `test\set_attrs.py` (GPT attributes +
+   CRCs) and `test\fat_add.py` (files into the image's ESP), both `python -I`, image files only. Each refusal must
+   exit 2 and leave the image byte-identical: slot a active for an export of slot b; both slots bootable with the
+   same priority; no slot bootable; one byte of `vendor_boot_<s>` changed; a loader.conf default of the other slot.
+   Then an ESP holding `gblog\`, `gbinstall\`, `gb\gb.cfg` and `gb\overlay\`: a dry run changes nothing; with
+   `-Apply` the raw backup equals the ESP before the update (sha256), the copies match the files that were put there,
+   the new ESP equals the export; the printed rollback restores the saved ESP; a normal update follows; and
+   `test\test_wanted_slot.ps1` runs the wanted_slot truth table shared with gb_slotsync's `test_gb_slotsync.sh`.
 7. Uninstall dry run (image unchanged), then `-Apply`. The GPT must be **byte-identical to before the install**.
 8. A plan that does not fit is refused.
 9. Re-install, then `gbdisk restore-gpt --tag pre_shrink`. The GPT must be byte-identical again.
@@ -379,6 +427,9 @@ The cycle runs these steps:
 * Real-disk dry runs: install/uninstall dry runs against disk 0 without elevation. The layout is unchanged
   afterwards and no backup folder was created. A `-ShrinkGB` larger than D:'s free space is refused; a smaller one
   that leaves userdata at least 8 GiB is accepted.
+
+**Wave 3 (2026-10-26):** small cycle with the 6b cases 57/57 (every refusal exit 2 for the intended reason, the
+image byte-identical after each), wanted_slot truth table 20/20 against the gb_slotsync table.
 
 **Safety review (2026-10-25):** small cycle 25/25, edge cases 56/56, BCD parser 19/19, real-disk dry runs
 read-only (layout byte-identical before/after, no backup folders created). Fixed in that review: the firmware

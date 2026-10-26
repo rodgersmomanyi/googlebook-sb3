@@ -12,8 +12,24 @@ during the watch (R-2); `reconcile_on()` re-starts gb_nouveau for a driverless d
 `dgpu_session` count of unclean endings while nouveau is bound, N21 (R-4); node modes always lowered, 0000 after a wedge
 (R-5); no compute start or hold in a load window (R-6); blocking faults set Intel mode (R-8); N08 for service-only
 refusals (R-9); `OP_UNMARK` content check and resume clears a pending detach (R-12); persistent-properties gate (R-15).
-Binary `bin\gb_power` `0d6a0b28...` (source `a8bf3f05...`); details and tests: `integration\gb-power.md` section 8.
+Binary of r2: `0d6a0b28...` (source `a8bf3f05...`); details and tests: `integration\gb-power.md` section 8.
 The pre-fix files are kept as `*.v1.2r1`.
+
+**v1.2 r3 (Wave 2b, INTERFACES section 30 E-1, 2026-10-26):** the ESP lock follows 5.4 r3: no lock while a steal is
+in progress (a live `/dev/gb_esp.lock.stale.<pid>`), the owner file of a new lock is created `O_EXCL` and an existing
+one is never removed (`esp_claim()`), a put-back after a steal never replaces an entry (`RENAME_NOREPLACE`, up to 10
+tries 20 ms apart; an ownerless moved directory is removed), and a release that finds its lock moved away by a steal in
+progress is retried from the status tick for up to 6 s. Tests: group GP-W2B-1 (14 checks; 1009 checks, 0 failures, also
+under ASan/UBSan). Binary `bin\gb_power` `acc23c89...` (source `49d0c40a...`, NDK build reproduced twice); the r2 binary
+and source are in `C:\GB-x86\archive\pre-w2b\GB-build\native\power\`.
+
+**v1.2 r4 (Wave 3, INTERFACES section 31 E-10/E-11, 2026-10-26):** ESP lock r4 (wave 2b review L1, L2, L4): no `mkdir`
+while a steal is in progress (`esp_lock_try()` checks "busy" first), a lock naming gb_power's own pid is stale
+(`esp_owner()`), the deferred release retries for 8 s (`ESP_REL_MS`, longer than a sleeping stealer's 5 s put-back
+budget), and `nouveau_window_open()` also reads the owner of a live stealer's `.stale.<pid>` directory, so a detach
+during a steal of gb_nouveau's lock is refused with N15. Tests: group GP-W3-1 (10 checks; 1019 checks, 0 failures, also
+under ASan/UBSan; socket 146/146; rc lint clean). Binary `bin\gb_power` `0ac03a00...` (source `e5a0055a...`); the r3
+binary is kept as `bin\gb_power.pre-w3` and the r3 source in `C:\GB-x86\archive\pre-w3\AUX\GB-build\native\power\`.
 
 `gb_power` is the Surface Book 3 power daemon for Googlebook OS native images (`gb.hw=native`). It is a static
 bionic binary started by init at `early-init` and runs as root in `u:r:shell:s0`. It implements plan Phase 3

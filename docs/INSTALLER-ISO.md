@@ -22,11 +22,16 @@ Every destructive step asks you to type a confirmation. The installer refuses di
 [The installer menu](#the-installer-menu)).
 
 **Status.** Tested in VMware only, never on the real Surface Book 3. Rufus and Ventoy themselves were never run;
-equivalent stick layouts were tested in VMware. The full test suite (`iso/test/run_all.py`) passed on the Wave 2 ISO
-(the build with the NVIDIA stack and kernel build #14). That ISO was then rebuilt after a review fix that changed one
-script in the native tree, which also meant a fresh dual-boot export with new GUIDs. For the rebuilt ISO, the static
-test, the raw-ISO boot tests and the whole-disk tests (T0, T7, T2e, T1a, T1b) passed. The dual-boot install and
-uninstall groups (G1-G4) still have to be re-run. Until they pass on the build you use, use option 1 only.
+equivalent stick layouts were tested in VMware. The last ISO built and tested is the wave 3 build (2026-10-26):
+kernel build #15, the native tree with the wave 3 fixes (the keyboard base's `8250.nr_uarts=4` among them, see
+[Boot entries](#boot-entries-and-the-nvidia-payload)) and a fresh dual-boot export with new GUIDs. The full test suite
+(`iso/test/run_all.py`, all 38 test ids: static, whole disk, dual boot install and uninstall, media and the Windows
+side) passed on it, so all four options were exercised in VMware. Run the suite again on every ISO you build before
+you use options 2 and 3 on a real disk.
+
+A dual-boot install made with an older ISO (built from another export, with other GUIDs) is removed with that older
+ISO or with `uninstall_dualboot.ps1 -Force`, not with a newer one. ISOs built before wave 3 also lack the
+`8250.nr_uarts=4` entry option: see [FLASHING.md](FLASHING.md#images-built-before-wave-3-no-keyboard-base).
 
 The full design (payload format, discovery, every refusal, the test plan and the review history) is
 [iso/DESIGN.md](../iso/DESIGN.md). The working README of the development setup is
@@ -228,6 +233,13 @@ The Googlebook ESP of options 1 and 2 has two systemd-boot entries for the syste
 `gb\dgpu-<kernel release>.erofs` and its `.sha256` (the NVIDIA firmware, modules and Vulkan driver, about 60 MB).
 Leave both files in place. The installer's own initramfs never loads nouveau or any NVIDIA module (a denylist that
 T0 checks).
+
+Both entries carry `8250.nr_uarts=4`. Our Googlebook kernel is built with `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, and
+without that token the serial UART that links the keyboard base (keyboard, touchpad, batteries, charger, detach) to
+the Surface Aggregator never registers. Credit: gbOS86 found this on the Surface Laptop 7
+([github.com/linuxkid473/gbos-x86](https://github.com/linuxkid473/gbos-x86), HANDOFF.md). The installer's Ubuntu
+kernel ships `RUNTIME_UARTS=32`, so it needs no token. The ISO build stops if that ever changes, and T0 checks it
+again.
 
 ## Recovery
 

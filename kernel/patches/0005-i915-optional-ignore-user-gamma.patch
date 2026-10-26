@@ -1,0 +1,71 @@
+Subject: [PATCH] drm/i915/display: optional gb_ignore_user_gamma (default off)
+
+Display parameter i915.gb_ignore_user_gamma, a bitmask (1 = gamma LUT, 2 = degamma LUT, 4 = CTM, default 0, mode
+0400): a set bit makes intel_crtc_copy_uapi_to_hw_state_nomodeset() use NULL (linear) instead of the user's blob, a
+fix for the grey "white veil" some i915 panels show while userspace programs a gamma LUT. 3 is the suggested value
+(CTM-based colour correction keeps working), 7 equals gbOS86 kernel #29. The value is fixed at module load; it is
+set through the ESP bring-up config (GB_MODOPTS_i915=gb_ignore_user_gamma=3 in gb\gb.cfg, boot entry with
+gb.overlay=1). Applicability to the Surface Book 3 panel is inferred; default off. Kernel build #15 (patch 0111 of
+kernel/patches/k15 has the same hunks).
+Cause and fix from github.com/linuxkid473/gbos-x86 @f8a5c1a HANDOFF.md:112-135; code is ours.
+
+Base: AOSP kernel/common android17-6.18-2026-06 at 3938c8d97142d5cf31543aa96f864a2cf832dda0 (kernel 6.18.21, ab/16302624;
+     the full pin is kernel/manifest_16302624.xml). Apply in common/ with: git apply <this file>
+License: GPL-2.0 (derived from Linux)
+---
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 3f40028e79cf..ea93b1b37735 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -4449,17 +4449,20 @@ static void
+ intel_crtc_copy_uapi_to_hw_state_nomodeset(struct intel_atomic_state *state,
+ 					   struct intel_crtc *crtc)
+ {
++	struct intel_display *display = to_intel_display(state);
+ 	struct intel_crtc_state *crtc_state =
+ 		intel_atomic_get_new_crtc_state(state, crtc);
++	/* GB: i915.gb_ignore_user_gamma (default 0): a set bit uses linear (NULL) */
++	int ig = display->params.gb_ignore_user_gamma;
+ 
+ 	WARN_ON(intel_crtc_is_joiner_secondary(crtc_state));
+ 
+ 	drm_property_replace_blob(&crtc_state->hw.degamma_lut,
+-				  crtc_state->uapi.degamma_lut);
++				  unlikely(ig & BIT(1)) ? NULL : crtc_state->uapi.degamma_lut);
+ 	drm_property_replace_blob(&crtc_state->hw.gamma_lut,
+-				  crtc_state->uapi.gamma_lut);
++				  unlikely(ig & BIT(0)) ? NULL : crtc_state->uapi.gamma_lut);
+ 	drm_property_replace_blob(&crtc_state->hw.ctm,
+-				  crtc_state->uapi.ctm);
++				  unlikely(ig & BIT(2)) ? NULL : crtc_state->uapi.ctm);
+ }
+ 
+ static void
+diff --git a/drivers/gpu/drm/i915/display/intel_display_params.c b/drivers/gpu/drm/i915/display/intel_display_params.c
+index 2aed110c5b09..50de165d792e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_params.c
++++ b/drivers/gpu/drm/i915/display/intel_display_params.c
+@@ -139,6 +139,11 @@ intel_display_param_named_unsafe(enable_dmc_wl, int, 0400,
+ 	"(-1=use per-chip default, 0=disabled, 1=enabled, 2=match any register, 3=always locked) "
+ 	"Default: -1");
+ 
++/* Googlebook (GB): "white veil" switch, default off. Cause and fix from
++ * github.com/linuxkid473/gbos-x86 @f8a5c1a HANDOFF.md:112-135; code is ours. */
++intel_display_param_named(gb_ignore_user_gamma, int, 0400,
++	"GB: bitmask 1=gamma 2=degamma 4=CTM -> linear (default 0)");
++
+ __maybe_unused
+ static void _param_print_bool(struct drm_printer *p, const char *driver_name,
+ 			      const char *name, bool val)
+diff --git a/drivers/gpu/drm/i915/display/intel_display_params.h b/drivers/gpu/drm/i915/display/intel_display_params.h
+index b01bc5700c52..083ec95c74bd 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_params.h
++++ b/drivers/gpu/drm/i915/display/intel_display_params.h
+@@ -50,6 +50,7 @@ struct drm_printer;
+ 	param(bool, psr_safest_params, false, 0400) \
+ 	param(bool, enable_psr2_sel_fetch, true, 0400) \
+ 	param(int, enable_dmc_wl, -1, 0400) \
++	param(int, gb_ignore_user_gamma, 0, 0400) \
+ 
+ #define MEMBER(T, member, ...) T member;
+ struct intel_display_params {

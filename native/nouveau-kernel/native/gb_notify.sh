@@ -2,12 +2,14 @@
 # gb_notify.sh -- delivers the dGPU notification queue (INTERFACES.md v1.2 section 12.1, D6). Service gb_notify,
 # user shell (the identity "adb shell cmd notification post" uses), started by init on any vendor.gb.notify change.
 #
-# Producers (gb_nouveau.sh, gb_dgpu_report.sh, gb_power) never run cmd/am themselves: they write
+# Producers (gb_nouveau.sh, gb_dgpu_report.sh, gb_power, and (wave 3) gb_slotsync) never run cmd/am themselves: they write
 # /data/vendor/gb/notify/<epoch_ms 13 digits>-<pid>-<n>.msg (as .tmp, then renamed) and set vendor.gb.notify.
 # Message: key=value lines; kind=notify (tag, title, text) | kind=broadcast | kind=force-stop (pkg, user) |
 # (v1.2) kind=settings (key + value, or key + src; INTERFACES 12.1, 24.6).
 # Every file is validated (fixed tag set, printable ASCII, length limits, package-name regex), delivered once,
 # and deleted after the attempt whatever the outcome. Failures are logged and dropped.
+# Tags: gb_dgpu, gb_dtx, gb_dgpu_test, (v1.2) gb_gfx, (wave 3, INTERFACES 12.1/12.2 N22-N23) gb_update: the
+# "System update held" notice of gb_slotsync's kernel check (an OTA whose kernel KMI differs from the running one).
 #
 # Settings (v1.2): exactly three Settings.Global keys can ever be written through the queue, each with its one
 # allowed form; anything else is logged and dropped:
@@ -155,7 +157,7 @@ handle() {                               # $1 = message file
   done < "$1"
   case $kind in
     notify)
-      case $tag in gb_dgpu | gb_dtx | gb_dgpu_test | gb_gfx) ;; *) logn "dropped ${1##*/}: bad tag"; return 0 ;; esac
+      case $tag in gb_dgpu | gb_dtx | gb_dgpu_test | gb_gfx | gb_update) ;; *) logn "dropped ${1##*/}: bad tag"; return 0 ;; esac
       printable "$title" 40 || { logn "dropped ${1##*/}: bad title"; return 0; }
       printable "$text" 200 || { logn "dropped ${1##*/}: bad text"; return 0; }
       timeout 20 cmd notification post -t "$title" "$tag" "$text" > /dev/null 2>&1 ||

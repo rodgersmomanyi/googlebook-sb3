@@ -12,7 +12,8 @@
 #                               automatic NVIDIA app-graphics self-test. nvk_probe -t ahb-i915-readback and
 #                               -t a17-swapchain-model inside the ESP lock, with the crash marker selftest/running;
 #                               verdict -> /data/vendor/gb/selftest/result (the record gb_power validates, 25.4),
-#                               full output -> report/selftest-<N>.txt. Never writes sysfs (the wakelock it
+#                               full output -> report/selftest-<N>.txt (wave 3: + the HWUI-on-Vulkan abort count,
+#                               section "== hwui_vulkan"). Never writes sysfs (the wakelock it
 #                               holds for the whole run, R-7, is /sys/power/wake_lock, not a dGPU attribute).
 # Note: "gb_power -o" (power samples) refreshes the test_power battery bridge exactly like the gb_power daemon does;
 # that is gb_power's own write, not one made by this script.
@@ -65,7 +66,7 @@ rd() {
 }
 
 lsdir() {                                # LS = basenames in directory $1, sorted (C locale); the only glob
-  LS=
+  LS=                                    # besides steal_busy's "$LOCK".stale.* (INTERFACES 5.4 r3)
   set +f
   for _ls_e in "$1"/*; do
     [ -e "$_ls_e" ] || [ -L "$_ls_e" ] || continue
@@ -218,7 +219,20 @@ notify() {                               # $1 title, $2 text, $3 tag (INTERFACES
   fi
 }
 
-steal_lock() {                           # INTERFACES 5.4 (same algorithm as gb_nouveau.sh steal_lock)
+steal_busy() {                           # INTERFACES 5.4 r3/r4 (same as gb_nouveau.sh steal_busy): 0 = a directory
+  # gb_esp.lock.stale.<pid> of a live pid other than ours exists (a steal is in progress)
+  _sb_r=1
+  set +f
+  for _sb_e in "$LOCK".stale.*; do
+    _sb_p=${_sb_e##*.}
+    case $_sb_p in '' | *[!0-9]*) continue ;; esac
+    [ "$_sb_p" != "$$" ] && [ -d "$_sb_e" ] && [ -d "$R/proc/$_sb_p" ] && { _sb_r=0; break; }
+  done
+  set -f
+  return $_sb_r
+}
+
+steal_lock() {                           # INTERFACES 5.4 r4 (same algorithm as gb_nouveau.sh steal_lock)
   _st=$LOCK.stale.$$
   rm -rf "$_st" 2>/dev/null
   mv -T "$LOCK" "$_st" 2>/dev/null || return 1
@@ -230,50 +244,92 @@ steal_lock() {                           # INTERFACES 5.4 (same algorithm as gb_
     rmdir "$_st" 2>/dev/null
     return 0
   fi
-  mv -T "$_st" "$LOCK" 2>/dev/null || log "ESP lock: the lock changed while stealing it and could not be put back"
+  _sl_n=0
+  while :; do
+    if [ ! -e "$LOCK" ] && mv -T "$_st" "$LOCK" 2>/dev/null; then
+      log "ESP lock: the lock changed while stealing it (owner '$(san "$_ol2" 60)'): put back"
+      return 1
+    fi
+    if [ ! -e "$_st/owner" ] && rmdir "$_st" 2>/dev/null; then
+      log "ESP lock: the lock changed while stealing it: the moved directory had no owner and another is in place: removed"
+      return 1
+    fi
+    [ $_sl_n -ge 100 ] && break          # r4 (wave 2b review L1): every 0.05 s for up to 5 s, not once per poll
+    sleep 0.05
+    _sl_n=$((_sl_n + 1))
+  done
+  log "ESP lock: the lock changed while stealing it and could not be put back (left as ${_st##*/})"
   return 1
 }
 
-lock_esp() {                             # INTERFACES 5.4 (same algorithm as gb_nouveau.sh)
+lock_esp() {                             # INTERFACES 5.4 r4 (same algorithm as gb_nouveau.sh)
   _w=0
   _miss=0
+  _lk_b=0
   while :; do
-    mkdir "$LOCK" 2>/dev/null && break
-    _ino=$(stat -c %i "$LOCK" 2>/dev/null)
-    _ol=
-    [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
-    _o=${_ol%% *}
-    _stale=0
-    if [ -n "$_ol" ]; then
-      _miss=0
-      case $_o in '' | *[!0-9]*) _stale=1 ;; *) [ -d "$R/proc/$_o" ] || _stale=1 ;; esac
+    if [ $_lk_b -lt 5 ] && steal_busy; then   # r4 (L1): a steal is in progress: no mkdir at all (our directory
+      _lk_b=$((_lk_b + 1))                    # would block its put-back); only consecutive back-off polls count
+      [ $_lk_b = 1 ] && log "ESP lock: a steal is in progress: backing off"
+    elif mkdir "$LOCK" 2>/dev/null; then
+      if [ $_lk_b -lt 5 ] && steal_busy; then
+        rmdir "$LOCK" 2>/dev/null        # a steal is in progress; rmdir only removes an empty directory (ours)
+        _lk_b=$((_lk_b + 1))
+        [ $_lk_b = 1 ] && log "ESP lock: a steal is in progress: backing off"
+      else
+        up_ms
+        OWNLINE="$$ gb_dgpu_report $UPS"
+        if (set -C; printf '%s\n' "$OWNLINE" > "$LOCK/owner") 2>/dev/null; then   # exclusive (noclobber)
+          LOCKED=1
+          return 0
+        fi
+        log "ESP lock: another lock took the place of ours before its owner was written: waiting"
+        OWNLINE=
+      fi
     else
-      _miss=$((_miss + 1))
-      [ $_miss -ge 5 ] && _stale=1
-    fi
-    if [ $_stale = 1 ] && [ -n "$_ino" ]; then
-      _miss=0
-      steal_lock "$_ol" "$_ino" && continue
+      _lk_b=0                            # r4 (L1): a poll that finds the lock held resets the back-off count
+      _ino=$(stat -c %i "$LOCK" 2>/dev/null)
+      _ol=
+      [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
+      _o=${_ol%% *}
+      _stale=0
+      if [ -n "$_ol" ]; then
+        _miss=0
+        # r4 (L2): our own pid while we hold nothing = a put-back that landed after a release of ours gave up
+        case $_o in '' | *[!0-9]*) _stale=1 ;; "$$") _stale=1 ;; *) [ -d "$R/proc/$_o" ] || _stale=1 ;; esac
+      else
+        _miss=$((_miss + 1))
+        [ $_miss -ge 5 ] && _stale=1
+      fi
+      if [ $_stale = 1 ] && [ -n "$_ino" ]; then
+        _miss=0
+        steal_lock "$_ol" "$_ino" && continue
+      fi
     fi
     [ $_w -ge "$1" ] && return 1
     sleep 1
     _w=$((_w + 1))
   done
-  up_ms
-  OWNLINE="$$ gb_dgpu_report $UPS"
-  printf '%s\n' "$OWNLINE" > "$LOCK/owner"
-  LOCKED=1
-  return 0
 }
 
-unlock_esp() {                           # only our own lock
+unlock_esp() {                           # only our own lock (r4: waits up to 7 polls while a steal is in progress)
   [ "$LOCKED" = 1 ] || return 0
-  _ol=
-  [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
-  if [ "$_ol" = "$OWNLINE" ]; then
-    rm -f "$LOCK/owner"
-    rmdir "$LOCK" 2>/dev/null
-  fi
+  _ul_n=0
+  while :; do
+    _ol=
+    [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
+    if [ "$_ol" = "$OWNLINE" ]; then
+      rm -f "$LOCK/owner"
+      rmdir "$LOCK" 2>/dev/null
+      break
+    fi
+    if [ $_ul_n -lt 7 ] && steal_busy; then
+      sleep 1
+      _ul_n=$((_ul_n + 1))
+      continue
+    fi
+    log "ESP lock: not ours any more at release (owner '$(san "$_ol" 60)'): left alone"
+    break
+  done
   LOCKED=0
 }
 
@@ -860,6 +916,14 @@ do_selftest() {
   st_record "$_vk" "$_vr" $((P_ATT + 1))
   st_unmark
   unlock_esp
+  # Wave 3 item 18 (WAVE3 contract 2.4): the HWUI-on-Vulkan abort signature, counted in a dump of every log buffer
+  # (logcat -d: dump and exit; a streaming logcat would never end). On our stack HWUI never gets NVK (INTERFACES
+  # 14.2), so a non-zero count means a shim bug or an ANV change: report it with the gblog folder. Diagnostic only:
+  # nothing here changes ro.hwui.use_vulkan/debug.hwui.renderer (INTERFACES 4 forbids it); the supported workaround is
+  # the Intel graphics mode. Signature from gbOS86 (github.com/linuxkid473/gbos-x86 @f8a5c1a, usb/hook.sh:489-492);
+  # code ours.
+  out "== hwui_vulkan (0 expected; non-zero: HWUI on a one-queue-per-family Vulkan device, report it)"
+  out "queueCount_abort=$(timeout 20 logcat -d -b all 2>/dev/null | grep -c -F 'queueFamilyProperties.queueCount < kRequestedQueueCount')"
   up_ms
   out "== end uptime_s=$UPS"
   sync

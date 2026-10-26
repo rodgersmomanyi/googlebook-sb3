@@ -7,7 +7,9 @@ project keeps that project's license:
 | Part | License | Notes |
 |---|---|---|
 | Our own code, scripts and docs: the workspace scripts (`*.py`, `*.ps1`, `*.sh` at the root), `vm/`, `host/`, `guest/`, `graphics/minigbm/`, `builder/`, `tools/`, `legacy/`, `docs/`, the `inject/` configs, and the native components' own scripts, daemons and docs (`native/*`, except the rows below) | Apache-2.0 | [LICENSE](LICENSE) |
-| Kernel patches and patch generators: `kernel/patches/` (including `kernel/patches/k14/`), `kernel/config/`, `kernel/scripts/patch_*.py`, `kernel/scripts/apply_vnni*.py`, `native/power/patches/`, `native/sensors/patches/` + `native/sensors/kernel/tools/`, `native/camera-kernel/kernel/`, `native/nouveau-kernel/kernel/` | GPL-2.0 | derived from Linux (AOSP kernel/common android17-6.18); [LICENSES/GPL-2.0.txt](LICENSES/GPL-2.0.txt) |
+| Kernel patches and patch generators: `kernel/patches/` (including `kernel/patches/k14/` and the `.patch` files of `kernel/patches/k15/`), `kernel/config/`, `kernel/scripts/patch_*.py`, `kernel/scripts/apply_vnni_patch.py`, `kernel/scripts/apply_vnni3.py`, `native/power/patches/`, `native/sensors/patches/` + `native/sensors/kernel/tools/`, `native/camera-kernel/kernel/`, `native/nouveau-kernel/kernel/` | GPL-2.0 | derived from Linux (AOSP kernel/common android17-6.18); [LICENSES/GPL-2.0.txt](LICENSES/GPL-2.0.txt) |
+| Kernel build #15 tools (wave 3): `kernel/scripts/apply_vnni4.py`, `kernel/scripts/kbuild15_native.sh`, `kernel/patches/k15/tools/`, and in `kernel/tools/` the KAT generators and scripts (`gen_*.py`, `build_vnni_kat.sh`, `kat0_run.sh`) | Apache-2.0 (ours) | as marked in each file. The kernel code the generators emit (`arch/x86/kernel/gb_vnni_core.h`, the traps.c and i915 changes) is our own and is published as GPL-2.0 in the patches (`kernel/patches/0002`, `0005`, `k15/0110`, `0111`) |
+| `kernel/tools/vnni_kat.c`, `kernel/tools/test_gb_vnni_core.c`, `kernel/tools/k14_merge_ref.h` | GPL-2.0 | ours, as marked in each file: the AVX-VNNI known-answer test and the host test of the emulator core (they build against the GPL-2.0 `gb_vnni_core.h`). Sources only; the test binary is never shipped |
 | `kernel/patches/k14/0001`-`0037` | GPL-2.0 | linux-6.18.y stable backports of nouveau commits, unmodified `git format-patch` output (0022: one-line backport fix) with the upstream authorship and `Signed-off-by` lines as received; `0101`-`0103` (N1-N3) are ours. The k14 tools and `kernel/scripts/kbuild14_native.sh` are ours (Apache-2.0) |
 | `native/camera-kernel/kernel/` IPU6/IPU7 import and the two ov8865 patches by their upstream author | GPL-2.0 | upstream authorship and `Signed-off-by` lines are kept as received |
 | linux-surface IPTS driver (`drivers/hid/ipts`, **not included**; fetched from linux-surface `patches/6.18/0005-ipts.patch`) | GPL-2.0 | see `kernel/patches/0004-*` |
@@ -30,6 +32,8 @@ project keeps that project's license:
 | `inject/fstab.android-desktop`, `inject/se_manifest.xml` | Apache-2.0 | edited versions of the AOSP-format lapis fstab and system_ext VINTF manifest |
 | `native/hw-gap-audit/tree/etc/excluded-input-devices.xml` | Apache-2.0 | our overlay of the AOSP-format input exclusion list; keeps lapis's one entry ("Power Button") |
 | `inject/odm_sepolicy.cil` | Apache-2.0 | generated: one `typepermissive` statement per SELinux type name in lapis's policy |
+| `kernel/patches/0005-i915-optional-ignore-user-gamma.patch` (wave 3) | GPL-2.0 | ours, derived from Linux (i915 display code) |
+| Wave 3 tools and changes: `native/nouveau-kernel/tools/fw_coverage.py`, the DRAS (`audio_default.xml`, `audio_config.xml`) and touchpad IDC edits, the ESP bring-up parser (`build_esp.py` `/gbbringup.sh`), the gb_slotsync kernel check, the `-UpdateEspOnly` checks (`native/dualboot/`, `gbdisk dump`, `tools/esp_extract.py`, the test helpers) | Apache-2.0 | ours. Ideas from gbOS86 (gbos-x86 @f8a5c1a) are credited in each file; **no gbos-x86 code is included anywhere** (gbos-x86 has no top-level licence, so its unlicensed files are not usable here) |
 
 ## What is deliberately not here
 
@@ -38,7 +42,9 @@ project keeps that project's license:
   copies of them (patched minigbm: we ship the patcher instead).
 * Android emulator / AOSP binaries (the software KeyMint graft), SwiftShader/Mesa/NVK/iptsd/tinyalsa/llama.cpp build
   outputs, our kernel and module builds, the GbGpu and GbGfxDriver APKs, the dGPU payload, the installer ISO and its
-  payload.
+  payload, the built `gb_slotsync` binary and the test-only `vnni_kat` known-answer test binary.
+* Code from gbOS86 (gbos-x86): none. Its findings and ideas are credited in the README and in each file that uses
+  them; gbos-x86 has no top-level licence, so none of its files is copied here.
 * Firmware (Intel graphics, Wi-Fi, Bluetooth, SOF audio, the proprietary IPU4P camera firmware, Realtek USB
   Ethernet, the NVIDIA TU117 firmware), ACPI table dumps and Windows driver INF files.
 * Keys and personal data: the ADB key used for scrcpy, the builder's SSH key, the signing keys of the sensors

@@ -30,9 +30,34 @@ Here nothing does: systemd-boot just starts its default entry, and our initrd em
    `build_esp.slot_stamp()`) skips the rebuild when nothing changed.
 5. Writes `loader/entries/gb-<x>.conf` from the booted slot's entry (same kernel and options, new initrd and title)
    and, on native ESPs, `gb-<x>-nvtest.conf` from the booted slot's `[NVIDIA test]` entry, then sets
-   `default gb-<x>` in `loader/loader.conf`. The old slot's entries stay in the menu as a fallback.
+   `default gb-<x>` in `loader/loader.conf`. The old slot's entries stay in the menu as a fallback while they still
+   match that slot. A rebuild first removes the slot's older entries and stamp, so an interrupted rebuild leaves no
+   entry that would boot the slot's new system with its old ramdisk. On later boots (no update pending) the other
+   slot's entries are checked once per boot and whenever its GPT bootable state changes: they are removed while an
+   update is being written into that slot (it is marked unbootable) or when its initrd no longer matches its
+   `init_boot`/`vendor_boot` (the stamp). The next update into that slot writes them again.
 6. Otherwise it keeps the default on the slot that actually booted, so after a failed new slot (you pick the old one
    in the menu) the default falls back.
+
+### Kernel check before the switch
+
+(Wave 3.) Before step 5 moves the default, gb_slotsync reads the kernel version of the new slot's `boot_<x>` (boot
+header v4, the bzImage setup header's `kernel_version` string, from the first 64 KiB) and compares its KMI generation
+`<maj>.<min>-android<N>-<gen>` (for example `6.18-android17-5`) with the running kernel's (`uname -r`). lapis's vendor
+modules for a build are made for the GKI in that build's `boot_<x>`, while this ESP keeps booting our kernel:
+
+* **Same KMI** (also when the GKI sublevel or build number changed, as long as the KMI is the same): switch as
+  above. The comparison is logged once.
+* **Different KMI, or a version that cannot be read:** **HOLD.** The new slot's initrd and its `(slot X)` entries are
+  still written, so it is in the boot menu and can be picked once by hand, but `loader.conf` keeps the old default.
+  kmsg gets one line per (slot, release), `gb_slotsync: HOLD slot <x>: KMI <new> != running <ours>; default stays
+  gb-<cur>`, again once on each later boot while the hold is in effect (so the `gblog\` summary shows it), and the
+  notification **"System update held"** ("Kernel mismatch: ...") appears (natively, through `gb_notify`) once the
+  new slot's initrd and entries are on the ESP, so "(slot X) is in the boot menu" is true when you read it. If the new slot is booted by hand and comes up, it becomes the default as usual. A matching kernel
+  rebuild is the real fix.
+
+Lead decision D-a of wave 3; the idea of checking the kernel interface before trusting a new slot comes from gbOS86's
+porting notes (github.com/linuxkid473/gbos-x86 @f8a5c1a, porting.md); the code is ours.
 
 Then reboot as Android asks. The new slot boots with **our kernel** and the new slot's ramdisks, vendor modules and
 system; Android marks it successful (`gb_bootok` -> `bootctl mark-boot-successful`, helped by the `crossystem` stub).
@@ -54,9 +79,12 @@ complete and no firmware is touched.
 ## Caveats
 
 * **Kernel compatibility**: we keep booting our kernel. As long as Google stays on the same GKI branch/KMI
-  (android17-6.18), the new vendor_boot/vendor_dlkm modules load into it. A build that moves to another kernel
-  branch would need a matching kernel rebuild before rebooting into it. Watch dmesg for module load failures after an
+  (android17-6.18), the new vendor_boot/vendor_dlkm modules load into it. A build that moves to another KMI is held
+  by the kernel check above until a matching kernel rebuild exists. Watch dmesg for module load failures after an
   update.
+* **fs-verity**: Android itself enables ext4 verity on `/data` at the first boot, natively and in the VM (the VM's
+  `/data` already has it). The native fstab also names `fsverity` (wave 3), which adds nothing on top
+  ([INPUTS.md](INPUTS.md#userdata-fs-verity)).
 * Natively, native modules we ship that are copies of lapis vendor modules (the HDA codecs) must match the booted
   build; `gb_audio.sh` swaps in the vendor_dlkm copies when they do not.
 * The ESP needs room for two initrds: 192 MiB in the VM, 512 MiB on USB/internal images.

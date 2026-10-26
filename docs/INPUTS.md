@@ -19,7 +19,8 @@ build, VM builds included: to build without a component (for example a VM-only w
 
 | Workspace path | What | Notes |
 |---|---|---|
-| `lapis.bin` | Googlebook (ASUS, "lapis") recovery image `android-desktop_signed_recovery_image.bin`, 19,069,493,760 bytes, build **CL3B.260622.271.R1** (ab/16452207); zip entry CRC-32 `52bcf144` | Google's software. Not distributed here or anywhere by this project. Rename it to `lapis.bin`, then `grow_esp.py` and `grow_userdata.py` once ([VMWARE.md](VMWARE.md)). Later builds come by OTA. |
+| `lapis.bin` | Googlebook (ASUS, "lapis") recovery image `android-desktop_signed_recovery_image.bin`, 19,069,493,760 bytes, build **CL3B.260622.271.R1** (ab/16452207); zip entry CRC-32 `52bcf144`. The recovery **zip** we used: 7,728,873,477 bytes, sha256 `5bc64936c11d9eb268da03063a443b8fd0bbc0f84d266f9a014231653939f247` (re-hashed 2026-10-26; the same value gbos-x86 recorded at git `03a6a46`, `lapis/recovery.zip.sha256`). | Google's software. Not distributed here or anywhere by this project. Rename it to `lapis.bin`, then `grow_esp.py` and `grow_userdata.py` once ([VMWARE.md](VMWARE.md)). Later builds come by OTA. |
+| (reference) the next build | CL3B.260622.276.R4 (ab/16658739) recovery zip, sha256 `97980097708f472962ba267d3801211eadbe9e3a8fa61408846ed23b3147b9e7` | **Third-party value, not checked by us:** from gbos-x86 @f8a5c1a `lapis/recovery.zip.sha256`. Our VM reached .276 by OTA, not from this zip. |
 | `boot/generic_ramdisk.lz4`, `boot/vendor_ramdisk.lz4`, `boot/vendor_bootconfig.txt` | slot A ramdisks | optional fallback only: normally read from lapis.bin (`extract_slot.py`) |
 
 ## Built by you from this repository
@@ -76,10 +77,52 @@ Staged uncompressed under `inject/native/firmware/` (-> `/odm/firmware`). From
 | `intel/ipu/ipu4p_fw.bin` | IPU4P camera ISP. **Intel's proprietary firmware, not in linux-firmware and not distributable here.** Take it from the laptop's own Windows camera driver: `cpd_component_signed.bin` in `C:\Windows\System32\DriverStore\FileRepository\iacamera64.inf_amd64_*\`, copied under the new name. Check it with `python -I native\camera-kernel\tools\cpd_check.py <file>`. Without it the cameras do not appear; nothing else depends on it |
 | `nvidia/tu117/...` (30 files) | NVIDIA GTX 1650 Max-Q. They go into the dGPU payload, not into `/odm/firmware`: see [NVIDIA dGPU](#nvidia-dgpu-native-only) |
 
+**Where the staged firmware comes from (pinned, wave 3).** `native/nouveau-kernel/tools/fw_coverage.py` (read-only, run
+on the builder) compares what our native modules and lapis's vendor_dlkm modules request (`modinfo -F firmware`)
+with what is staged, resolves linux-firmware's links, and checks each staged file against the extracted package it
+came from. Result on 2026-10-26: 71 staged files byte-identical to their package copy (36 of them requested by
+`modinfo`, 35 named at run time), none differing; 8 have no package copy here (`rtl_nic/*`, the IPU4P file):
+
+| Files | Source (Ubuntu archive packages, noble) |
+|---|---|
+| `i915/icl_*` | `linux-firmware-intel-graphics` `20240318.git3b128b60-0ubuntu3.1` (deb sha256 `ee235578...`) |
+| `iwlwifi-Qu*-hr-b0-77.ucode`, `intel/ibt-19-*` | `linux-firmware-intel-wireless` `20240318.git3b128b60-0ubuntu3.1` (deb sha256 `01ee15ac...`) |
+| `intel/sof/*`, `intel/sof-tplg/*` | `firmware-sof-signed` `2023.12.1-1ubuntu1.11` (deb sha256 `9cc84a9e...`); `sof-icl.ri` is a copy of `intel-signed/sof-icl.ri` |
+| `nvidia/tu117/*` | byte-identical to `linux-firmware-nvidia-graphics` `20240318.git3b128b60-0ubuntu3.1` as well; pinned by its own table (tag 20260916, below) |
+| `rtl_nic/*` | not in those packages; pinned by sha256 only (`rtl_nic.sha256`) |
+| `intel/ipu/ipu4p_fw.bin` | Intel's, from your Windows driver (above) |
+
+The full table (requested name, real linux-firmware path, package, sha256, status) is the tool's output. Notes from
+it: i915 asks for exactly the three staged ICL files; iwlwifi's AX201 names are the three staged `-77` files; the
+legacy Bluetooth names are built at run time (`intel/ibt-<hw_variant>-<hw_rev>-<fw_rev>`, decimal: `19` = hw_variant
+0x13, the AX201 family) and are staged under their names although linux-firmware links them (every `.ddc` is
+`ibt-0040-0041.ddc`). If the controller boots in TLV mode instead, it asks for `intel/ibt-<cnvi>-<cnvr>.sfi` (gbOS86
+saw `ibt-0040-1050.sfi`, which linux-firmware links to `ibt-0040-0041.sfi`); none of those is staged, so a first-boot
+`Direct firmware load for intel/ibt-...` line names the file to add. Idea credit: gbOS86
+(github.com/linuxkid473/gbos-x86 @f8a5c1a, tools/fetch_firmware.sh:72-80, HANDOFF.md:211-213); no code taken.
+
 The Realtek USB Ethernet / SurfaceDock PHY firmware goes to `native/hw-gap-audit/tree/firmware/rtl_nic/` instead
 (the `hw.json` manifest copies it to `/odm/firmware/rtl_nic/`): `rtl8153a-2/-3/-4.fw`, `rtl8153b-2.fw`,
 `rtl8153c-1.fw`, `rtl8156a-2.fw`, `rtl8156b-2.fw` from linux-firmware's `rtl_nic/`, checked with
 `sha256sum -c ../rtl_nic.sha256` inside that folder.
+
+## Userdata fs-verity
+
+Play uses fs-verity for some app updates (gbos-x86 issue #17). On this build Android turns the ext4 `verity` feature
+of `/data` on **by itself**: fs_mgr runs `tune2fs -O verity` once, before the mount, on a `/data` whose superblock
+lacks it, and logs `Enabling ext4 verity on /dev/block/by-name/userdata` (likewise for a freshly formatted
+`/metadata`). It does this whether or not the fstab names `fsverity`: the wave 2 native boots and the wave 3 VM-tree
+test boots, whose fstab has no `fsverity`, log the same lines. (INFERRED mechanism: AOSP forces the flag on `/data`
+for devices whose `ro.product.first_api_level` is 30 or more; this build reports 37.) The feature is permanent;
+`tune2fs` cannot remove it.
+
+Natively the userdata line of the fstab also carries `fsverity` (wave 3; `build_esp.py` derives the native copy, the
+shared `inject/fstab.android-desktop` is unchanged). This only makes the request explicit; it adds nothing to what
+Android does anyway. A failure only logs (`FS_STAT_ENABLE_VERITY_FAILED`).
+
+**The VM already has it.** Wave 3 did not change the VM. Its `/data` superblock had `RO_COMPAT_VERITY` set before
+wave 3 (read-only check of the VM disk: ro_compat `0x807b`), so adding `fsverity` to the VM fstab would change nothing
+on that `/data`. Any change to the VM still waits for your approval, but this flag is not a reason to wait.
 
 ## NVIDIA dGPU (native only)
 
@@ -111,6 +154,8 @@ builder.
 | Output | Built by | Pins |
 |---|---|---|
 | kernel build #14 (`/build/dist14`) | [kernel/scripts/kbuild14_native.sh](../kernel/scripts/kbuild14_native.sh) + [kernel/patches/k14/](../kernel/patches/k14/), staged with `stage_kernel.py k14 --dist /build/dist14` | the 40 patches in `SHA256SUMS`, `BUILD_NUMBER=16302714` |
+| kernel build #15 (`/build/dist15`, current) | [kernel/scripts/kbuild15_native.sh](../kernel/scripts/kbuild15_native.sh) on top of the k14 tree + [kernel/patches/k15/](../kernel/patches/k15/), staged with `stage_kernel.py k15 --dist /build/dist15` ([kernel/K15.md](../kernel/K15.md)) | the 2 patches in `k15/SHA256SUMS`, `BUILD_NUMBER=16302715`, release `6.18.21-android17-5-g3c2c2f588d3f-ab16302715` |
+| the AVX-VNNI known-answer test `vnni_kat` (test-only, never in a shipped image) | [kernel/tools/build_vnni_kat.sh](../kernel/tools/build_vnni_kat.sh) from `kernel/tools/vnni_kat.c` | dropped into `inject\kat\` for `build_usb.py --vm-test --vm-test-kat` only |
 | `native/nvk-android/bin/vulkan.nouveau.so`, `nvk_probe` and `libgb_nvk.so` | `native/nvk-android/scripts/` (`PATCHSET=8a bash scripts/20_build_nvk_android.sh`, `30_build_probe.sh`) | Mesa `mesa-26.3.0-rc2`, patches 0001 0002 0004 0005 0006, NDK r27c, `-Dplatform-sdk-version=37` |
 | `native/gfx-driver-pkg/out/GbGfxDriver.apk` | `native/gfx-driver-pkg/scripts/build_shim.sh`, then `apk/build_apk.sh` | build-tools 36.0.0, `platforms/android-36/android.jar`; signed with your own key `~/keys/gbgfxdriver.p12` on the builder (generated on first use; never commit it) |
 | `native/gpu-ui/out/GbGpu.apk` | `native/gpu-ui/build_on_builder.sh` | SDK platform 36, build-tools 36.1.0, JDK 17; your own key `~/keys/gbgpu.p12` (generated on first use; never commit it) |

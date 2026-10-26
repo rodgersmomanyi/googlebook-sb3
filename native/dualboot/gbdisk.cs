@@ -930,6 +930,7 @@ namespace GbDualBoot
                     case "resize-image": return CmdResizeImage();
                     case "voldev": return CmdVolDev();
                     case "restore-gpt": return CmdRestoreGpt();
+                    case "dump": return CmdDump();
                     default: Usage(); return 1;
                 }
             }
@@ -952,7 +953,9 @@ namespace GbDualBoot
                                                              delete the Googlebook partitions after the anchor (D:)
   resize-image --number N --length B [--apply]               image only: stands in for Resize-Partition
   voldev       --id GUID                                     disk only: \Device\HarddiskVolumeN of a partition
-  restore-gpt  --from DIR --tag T [--apply]                  write a 'backup' GPT copy back");
+  restore-gpt  --from DIR --tag T [--apply]                  write a 'backup' GPT copy back
+  dump         --id GUID --out FILE                          read-only: a Googlebook partition raw into a new file
+                                                             (sha256 printed, the file read back once)");
         }
 
         static IDisk OpenTarget(Access acc)
@@ -1519,6 +1522,53 @@ namespace GbDualBoot
                         return 0;
                     }
             throw new GbError("no volume for partition " + id + " yet (Windows creates it a few seconds after the layout change)", 3);
+        }
+
+        // ---------------------------------------------------------------- dump (wave 3, item 7)
+        // Read-only copy of one Googlebook partition (install_dualboot.ps1 -UpdateEspOnly saves the installed EFI-SYSTEM
+        // before it rewrites it: the rollback image). The disk is opened GENERIC_READ (Access.Read, like verify); only
+        // FILE is written, which must not exist yet. The partition is found by GUID and must carry a Googlebook name.
+        static int CmdDump()
+        {
+            Guid id = new Guid(Need("id"));
+            string outp = Need("out");
+            if (File.Exists(outp) || Directory.Exists(outp)) throw new GbError(outp + " already exists - refusing to overwrite it", 1);
+            using (IDisk d = OpenTarget(Access.Read))
+            {
+                Part p = d.GetLayout().ById(id);
+                if (p == null) throw new GbError("no partition " + id + " on " + d.Describe);
+                if (Array.IndexOf(K.GbNames, p.Name) < 0 || K.WindowsTypes.Contains(p.Type))
+                    throw new GbError("refusing: partition " + id + " '" + p.Name + "' is not a Googlebook partition");
+                var buf = new byte[K.Chunk];
+                string sha1, sha2;
+                using (var fo = new FileStream(outp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16))
+                using (var sha = new SHA256Cng())
+                {
+                    for (long o = 0; o < p.Length; o += K.Chunk)
+                    {
+                        int n = (int)Math.Min(K.Chunk, p.Length - o);
+                        d.Read(p.Offset + o, buf, n);
+                        sha.TransformBlock(buf, 0, n, null, 0);
+                        fo.Write(buf, 0, n);
+                    }
+                    sha.TransformFinalBlock(new byte[0], 0, 0);
+                    sha1 = U.Hexs(sha.Hash);
+                    fo.Flush(true);
+                }
+                using (var fi = new FileStream(outp, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan))
+                using (var sha = new SHA256Cng())
+                {
+                    if (fi.Length != p.Length) throw new GbError(outp + ": " + fi.Length + " bytes written, partition has " + p.Length);
+                    int r;
+                    while ((r = fi.Read(buf, 0, buf.Length)) > 0) sha.TransformBlock(buf, 0, r, null, 0);
+                    sha.TransformFinalBlock(new byte[0], 0, 0);
+                    sha2 = U.Hexs(sha.Hash);
+                }
+                if (sha1 != sha2) throw new GbError(outp + ": read-back sha256 " + sha2 + " != " + sha1);
+                Console.WriteLine("dump: #{0} '{1}' {2} bytes from {3} -> {4}", p.Number, p.Name, p.Length, d.Describe, outp);
+                Console.WriteLine("sha256 " + sha1);
+            }
+            return 0;
         }
 
         // ---------------------------------------------------------------- restore-gpt

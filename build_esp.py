@@ -48,6 +48,22 @@ def slot_ramdisks(slot):
 GENERIC, VENDOR, VBC = slot_ramdisks(SLOT)
 BUSYBOX = open(os.path.join(HERE, "inject", "busybox"), "rb").read()
 FSTAB   = open(os.path.join(HERE, "inject", "fstab.android-desktop"), "rb").read()
+def _with_fsverity(fstab):
+    """Native-only fstab (WAVE3_PLAN item 4, [W3R-06]): `fsverity` appended to the fs_mgr flags of the one userdata
+    line. The VM tree keeps FSTAB byte-identical: in the user's VM fs_mgr would run `tune2fs -O verity` on the existing
+    /data at its next mount, a permanent superblock change that needs the user's decision. Natively the flag takes
+    effect once, at the next boot, on the existing /data (a tune2fs failure only logs). Idea: gbOS86 issue #17
+    (github.com/linuxkid473/gbos-x86); code ours."""
+    out, n = [], 0
+    for ln in fstab.split(b"\n"):
+        f = ln.split()
+        if len(f) == 5 and f[0] == b"/dev/block/by-name/userdata" and f[1] == b"/data" and \
+                b"fsverity" not in f[4].split(b","):
+            ln = ln.rstrip() + b",fsverity"; n += 1
+        out.append(ln)
+    assert n == 1, "userdata line not found exactly once"
+    return b"\n".join(out)
+FSTAB_NATIVE = _with_fsverity(FSTAB)
 ODMCIL  = open(os.path.join(HERE, "inject", "odm_sepolicy.cil"), "rb").read()
 ODMPRE  = open(os.path.join(HERE, "inject", "precompiled_sepolicy"), "rb").read()
 SEMAN   = open(os.path.join(HERE, "inject", "se_manifest.xml"), "rb").read()
@@ -216,8 +232,9 @@ GBINIT = (b"#!/busybox sh\n"
           b"/busybox mkdir -p /proc /sys /odm\n"
           b"/busybox mount -t proc proc /proc\n"
           b"/busybox mount -t sysfs sysfs /sys\n"
-          b"HW=; USB=0\n"
-          b"for a in $(/busybox cat /proc/cmdline); do case \"$a\" in gb.hw=*) HW=${a#gb.hw=};; gb.boot=usb) USB=1;; esac; done\n"
+          # HWTOK: the explicit token gb.hw=native (never the DMI fallback); OV: gb.overlay=1 (the ESP bring-up, below)
+          b"HW=; USB=0; HWTOK=0; OV=0\n"
+          b"for a in $(/busybox cat /proc/cmdline); do case \"$a\" in gb.hw=*) HW=${a#gb.hw=}; HWTOK=0; [ \"$HW\" = native ] && HWTOK=1;; gb.boot=usb) USB=1;; gb.overlay=1) OV=1;; esac; done\n"
           b"if [ -z \"$HW\" ]; then\n"
           b"  case \"$(/busybox cat /sys/class/dmi/id/sys_vendor 2>/dev/null)\" in *VMware*) HW=vm;; *) HW=native;; esac\n"
           b"fi\n"
@@ -248,6 +265,16 @@ GBINIT = (b"#!/busybox sh\n"
           # VINTF is already undeclared (gb.rc early-init), so LockSettings skips it (enroll fails fast, no
           # lock password) and nothing waits on it. (gbos-x86 hook.sh empties this same .rc unconditionally.)
           b"/busybox mknod /odm/vup/etc/init/android.hardware.gatekeeper-service.trusty.rc c 0 0\n"
+          # ESP bring-up config (WAVE3_PLAN item 12, contract 2.3): off unless this boot's command line carries both
+          # gb.hw=native and gb.overlay=1 (never in a shipped entry). /gbbringup.sh exists only in the native cpio and
+          # may only apply a whitelisted gb\gb.cfg + overlay from this boot's ESP to the /odm tmpfs. Whatever it does
+          # (an error, a hang: timeout 40), this script goes on to exec /init. No cmdline module-option forwarding
+          # (lead decision D-d: i915.gb_ignore_user_gamma is set only through gb.cfg GB_MODOPTS_i915).
+          b"if [ \"$HW\" = native ] && [ \"$HWTOK\" = 1 ] && [ \"$OV\" = 1 ] && [ -f /gbbringup.sh ]; then\n"
+          b"  /busybox timeout 40 /busybox sh /gbbringup.sh >> /odm/gbinit_bringup.log 2>&1\n"
+          b"  echo \"bringup rc=$?\" >> /odm/gbinit_bringup.log\n"
+          b"  for m in /gbbu/esp /gbbu/sys /gbbu/proc; do /busybox umount -l $m 2>/dev/null; done\n"
+          b"fi\n"
           # Native: load our modules (signed GKI replacements for lapis system_dlkm, Surface Aggregator stack, i915,
           # sensors, IPTS ...) right here, before Android init and ueventd. Otherwise lapis's vendor_dlkm copies of
           # video/wmi/drm helpers autoload first by modalias and i915 cannot link against them (other symbol CRCs),
@@ -260,6 +287,258 @@ GBINIT = (b"#!/busybox sh\n"
           b"  done < /odm/lib/modules/modules.load\n"
           b"fi\n"
           b"exec /init\n")
+# /gbbringup.sh (native cpio only; WAVE3_PLAN item 12, contract 2.3, [W3R-01/02/03/17]). Run by GBINIT as above; its
+# output is /odm/gbinit_bringup.log, which gb_bootlog's summary shows. Busybox ash only, every command through /busybox
+# (there is no PATH at rdinit). The test harness (tests\w3a\bringup) replaces only the line before #@@config-end.
+GB_BRINGUP_SH = rb"""#!/busybox sh
+# gbbringup (native, rdinit): apply ESP:\gb\gb.cfg (first line exactly "# gb.cfg v1") and ESP:\gb\overlay\ to the
+# /odm tmpfs before Android starts. GBINIT runs this only for the explicit tokens gb.hw=native and gb.overlay=1, under
+# "timeout 40", and goes on to exec /init whatever happens here (a failure only leaves log lines).
+# Trust: Secure Boot is off for this project, so whoever can write this boot's ESP already controls vmlinuz and the
+# initrd; this adds nothing beyond that. It reads only THIS boot's ESP (the one disk whose GPT holds the partition GUID
+# of androidboot.boot_part_uuid; its partition PARTNAME=EFI-SYSTEM), mounted ro,nosuid,nodev,noexec; it executes
+# nothing from it. It may write only: module options and commented-out lines in the tmpfs modules.load (GB_MODOPTS_<m>,
+# GB_SKIPMOD), property lines appended to /odm/etc/build.prop (GB_PROP_<n>, a deny list), and input/audio
+# configuration files (overlay whitelist), each created 0644 by root. Never rc files, SELinux policy, VINTF,
+# libraries, firmware, modules or binaries. A format error anywhere in gb.cfg or the overlay = nothing is applied.
+# Single process at rdinit, read-only mount: the one exception to INTERFACES 5.4 (no ESP lock user exists yet).
+# Design idea: gbOS86 (gbos86.com/docs/how-it-works, github.com/linuxkid473/gbos-x86 @f8a5c1a); code ours, Apache-2.0.
+B=/busybox; R=
+#@@config-end
+set -f
+umask 022
+G=$R/gbbu; S=$G/sys; ESP=$G/esp; PLAN=$G/plan; ODM=$R/odm; ML=$ODM/lib/modules/modules.load; BP=$ODM/etc/build.prop
+CR=$(printf '\r')
+log() { echo "gbbringup: $*"; }
+fin() {
+  $B umount $ESP 2>/dev/null; $B umount $S 2>/dev/null; $B umount $G/proc 2>/dev/null
+  $B rm -rf $G/dev $PLAN
+}
+out() { fin; log "$*"; exit 0; }
+rev2() { v=$1; o=; while [ -n "$v" ]; do o=$o${v#"${v%??}"}; v=${v%??}; done; printf '%s' "$o"; }
+le() { x=$(rev2 "$1"); echo $((0x${x:-0})); }
+okn() { case $1 in ''|.|..|*[!A-Za-z0-9_.-]*) return 1;; esac; }
+
+$B mkdir -p $G/proc $S $G/dev $ESP $PLAN || { log "cannot create $G"; exit 1; }
+$B mount -t proc proc $G/proc || out "cannot mount proc: skipped"
+$B mount -t sysfs sysfs $S || out "cannot mount sysfs: skipped"
+U=
+for a in $($B cat $G/proc/cmdline); do case $a in androidboot.boot_part_uuid=*) U=${a#androidboot.boot_part_uuid=};; esac; done
+[ -n "$U" ] || out "no androidboot.boot_part_uuid on the command line (a --boot-devices install): skipped"
+u=$(printf '%s' "$U" | $B tr 'A-F' 'a-f')
+case $u in ????????-????-????-????-????????????) ;; *) out "androidboot.boot_part_uuid is not a GUID: skipped";; esac
+case $u in *[!0-9a-f-]*) out "androidboot.boot_part_uuid is not a GUID: skipped";; esac
+g1=${u%%-*}; r=${u#*-}; g2=${r%%-*}; r=${r#*-}; g3=${r%%-*}; r=${r#*-}; g45=${r%%-*}${r#*-}
+W=$(rev2 $g1)$(rev2 $g2)$(rev2 $g3)$g45
+
+# ---- the boot disk: the one whole disk whose GPT holds the GUID W (bytes_le hex), private nodes under $G/dev
+gpt_count() {   # $1 node, $2 disk name: how often W is a partition GUID in its primary GPT (0 = none or no GPT)
+  lbs=$($B cat $S/class/block/$2/queue/logical_block_size 2>/dev/null)
+  case $lbs in 512|4096) ;; *) lbs=512;; esac
+  h=$($B dd if=$1 bs=$lbs skip=1 count=1 2>/dev/null | $B od -A n -t x1 -v | $B tr -d ' \n')
+  case $h in 4546492050415254*) ;; *) echo 0; return;; esac
+  case $h in *[!0-9a-f]*) echo 0; return;; esac
+  [ ${#h} -ge 176 ] || { echo 0; return; }
+  lba=$(le ${h:144:16}); cnt=$(le ${h:160:8}); esz=$(le ${h:168:8})
+  if [ $lba -lt 2 ] || [ $cnt -lt 1 ] || [ $cnt -gt 256 ] || [ $esz -lt 128 ] || [ $esz -gt 1024 ] || \
+     [ $((esz % 8)) != 0 ]; then echo 0; return; fi
+  nb=$(((cnt * esz + lbs - 1) / lbs))
+  $B dd if=$1 bs=$lbs skip=$lba count=$nb 2>/dev/null | $B hexdump -v -e "$esz/1 \"%02x\" \"\n\"" | $B head -n $cnt |
+    $B cut -c33-64 | $B grep -c -x "$W"
+}
+scan() {        # DISK = the matching disk, NHIT = matches over all disks (1 = found)
+  DISK=; NHIT=0
+  for k in $($B ls $S/class/block 2>/dev/null); do
+    case $k in ''|*[!a-z0-9]*|loop*|ram*|zram*) continue;; esac
+    [ -e $S/class/block/$k/partition ] && continue
+    d=$($B cat $S/class/block/$k/dev 2>/dev/null)
+    case $d in ''|*[!0-9:]*|:*|*:|*:*:*) continue;; esac
+    [ -e $G/dev/$k ] || $B mknod -m 0600 $G/dev/$k b ${d%%:*} ${d#*:} 2>/dev/null || continue
+    c=$(gpt_count $G/dev/$k $k)
+    case $c in ''|*[!0-9]*) c=0;; esac
+    [ $c -gt 0 ] && { NHIT=$((NHIT + c)); DISK=$k; }
+  done
+}
+i=0
+while :; do
+  scan
+  [ $NHIT -ge 1 ] && break
+  [ $i -ge 20 ] && break
+  $B sleep 0.5; i=$((i + 1))
+done
+[ $NHIT = 1 ] || out "the boot partition GUID was found $NHIT times (one disk needed): skipped"
+P=; NP=0
+for p in $($B ls $S/class/block/$DISK 2>/dev/null); do
+  case $p in "$DISK"*) ;; *) continue;; esac
+  case $p in *[!a-z0-9]*) continue;; esac
+  [ -e $S/class/block/$DISK/$p/partition ] || continue
+  $B grep -q -x 'PARTNAME=EFI-SYSTEM' $S/class/block/$DISK/$p/uevent 2>/dev/null || continue
+  NP=$((NP + 1)); P=$p
+done
+[ $NP = 1 ] || out "boot disk $DISK has $NP EFI-SYSTEM partitions (one needed): skipped"
+d=$($B cat $S/class/block/$DISK/$P/dev 2>/dev/null)
+case $d in ''|*[!0-9:]*|:*|*:|*:*:*) out "no device number for $P: skipped";; esac
+$B mknod -m 0600 $G/dev/esp b ${d%%:*} ${d#*:} || out "cannot create the $P node: skipped"
+$B mount -t vfat -o ro,nosuid,nodev,noexec,uid=0,gid=0,fmask=0133,dmask=0022 $G/dev/esp $ESP ||
+  out "cannot mount $DISK/$P read-only: skipped"
+log "boot disk $DISK, ESP $P mounted read-only"
+
+# ---- phase 1: check everything, record the plan; a format error = fatal (nothing is applied)
+fatal=
+$B sed -n 's/^\([^#[:space:]][^[:space:]]*\)\.ko\([[:space:]].*\)\{0,1\}$/\1/p' $ML 2>/dev/null | $B tr - _ > $PLAN/mods
+inload() { $B grep -q -x "$1" $PLAN/mods; }
+modopts() {   # $1 GB_MODOPTS_<m>, $2 the options
+  m=${1#GB_MODOPTS_}
+  case $m in ''|*[!a-z0-9_]*) fatal="line $n: $1: module names are [a-z0-9_]"; return 1;; esac
+  [ ${#2} -le 200 ] || { fatal="line $n: $1: options longer than 200 characters"; return 1; }
+  c=0; o=
+  for t in $2; do
+    tn=${t%%=*}; tv=${t#*=}
+    case $t in *=*) ;; *) fatal="line $n: $1: '$t' is not name=value"; return 1;; esac
+    case $tn in ''|*[!a-z0-9_]*) fatal="line $n: $1: bad option name"; return 1;; esac
+    case $tv in ''|*[!A-Za-z0-9_.,:-]*) fatal="line $n: $1: bad option value"; return 1;; esac
+    if [ "$m" = i915 ] && [ "$tn" = gb_ignore_user_gamma ]; then
+      case $tv in [0-7]) ;; *) fatal="line $n: $1: gb_ignore_user_gamma must be 0-7"; return 1;; esac
+    fi
+    c=$((c + 1)); o="$o $t"
+  done
+  [ $c -ge 1 ] && [ $c -le 8 ] || { fatal="line $n: $1: 1 to 8 options needed"; return 1; }
+  if inload "$m"; then printf '%s\n' "${o# }" > $PLAN/opt.$m; log "line $n: $1 accepted"
+  else log "line $n: $1 ignored: $m is not in modules.load"; fi
+  return 0
+}
+skipmod() {   # $1 comma list of modules.load names
+  case $1 in ''|*[!a-z0-9_.,-]*) fatal="line $n: GB_SKIPMOD: names are [a-z0-9_-], comma separated"; return 1;; esac
+  oi=$IFS; IFS=,; set -- $1; IFS=$oi
+  for x in "$@"; do
+    x=${x%.ko}; x=$(printf '%s' "$x" | $B tr - _)
+    case $x in ''|*[!a-z0-9_]*) fatal="line $n: GB_SKIPMOD: bad name"; return 1;; esac
+    if inload "$x"; then : > $PLAN/skip.$x; log "line $n: GB_SKIPMOD $x accepted"
+    else log "line $n: GB_SKIPMOD $x ignored: not in modules.load"; fi
+  done
+  return 0
+}
+prop() {      # $1 GB_PROP_<n>, $2 <prop>=<value>
+  ix=${1#GB_PROP_}
+  case $2 in *=*) ;; *) fatal="line $n: $1 is not <prop>=<value>"; return 1;; esac
+  p=${2%%=*}; pv=${2#*=}
+  case $p in ''|*[!a-z0-9_.]*) fatal="line $n: $1: property names are [a-z0-9_.]"; return 1;; esac
+  case $pv in *[!A-Za-z0-9_.,:/+=-]*) fatal="line $n: $1: bad value characters"; return 1;; esac
+  [ ${#pv} -le 91 ] || { fatal="line $n: $1: value longer than 91 characters"; return 1; }
+  case $ix in [1-9]|1[0-6]) ;; *) log "line $n: $1 refused: the index must be 1-16"; return 0;; esac
+  case $p in ro.?*|persist.?*|vendor.?*|debug.?*) ;; *) log "line $n: $1 refused: $p (ro. persist. vendor. debug. only)"; return 0;; esac
+  case $p in
+    ro.hardware.vulkan*|ro.hardware.egl*|ro.hwui.use_vulkan*|debug.hwui.renderer*|ro.vendor.gb.gfx_default*|\
+    persist.vendor.gb.gfx_mode*|persist.vendor.gb.nouveau*|ro.gfx.*|ro.vendor.gb.*|persist.vendor.gb.*|\
+    ro.debuggable*|ro.secure*|ro.adb.*|persist.adb.*|service.adb.*|ro.boot.*|ro.build.*|ro.product.*|ro.crypto.*|\
+    persist.sys.usb.*|sys.usb.*|ro.zygote*|ro.control_privapp_permissions*)
+      log "line $n: $1 refused: $p is a denied property"; return 0;;
+  esac
+  printf '%s\n' "$p=$pv" > $PLAN/prop.$ix; log "line $n: $1 accepted ($p)"
+  return 0
+}
+C=$ESP/gb/gb.cfg
+if [ -e $C ]; then
+  if [ -L $C ] || [ ! -f $C ]; then fatal="gb.cfg is not a regular file"
+  else
+    sz=$($B wc -c < $C); bad=$($B tr -d '\n\r -~' < $C | $B wc -c)
+    case $sz$bad in ''|*[!0-9]*) fatal="cannot read gb.cfg";; esac
+    [ -z "$fatal" ] && [ $sz -gt 4096 ] && fatal="gb.cfg is larger than 4 KiB"
+    [ -z "$fatal" ] && [ $bad != 0 ] && fatal="gb.cfg has $bad byte(s) that are not printable ASCII"
+  fi
+  if [ -z "$fatal" ]; then
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      n=$((n + 1)); line=${line%"$CR"}
+      [ $n -gt 64 ] && { fatal="gb.cfg has more than 64 lines"; break; }
+      case $line in *"$CR"*) fatal="line $n: a CR inside the line"; break;; esac
+      if [ $n = 1 ]; then [ "$line" = "# gb.cfg v1" ] || { fatal="line 1 is not '# gb.cfg v1'"; break; }; continue; fi
+      case $line in ''|'#'*) continue;; esac
+      case $line in *=*) ;; *) fatal="line $n is not KEY=VALUE"; break;; esac
+      k=${line%%=*}; v=${line#*=}
+      case $k in ''|*[!A-Za-z0-9_]*) fatal="line $n: keys are [A-Za-z0-9_]"; break;; esac
+      [ -e $PLAN/key.$k ] && { fatal="line $n: $k given twice"; break; }
+      : > $PLAN/key.$k
+      case $k in
+        GB_MODOPTS_*) modopts "$k" "$v" || break;;
+        GB_SKIPMOD) skipmod "$v" || break;;
+        GB_PROP_*) prop "$k" "$v" || break;;
+        *) log "line $n: unknown key $k ignored";;
+      esac
+    done < $C
+    [ -z "$fatal" ] && [ $n = 0 ] && fatal="gb.cfg is empty"
+  fi
+else
+  log "no gb\\gb.cfg"
+fi
+O=$ESP/gb/overlay
+: > $PLAN/overlay
+if [ -z "$fatal" ] && [ -e $O ]; then
+  if [ -L $O ] || [ ! -d $O ]; then fatal="gb\\overlay is not a directory"
+  else
+    $B find $O > $PLAN/olist 2>/dev/null || fatal="cannot list gb\\overlay"
+    nf=0; tot=0
+    while [ -z "$fatal" ] && IFS= read -r f; do
+      [ "$f" = "$O" ] && continue
+      rel=${f#"$O"/}
+      if [ -L "$f" ]; then log "overlay: refused $rel (a symlink)"; continue; fi
+      [ -d "$f" ] && continue
+      if [ ! -f "$f" ]; then log "overlay: refused $rel (not a regular file)"; continue; fi
+      nf=$((nf + 1))
+      [ $nf -gt 64 ] && { fatal="gb\\overlay has more than 64 files"; break; }
+      ok=0
+      case $rel in
+        vup/etc/data/hal_configs/audio_default.xml) ok=1;;
+        usr/idc/?*.idc) okn "${rel#usr/idc/}" && ok=1;;
+        usr/keylayout/?*.kl) okn "${rel#usr/keylayout/}" && ok=1;;
+        usr/keychars/?*.kcm) okn "${rel#usr/keychars/}" && ok=1;;
+        vup/etc/audio/?*/?*.xml) x=${rel#vup/etc/audio/}; okn "${x%%/*}" && okn "${x#*/}" && ok=1;;
+      esac
+      case ${rel##*/} in .idc|.kl|.kcm|.xml) ok=0;; esac
+      [ $ok = 1 ] || { log "overlay: refused $rel (not an allowed destination)"; continue; }
+      s=$($B wc -c < "$f"); case $s in ''|*[!0-9]*) log "overlay: refused $rel (unreadable)"; continue;; esac
+      [ $s -le 262144 ] || { log "overlay: refused $rel (larger than 256 KiB)"; continue; }
+      tot=$((tot + s)); [ $tot -le 4194304 ] || { fatal="gb\\overlay holds more than 4 MiB"; break; }
+      printf '%s\n' "$rel" >> $PLAN/overlay
+    done < $PLAN/olist
+  fi
+fi
+[ -z "$fatal" ] || out "refused, nothing applied: $fatal"
+
+# ---- phase 2: apply the plan
+na=0
+if [ -n "$($B ls $PLAN | $B grep -E '^(opt|skip)\.')" ]; then
+  : > $ML.new
+  while IFS= read -r line || [ -n "$line" ]; do
+    set -- $line
+    case ${1:-} in ''|'#'*) printf '%s\n' "$line" >> $ML.new; continue;; esac
+    b=${1%.ko}; b=$(printf '%s' "$b" | $B tr - _)
+    if [ -e $PLAN/skip.$b ]; then printf '#%s\n' "$line" >> $ML.new; log "modules.load: $1 commented out"; na=$((na + 1)); continue; fi
+    if [ -e $PLAN/opt.$b ]; then
+      IFS= read -r x < $PLAN/opt.$b; line="$line $x"; log "modules.load: $1 gets options $x"; na=$((na + 1))
+    fi
+    printf '%s\n' "$line" >> $ML.new
+  done < $ML
+  $B cat $ML.new > $ML && $B rm -f $ML.new || log "modules.load: rewrite FAILED"
+fi
+for ix in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  [ -f $PLAN/prop.$ix ] || continue
+  [ -s $BP ] && [ "$($B tail -c 1 $BP | $B od -A n -t x1 | $B tr -d ' \n')" != 0a ] && echo >> $BP
+  $B cat $PLAN/prop.$ix >> $BP && { log "build.prop: appended GB_PROP_$ix"; na=$((na + 1)); }
+done
+while IFS= read -r rel; do
+  dst=$ODM/$rel; dd=${dst%/*}; q=$dd; sl=0
+  while [ "$q" != "$ODM" ] && [ -n "$q" ]; do [ -L "$q" ] && sl=1; q=${q%/*}; done
+  if [ $sl = 1 ] || [ -L "$dst" ]; then log "overlay: refused $rel (a symlink on the destination path)"; continue; fi
+  if [ -e "$dst" ] && [ ! -f "$dst" ]; then log "overlay: refused $rel (the destination is not a regular file)"; continue; fi
+  if $B mkdir -p "$dd" && $B cat "$O/$rel" > "$dst" && $B chmod 0644 "$dst"; then
+    log "overlay: applied $rel"; na=$((na + 1))
+  else log "overlay: FAILED $rel"; fi
+done < $PLAN/overlay
+out "done: $na change(s) applied"
+"""
+assert b"\r" not in GB_BRINGUP_SH and GB_BRINGUP_SH.isascii()
+assert GB_BRINGUP_SH.count(b"\nB=/busybox; R=\n#@@config-end\n") == 1, "bring-up config block (test harness hook)"
 # Graphics crash capture (staged to /odm/gfxlog.sh, run by the gb_tomb service). STREAMS logcat in
 # follow mode (not -d polling, which missed the fast SF SIGABRT), filtered to fatal-level + the SF/Skia/
 # Vulkan/DEBUG tags. A *:F fatal line is emitted by the crashing process's OWN handler inline, so it
@@ -961,14 +1240,19 @@ GB_MODULES_SH = (b"#!/system/bin/sh\n"
 
 # Native boot log: there is no serial console on real hardware, so kernel + Android logs are written to the boot
 # partition (FAT32), readable from Windows: <boot partition>\gblog\boot<N>-t<T>.txt (T = 40, 90, 180, 420, 900 s).
-# Each snapshot is collected in /dev first; the ESP is taken with the INTERFACES 5.4 lock and mounted rw,flush only for
-# the copy; the newest 8 boots are kept and nothing is written below 128 MiB free. The dgpu section is read-only
+# Each snapshot is collected in /dev first; the ESP is taken with the INTERFACES 5.4 (r3) lock and mounted rw,flush
+# only for the copy (after 600 s it goes on without the lock only if the holder is another log writer, else it skips
+# that snapshot); the newest 8 boots are kept and nothing is written below 128 MiB free or when the free space cannot
+# be read (fail closed). (Wave 3) Each snapshot starts with a "== summary" triage block (item 8). The dgpu section is read-only
 # (cached sysfs attributes, node metadata, gb_power hello/status/get-mode). The text between #@@functions-begin and
 # #@@functions-end is sourced by the test harness (tests\w2a), with the GB_BOOTLOG_* overrides init never sets.
 GB_BOOTLOG_SH = rb"""#!/system/bin/sh
 # gb_bootlog (native): kernel + Android logs to <boot partition>\gblog\boot<N>-t<T>.txt at T = 40, 90, 180, 420, 900 s.
-# Each snapshot is collected in /dev first; the ESP is locked (INTERFACES 5.4) and mounted rw,flush only for the copy.
-# Retention: the newest 8 boots of boot*/audio-b* files; nothing is written while the ESP has less than 128 MiB free.
+# Each snapshot is collected in /dev first; the ESP is locked (INTERFACES 5.4 r3) and mounted rw,flush only for the
+# copy. Lock held over 600 s: proceed without it only if the holder is gb_slotsync, gb_audiodiag or gb_bootlog; any
+# other holder (a dGPU window: gb_nouveau, gb_power, gb_dgpu_report) skips that snapshot.
+# Retention: the newest 8 boots of boot*/audio-b* files; nothing is written while the ESP has less than 128 MiB free
+# or when df gives no number (fail closed).
 # The dgpu section reads cached sysfs attributes and node metadata only (PLAN invariant 12) and sends only the
 # read-only socket commands hello, status and get-mode. GB_BOOTLOG_* overrides exist for the test harness only.
 P=EFI-SYSTEM
@@ -978,30 +1262,71 @@ D=/dev/block/by-name/$P; M=${GB_BOOTLOG_MNT:-/mnt/gb_esp}; L=${GB_BOOTLOG_LOCK:-
 T=${GB_BOOTLOG_TMP:-/dev/gb_bootlog.txt}; G=/data/vendor/gb; N=; OWN=; KEEP=8; FLOOR_KB=131072
 mkdir -p "$M"
 #@@functions-begin
-steal() {   # $1 = owner line seen, $2 = inode seen (gb_nouveau.sh steal_lock)
+busy() {    # 0 = a steal is in progress: a $L.stale.<pid> directory of another live pid (INTERFACES 5.4 r3)
+  for s in "$L".stale.*; do
+    p=${s##*.}; case $p in ''|*[!0-9]*) continue;; esac
+    [ "$p" != $$ ] && [ -d "$s" ] && [ -d "/proc/$p" ] && return 0
+  done
+  return 1
+}
+steal() {   # $1 = owner line seen, $2 = inode seen (gb_nouveau.sh steal_lock, INTERFACES 5.4 r3)
   s=$L.stale.$$; rm -rf "$s" 2>/dev/null
   mv -T "$L" "$s" 2>/dev/null || return 1
   o2=; [ -r "$s/owner" ] && IFS= read -r o2 < "$s/owner"
   if [ "$(stat -c %i "$s" 2>/dev/null)" = "$2" ] && [ "$o2" = "$1" ]; then rm -f "$s/owner"; rmdir "$s" 2>/dev/null; return 0; fi
-  mv -T "$s" "$L" 2>/dev/null || echo "gb_bootlog: ESP lock changed while stealing it, left as ${s##*/}" > /dev/kmsg
+  n=0           # not the stale lock: put it back, never over an entry in the way; one without an owner goes.
+  # (wave 3, wave 2b review L1) retried every 0.05 s for up to 5 s, not once per poll: newcomers no longer mkdir
+  # while our .stale.<pid> exists, and a releaser waits 7 polls (unlock), longer than this budget
+  while :; do
+    if [ ! -e "$L" ] && mv -T "$s" "$L" 2>/dev/null; then return 1; fi
+    if [ ! -e "$s/owner" ] && rmdir "$s" 2>/dev/null; then return 1; fi
+    [ $n -ge 100 ] && break
+    sleep 0.05; n=$((n+1))
+  done
+  echo "gb_bootlog: ESP lock changed while stealing it, left as ${s##*/}" > /dev/kmsg
   return 1
 }
-lock() {    # 1 s polls; stale = dead or non-numeric owner, or 5 polls without an owner file; after 600 s: no lock
-  w=0; miss=0; OWN=
-  while ! mkdir "$L" 2>/dev/null; do
-    i=$(stat -c %i "$L" 2>/dev/null); ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"; o=${ol%% *}; st=0
-    if [ -n "$ol" ]; then miss=0; case $o in ''|*[!0-9]*) st=1;; *) [ -d "/proc/$o" ] || st=1;; esac
-    else miss=$((miss+1)); [ $miss -ge 5 ] && st=1; fi
-    if [ $st = 1 ] && [ -n "$i" ]; then miss=0; steal "$ol" "$i" && continue; fi
-    if [ $w -ge 600 ]; then echo "gb_bootlog: ESP lock held over 600 s ($ol), proceeding without it" > /dev/kmsg; return 0; fi
+lock() {    # 1 s polls; stale = dead or non-numeric owner, our own pid (a lock we do not hold), or 5 polls without an
+  w=0; miss=0; bo=0; OWN=   # owner file; after 600 s: see below
+  while :; do
+    ol=         # (wave 3, wave 2b review L3) the 600 s rule below judges only a holder read in this poll
+    if [ $bo -lt 5 ] && busy; then
+      bo=$((bo+1))   # (wave 3, L1) a steal is in progress: no mkdir at all (our directory would block its put-back)
+    elif mkdir "$L" 2>/dev/null; then
+      if [ $bo -lt 5 ] && busy; then
+        rmdir "$L" 2>/dev/null; bo=$((bo+1))   # a steal started meanwhile: back off (rmdir only removes our empty one)
+      else
+        OWN="$$ gb_bootlog $(cut -d. -f1 /proc/uptime)"
+        if (set -C; echo "$OWN" > "$L/owner") 2>/dev/null; then return 0; fi   # exclusive: never another's owner
+        OWN=
+      fi
+    else
+      bo=0      # (wave 3, L1) only consecutive back-off polls count: a poll that finds the lock held resets them
+      i=$(stat -c %i "$L" 2>/dev/null); [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"; o=${ol%% *}; st=0
+      # (wave 3, L2) our own pid while we hold nothing: a put-back that landed after our release gave up
+      if [ -n "$ol" ]; then miss=0; case $o in ''|*[!0-9]*) st=1;; "$$") st=1;; *) [ -d "/proc/$o" ] || st=1;; esac
+      else miss=$((miss+1)); [ $miss -ge 5 ] && st=1; fi
+      if [ $st = 1 ] && [ -n "$i" ]; then miss=0; steal "$ol" "$i" && continue; fi
+    fi
+    if [ $w -ge 600 ]; then  # another log writer: proceed without the lock; a dGPU window or an unknown holder: skip
+      n=${ol#* }; n=${n%% *}
+      case $n in gb_slotsync|gb_audiodiag|gb_bootlog)
+        echo "gb_bootlog: ESP lock held over 600 s ($ol), proceeding without it" > /dev/kmsg; return 0;;
+      esac
+      echo "gb_bootlog: ESP lock held over 600 s ($ol), not a log writer: t=$t not written" > /dev/kmsg; return 1
+    fi
     sleep 1; w=$((w+1))
   done
-  OWN="$$ gb_bootlog $(cut -d. -f1 /proc/uptime)"; echo "$OWN" > "$L/owner"
 }
-unlock() {  # only our own lock (a lock stolen from us belongs to someone else now)
-  [ -n "$OWN" ] || return 0
-  ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"
-  [ "$ol" = "$OWN" ] && { rm -f "$L/owner"; rmdir "$L" 2>/dev/null; }
+unlock() {  # only our own lock (a lock stolen from us belongs to someone else now); waits while a steal is in progress
+  [ -n "$OWN" ] || return 0   # (wave 3, wave 2b review L2: 7 polls, longer than a stealer's 5 s put-back budget)
+  n=0
+  while :; do
+    ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"
+    if [ "$ol" = "$OWN" ]; then rm -f "$L/owner"; rmdir "$L" 2>/dev/null; break; fi
+    if [ $n -ge 7 ] || ! busy; then echo "gb_bootlog: ESP lock not ours at release ($ol), left alone" > /dev/kmsg; break; fi
+    sleep 1; n=$((n+1))
+  done
   OWN=
 }
 prune() {   # once per boot, right after N is known
@@ -1013,7 +1338,58 @@ prune() {   # once per boot, right after N is known
   done
 }
 rdf() { v=-; [ -r "$1" ] && v=$(head -c 600 "$1"); echo "$v"; }
+# (wave 3, item 8) one-screen triage, tied to the DEVICE-STATUS checklist. Read-only and bounded: dmesg and logcat -d
+# (dump and exit, never a streaming logcat: [W3R-14]) once each into /dev, then fixed greps. It prints no serial
+# numbers, SSIDs or account names (input device names only for the Surface Aggregator bus 0019, no Uniq/Phys lines,
+# only the two apgetty properties of getprop). Section list idea: gbOS86 hwdetect.sh (names only); code ours.
+# GB_BOOTLOG_ROOT: test harness only (a fake /proc, /sys, /odm).
+summary() {
+  r=${GB_BOOTLOG_ROOT:-}
+  echo '== summary (triage; the full logs follow)'
+  dmesg > "$T.dm" 2>/dev/null; timeout 20 logcat -d -b all > "$T.lc" 2>/dev/null     # (dmesg never blocks)
+  # item 1: 8250 / Surface Aggregator (base keyboard/touchpad, batteries, charger, detach)
+  echo "serial 8250: $(grep -m1 -F 'Serial: 8250/16550 driver' "$T.dm" || echo 'no 8250 banner')"
+  echo "serial errors: dw-apb-uart -22: $(grep -c -E 'dw-apb-uart.*-22' "$T.dm"), failed to setup IRQ: $(grep -c -F 'failed to setup IRQ' "$T.dm")"
+  b=; for x in "$r"/sys/bus/serial/drivers/surface_serial_hub/*; do
+    case ${x##*/} in module|'*') continue;; esac; [ -L "$x" ] && b="$b ${x##*/}"
+  done
+  echo "serial surface_serial_hub bound:${b:- none}"
+  echo '-- /proc/tty/driver/serial'; timeout 5 cat "$r/proc/tty/driver/serial" 2>&1 | head -n 40
+  echo '-- serial bus devices'; ls -l "$r/sys/bus/serial/devices" 2>&1; ls "$r/sys/bus/serdev/devices" 2>/dev/null
+  echo "inputs (Surface Aggregator HID, bus 0019): $(awk '/^I:/ { b = ($2 == "Bus=0019") } /^N:/ && b { sub(/^N: Name=/, ""); printf "%s; ", $0 }' "$r/proc/bus/input/devices" 2>/dev/null)"
+  # item 2: the DRAS card id
+  echo "audio cards: $(grep -F ']: ' "$r/proc/asound/cards" 2>/dev/null | tr -s ' ' | tr '\n' ';')"
+  echo "audio DRAS: logcat lines naming sofhdadsp: $(grep -c -F sofhdadsp "$T.lc")"
+  grep -i -E 'dras|soundcard' "$T.lc" | grep -F -e sofhdadsp -e sof-hda-dsp | tail -n 3
+  # firmware
+  echo '-- firmware load failures (dmesg)'; grep -i -E 'Direct firmware load.*failed|Failed to load' "$T.dm" | tail -n 12
+  echo "firmware i915 DMC: $(grep -m1 -i -E 'i915.*DMC' "$T.dm" || echo 'no DMC line')"
+  echo "swaps: $(tail -n +2 "$r/proc/swaps" 2>/dev/null | tr -s ' ' | tr '\n' ';')"
+  n=0; l=
+  for d in "$r"/sys/bus/pci/devices/*; do
+    [ -e "$d/vendor" ] || continue; [ -e "$d/driver" ] && continue
+    n=$((n+1)); l="$l ${d##*/}=$(cat "$d/vendor"):$(cat "$d/device")"
+  done
+  echo "pci functions without a driver: $n$l"
+  # item 3: the #UD AVX-VNNI emulator counter (the k15 sysfs node, WAVE3_PLAN contract 2.2)
+  echo '-- gb_vnni'; timeout 5 cat "$r/sys/kernel/gb_vnni/summary" 2>&1 | head -n 17
+  # item 10: i915 white veil (the default-off fix is set only through gb.cfg GB_MODOPTS_i915)
+  echo "i915 white veil: drmhwc LOG_GAMMA_LUT lines: $(grep -c -F 'drmhwc: Missing optional LOG_GAMMA_LUT' "$T.lc"), gb_ignore_user_gamma=$(cat "$r/sys/module/i915/parameters/gb_ignore_user_gamma" 2>/dev/null || echo -)"
+  echo "i915 modules.load: $(grep -E '^#?i915\.ko' "$r/odm/lib/modules/modules.load" 2>/dev/null); gbinit: $(grep -F i915.ko "$r/odm/gbinit_modules.log" 2>/dev/null | tr '\n' ' ')"
+  # item 18: HWUI on a one-queue-per-family Vulkan backend (literal of WAVE3 2.4; gbOS86 hook.sh:489-492)
+  echo "HWUI Vulkan queueCount abort lines: $(grep -c -F 'queueFamilyProperties.queueCount < kRequestedQueueCount' "$T.lc")"
+  # item 13: gb_slotsync HOLD (WAVE3 2.6)
+  echo "gb_slotsync HOLD: $(grep -F 'gb_slotsync: HOLD slot ' "$T.dm" | tail -n 2 | tr '\n' ' ')"
+  # item 11: apgetty off natively; item 4: fs-verity on /data
+  echo "apgetty: desktop.apgetty.enable=$(getprop desktop.apgetty.enable) init.svc.apgetty=$(getprop init.svc.apgetty)"
+  echo "fs-verity: ext4 feature $([ -e "$r/sys/fs/ext4/features/verity" ] && echo present || echo absent); $(grep -E 'Enabling ext4 verity|FS_STAT_ENABLE_VERITY_FAILED|Failed to run tune2fs' "$T.dm" | tail -n 2 | tr '\n' ' ')"
+  # item 12: the ESP bring-up log (absent = the feature was off this boot)
+  echo '-- ESP bring-up (/odm/gbinit_bringup.log)'
+  if [ -f "$r/odm/gbinit_bringup.log" ]; then tail -n 40 "$r/odm/gbinit_bringup.log"; else echo 'absent (gb.overlay=1 not set)'; fi
+  rm -f "$T.dm" "$T.lc"
+}
 snapshot() {
+  summary
   echo "== uptime $(cat /proc/uptime) boot_completed=$(getprop sys.boot_completed) hw=$(cat /odm/etc/gb_hw)"
   echo '== cmdline'; cat /proc/cmdline
   echo '== gbinit module loading'; cat /odm/gbinit_modules.log
@@ -1076,19 +1452,22 @@ for t in 40 90 180 420 900; do
   while [ "$(cut -d. -f1 /proc/uptime)" -lt $t ]; do sleep 5; done
   [ $t = 40 ] && setprop vendor.gb.dgpu_report 1
   snapshot > "$T" 2>&1
-  lock
+  lock || { rm -f "$T"; continue; }
   if ! mount -t vfat -o rw,flush,nosuid,nodev,noexec "$D" "$M"; then
     unlock; rm -f "$T"; echo "gb_bootlog: cannot mount $D, t=$t skipped" > /dev/kmsg; continue
   fi
   mkdir -p "$M/gblog"
   if [ -z "$N" ]; then
-    c=$(cat "$M/gblog/bootcount" 2>/dev/null); case $c in ''|*[!0-9]*) c=0;; esac
+    c=$(tr -d '\r' < "$M/gblog/bootcount" 2>/dev/null); case $c in ''|*[!0-9]*) c=0;; esac   # a CRLF edit keeps N
     N=$((c+1)); echo $N > "$M/gblog/bootcount"; prune
   fi
-  # shellcheck disable=SC2046  # df's output line is split into its fields on purpose
-  set -- $(df -k "$M" 2>/dev/null | tail -n 1); fr=$4
+  # free KiB = the third field from the end of df's last line (a wrapped long device name moves the others); no
+  # number = fail closed: nothing is written
+  fr=; f1=; f2=; for x in $(df -k "$M" 2>/dev/null | tail -n 1); do fr=$f2; f2=$f1; f1=$x; done
   case $fr in ''|*[!0-9]*) fr=;; esac
-  if [ -n "$fr" ] && [ "$fr" -lt $FLOOR_KB ]; then
+  if [ -z "$fr" ]; then
+    echo "gb_bootlog: cannot read the ESP free space, t=$t not written" > /dev/kmsg
+  elif [ "$fr" -lt $FLOOR_KB ]; then
     echo "gb_bootlog: ESP free ${fr} KiB below the 128 MiB floor, t=$t not written" > /dev/kmsg
   else
     cp "$T" "$M/gblog/boot$N-t$t.txt"
@@ -1180,6 +1559,19 @@ GB_RC_NATIVE = (
          b"    setprop keystore.module_hash.sent true\n"
          b"    setprop ro.setupwizard.mode DISABLED\n"
          b"    setprop persist.sys.setupwizard DISABLED\n"
+         # apgetty off natively (WAVE3_PLAN item 11, [W3R-21]; idea gbOS86 hook.sh:611-612). /system_ext/etc/init/
+         # apgetty.rc (read from lapis.bin, both slots): orange boot state -> early-init `setprop
+         # desktop.apgetty.enable 1`; started by `on property:desktop.apgetty.enable=1` AND by `on init &&
+         # property:desktop.apgetty.enable=1`, which init runs before this file's `on init` (system_ext rc files are
+         # parsed first). So: 0 here stops the property start, and the init.svc triggers below stop the init-time
+         # start. There is no console UART natively (the SAM UART belongs to serdev), so it would only crash-loop.
+         b"    setprop desktop.apgetty.enable 0\n"
+         b"\n"
+         b"on property:init.svc.apgetty=running\n"
+         b"    stop apgetty\n"
+         b"\n"
+         b"on property:init.svc.apgetty=restarting\n"
+         b"    stop apgetty\n"
          b"\n"
          b"on post-fs\n"
          b"    setprop trusty.security_vm.enabled 0\n"
@@ -1201,6 +1593,7 @@ GB_RC_NATIVE = (
          b"\n"
          b"on boot\n"
          b"    stop android.system.desktop.security.gscd\n"
+         b"    stop apgetty\n"
          b"\n"
          b"on property:sys.boot_completed=1\n"
          b"    stop android.system.desktop.security.gscd\n"
@@ -1407,6 +1800,8 @@ _KNOWN = {"name", "source", "comment", "files", "payload", "symlinks", "rc_files
 # never in any build.prop line of a component (PLAN invariant 1, INTERFACES 4 and 14, W2G-03: no build-time default)
 _BAD_PROP = ("ro.hardware.vulkan", "ro.hardware.egl", "ro.hwui.use_vulkan", "debug.hwui.renderer",
              "ro.vendor.gb.gfx_default", "persist.vendor.gb.gfx_mode", "persist.vendor.gb.nouveau")
+# the ESP bring-up refuses every _BAD_PROP name as a GB_PROP (contract 2.3); keep its deny pattern in step
+assert all((_b + "*").encode() in GB_BRINGUP_SH for _b in _BAD_PROP), "GB_BRINGUP_SH deny list lacks a _BAD_PROP name"
 def _xv(o):
     """Repository: expand ${GB_HOME} / ${GB_BUILD} in every string of a component manifest."""
     if isinstance(o, str):
@@ -1476,7 +1871,7 @@ for _p, _d, _m in [
         ("gb_ui.sh", GB_UI_SH, 0o100755), ("gb_dexopt.sh", GB_DEXOPT_SH, 0o100755),
         ("gb_noop.sh", b"#!/system/bin/sh\nexit 0\n", 0o100755), ("gb_sleeper.sh", GB_SLEEPER, 0o100755), ("gb_fw_stub.sh", GB_FW_STUB, 0o100755),
         ("empty_vintf.xml", EMPTY_VINTF, 0o100644),
-        ("etc/fstab.android-desktop", FSTAB, 0o100644), ("etc/se_manifest.xml", SEMAN, 0o100644),
+        ("etc/fstab.android-desktop", FSTAB_NATIVE, 0o100644), ("etc/se_manifest.xml", SEMAN, 0o100644),
         ("etc/init/gb.rc", GB_RC_NATIVE + GB_SLOTSYNC_RC + _COMP_RC, 0o100644), ("etc/build.prop", ODM_BUILD_PROP_NATIVE, 0o100644),
         ("etc/selinux/odm_sepolicy.cil", ODMCIL, 0o100644), ("etc/selinux/precompiled_sepolicy", ODMPRE, 0o100644),
         ("vup/bin/hw/android.hardware.security.keymint-service", KM_BIN, 0o100755),
@@ -1734,6 +2129,12 @@ def _check_vm(ents, label="VM tree"):
     assert b"ro.gfx.driver." not in d["gbstage/etc/build.prop"], f"{label}: build.prop has ro.gfx.driver."
     for s in (b"gb_nouveau", b"gb_gfx_selftest", b"nvk_probe", b"gb_gpu_compute", b"gb_gfxdriver"):
         assert s not in d["gbstage/etc/init/gb.rc"], f"{label}: gb.rc mentions {s.decode()}"
+    # wave 3: the VM stays unchanged (items 4, 11, 12): no bring-up script, the shared fstab, no apgetty rule
+    assert "gbbringup.sh" not in d, f"{label}: /gbbringup.sh is native only"
+    assert d["gbstage/etc/fstab.android-desktop"] == FSTAB, f"{label}: the VM fstab must be inject\\fstab.android-desktop"
+    assert b"apgetty" not in d["gbstage/etc/init/gb.rc"], f"{label}: apgetty is disabled natively only"
+    for p in ("gbstage/vnni_kat", "gbstage/gb_vnni_kat.sh", "gbstage/lib/modules/zram.ko", "gbstage/lib/modules/zsmalloc.ko"):
+        assert p not in d, f"{label}: {p} belongs to the throwaway KAT tree only"
 
 def _check_native(ents, label="native tree"):
     _check_common(ents, label)
@@ -1780,6 +2181,14 @@ def _check_native(ents, label="native tree"):
     assert prop.count(b"ro.gfx.driver.0=") == (1 if "gfxdriver" in NATIVE_COMPONENTS else 0), f"{label}: ro.gfx.driver.0"
     for line in prop.decode().splitlines():
         assert not line.startswith(_BAD_PROP), f"{label}: build.prop {line}"
+    # wave 3: item 12 (bring-up script, gated GBINIT), item 4 (native fstab), item 11 (apgetty off)
+    assert d.get("gbbringup.sh") == (0o100755, GB_BRINGUP_SH), f"{label}: /gbbringup.sh 0755 missing"
+    assert d.get("gbinit") == (0o100755, GBINIT), f"{label}: gbinit"
+    assert d["gbnative/etc/fstab.android-desktop"][1] == FSTAB_NATIVE, f"{label}: native fstab (fsverity)"
+    rc = d["gbnative/etc/init/gb.rc"][1]
+    for s in (b"    setprop desktop.apgetty.enable 0\n", b"on property:init.svc.apgetty=running\n    stop apgetty\n",
+              b"on property:init.svc.apgetty=restarting\n    stop apgetty\n"):
+        assert s in rc, f"{label}: gb.rc lacks {s!r}"
 
 def _gfx_build_id(ents, payload):
     """/odm/etc/gb/gfx_build_id (INTERFACES 5.3, 25.1): one line from the bytes that go into this tree."""
@@ -1808,6 +2217,7 @@ def native_cpio():
     call may build it. Module attribute INJECT_CPIO_NATIVE returns this (PEP 562)."""
     if not _NATIVE:
         ents = [e for e in _entries if not e[0].startswith("gbstage")]
+        ents.append(("gbbringup.sh", 0o100755, GB_BRINGUP_SH))      # item 12: native cpio only (contract 2.3)
         p = dgpu_payload()
         _add_entry(ents, "gbnative/etc/gb/dgpu_payload.sha256", p["sha_line"].encode(), 0o100644)
         if "gfxdriver" in NATIVE_COMPONENTS:
@@ -1868,6 +2278,115 @@ def vm_test_gfx_cpio():
     _VMGFX.append(cpio_newc(ents))
     print(f"VM test gfx tree: {len(extra)} entries added to the VM tree", flush=True)
     return _VMGFX[0]
+
+# ---- test-only VNNI KAT tree (WAVE3_PLAN 6.4, R-13, contract 2.7; lead decision D-e) ----
+KAT_DIR = os.path.join(HERE, "inject", "kat")       # KERNEL's drop: vnni_kat (static x86-64 ELF) + SHA256SUMS
+KAT_RC = (b"\n# ---- VNNI KAT (VM test only) ----\n"         # one literal: verify_image V28 reads it with ast
+          b"on property:sys.boot_completed=1\n"
+          b"    insmod /odm/lib/modules/zsmalloc.ko\n"
+          b"    insmod /odm/lib/modules/zram.ko\n"
+          b"    write /sys/block/zram0/disksize 67108864\n"
+          b"    start gb_vnni_kat\n"
+          b"\n"
+          b"service gb_vnni_kat /system/bin/sh /odm/gb_vnni_kat.sh\n"
+          b"    user root\n"
+          b"    seclabel u:r:shell:s0\n"
+          b"    oneshot\n"
+          b"    disabled\n")
+# the shell part lives in a file: `$` in an rc line is a property reference
+GB_VNNI_KAT_SH = (b"#!/system/bin/sh\n"
+                  b"# Test-only (WAVE3_PLAN 6.4, R-13): the throwaway VMware KAT image only, never a shipped tree.\n"
+                  b"k() { echo \"$1\" > /dev/kmsg; }\n"
+                  b"k 'gb_vnni_kat: start'\n"
+                  b"if /system/bin/toybox mkswap /dev/block/zram0 > /dev/null 2>&1 && /system/bin/toybox swapon /dev/block/zram0; then\n"
+                  b"  k 'gb_vnni_kat: zram swap on'\n"
+                  b"else k 'gb_vnni_kat: zram swap FAILED'; fi\n"
+                  b"/system/bin/toybox cat /proc/swaps | while IFS= read -r l; do k \"gb_vnni_kat: swaps $l\"; done\n"
+                  # (wave 3 build, R-13 early run) the counters are system-wide (INTERFACES E-15): right after
+                  # boot_completed lapis's own processes (system_server, dex2oat, surfaceflinger) emulate VEX VNNI in
+                  # bursts, faster than the KAT's 3 quiet re-runs can dodge. Wait (at most 600 s) until the emulated
+                  # total has not moved for 5 s in a row, then run; after 600 s run anyway (the KAT then reports
+                  # counter_foreign itself).
+                  b"q=0; w=0; last=\n"
+                  b"while [ $w -lt 600 ]; do\n"
+                  b"  cur=$(/system/bin/toybox head -n 1 /sys/kernel/gb_vnni/summary 2>/dev/null); cur=${cur#emulated }; cur=${cur%% *}\n"
+                  b"  if [ -n \"$cur\" ] && [ \"$cur\" = \"$last\" ]; then q=$((q+1)); [ $q -ge 5 ] && break; else q=0; fi\n"
+                  b"  last=$cur; /system/bin/toybox sleep 1; w=$((w+1))\n"
+                  b"done\n"
+                  b"k \"gb_vnni_kat: quiet wait $w s (emulated total $last, unchanged for $q s)\"\n"
+                  b"/odm/vnni_kat --all > /dev/gb_vnni_kat.out 2>&1\n"
+                  b"rc=$?\n"
+                  b"while IFS= read -r l; do k \"$l\"; done < /dev/gb_vnni_kat.out\n"
+                  b"k \"gb_vnni_kat: exit $rc\"\n"
+                  b"/system/bin/toybox timeout 5 /system/bin/toybox cat /sys/kernel/gb_vnni/summary 2>&1 | "
+                  b"while IFS= read -r l; do k \"gb_vnni_kat: summary $l\"; done\n"
+                  b"k 'gb_vnni_kat: done'\n")
+KAT_FILES = {"gbstage/vnni_kat": 0o100755, "gbstage/gb_vnni_kat.sh": 0o100755,
+             "gbstage/lib/modules/zsmalloc.ko": 0o100644, "gbstage/lib/modules/zram.ko": 0o100644}
+
+def _kat_inputs(kat_dir):
+    """(vnni_kat bytes, {module name: bytes}) after the contract 2.7 checks; RuntimeError names what is missing."""
+    def need(c, msg):
+        if not c:
+            raise RuntimeError(f"VM test KAT tree: {msg}")
+    exe_p, sums_p = os.path.join(kat_dir, "vnni_kat"), os.path.join(kat_dir, "SHA256SUMS")
+    need(os.path.isfile(exe_p) and os.path.isfile(sums_p), f"{kat_dir} needs vnni_kat and SHA256SUMS (contract 2.7)")
+    exe = open(exe_p, "rb").read()
+    sums = {}
+    for ln in open(sums_p, "rb").read().decode("ascii", "replace").splitlines():
+        m = re.fullmatch(r"([0-9a-f]{64}) [ *]\.?/?([A-Za-z0-9_.-]+)", ln.strip())
+        need(m is not None or not ln.strip(), f"SHA256SUMS: bad line {ln[:60]!r}")
+        if m:
+            sums[m.group(2)] = m.group(1)
+    need("vnni_kat" in sums, "SHA256SUMS does not list vnni_kat")
+    for n, h in sums.items():
+        p = os.path.join(kat_dir, n)
+        need(os.path.isfile(p), f"SHA256SUMS lists {n}, which is missing")
+        need(_sha(open(p, "rb").read()) == h, f"{n} does not match SHA256SUMS")
+    need(exe[:4] == b"\x7fELF" and exe[4] == 2 and exe[5] == 1 and struct.unpack_from("<H", exe, 18)[0] == 62,
+         "vnni_kat is not an x86-64 ELF")
+    phoff = struct.unpack_from("<Q", exe, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", exe, 54)
+    need(not any(struct.unpack_from("<I", exe, phoff + i * phentsize)[0] == 3 for i in range(phnum)),
+         "vnni_kat has a PT_INTERP (it must be static)")
+    krel = kernel_release()
+    mods = {}
+    for n in ("zsmalloc.ko", "zram.ko"):          # the native set's staged copies (stage_kernel.py NATIVE_EARLY)
+        p = os.path.join(NATIVE_MOD_DIR, n)
+        need(os.path.isfile(p), f"{p} missing")
+        d = open(p, "rb").read()
+        need(_vermagic(d).split()[0] == krel and d.endswith(SIG_TRAILER),
+             f"{n}: vermagic/signature do not match the kernel {krel} (stage it first)")
+        mods[n] = d
+    return exe, mods
+
+_VMKAT = []
+def vm_test_kat_cpio(kat_dir=None):
+    """Test-only VM tree (WAVE3_PLAN 6.4): the gbstage cpio plus /odm/vnni_kat (inject\\kat, checked against its
+    SHA256SUMS), the k15-staged zsmalloc.ko + zram.ko from inject\\native\\modules (this throwaway image only: the
+    shipped VM tree stays without zram, item 5), /odm/gb_vnni_kat.sh and the KAT rc fragment appended to gb.rc.
+    For one throwaway VMware boot (build_usb.py --vm-test --vm-test-kat); never written to lapis.bin."""
+    if _VMKAT and kat_dir is None:
+        return _VMKAT[0]
+    exe, mods = _kat_inputs(kat_dir or KAT_DIR)
+    ents = [(p, m, (x + KAT_RC) if p == "gbstage/etc/init/gb.rc" else x) for p, m, x in _VM_ENTRIES]
+    _add_entry(ents, "gbstage/vnni_kat", exe, 0o100755)
+    _add_entry(ents, "gbstage/gb_vnni_kat.sh", GB_VNNI_KAT_SH, 0o100755)
+    for n, d in mods.items():
+        _add_entry(ents, "gbstage/lib/modules/" + n, d, 0o100644)
+    ents = _dedupe(ents, "VM test KAT tree")
+    _check_common(ents, "VM test KAT tree")
+    old, new = {p: (m, x) for p, m, x in _VM_ENTRIES}, {p: (m, x) for p, m, x in ents}
+    extra = set(new) - set(old)
+    assert extra == set(KAT_FILES) and all(new[p][0] == m for p, m in KAT_FILES.items()), sorted(extra)
+    for p in old:
+        assert new[p] == ((old[p][0], old[p][1] + KAT_RC) if p == "gbstage/etc/init/gb.rc" else old[p]), p
+    assert not any(any(s in p for s in _VM_FORBIDDEN) for p in new), "VM test KAT tree: dGPU parts"
+    cpio = cpio_newc(ents)
+    if kat_dir is None:
+        _VMKAT.append(cpio)
+    print(f"VM test KAT tree: {len(extra)} files added to the VM tree", flush=True)
+    return cpio
 
 BOOTCONFIG_EXTRA = (
  'androidboot.force_normal_boot = "1"\n'

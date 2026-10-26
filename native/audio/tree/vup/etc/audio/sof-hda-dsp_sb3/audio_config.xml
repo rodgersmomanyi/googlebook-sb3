@@ -15,6 +15,9 @@ headphone in hardware.
 Jack input devices are named "<card shortname> <jack>" (sound/core/jack.c), so "sof-hda-dsp Headphone",
 "sof-hda-dsp Mic" (the generic parser's label; "Headset Mic" or "Headphone Mic" when a fixup applies) and
 "sof-hda-dsp HDMI/DP,pcm=N". Check them with /proc/bus/input/devices (gb_audiodiag.sh dumps it).
+Mic CaptureMixerElem (wave 3, item 2): added as in lapis's sof-soundwire Mic section; DRAS's required field set
+is INFERRED from its strings, not its source. "Capture" is the HDA generic parser's capture control. Idea: gbOS86
+(github.com/linuxkid473/gbos-x86 @f8a5c1a, HANDOFF.md:96-104), which mirrored sof-soundwire field for field.
 -->
 	<SoundCardName>hw:sofhdadsp</SoundCardName>
 	<HiFi>
@@ -33,6 +36,7 @@ Jack input devices are named "<card shortname> <jack>" (sound/core/jack.c), so "
 		</InternalMic>
 		<Mic>
 			<CapturePCM>hw:sofhdadsp,0</CapturePCM>
+			<CaptureMixerElem>Capture</CaptureMixerElem>
 			<JackDev>sof-hda-dsp Mic</JackDev>
 		</Mic>
 		<HDMI1>

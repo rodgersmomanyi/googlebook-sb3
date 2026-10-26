@@ -119,6 +119,8 @@ static void reset_daemon(void) {                  /* per-boot daemon state back 
   g_start = T - 200000;
   g_iommu_dmafq = g_iommu_done = 0;
   g_term = 0;
+  memset(&g_esp_rel, 0, sizeof g_esp_rel);        /* wave 2b: a deferred ESP lock release, the steal race hook */
+  g_esp_hook = NULL;
 }
 static void set_root(const char *name) {
   snprintf(g_root, sizeof g_root, "%s/%s", W, name);
@@ -2581,6 +2583,9 @@ int main(int argc, char **argv) {
   printf("v1.2 groups: %d checks, %d failures\n", checks - wave1, fails - wave1_fails);
   test_fix_all();
   printf("review-fix groups: %d checks, %d failures\n", checks - v12, fails - v12_fails);
+  int rf = checks, rf_fails = fails;
+  test_w2b_all();
+  printf("wave-2b groups: %d checks, %d failures\n", checks - rf, fails - rf_fails);
   set_root("tree_end");                           /* reaps every worker */
   printf("\n%d checks, %d failures\n", checks, fails);
   return fails ? 1 : 0;

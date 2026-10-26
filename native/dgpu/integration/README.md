@@ -163,6 +163,12 @@ Replace the script body with the following (as a bytes literal in the same style
 steal of INTERFACES 5.4, releases only its own lock, proceeds **without** the lock after 600 s (never breaking a live
 holder's lock), and the dgpu section reads gb_notify's logcat lines.
 
+> **Superseded (Wave 2b, 2026-10-26):** the shipped script (`build_esp.py` `GB_BOOTLOG_SH`) follows INTERFACES 5.4 r3
+> (back-off while a steal is in progress, exclusive owner file, put-back without replacing, release waits for a
+> put-back), goes on without the lock after 600 s only when the holder is another log writer, and fails closed when
+> `df` gives no number (INTERFACES section 30, E-1..E-3). The snippet below is the Wave 2 integration text, kept as it
+> was.
+
 ```sh
 #!/system/bin/sh
 P=EFI-SYSTEM

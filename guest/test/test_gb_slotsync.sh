@@ -11,6 +11,21 @@
 #   S1 copy gb-a.conf + gb-a-nvtest.conf to slot b    S2 no nvtest template         S3 no final newline, CRLF, 4 KiB line
 #   S3b a 3 MiB template (read_all growth)            S4 the old source fails S1 under ASan (mutation proof)
 #   S5 the ESP lock (INTERFACES 5.4), fake clock      S6 --dry-run end to end         S7 the NDK binary
+#   S8 (Wave 2b) the lock r3: steal-in-progress back-off, exclusive owner, release wait, put-back without replacing
+#   S8b (Wave 3, INTERFACES 5.4 r4, wave 2b review L1/L2): no mkdir while a steal is in progress, only consecutive
+#       back-off polls count, a lock naming our own pid is stale, release waits 7 polls, put-back retried at 50 ms
+#   S9 (Wave 2b) the loader.conf default as a whole line (not gb-b-nvtest, not #default, CR ignored, every line)
+#   S10 (Wave 3 item 13, lead decision D-a) the kernel check before a switch, end to end on fake boot/init_boot/
+#       vendor_boot images (--test-ticks): same release -> switch; same KMI, other GKI build -> switch (logged);
+#       other KMI -> HOLD (initrd + entries written, loader.conf untouched, one HOLD line and one gb_update
+#       notification over 3 ticks); truncated / garbage boot_b -> HOLD, no crash; gb/gb.cfg + gb/overlay survive
+#       (WAVE3 contract 2.3); no OTA pending -> unchanged; KMI parser and boot-header reader vectors
+#   S12 (Wave 3 fix phase, safety review MEDIUM) the HOLD notification only after the held slot's initrd + entries
+#       are written; a rebuild removes the slot's older entries + stamp first; on later boots the non-running slot's
+#       entries are removed when its stamp no longer matches or it is not bootable (never before the running slot is
+#       the default; not in --dry-run); a HOLD still in effect is logged again
+#   S11 (Wave 3 item 7) the wanted_slot truth table (block wanted_slot-vectors below; install_dualboot.ps1's
+#       Get-GbWantedSlot runs the same block, dualboot test\test_wanted_slot.ps1)
 set -u
 S=$(cd "$1" && pwd); W=$2
 NDK_CC=/build/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang
@@ -180,7 +195,353 @@ wait "$TP"; rc=$?
 [ $rc = 0 ] && grep -q 'not ours any more at release' "$L5/repl.out" && [ "$(cat "$LK/owner" 2> /dev/null)" = "1 gb_other 5" ]
 ok $? "S5 owner replaced while held: not removed at release"
 rm -rf "$LK"
+
+# ---- S8: the ESP lock r3 (INTERFACES 5.4, Wave 2b: safety finding 4)
+sleep 120 & HP=$!
+rm -rf "$LK" "$LK".stale.*; mkdir "$LK.stale.$HP"
+lockrun busy; rc=$?
+[ $rc = 0 ] && grep -q 'lock acquired after 5 s' "$L5/busy.out" && [ "$(grep -c 'a steal is in progress: backing off' "$L5/busy.out")" = 1 ] &&
+  [ -d "$LK.stale.$HP" ] && [ ! -e "$LK" ]
+ok $? "S8 steal in progress (live .stale.<pid>): 5 back-offs, then taken (5 fake s), the stealer's directory untouched"
+rm -rf "$LK".stale.*; mkdir "$LK.stale.$(deadpid)"
+lockrun busydead; rc=$?
+[ $rc = 0 ] && grep -q 'lock acquired after 0 s' "$L5/busydead.out" && ! grep -q 'backing off' "$L5/busydead.out"
+ok $? "S8 a dead stealer's leftover: not a steal in progress, taken at once"
+rm -rf "$LK" "$LK".stale.*
+GB_SLOTSYNC_LOCK=$LK GB_SLOTSYNC_TEST_RACE_OWNER="$(deadpid) gb_bootlog 3" "$T" --test-lock > "$L5/race.out" 2> "$L5/race.err"; rc=$?
+[ $rc = 0 ] && grep -q 'another lock took the place of ours' "$L5/race.out" && [ "$(steals "$L5/race.out")" = 1 ] &&
+  grep -q 'lock acquired after 1 s' "$L5/race.out" && [ ! -e "$LK" ]
+ok $? "S8 an owner file in our new directory (EEXIST): not ours, never overwritten (stolen once as stale next poll), taken"
+rm -rf "$LK"
+GB_SLOTSYNC_LOCK=$LK GB_SLOTSYNC_TEST_DISPLACE="$LK.stale.$HP" GB_SLOTSYNC_TEST_PUTBACK="$LK.stale.$HP" \
+  GB_SLOTSYNC_TEST_PUTBACK_POLLS=2 "$T" --test-lock > "$L5/rel.out" 2> "$L5/rel.err"; rc=$?
+[ $rc = 0 ] && grep -q 'put back after 2 polls' "$L5/rel.out" && grep -q 'test: lock released' "$L5/rel.out" &&
+  ! grep -q 'not ours' "$L5/rel.out" && [ ! -e "$LK" ] && [ ! -e "$LK.stale.$HP" ]
+ok $? "S8 release while a stealer has our lock moved away: waited for the put-back (2 polls), then released"
+rm -rf "$LK" "$LK".stale.*
+GB_SLOTSYNC_LOCK=$LK GB_SLOTSYNC_TEST_DISPLACE="$LK.stale.$HP" "$T" --test-lock > "$L5/rel2.out" 2> "$L5/rel2.err"; rc=$?
+[ $rc = 0 ] && grep -q 'not ours any more at release' "$L5/rel2.out" && ! grep -q 'test: lock released' "$L5/rel2.out" &&
+  [ -d "$LK.stale.$HP" ] && grep -q 'test: release gave up after 7 polls' "$L5/rel2.out"
+ok $? "S8 never put back: after 7 polls (r4: longer than the 5 s put-back budget) left alone (logged)"
+rm -rf "$LK" "$LK".stale.*
+mkdir "$LK"; echo "$(deadpid) gb_bootlog 12" > "$LK/owner"
+GB_SLOTSYNC_LOCK=$LK GB_SLOTSYNC_TEST_STEAL_RACE="$HP gb_bootlog 30" GB_SLOTSYNC_TEST_INTRUDE_POLLS=2 \
+  "$T" --test-lock > "$L5/pb.out" 2> "$L5/pb.err"; rc=$?
+[ $rc = 3 ] && grep -q 'the lock changed while stealing it (owner .*): put back' "$L5/pb.out" &&
+  [ "$(cat "$LK/owner" 2> /dev/null)" = "$HP gb_bootlog 30" ] && [ "$(steals "$L5/pb.out")" = 0 ] &&
+  [ -z "$(find "$L5" -maxdepth 1 -name 'gb_esp.lock.stale.*')" ]
+ok $? "S8 the steal moved a live lock, a newcomer in the way: put back after it backed off (never replaced), then waited"
+rm -rf "$LK" "$LK".stale.*
+mkdir "$LK"; echo "$(deadpid) gb_bootlog 12" > "$LK/owner"
+GB_SLOTSYNC_LOCK=$LK GB_SLOTSYNC_TEST_STEAL_RACE=- GB_SLOTSYNC_TEST_INTRUDE_POLLS=99 \
+  "$T" --test-lock > "$L5/pbo.out" 2> "$L5/pbo.err"; rc=$?
+[ $rc = 0 ] && grep -q 'the moved directory had no owner and another is in place: removed' "$L5/pbo.out" &&
+  grep -q 'lock acquired after' "$L5/pbo.out" && [ ! -e "$LK" ] && [ -z "$(find "$L5" -maxdepth 1 -name 'gb_esp.lock.stale.*')" ]
+ok $? "S8 an ownerless moved directory with a newcomer in the way: removed; the newcomer's empty lock stolen later, taken"
+
+# ---- S8b: lock r4 (INTERFACES 5.4 r4; wave 2b review L1, L2)
+rm -rf "$LK" "$LK".stale.*; mkdir "$LK.stale.$HP"
+lockrun busy4; rc=$?
+[ $rc = 0 ] && [ "$(grep -c '^test: mkdir lock$' "$L5/busy4.out")" = 1 ] && grep -q 'lock acquired after 5 s' "$L5/busy4.out"
+ok $? "S8b L1 steal in progress: no mkdir during the 5 back-offs (mkdir calls: $(grep -c '^test: mkdir lock$' "$L5/busy4.out")), then one, taken"
+sleep 120 & HP2=$!
+rm -rf "$LK" "$LK".stale.*; mkdir "$LK.stale.$HP" "$LK"; echo "$HP2 gb_nouveau 9" > "$LK/owner"
+lockrun consec; rc=$?
+nm=$(grep -c '^test: mkdir lock$' "$L5/consec.out")
+[ $rc = 3 ] && [ "$nm" -ge 95 ] && [ "$nm" -le 105 ] && [ "$(steals "$L5/consec.out")" = 0 ] &&
+  [ "$(cat "$LK/owner")" = "$HP2 gb_nouveau 9" ]
+ok $? "S8b L1 only consecutive back-offs count: live holder + live stealer leftover over 600 fake s -> mkdir every 6th poll ($nm), no steal"
+kill "$HP2" 2> /dev/null; wait "$HP2" 2> /dev/null
+rm -rf "$LK" "$LK".stale.*
+GB_SLOTSYNC_LOCK=$LK GB_SLOTSYNC_TEST_OWN_ORPHAN=1 "$T" --test-lock > "$L5/orph.out" 2> "$L5/orph.err"; rc=$?
+[ $rc = 0 ] && [ "$(steals "$L5/orph.out")" = 1 ] && grep -q 'lock acquired after 0 s' "$L5/orph.out" && [ ! -e "$LK" ]
+ok $? "S8b L2 a lock naming our own pid while we hold nothing (a late put-back): stale, stolen once, taken at once"
+rm -rf "$LK" "$LK".stale.*
+mkdir "$LK"; echo "$(deadpid) gb_bootlog 12" > "$LK/owner"
+GB_SLOTSYNC_LOCK=$LK GB_SLOTSYNC_TEST_STEAL_RACE="$HP gb_bootlog 30" GB_SLOTSYNC_TEST_INTRUDE_POLLS=60 \
+  "$T" --test-lock > "$L5/pb60.out" 2> "$L5/pb60.err"; rc=$?
+[ $rc = 3 ] && grep -q 'the lock changed while stealing it (owner .*): put back' "$L5/pb60.out" &&
+  [ "$(cat "$LK/owner" 2> /dev/null)" = "$HP gb_bootlog 30" ]
+ok $? "S8b L1 put-back retried at 50 ms: a newcomer in the way for 60 tries (3 s) - still put back (r3 gave up after 5)"
+kill "$HP" 2> /dev/null; wait "$HP" 2> /dev/null
+rm -rf "$LK" "$LK".stale.*
+
+# ---- S9: loader.conf default as a whole line (Wave 2b: safety finding 5), select_entry b a
+for v in nvtest:'default gb-b-nvtest' hash:'#default gb-b' crlf:'default gb-b\r' last:'default gb-b\ndefault gb-a' ok:'default gb-b'; do
+  k=${v%%:*}; line=${v#*:}
+  E=$W/s9-$k/esp; mkesp "$E" nvtest
+  printf "$line"'\ntimeout 4\neditor yes\n' > "$E/loader/loader.conf"
+  before=$(sha256sum < "$E/loader/loader.conf")
+  GB_SLOTSYNC_MNT=$E "$T" --test-copy-entry b a > "$W/s9-$k/out" 2> "$W/s9-$k/err"; rc=$?
+  after=$(sha256sum < "$E/loader/loader.conf")
+  case $k in
+    nvtest) printf 'default gb-b\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    hash) printf '#default gb-b\ntimeout 4\neditor yes\ndefault gb-b\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    crlf|ok) [ "$before" = "$after" ]; r=$? ;;
+    last) printf 'default gb-b\ndefault gb-b\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+  esac
+  [ $rc = 0 ] && [ $r = 0 ] && clean "$W/s9-$k/err"
+  ok $? "S9 loader.conf '$line' -> $(tr '\r\n' '^|' < "$E/loader/loader.conf")"
+done
 cat "$L5"/*.err 2> /dev/null > "$L5/all.err"; clean "$L5/all.err"; ok $? "S5 no sanitizer report"
+
+# ---- S10: the kernel check before a switch (item 13, D-a), end to end with --test-ticks on a fake ESP + by-name dir
+REL_A='6.18.21-android17-5-g3938c8d97142-ab16302624'          # lapis .271/.276 boot_a/boot_b (both slots)
+RUN='6.18.21-android17-5-g9629ced3e50e-ab16302714'            # our k14 (uname)
+mkboot() {   # mkboot FILE RELEASE|-truncated|-garbage: boot header v4 + a bzImage setup header with the version string
+  python3 - "$1" "$2" <<'PY'
+import os, struct, sys
+f, rel = sys.argv[1], sys.argv[2]
+if rel == "-truncated":
+    open(f, "wb").write(b"ANDROID!" + b"\0" * 92); sys.exit(0)
+if rel == "-garbage":
+    open(f, "wb").write(os.urandom(65536)); sys.exit(0)
+ksz = 1 << 20
+hdr = bytearray(4096); hdr[0:8] = b"ANDROID!"; struct.pack_into("<II", hdr, 8, ksz, 0); struct.pack_into("<I", hdr, 40, 4)
+k = bytearray(65536)
+k[0x202:0x206] = b"HdrS"; ptr = 0x3c40; struct.pack_into("<H", k, 0x20E, ptr)
+s = (rel + " (kleaf@build-host) #1 SMP PREEMPT Thu Jan  1 00:00:00 UTC 1970").encode() + b"\0"
+k[0x200 + ptr:0x200 + ptr + len(s)] = s
+open(f, "wb").write(bytes(hdr) + bytes(k) + b"\0" * (2 << 20))
+PY
+}
+mkramdisks() {   # mkramdisks BYNAME_DIR SLOT: minimal init_boot (v4) and vendor_boot (v4) images build_slot accepts
+  python3 - "$1" "$2" <<'PY'
+import struct, sys
+d, s = sys.argv[1], sys.argv[2]
+rd = b"generic-ramdisk-" + s.encode() * 100
+h = bytearray(4096); h[0:8] = b"ANDROID!"; struct.pack_into("<II", h, 8, 0, len(rd)); struct.pack_into("<I", h, 40, 4)
+open(f"{d}/init_boot_{s}", "wb").write(bytes(h) + rd + b"\0" * (4096 - len(rd) % 4096))
+vr, bc, page = b"vendor-ramdisk-" + s.encode() * 50, b"androidboot.hardware = android-desktop\n", 4096
+v = bytearray(page); v[0:8] = b"VNDRBOOT"; struct.pack_into("<II", v, 8, 4, page); struct.pack_into("<I", v, 24, len(vr))
+struct.pack_into("<II", v, 2096, 2128, 0); struct.pack_into("<I", v, 2112, 0); struct.pack_into("<I", v, 2124, len(bc))
+pad = lambda b: b + b"\0" * (-len(b) % page)
+open(f"{d}/vendor_boot_{s}", "wb").write(bytes(v) + pad(vr) + pad(bc))
+PY
+}
+s10() {   # s10 TAG BOOT_B [extra env assignments...]: fresh fake device, 3 ticks; output in $W/s10-TAG/out
+  X=$W/s10-$1; rm -rf "$X"; mkdir -p "$X/bn" "$X/notify" "$X/ue"
+  E=$X/esp; mkesp "$E" nvtest
+  printf 'gzip-cpio' > "$E/gb/inject.gz"; printf 'androidboot.gb = 1\n' > "$E/gb/bootconfig_extra"
+  printf '# gb.cfg v1\nGB_PROP_1=debug.gb.x=1\n' > "$E/gb/gb.cfg"; mkdir -p "$E/gb/overlay/usr/idc"
+  printf 'touch.deviceType = pointer\n' > "$E/gb/overlay/usr/idc/x.idc"
+  mkboot "$X/bn/boot_a" "$REL_A"; mkboot "$X/bn/boot_b" "$2"; mkramdisks "$X/bn" b
+  echo test-boot-id > "$X/ue/done"
+  (cd "$E" && find . -type f -exec sha256sum {} + | sort) > "$X/before"
+  tag=$1; shift 2
+  env GB_SLOTSYNC_MNT="$E" GB_SLOTSYNC_LOCK="$X/gb_esp.lock" GB_SLOTSYNC_SLOT_SUFFIX=_a GB_SLOTSYNC_BOOT_ID=test-boot-id \
+    GB_SLOTSYNC_BYNAME="$X/bn" GB_SLOTSYNC_UE_PREFS="$X/ue/done" GB_SLOTSYNC_NOTIFY="$X/notify" \
+    GB_SLOTSYNC_TEST_ATTRS='010e000000000000 007f000000000000' GB_SLOTSYNC_TEST_UNAME="$RUN" "$@" \
+    "$T" --test-ticks 3 > "$X/out" 2> "$X/err"
+  echo $? > "$X/rc"
+  (cd "$E" && find . -type f -exec sha256sum {} + | sort) > "$X/after"
+  echo "  s10-$tag: $(grep -c . "$X/out") output lines, rc $(cat "$X/rc")"
+}
+lc() { grep -c -F -- "$2" "$W/s10-$1/out"; }
+same() { grep -q -F " ./$2" "$W/s10-$1/before" &&
+         [ "$(grep -F " ./$2" "$W/s10-$1/before")" = "$(grep -F " ./$2" "$W/s10-$1/after")" ]; }
+default_is() { grep -q -x "default gb-$2" "$W/s10-$1/esp/loader/loader.conf"; }
+bcfg() { same "$1" gb/gb.cfg && same "$1" gb/overlay/usr/idc/x.idc; }
+nnote() { find "$W/s10-$1/notify" -type f | wc -l; }
+
+s10 same "$REL_A"
+[ "$(cat "$W/s10-same/rc")" = 0 ] && default_is same b && [ -f "$W/s10-same/esp/initrd-b.img" ] &&
+  [ -f "$W/s10-same/esp/loader/entries/gb-b.conf" ] && [ "$(lc same 'kernel check passed (GKI unchanged')" = 1 ] &&
+  [ "$(lc same 'HOLD slot')" = 0 ] && [ "$(nnote same)" = 0 ] && bcfg same && clean "$W/s10-same/err"
+ok $? "S10 same release in boot_b: switched (default gb-b, initrd-b + gb-b.conf), logged once, no notification, gb.cfg/overlay untouched"
+
+s10 gki "6.18.30-android17-5-g0123456789ab-ab16302999"
+[ "$(cat "$W/s10-gki/rc")" = 0 ] && default_is gki b && [ "$(lc gki "GKI changed $REL_A -> 6.18.30-android17-5-g0123456789ab-ab16302999 (same KMI 6.18-android17-5")" = 1 ] &&
+  [ "$(lc gki 'HOLD slot')" = 0 ] && [ "$(nnote gki)" = 0 ] && bcfg gki && clean "$W/s10-gki/err"
+ok $? "S10 D-a same KMI, other GKI sublevel/build: switched (not held), the change logged once, no notification"
+
+s10 kmi "6.18.30-android17-6-g0123456789ab-ab16400000"
+X=$W/s10-kmi
+hl=$(lc kmi 'gb_slotsync: HOLD slot b: KMI 6.18-android17-6 != running 6.18-android17-5; default stays gb-a')
+nf=$(find "$X/notify" -type f -name '[0-9]*-[0-9]*-[0-9]*.msg'); nf1=$(echo "$nf" | head -n 1)
+txt=$(sed -n 's/^text=//p' "$nf1" 2> /dev/null)
+[ "$(cat "$X/rc")" = 0 ] && [ "$hl" = 1 ] && default_is kmi a && same kmi loader/loader.conf &&
+  [ -f "$X/esp/initrd-b.img" ] && [ -f "$X/esp/loader/entries/gb-b.conf" ] && [ -f "$X/esp/loader/entries/gb-b-nvtest.conf" ] &&
+  [ "$(nnote kmi)" = 1 ] && [ "$(echo "$nf" | grep -c .)" = 1 ] && [ "$(lc kmi 'test: setprop vendor.gb.notify ')" = 1 ] &&
+  grep -q -x 'kind=notify' "$nf1" && grep -q -x 'tag=gb_update' "$nf1" && grep -q -x 'title=System update held' "$nf1" &&
+  [ ${#txt} -le 200 ] && [ -z "$(printf '%s' "$txt" | tr -d ' -~')" ] && case $txt in 'Kernel mismatch: '*) true;; *) false;; esac &&
+  [ "$(stat -c %a "$nf1")" = 644 ] && [ "$(lc kmi 'test: sync_once rc=0 settled=- held=b ')" = 1 ] && bcfg kmi && clean "$X/err"
+ok $? "S10 other KMI: HOLD - initrd-b + gb-b(-nvtest).conf written, loader.conf untouched, 1 HOLD line + 1 gb_update notification over 3 ticks"
+echo "  notification text (${#txt} chars): $txt"
+
+s10 trunc -truncated
+[ "$(cat "$W/s10-trunc/rc")" = 0 ] && default_is trunc a && same trunc loader/loader.conf &&
+  [ "$(lc trunc 'HOLD slot b: cannot read boot_b kernel version; default stays gb-a')" = 1 ] && [ "$(nnote trunc)" = 1 ] &&
+  grep -q '^text=Kernel check failed: ' "$W"/s10-trunc/notify/*.msg && bcfg trunc && clean "$W/s10-trunc/err"
+ok $? "S10 truncated boot_b: HOLD (cannot read boot_b kernel version), no crash, one notification"
+
+s10 garbage -garbage
+[ "$(cat "$W/s10-garbage/rc")" = 0 ] && default_is garbage a && [ "$(lc garbage 'HOLD slot b: cannot read boot_b kernel version')" = 1 ] &&
+  bcfg garbage && clean "$W/s10-garbage/err"
+ok $? "S10 garbage boot_b (64 KiB random): HOLD, no crash, no sanitizer report"
+
+s10 noq "6.18.30-android17-6-g0123456789ab-ab16400000" GB_SLOTSYNC_NOTIFY="$W/s10-noq/absent"
+[ "$(cat "$W/s10-noq/rc")" = 0 ] && default_is noq a && [ "$(lc noq 'no notification queue')" = 1 ] &&
+  [ "$(lc noq 'HOLD slot b: KMI ')" = 1 ] && [ "$(lc noq 'test: setprop')" = 0 ] && clean "$W/s10-noq/err"
+ok $? "S10 no notification queue (a tree without gb_notify, e.g. the VM): HOLD logged to kmsg only"
+
+s10 nopend "6.18.30-android17-6-g0123456789ab-ab16400000" GB_SLOTSYNC_BOOT_ID=another-boot
+[ "$(cat "$W/s10-nopend/rc")" = 0 ] && default_is nopend a && same nopend loader/loader.conf && [ ! -e "$W/s10-nopend/esp/initrd-b.img" ] &&
+  [ "$(lc nopend 'kernel')" = 0 ] && [ "$(lc nopend 'test: sync_once rc=0 settled=a')" = 1 ] && bcfg nopend
+ok $? "S10 no OTA completed in this boot: unchanged (settled a, no kernel check, nothing written for b)"
+
+s10 dry "6.18.30-android17-6-g0123456789ab-ab16400000"
+X=$W/s10-dry; rm -rf "$X/notify"/*
+env GB_SLOTSYNC_MNT="$X/esp" GB_SLOTSYNC_LOCK="$X/gb_esp.lock" GB_SLOTSYNC_SLOT_SUFFIX=_a GB_SLOTSYNC_BOOT_ID=test-boot-id \
+  GB_SLOTSYNC_BYNAME="$X/bn" GB_SLOTSYNC_UE_PREFS="$X/ue/done" GB_SLOTSYNC_NOTIFY="$X/notify" \
+  GB_SLOTSYNC_TEST_ATTRS='010e000000000000 007f000000000000' GB_SLOTSYNC_TEST_UNAME="$RUN" "$T" --dry-run > "$X/dry.out" 2>&1
+[ "$(find "$X/notify" -type f | wc -l)" = 0 ] && grep -q 'dry-run: would post the notification' "$X/dry.out"
+ok $? "S10 --dry-run: the HOLD notification is not written"
+
+v=0
+for kv in "$REL_A=6.18-android17-5" "$RUN=6.18-android17-5" "6.18-android17-5=6.18-android17-5" \
+          "6.1.99-android14-11-gabc-ab1=6.1-android14-11" "6.18.21-android17-5+=6.18-android17-5" \
+          "6.18.21=-" "6.18.21-android17=-" "6.18.21-android17-x-g1=-" "6.18.21-android17-5x=-" "android17-5=-" "=-" \
+          "6.18.21-androidX-5=-" "10.100.1-android123-45-gfff=10.100-android123-45"; do
+  in=${kv%=*}; want=${kv##*=}
+  got=$("$T" --test-kmi "$in" 2> /dev/null)
+  [ "$got" = "$want" ] || { echo "  kmi '$in': got '$got', want '$want'"; v=$((v + 1)); }
+done
+ok $v "S10 KMI parser: 13 vectors (release -> <maj>.<min>-android<N>-<gen>, malformed -> none)"
+X=$W/s10-gkiv; mkdir -p "$X"; mkboot "$X/boot_a" "$REL_A"; mkboot "$X/boot_b" -truncated
+python3 -c "import sys; b=bytearray(open(sys.argv[1],'rb').read()); b[4096+0x202:4096+0x206]=b'XXXX'; open(sys.argv[2],'wb').write(b)" "$X/boot_a" "$X/boot_c"
+python3 -c "import sys,struct; b=bytearray(open(sys.argv[1],'rb').read()); struct.pack_into('<H',b,4096+0x20E,0xff00); open(sys.argv[2],'wb').write(b)" "$X/boot_a" "$X/boot_d"
+python3 -c "import sys; b=bytearray(open(sys.argv[1],'rb').read()); i=b.find(b' (kleaf'); b[i]=0x07; open(sys.argv[2],'wb').write(b)" "$X/boot_a" "$X/boot_e"
+r=$(for s in a b c d e f; do GB_SLOTSYNC_BYNAME=$X "$T" --test-gki $s 2> /dev/null; done | tr '\n' ' ')
+[ "$r" = "$REL_A - - - - - " ]; ok $? "S10 boot header reader: good, truncated, no HdrS, pointer past 64 KiB, non-printable end, missing -> '$r'"
+
+# ---- S12 (wave 3 fix phase, safety review MEDIUM): the HOLD notification only after the held slot's initrd and
+#      entries are on the ESP; a rebuild removes the slot's older entries first; with no switch pending the
+#      non-running slot's entries are removed when they no longer match it (stamp) or it is not bootable (GPT), only
+#      after the running slot is the default, nothing in --dry-run; a HOLD still in effect is logged again later.
+KMI_B='6.18.30-android17-6-g0123456789ab-ab16400000'
+WANT_B='010e000000000000 007f000000000000'                   # b wanted + bootable (an OTA completed into b)
+B_DEAD='010e000000000000 0000000000000000'                   # b priority 0: not bootable (an OTA is writing b)
+s12dev() {   # s12dev TAG BOOT_B_RELEASE: a fresh fake device as in S10 (running a), nothing run yet
+  X=$W/s12-$1; rm -rf "$X"; mkdir -p "$X/bn" "$X/notify" "$X/ue"
+  E=$X/esp; mkesp "$E" nvtest
+  printf 'gzip-cpio' > "$E/gb/inject.gz"; printf 'androidboot.gb = 1\n' > "$E/gb/bootconfig_extra"
+  printf '# gb.cfg v1\n' > "$E/gb/gb.cfg"
+  mkboot "$X/bn/boot_a" "$REL_A"; mkboot "$X/bn/boot_b" "$2"; mkramdisks "$X/bn" b
+  echo test-boot-id > "$X/ue/done"
+}
+s12run() {   # s12run TAG OUT BOOT_ID ATTRS ARGS...: one run of the test binary on $W/s12-TAG; output $X/OUT{,.err,.rc}
+  X=$W/s12-$1; o=$2; b=$3; at=$4; shift 4
+  env GB_SLOTSYNC_MNT="$X/esp" GB_SLOTSYNC_LOCK="$X/gb_esp.lock" GB_SLOTSYNC_SLOT_SUFFIX=_a GB_SLOTSYNC_BOOT_ID="$b" \
+    GB_SLOTSYNC_BYNAME="$X/bn" GB_SLOTSYNC_UE_PREFS="$X/ue/done" GB_SLOTSYNC_NOTIFY="$X/notify" \
+    GB_SLOTSYNC_TEST_ATTRS="$at" GB_SLOTSYNC_TEST_UNAME="$RUN" "$T" "$@" > "$X/$o" 2> "$X/$o.err"
+  echo $? > "$X/$o.rc"
+}
+c12() { grep -c -F -- "$3" "$W/s12-$1/$2"; }
+n12() { find "$W/s12-$1/notify" -type f | wc -l; }
+tree12() { (cd "$W/s12-$1/esp" && find . -type f -exec sha256sum {} + | sort); }
+flip_ib() { python3 -c "import sys; p=sys.argv[1]; b=bytearray(open(p,'rb').read()); b[4096]^=0xff; open(p,'wb').write(b)" "$1"; }
+
+s12dev nfy "$KMI_B"; X=$W/s12-nfy; mv "$X/esp/gb/inject.gz" "$X/inject.gz.aside"
+s12run nfy t1 test-boot-id "$WANT_B" --test-ticks 3
+[ "$(cat "$X/t1.rc")" = 1 ] && [ "$(c12 nfy t1 'HOLD slot b: KMI 6.18-android17-6')" = 1 ] && [ "$(n12 nfy)" = 0 ] &&
+  [ "$(c12 nfy t1 'test: setprop vendor.gb.notify')" = 0 ] && [ ! -e "$X/esp/loader/entries/gb-b.conf" ] &&
+  [ "$(c12 nfy t1 'ESP lacks /gb/inject.gz')" = 3 ] && clean "$X/t1.err"
+ok $? "S12 HOLD whose rebuild fails (3 ticks): HOLD logged once, no notification, no gb-b entry"
+mv "$X/inject.gz.aside" "$X/esp/gb/inject.gz"
+s12run nfy t2 test-boot-id "$WANT_B" --test-ticks 2
+nf=$(find "$X/notify" -type f -name '*.msg' | head -n 1)
+[ "$(cat "$X/t2.rc")" = 0 ] && [ "$(n12 nfy)" = 1 ] && [ -f "$X/esp/loader/entries/gb-b.conf" ] && [ -f "$X/esp/initrd-b.img" ] &&
+  grep -q -x 'tag=gb_update' "$nf" && grep -q '^text=Kernel mismatch: .*(slot B) is in the boot menu\.$' "$nf" &&
+  awk '/copy|written|built initrd-b/{b=NR} /test: setprop vendor.gb.notify/{n=NR} END {exit !(b && n && b < n)}' "$X/t2" &&
+  clean "$X/t2.err"
+ok $? "S12 the same HOLD once the ESP is complete (2 ticks): initrd + entries written, then exactly one notification"
+
+s12dev old "$KMI_B"; X=$W/s12-old; E=$X/esp
+expect_b "$E/loader/entries/gb-a.conf" > "$E/loader/entries/gb-b.conf"
+expect_b "$E/loader/entries/gb-a-nvtest.conf" > "$E/loader/entries/gb-b-nvtest.conf"
+printf 'deadbeef\n' > "$E/gb/slot_b.stamp"; mkdir -p "$E/initrd-b.img/x"        # the new initrd cannot be written
+s12run old t1 test-boot-id "$WANT_B" --test-ticks 1
+[ "$(cat "$X/t1.rc")" = 1 ] && [ ! -e "$E/loader/entries/gb-b.conf" ] && [ ! -e "$E/loader/entries/gb-b-nvtest.conf" ] &&
+  [ ! -e "$E/gb/slot_b.stamp" ] && [ "$(c12 old t1 'slot b: removed its older boot entries before rebuilding initrd-b.img')" = 1 ] &&
+  [ "$(c12 old t1 'writing initrd-b.img failed')" = 1 ] && [ "$(n12 old)" = 0 ] && [ ! -e "$E/initrd-b.img.tmp" ] &&
+  grep -q -x 'default gb-a' "$E/loader/loader.conf" && clean "$X/t1.err"
+ok $? "S12 rebuild of slot b fails after an older gb-b(-nvtest).conf existed: old entries + stamp removed first, no .tmp left, no notification"
+rm -rf "$E/initrd-b.img"
+s12run old t2 test-boot-id "$WANT_B" --test-ticks 1
+expect_b "$E/loader/entries/gb-a.conf" | cmp -s - "$E/loader/entries/gb-b.conf" && [ -s "$E/gb/slot_b.stamp" ] &&
+  [ "$(cat "$E/gb/slot_b.stamp")" != deadbeef ] && [ "$(n12 old)" = 1 ] && [ "$(cat "$X/t2.rc")" = 0 ] && clean "$X/t2.err"
+ok $? "S12 the retry builds initrd-b, writes gb-b.conf again from the template and a new stamp, then notifies once"
+
+# a held slot b with current entries, then later boots (another boot id: no update pending)
+s12dev held "$KMI_B"; s12run held t0 test-boot-id "$WANT_B" --test-ticks 1
+H=$W/s12-held; [ -f "$H/esp/loader/entries/gb-b.conf" ] && [ -f "$H/esp/gb/slot_b.stamp" ] && [ "$(cat "$H/t0.rc")" = 0 ]
+ok $? "S12 fixture: slot b held with its initrd, entries and stamp"
+for t in keep stale dead dry dflt; do rm -rf "$W/s12-$t"; cp -a "$H" "$W/s12-$t"; done
+s12run keep t1 next-boot "$WANT_B" --test-ticks 3
+[ "$(cat "$W/s12-keep/t1.rc")" = 0 ] && [ "$(tree12 held)" = "$(tree12 keep)" ] &&
+  [ "$(c12 keep t1 'gb_slotsync: HOLD slot b: KMI 6.18-android17-6 != running 6.18-android17-5; default stays gb-a')" = 1 ] &&
+  [ "$(c12 keep t1 'removed')" = 0 ] && [ "$(c12 keep t1 'test: sync_once rc=0 settled=a')" = 1 ] && clean "$W/s12-keep/t1.err"
+ok $? "S12 later boot, held b still current: nothing changed, the HOLD line logged again once over 3 ticks"
+flip_ib "$W/s12-stale/bn/init_boot_b"
+s12run stale t1 next-boot "$WANT_B" --test-ticks 2
+E=$W/s12-stale/esp
+[ "$(cat "$W/s12-stale/t1.rc")" = 0 ] && [ ! -e "$E/loader/entries/gb-b.conf" ] && [ ! -e "$E/loader/entries/gb-b-nvtest.conf" ] &&
+  [ ! -e "$E/gb/slot_b.stamp" ] && [ -f "$E/loader/entries/gb-a.conf" ] && [ -f "$E/loader/entries/gb-a-nvtest.conf" ] &&
+  [ "$(c12 stale t1 'slot b: removed its boot entries (2): its initrd does not match')" = 1 ] &&
+  [ "$(c12 stale t1 'HOLD slot')" = 0 ] && grep -q -x 'default gb-a' "$E/loader/loader.conf" &&
+  cmp -s "$E/gb/gb.cfg" "$H/esp/gb/gb.cfg" && clean "$W/s12-stale/t1.err"
+ok $? "S12 later boot, slot b's init_boot changed after its initrd was built: gb-b(-nvtest).conf + stamp removed once, slot a and gb.cfg untouched"
+s12run dead t1 next-boot "$B_DEAD" --test-ticks 1
+E=$W/s12-dead/esp
+[ ! -e "$E/loader/entries/gb-b.conf" ] && [ "$(c12 dead t1 'slot b: removed its boot entries (2): the slot is not bootable')" = 1 ] &&
+  [ "$(c12 dead t1 'HOLD slot')" = 0 ] && clean "$W/s12-dead/t1.err"
+ok $? "S12 later boot, slot b not bootable by its GPT attributes (an OTA is writing it): its entries are removed"
+flip_ib "$W/s12-dry/bn/init_boot_b"
+before=$(tree12 dry); s12run dry t1 next-boot "$WANT_B" --dry-run; after=$(tree12 dry)
+[ "$before" = "$after" ] && [ "$(c12 dry t1 'dry-run: would remove the boot entries of slot b')" = 1 ]
+ok $? "S12 --dry-run with stale slot-b entries: nothing removed, the removal is reported"
+flip_ib "$W/s12-dflt/bn/init_boot_b"
+printf 'default gb-b\ntimeout 4\n' > "$W/s12-dflt/esp/loader/loader.conf"
+s12run dflt t1 next-boot "$WANT_B" --test-ticks 1
+E=$W/s12-dflt/esp
+[ ! -e "$E/loader/entries/gb-b.conf" ] && grep -q -x 'default gb-a' "$E/loader/loader.conf" &&
+  awk '/systemd-boot default -> gb-a/{d=NR} /slot b: removed its boot entries/{r=NR} END {exit !(d && r && d < r)}' "$W/s12-dflt/t1"
+ok $? "S12 stale slot-b entries while loader.conf names gb-b: the running slot a is made the default first, then they are removed"
+
+# ---- S11: the wanted_slot truth table (also run by install_dualboot.ps1's Get-GbWantedSlot, test_wanted_slot.ps1)
+# Columns: GPT attributes of vbmeta_a and vbmeta_b (hex), wanted slot (a, b, - = none), ambiguous (1 = both bootable
+# with the same priority: gb_slotsync takes a, install_dualboot.ps1 -UpdateEspOnly refuses). Bits: priority 48-51,
+# tries 52-55, successful 56.
+# @@wanted_slot-vectors-begin
+# 0000000000000000 0000000000000000 - 0
+# 010f000000000000 0000000000000000 a 0
+# 0000000000000000 010f000000000000 b 0
+# 010f000000000000 010e000000000000 a 0
+# 010e000000000000 010f000000000000 b 0
+# 010f000000000000 010f000000000000 a 1
+# 007f000000000000 010e000000000000 a 0
+# 000f000000000000 010e000000000000 b 0
+# 000f000000000000 000f000000000000 - 0
+# 0100000000000000 0100000000000000 - 0
+# 001f000000000000 001e000000000000 a 0
+# 001f000000000000 001f000000000000 a 1
+# 010e000000000000 007f000000000000 b 0
+# 01ff000000000000 010f000000000000 a 1
+# 00f1000000000000 0000000000000000 a 0
+# 0ef0000000000000 0000000000000000 - 0
+# 010f00000000ffff 0000000000000000 a 0
+# f10f000000000000 0000000000000000 a 0
+# 0001000000000000 0002000000000000 - 0
+# 0102000000000000 0101000000000000 a 0
+# @@wanted_slot-vectors-end
+v=0; nv=0
+sed -n '/^# @@wanted_slot-vectors-begin$/,/^# @@wanted_slot-vectors-end$/p' "$0" | grep -E '^# [0-9a-f]{16} ' > "$W/wsv.txt"
+while read -r _ a b want amb; do
+  nv=$((nv + 1)); got=$("$T" --test-wanted-slot "$a" "$b")
+  [ "$got" = "$want" ] || { echo "  wanted_slot($a, $b) = '$got', want '$want'"; v=$((v + 1)); }
+done < "$W/wsv.txt"
+[ "$nv" -ge 20 ]; ok $(( v + $? )) "S11 wanted_slot truth table: $nv vectors (shared with install_dualboot.ps1)"
 
 # ---- S6: --dry-run end to end on a fake ESP dir, no OTA pending
 E=$W/s6/esp; mkesp "$E" nvtest

@@ -55,7 +55,7 @@ BUILD_INTERNAL = r"C:\GB-build\native\dualboot\build_internal.py"
 VERIFY_IMAGE = r"C:\GB-x86\verify_image.py"
 DEFAULT_OUT = r"D:\GB-iso\googlebook-sb3-installer.iso"
 DEFAULT_USB = r"C:\GB-x86\out\googlebook-sb3-usb.img"
-VERIFIED_USB_SHA256 = "db7003187a1686109ce86783839c33c25c0ad87803ffd172b5e5487aad1b83fd"
+VERIFIED_USB_SHA256 = "377310ee5742b746847f96027f9e8965ceb05d556003e3e74ae5dfcaae67488b"
 TEST_OUT_DIR = r"D:\GB-iso\pipeline-test"
 SSH_KEY = "C:/GB-build/builder_key"
 BUILDER = "builder@192.168.115.132"
@@ -1185,6 +1185,10 @@ def build(a, bid, created, wdir, out_iso, tiny):
     kern = parse_kv_json(lines, "KERNEL-JSON")
     if not a.keep_nx_compat and int(kern["after"], 16) & 0x0100:
         raise BuildError("kernel NX_COMPAT still set after clearing")
+    # WAVE3 item 1: the installer kernel registers its 8250 driver (and so the Surface Aggregator UART) without a
+    # cmdline token only with CONFIG_SERIAL_8250_RUNTIME_UARTS >= 1 (remote.sh already refuses 0; T0 re-checks)
+    if not isinstance(kern.get("runtime_uarts"), int) or kern["runtime_uarts"] < 1:
+        raise BuildError(f"installer kernel CONFIG_SERIAL_8250_RUNTIME_UARTS={kern.get('runtime_uarts')!r}: needs >= 1")
     _, lines = b.run(["bash", f"{rbuild}/builder/mk_initramfs.sh", rbuild, f"{rbuild}/installer", bid, ANDROID_BUILD,
                       KREL], timeout=3600)
     initrd = parse_kv_json(lines, "INITRD-JSON")
@@ -1238,6 +1242,7 @@ def build(a, bid, created, wdir, out_iso, tiny):
         "export_dir": EXPORT, "export_manifest_sha256": exp["manifest_sha256"],
         "builder_iso": f"{REMOTE}/last/{ISO_NAME}" if not tiny else None,
         "kernel_release": KREL, "kernel_dllcharacteristics": {"before": kern["before"], "after": kern["after"]},
+        "kernel_8250_runtime_uarts": kern["runtime_uarts"],
         "grub_efi_sha256": grub["grub_efi_sha256"], "grub_efi_dllcharacteristics": grub["grub_efi_dllcharacteristics"],
         "efiboot_img_bytes": grub["efiboot_img_bytes"],
         "initrd_sha256": initrd["initrd_sha256"], "initrd_size": initrd["initrd_size"],

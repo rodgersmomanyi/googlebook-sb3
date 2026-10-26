@@ -10,9 +10,10 @@
 # (a real directory owned by this script's uid, mode 0700, like gb_nouveau.sh's payload/); anything else there (a
 # symlink, a file, another owner or mode) is removed and re-created first, and symlinks are never copied, so no other
 # uid (adb shell can write /data/local/tmp) can make root write through a planted link. Then the ESP lock is taken
-# (INTERFACES 5.4, owner gb_audiodiag; after 600 s it gives up), the partition named by gb.logpart= (default
+# (INTERFACES 5.4 r4, owner gb_audiodiag; after 600 s it gives up), the partition named by gb.logpart= (default
 # EFI-SYSTEM) is mounted rw,flush only for the copy, and each file is copied as gblog\audio-b<N>-<name> (N =
-# gblog\bootcount, the boot number gb_bootlog keeps). Nothing is copied while the ESP has less than 128 MiB free. The
+# gblog\bootcount, the boot number gb_bootlog keeps). Nothing is copied while the ESP has less than 128 MiB free or
+# when df gives no number (fail closed). The
 # local copy is removed only after a successful copy; otherwise it stays (at most 3 older ones are kept).
 # GB_ADIAG_LOCK, GB_ADIAG_MNT, GB_ADIAG_TMP and GB_ADIAG_KMSG exist for the test harness only (init never sets them).
 MODE=$1
@@ -31,7 +32,14 @@ S() { echo; echo "===== $*"; }
 R() { S "$*"; timeout 25 "$@" 2>&1; }
 cardnum() { for c in /proc/asound/card[0-9]*; do [ "$(cat "$c/id" 2>/dev/null)" = "$1" ] && { echo "${c##*/card}"; return; }; done; }
 
-# ---- ESP lock (INTERFACES 5.4; the same protocol as gb_bootlog and gb_nouveau.sh)
+# ---- ESP lock (INTERFACES 5.4 r4; the same protocol as gb_bootlog and gb_nouveau.sh)
+busy() {    # 0 = a steal is in progress: a $L.stale.<pid> directory of another live pid
+  for s in "$L".stale.*; do
+    p=${s##*.}; case $p in ''|*[!0-9]*) continue;; esac
+    [ "$p" != $$ ] && [ -d "$s" ] && [ -d "/proc/$p" ] && return 0
+  done
+  return 1
+}
 steal() {   # $1 = owner line seen, $2 = inode seen; 0 = the stale lock was removed: retry mkdir
   s=$L.stale.$$; rm -rf "$s" 2>/dev/null
   mv -T "$L" "$s" 2>/dev/null || return 1
@@ -40,25 +48,52 @@ steal() {   # $1 = owner line seen, $2 = inode seen; 0 = the stale lock was remo
     echo "gb_audiodiag: stealing a stale ESP lock (owner '$1')" >> "$K"
     rm -f "$s/owner"; rmdir "$s" 2>/dev/null; return 0
   fi
-  mv -T "$s" "$L" 2>/dev/null || echo "gb_audiodiag: ESP lock changed while stealing it, left as ${s##*/}" >> "$K"
+  n=0           # not the stale lock: put it back, never over an entry in the way; one without an owner goes.
+  # (wave 3, INTERFACES 5.4 r4, wave 2b review L1) retried every 0.05 s for up to 5 s, not once per poll: newcomers no
+  # longer mkdir while our .stale.<pid> exists, and a releaser waits 7 polls (unlock), longer than this budget
+  while :; do
+    if [ ! -e "$L" ] && mv -T "$s" "$L" 2>/dev/null; then return 1; fi
+    if [ ! -e "$s/owner" ] && rmdir "$s" 2>/dev/null; then return 1; fi
+    [ $n -ge 100 ] && break
+    sleep 0.05; n=$((n+1))
+  done
+  echo "gb_audiodiag: ESP lock changed while stealing it, left as ${s##*/}" >> "$K"
   return 1
 }
-lock() {    # 1 s polls; stale = dead or non-numeric owner, or 5 polls without an owner file; 600 s: give up (1)
-  w=0; miss=0; OWN=
-  while ! mkdir "$L" 2>/dev/null; do
-    i=$(stat -c %i "$L" 2>/dev/null); ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"; o=${ol%% *}; st=0
-    if [ -n "$ol" ]; then miss=0; case $o in ''|*[!0-9]*) st=1;; *) [ -d "/proc/$o" ] || st=1;; esac
-    else miss=$((miss+1)); [ $miss -ge 5 ] && st=1; fi
-    if [ $st = 1 ] && [ -n "$i" ]; then miss=0; steal "$ol" "$i" && continue; fi
+lock() {    # 1 s polls; stale = dead or non-numeric owner, our own pid (a lock we do not hold), or 5 polls without
+  w=0; miss=0; bo=0; OWN=   # an owner file; 600 s: give up (1)
+  while :; do
+    if [ $bo -lt 5 ] && busy; then
+      bo=$((bo+1))   # (wave 3, r4, L1) a steal is in progress: no mkdir at all (our directory would block its put-back)
+    elif mkdir "$L" 2>/dev/null; then
+      if [ $bo -lt 5 ] && busy; then
+        rmdir "$L" 2>/dev/null; bo=$((bo+1))   # a steal started meanwhile: back off (rmdir only removes our empty one)
+      else
+        OWN="$$ gb_audiodiag $(cut -d. -f1 /proc/uptime)"
+        if (set -C; echo "$OWN" > "$L/owner") 2>/dev/null; then return 0; fi   # exclusive: never another's owner
+        OWN=
+      fi
+    else
+      bo=0      # (wave 3, r4, L1) only consecutive back-off polls count: a poll that finds the lock held resets them
+      i=$(stat -c %i "$L" 2>/dev/null); ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"; o=${ol%% *}; st=0
+      # (wave 3, r4, L2) our own pid while we hold nothing: a put-back that landed after our release gave up
+      if [ -n "$ol" ]; then miss=0; case $o in ''|*[!0-9]*) st=1;; "$$") st=1;; *) [ -d "/proc/$o" ] || st=1;; esac
+      else miss=$((miss+1)); [ $miss -ge 5 ] && st=1; fi
+      if [ $st = 1 ] && [ -n "$i" ]; then miss=0; steal "$ol" "$i" && continue; fi
+    fi
     [ $w -ge 600 ] && return 1
     sleep 1; w=$((w+1))
   done
-  OWN="$$ gb_audiodiag $(cut -d. -f1 /proc/uptime)"; echo "$OWN" > "$L/owner"
 }
-unlock() {  # only our own lock (a lock stolen from us belongs to someone else now)
-  [ -n "$OWN" ] || return 0
-  ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"
-  [ "$ol" = "$OWN" ] && { rm -f "$L/owner"; rmdir "$L" 2>/dev/null; }
+unlock() {  # only our own lock (a lock stolen from us belongs to someone else now); waits while a steal is in progress
+  [ -n "$OWN" ] || return 0   # (wave 3, r4, wave 2b review L2: 7 polls, longer than a stealer's 5 s put-back budget)
+  n=0
+  while :; do
+    ol=; [ -r "$L/owner" ] && IFS= read -r ol < "$L/owner"
+    if [ "$ol" = "$OWN" ]; then rm -f "$L/owner"; rmdir "$L" 2>/dev/null; break; fi
+    if [ $n -ge 7 ] || ! busy; then echo "gb_audiodiag: ESP lock not ours at release ($ol), left alone" >> "$K"; break; fi
+    sleep 1; n=$((n+1))
+  done
   OWN=
 }
 copy_out() {   # 0 = every file of $O copied to the ESP's gblog/ (B = the boot number used)
@@ -70,11 +105,13 @@ copy_out() {   # 0 = every file of $O copied to the ESP's gblog/ (B = the boot n
     unlock; echo "gb_audiodiag: cannot mount $D, files kept in $O" >> "$K"; return 1
   fi
   r=1
-  B=$(cat "$M/gblog/bootcount" 2>/dev/null); case $B in ''|*[!0-9]*) B=0;; esac
-  # shellcheck disable=SC2046  # df's fields are split into words on purpose
-  set -- $(df -k "$M" 2>/dev/null | tail -n 1); fr=$4
+  B=$(tr -d '\r' < "$M/gblog/bootcount" 2>/dev/null); case $B in ''|*[!0-9]*) B=0;; esac   # a CRLF edit keeps B
+  # free KiB = the third field from the end of df's last line; no number = fail closed (nothing copied)
+  fr=; f1=; f2=; for x in $(df -k "$M" 2>/dev/null | tail -n 1); do fr=$f2; f2=$f1; f1=$x; done
   case $fr in ''|*[!0-9]*) fr=;; esac
-  if [ -n "$fr" ] && [ "$fr" -lt $FLOOR_KB ]; then
+  if [ -z "$fr" ]; then
+    echo "gb_audiodiag: cannot read the ESP free space, files kept in $O" >> "$K"
+  elif [ "$fr" -lt $FLOOR_KB ]; then
     echo "gb_audiodiag: ESP free ${fr} KiB below the 128 MiB floor, files kept in $O" >> "$K"
   else
     mkdir -p "$M/gblog"; r=0

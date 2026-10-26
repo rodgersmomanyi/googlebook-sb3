@@ -52,6 +52,11 @@ the same initrd boots from the VMware NVMe, a USB stick or the internal NVMe.
 * on a USB boot, drops the `voldmanaged=usb` line from our fstab so vold does not offer to format the boot stick.
 * creates **overlayfs whiteouts** (char 0:0) in `/odm/vup` that hide the Trusty/GSC-only pieces: the strongbox
   KeyMint apex, the secretkeeper VINTF fragment and rc, the Trusty Gatekeeper rc.
+* **native only, opt-in** (wave 3): when the command line has both `gb.hw=native` and `gb.overlay=1`, runs
+  `/gbbringup.sh` under a 40 s timeout. It mounts the boot disk's own ESP read-only and applies `gb\gb.cfg` and
+  `gb\overlay\` to the tmpfs `/odm` (module options and skipped lines in `modules.load`, `build.prop` lines,
+  input/audio config files), each checked against an allow-list (log: `/odm/gbinit_bringup.log`;
+  [NATIVE.md](NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg)). No shipped entry has `gb.overlay=1`.
 * **native only**: insmods `/odm/lib/modules/modules.load` in order (log: `/odm/gbinit_modules.log`), before ueventd
   can autoload lapis's own copies of `video`, `wmi`, DRM helpers etc. that our i915 could not link against.
 * `exec /init`.
@@ -142,8 +147,9 @@ VM (`CMDLINE_VM`): `rdinit=/gbinit root=/dev/ram0 kvm-intel.pkvm=0 kvm.enable_vi
 ... video=Virtual-1:2560x1600e ia32_emulation=false vsyscall=none bootconfig gb.hw=vm
 androidboot.boot_devices=pci0000:00/0000:00:15.2`.
 
-Native (`build_usb.native_cmdline()`): the same minus the serial console, earlycon, `8250.nr_uarts` and the virtual
-display mode, plus `firmware_class.path=/odm/firmware,/vendor/firmware efi_pstore.pstore_disable=1
+Native (`build_usb.native_cmdline()`): the same minus the serial console, earlycon and the virtual display mode
+(`8250.nr_uarts=4` stays since wave 3: our GKI has `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, and without the token the
+LPSS UART that carries the Surface Aggregator never registers), plus `firmware_class.path=/odm/firmware,/vendor/firmware efi_pstore.pstore_disable=1
 iommu.passthrough=1 reboot=pci snd_intel_dspcfg.dsp_driver=3 module_blacklist=tpm,...,spi_intel,spi_nor,mtd,gsmi
 gb.logpart=EFI-SYSTEM gb.hw=native gb.boot=usb|internal androidboot.boot_part_uuid=<this disk's super GUID>`.
 `boot_part_uuid` makes first-stage init use exactly one disk, so a USB stick and an internal install never mix.

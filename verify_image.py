@@ -1,10 +1,10 @@
 """Verify a built Googlebook disk image (build_usb.py output) or an ESP image file before it is used
 (WAVE2_PLAN_v2 B-03, section 3.2).
 
-  python -I verify_image.py [IMG] [--expect-tree auto|native|vm|vmtest-gfx] [--krel FILE] [--no-gfxdriver]
+  python -I verify_image.py [IMG] [--expect-tree auto|native|vm|vmtest-gfx|vmtest-kat] [--krel FILE] [--no-gfxdriver]
                             [--compare-export ESP]
   python -I verify_image.py --esp FILE [--boot usb|internal] [--super-guid G] [--expect-tree ...] [--krel FILE]
-                            [--no-gfxdriver] [--compare-export ESP]
+                            [--no-gfxdriver] [--compare-export ESP] [--expect-bringup-test]
   python -I verify_image.py --extract IMG ESP_PATH OUTDIR     (IMG: a disk image or an ESP image; OUTDIR new or empty)
 
 Image mode (IMG, default C:\\GB-x86\\out\\googlebook-sb3-usb.img):
@@ -27,19 +27,31 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
   V8  native gb.rc content (15.1-v12 and the other component rules)   V8b every /odm and gb_* service binary is packed
   V9  native build.prop: exactly one ro.gfx.driver.0 (none with --no-gfxdriver), no forbidden graphics props; VM
       build.prop: no ro.gfx.driver. (vmtest-gfx: exactly the one line)   V10 no priv-app
-  V11 the tree kind's dGPU rules (VM: no dGPU stack; vmtest-gfx: exactly the test additions; native: no gbstage)
-  V12 every component manifest's files/payload/symlinks/rc/build_prop are in the image
+  V11 the tree kind's dGPU rules (VM, vmtest-kat: no dGPU stack; vmtest-gfx: exactly the test additions; native: no
+      gbstage)
+  V12 native: every component manifest's files/payload/symlinks/rc/build_prop are in the image; every kind (wave 3,
+      wave 2b review L5): gbinit, gb_bootlog.sh, gbbringup.sh (build_esp.py, read with ast) and gb_slotsync
+      (inject\\slotsync) are byte-identical to their sources
   V13 the vulkan.nouveau.so symlink and the empty payload mount points   V14 no libvulkan.so
-  V15 the GbGpu / GbGfxDriver APKs   V16 the default entry's native options   V17 --compare-export: same tree as ESP
+  V15 the GbGpu / GbGfxDriver APKs   V16 the default entry's native options, incl. 8250.nr_uarts >= 1 and no
+      console=ttyS / earlycon (WAVE3 item 1)   V17 --compare-export: same tree as ESP
   V18 gb/slot_<slot>.stamp and initrd-<slot>.img   V19 modules.load names this vmlinuz (md5)
   V20 /odm/etc/gb/gfx_build_id   V21 gb_nouveau.sh has GB_PANIC_TIMEOUT=30   V22 gfx_app_prefs.default, tu117.sha256
-  V23 no gb_gfxdriver.sh   V24 VM kinds: gb.hw=vm and console=ttyS0 (vmtest-gfx: the test title)
+  V23 no gb_gfxdriver.sh   V24 VM kinds: gb.hw=vm, console=ttyS0,115200 and 8250.nr_uarts=4 (the VM is unchanged;
+      vmtest-gfx/vmtest-kat: the test title)
+  V25 ESP bring-up (WAVE3 item 12): no gb/gb.cfg, no gb/overlay/, no gb.overlay= in any entry (--expect-bringup-test:
+      the R-12b test ESP instead carries them); gbinit has the three-token gate, the timed call and exec /init last, and
+      no cmdline module-option forwarder (D-d); /gbbringup.sh in the native cpio only
+  V26 fstab (item 4): native userdata has fsverity; the VM tree's fstab == inject\\fstab.android-desktop
+  V27 apgetty off (item 11) in the native gb.rc only   V28 the VNNI KAT (vnni_kat, gb_vnni_kat.sh, zram/zsmalloc in a
+      gbstage tree) only in kind vmtest-kat, and there exactly the inject\\kat / staged inputs
 Read-only: images, lapis.bin and the host inputs are opened "rb"; only --extract writes (into OUTDIR).
 Exit 0 and last line "RESULT: OK"; exit 1 and "RESULT: <n> problem(s)" with one "PROBLEM: V<n> ..." line each;
 exit 2 = usage. Module API (build_iso.py imports this file by path): esp_of_disk, fat_files, fat_parse, cpio_entries,
 gunzip_padded, native_tree, erofs_listing, kernel_release, compare_export.
 """
 import argparse
+import ast
 import glob
 import hashlib
 import io
@@ -80,13 +92,18 @@ HOST = {
     # vermagic names the lapis kernel and they are unsigned; they load through modversions (only the vermagic part
     # after the release must match). V4 accepts exactly byte-identical copies of these files.
     "lapis_mods": os.path.join(GB_BUILD, r"native\audio\modules"),
+    # wave 3 (V12 sources, V25-V28): build_esp.py (literal constants read with ast, never imported), the inputs it packs
+    "build_esp": os.path.join(HERE, r"build_esp.py"),
+    "slotsync": os.path.join(HERE, r"inject\slotsync\gb_slotsync"),
+    "fstab": os.path.join(HERE, r"inject\fstab.android-desktop"),
+    "kat": os.path.join(HERE, r"inject\kat"),
 }
 SIG_TRAILER = b"~Module signature appended~\n"
 OPTIN = ("drm_exec", "drm_gpuvm", "gpu_sched", "drm_ttm_helper", "nouveau")          # names with "-" -> "_"
 OPTIN_FILES = ("drm_exec.ko", "drm_gpuvm.ko", "gpu-sched.ko", "drm_ttm_helper.ko", "nouveau.ko")
 BAD_NAME = re.compile(r"\.pre-|\.merged|\.orig|\.v1\.1|\.v1\.2r1|superseded/|\.bak$|\.part$")
-BAD_PROP = ("ro.hardware.vulkan", "ro.hardware.egl", "ro.hwui.use_vulkan", "debug.hwui.renderer",
-            "ro.vendor.gb.gfx_default", "persist.vendor.gb.gfx_mode")
+BAD_PROP = ("ro.hardware.vulkan", "ro.hardware.egl", "ro.hwui.use_vulkan", "debug.hwui.renderer",   # == build_esp
+            "ro.vendor.gb.gfx_default", "persist.vendor.gb.gfx_mode", "persist.vendor.gb.nouveau")   # _BAD_PROP
 VM_FORBIDDEN = ("nouveau.ko", "firmware/nvidia", "vulkan.nouveau.so", "gb_nouveau", "nvk_probe", "gb_gpu_compute",
                 "app/GbGpu", "GbGfxDriver", "gb_gfxdriver", "gfx_build_id", "gfx_app_prefs.default",
                 "gb_gfx_selftest", "dgpu")
@@ -95,6 +112,13 @@ VMTEST_GFX = {"gbstage/app/GbGpu/GbGpu.apk": 0o100644, "gbstage/app/GbGfxDriver/
               "gbstage/etc/gb/gfx_app_prefs.default": 0o100644, "gbstage/vup/bin/gb_gpu_ui_setup.sh": 0o100755}
 VMTEST_RC_MARK = "\n# ---- component gpu_ui (VM test) ----\n"
 VMTEST_TITLE = "(VM test, gfx components)"
+VMTEST_KAT_TITLE = "(VM test, KAT)"
+KAT_FILES = {"gbstage/vnni_kat": 0o100755, "gbstage/gb_vnni_kat.sh": 0o100755,       # == build_esp.KAT_FILES
+             "gbstage/lib/modules/zsmalloc.ko": 0o100644, "gbstage/lib/modules/zram.ko": 0o100644}
+# GBINIT's ESP bring-up call (WAVE3 contract 2.3, exact lines)
+GBINIT_GATE = 'if [ "$HW" = native ] && [ "$HWTOK" = 1 ] && [ "$OV" = 1 ] && [ -f /gbbringup.sh ]; then'
+GBINIT_CALL = "  /busybox timeout 40 /busybox sh /gbbringup.sh >> /odm/gbinit_bringup.log 2>&1"
+GBINIT_UMOUNT = "  for m in /gbbu/esp /gbbu/sys /gbbu/proc; do /busybox umount -l $m 2>/dev/null; done"
 GFXDRIVER_MEMBERS = {"AndroidManifest.xml", "resources.arsc", "assets/sphal_libraries.txt", "lib/x86_64/libgb_nvk.so",
                      "lib/x86_64/vulkan.intel.so"}
 MODULES_DGPU = b"drm_exec.ko\ndrm_gpuvm.ko\ngpu-sched.ko\ndrm_ttm_helper.ko\nnouveau.ko\n"
@@ -762,13 +786,43 @@ def first_line(path):
     return rd_host(path).decode("utf-8", "replace").splitlines()[0].strip()
 
 
+_BE = {}
+
+
+def be_const(name):
+    """A literal constant (bytes/str/tuple) of build_esp.py (HOST["build_esp"]), read with ast: build_esp is never
+    imported here (it reads lapis.bin). KeyError if it is not a literal top-level assignment."""
+    path = HOST["build_esp"]
+    if path not in _BE:
+        tab = {}
+        for n in ast.parse(rd_host(path).decode("utf-8")).body:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                try:
+                    tab[n.targets[0].id] = ast.literal_eval(n.value)
+                except ValueError:
+                    pass
+        _BE[path] = tab
+    return _BE[path][name]
+
+
+def fstab_userdata(fstab):
+    """[(index, fields)] of the fs_mgr lines for /dev/block/by-name/userdata on /data."""
+    out = []
+    for i, ln in enumerate(fstab.split(b"\n")):
+        f = ln.split()
+        if len(f) >= 2 and f[0] == b"/dev/block/by-name/userdata" and f[1] == b"/data":
+            out.append((i, f))
+    return out
+
+
 class Ctx:
     """Everything the ESP checks look at, parsed once. files: {ESP path: bytes}; info: fat_parse info (None in unit
     tests that build files directly); cpio / listing: parsed from files unless given."""
 
     def __init__(self, files, info=None, kind="auto", super_guid=None, boot=None, part_size=None, krel_file=None,
-                 no_gfxdriver=False, compare=None, cpio=None, listing=None):
+                 no_gfxdriver=False, compare=None, cpio=None, listing=None, bringup_test=False):
         self.files, self.info, self.boot, self.part_size = files, info, boot, part_size
+        self.bringup_test = bringup_test                 # the R-12b test ESP (build_usb.py --bringup-test)
         self.super_guid = super_guid.lower() if super_guid else None
         self.krel_file, self.no_gfxdriver, self.compare = krel_file, no_gfxdriver, compare
         self.notes = []                                 # (check id, text): informational lines for the report
@@ -1238,7 +1292,7 @@ def v11(c):
     rc = c.rc("gbstage")
     if rc is None:
         return p + ["no gbstage/etc/init/gb.rc"]
-    if c.kind == "vm":
+    if c.kind in ("vm", "vmtest-kat"):              # the KAT tree's own additions: V28
         if hits:
             p.append(f"dGPU stack in the VM tree: {hits[:4]}")
         for s in VM_RC_FORBIDDEN:
@@ -1276,8 +1330,39 @@ def v11(c):
     return p
 
 
+def tree_sources(c):
+    """(wave 3, wave 2b review L5) [(label, cpio path, mode, source bytes or an error text)] of the tree files that do
+    not come from a component manifest: build_esp.py's own scripts and the gb_slotsync binary from inject."""
+    tr = "gbnative" if c.kind == "native" else "gbstage"
+    out = []
+    names = [("gbinit", "GBINIT")] + ([("gbnative/gb_bootlog.sh", "GB_BOOTLOG_SH"), ("gbbringup.sh", "GB_BRINGUP_SH")]
+                                      if c.kind == "native" else [])
+    for path, const in names:
+        try:
+            out.append(("build_esp.py", path, 0o100755, be_const(const)))
+        except (OSError, KeyError, ValueError, SyntaxError) as e:
+            out.append(("build_esp.py", path, 0o100755, f"{const} unreadable ({e.__class__.__name__})"))
+    path = f"{tr}/vup/bin/gb_slotsync"
+    try:
+        out.append(("inject", path, 0o100755, rd_host(HOST["slotsync"])))
+    except OSError:
+        if path in c.tree:                           # build_esp packs it only when the binary exists
+            out.append(("inject", path, 0o100755, "inject\\slotsync\\gb_slotsync unreadable"))
+    return out
+
+
 def v12(c):
     p = []
+    for label, path, md, want in tree_sources(c):
+        have = c.tree.get(path)
+        if isinstance(want, str):
+            p.append(f"{label}: {path}: {want}")
+        elif have is None:
+            p.append(f"{label}: {path} not in the cpio")
+        elif have[1] != want or have[0] != md:
+            p.append(f"{label}: {path} differs from its source (bytes or mode)")
+    if c.kind != "native":
+        return ["; ".join(p)] if p else []
     rc = c.rc() or ""
     prop = (c.data("gbnative/etc/build.prop") or b"").decode("utf-8", "replace").splitlines()
     try:
@@ -1318,8 +1403,8 @@ def v12(c):
         for ln in m.get("build_prop", []):
             if ln not in prop:
                 p.append(f"{fn}: build.prop line {ln!r} missing")
-    if len(p) > 6:
-        p = p[:6] + [f"... {len(p) - 6} more"]
+    if len(p) > 12:
+        p = p[:12] + [f"... {len(p) - 12} more"]
     return ["; ".join(p)] if p else []
 
 
@@ -1402,7 +1487,16 @@ def v16(c):
     t = c.base["tokens"]
     miss = [x for x in ("gb.hw=native", "efi_pstore.pstore_disable=1", "reboot=pci", "gb.logpart=EFI-SYSTEM")
             if x not in t] + ([] if any(x.startswith("module_blacklist=") for x in t) else ["module_blacklist="])
-    return [f"the default entry lacks {miss}"] if miss else []
+    p = [f"the default entry lacks {miss}"] if miss else []
+    # WAVE3 item 1: our GKI has CONFIG_SERIAL_8250_RUNTIME_UARTS=0, so without 8250.nr_uarts >= 1 the Surface
+    # Aggregator UART never registers; and no serial console natively (serdev owns that UART)
+    nr = [x[len("8250.nr_uarts="):] for x in t if x.startswith("8250.nr_uarts=")]
+    if not nr or not all(v.isdigit() and int(v) >= 1 for v in nr):
+        p.append(f"the default entry needs 8250.nr_uarts=<n>, n >= 1 (has {nr or 'none'})")
+    bad = [x for x in t if x.startswith(("console=ttyS", "earlycon"))]
+    if bad:
+        p.append(f"the native default entry has a serial console token {bad}")
+    return p
 
 
 def v17(c):
@@ -1514,17 +1608,152 @@ def v24(c):
         p.append("the default entry lacks gb.hw=vm")
     if not any(x.startswith("console=ttyS0") for x in t):
         p.append("the default entry lacks console=ttyS0")
+    # [W3R-19] the VM entry is unchanged by WAVE3 item 1
+    if "console=ttyS0,115200" not in t or [x for x in t if x.startswith("8250.nr_uarts=")] != ["8250.nr_uarts=4"]:
+        p.append("the VM entry must keep exactly 8250.nr_uarts=4 and console=ttyS0,115200")
     if c.kind == "vmtest-gfx" and VMTEST_TITLE not in (c.base["title"] or ""):
         p.append(f"the VM test gfx title lacks {VMTEST_TITLE!r}")
+    if c.kind == "vmtest-kat" and VMTEST_KAT_TITLE not in (c.base["title"] or ""):
+        p.append(f"the VM test KAT title lacks {VMTEST_KAT_TITLE!r}")
+    return p
+
+
+def v25(c):
+    """WAVE3 item 12 (contract 2.3, [W3R-01/02/03/17]): the ESP bring-up is opt-in and never shipped."""
+    p = []
+    cfg = [k for k in c.files if k.lower() == "gb/gb.cfg"]
+    ov = sorted(k for k in c.files if k.lower().startswith("gb/overlay/"))
+    tok = {n: [x for x in parse_entry(t)["tokens"] if x.startswith("gb.overlay=")] for n, t in sorted(c.entries.items())}
+    if c.bringup_test:                                   # the R-12b test ESP: exactly the opt-in pieces
+        if not cfg:
+            p.append("--expect-bringup-test: no gb/gb.cfg")
+        if c.base is not None and tok.get(f"gb-{c.slot}.conf") != ["gb.overlay=1"]:
+            p.append("--expect-bringup-test: the default entry lacks exactly one gb.overlay=1")
+    else:
+        if cfg or ov:
+            p.append(f"a build artifact must not carry gb/gb.cfg or gb/overlay/ ({(cfg + ov)[:3]})")
+        bad = sorted(n for n, v in tok.items() if v)
+        if bad:
+            p.append(f"gb.overlay= in shipped entries {bad} (one boot only, typed in the editor)")
+    gi = c.data("gbinit")
+    if gi is None:
+        return p + ["no gbinit in the cpio"]
+    lines = gi.decode("utf-8", "replace").splitlines()
+    body = [ln for ln in lines if ln.strip()]
+    idx = lambda s: lines.index(s) if s in lines else -1
+    gate, call, um = idx(GBINIT_GATE), idx(GBINIT_CALL), idx(GBINIT_UMOUNT)
+    cp = next((i for i, ln in enumerate(lines) if ln.startswith("/busybox cp -a $SRC/. /odm/")), -1)
+    mods = next((i for i, ln in enumerate(lines) if "while read -r m a; do" in ln), -1)
+    if not (0 <= cp < gate < call < um < mods):
+        p.append("gbinit: the gated, timed /gbbringup.sh call is missing or not between the /odm copy and the modules")
+    if not any('gb.hw=*) HW=${a#gb.hw=}; HWTOK=0; [ "$HW" = native ] && HWTOK=1;;' in ln for ln in lines) or \
+            not any("gb.overlay=1) OV=1;;" in ln for ln in lines):
+        p.append("gbinit: HWTOK must come from the explicit gb.hw=native token and OV from gb.overlay=1")
+    if not body or body[-1] != "exec /init":
+        p.append("gbinit: exec /init is not the last line")
+    if any(s in gi for s in (b"gb_ignore_user_gamma", b"I915OPT", b"set -e")):
+        p.append("gbinit: no module-option forwarding from the command line (lead decision D-d) and no set -e")
+    b = c.tree.get("gbbringup.sh")
+    if c.kind == "native":
+        if b is None or b[0] != 0o100755 or not b[1].startswith(b"#!/busybox sh\n") or \
+                b"\nB=/busybox; R=\n#@@config-end\n" not in b[1]:
+            p.append("the native cpio lacks /gbbringup.sh (0755, #!/busybox sh, B=/busybox; R=)")
+    elif b is not None:
+        p.append("a VM cpio carries /gbbringup.sh (native only)")
+    return p
+
+
+def v26(c):
+    """WAVE3 item 4 ([W3R-06]): fs-verity on the native userdata only; the VM fstab is the shared input unchanged."""
+    try:
+        host = rd_host(HOST["fstab"])
+    except OSError as e:
+        return [f"inject fstab unreadable ({e})"]
+    if c.kind != "native":
+        got = c.data("gbstage/etc/fstab.android-desktop")
+        return [] if got == host else ["the VM tree's fstab differs from inject\\fstab.android-desktop (the user's VM)"]
+    got = c.data("gbnative/etc/fstab.android-desktop")
+    if got is None:
+        return ["no gbnative/etc/fstab.android-desktop"]
+    ud = fstab_userdata(got)
+    if len(ud) != 1 or len(ud[0][1]) != 5 or ud[0][1][4].split(b",").count(b"fsverity") != 1:
+        return ["the native fstab needs exactly one userdata line with fsverity in its fs_mgr flags"]
+    hu = fstab_userdata(host)
+    lines = host.split(b"\n")
+    if len(hu) == 1:
+        lines[hu[0][0]] = lines[hu[0][0]].rstrip() + b",fsverity"
+    if len(hu) != 1 or b"\n".join(lines) != got:
+        return ["the native fstab is not inject\\fstab.android-desktop plus ',fsverity' on the userdata line"]
+    return []
+
+
+def v27(c):
+    """WAVE3 item 11 ([W3R-21]): apgetty off in the native gb.rc only."""
+    if c.kind != "native":
+        rc = c.rc("gbstage") or ""
+        return ["the VM gb.rc mentions apgetty (native only)"] if "apgetty" in rc else []
+    secs = rc_sections(c.rc() or "")
+    has = lambda head, line: any(s[0] == head and line in s[1:] for s in secs)
+    miss = [f"{h}: {ln}" for h, ln in (("on init", "setprop desktop.apgetty.enable 0"), ("on boot", "stop apgetty"),
+                                       ("on property:init.svc.apgetty=running", "stop apgetty"),
+                                       ("on property:init.svc.apgetty=restarting", "stop apgetty")) if not has(h, ln)]
+    return [f"native gb.rc lacks {miss}"] if miss else []
+
+
+def v28(c):
+    """WAVE3 6.4 / contract 2.7: the VNNI KAT and its zram modules only in the throwaway vmtest-kat tree."""
+    p = []
+    kat = sorted(x for x in c.tree if x.rsplit("/", 1)[-1] in ("vnni_kat", "gb_vnni_kat.sh"))
+    if c.kind != "vmtest-kat":
+        if kat:
+            p.append(f"the KAT is in a {c.kind} tree: {kat}")
+        if c.kind != "native":
+            z = sorted(x for x in c.tree if x in ("gbstage/lib/modules/zram.ko", "gbstage/lib/modules/zsmalloc.ko"))
+            if z:
+                p.append(f"zram in the shipped VM tree {z} (item 5 is out of scope)")
+        if "VNNI KAT" in (c.rc("gbstage") or "") + (c.rc() or ""):
+            p.append("the KAT rc fragment is in a shipped gb.rc")
+        return p
+    for path, md in KAT_FILES.items():
+        e = c.tree.get(path)
+        if e is None or e[0] != md:
+            p.append(f"{path} missing or not mode {md:o}")
+    try:
+        sums = {}
+        for ln in rd_host(os.path.join(HOST["kat"], "SHA256SUMS")).decode("ascii", "replace").splitlines():
+            m = re.fullmatch(r"([0-9a-f]{64}) [ *]\.?/?([A-Za-z0-9_.-]+)", ln.strip())
+            if m:
+                sums[m.group(2)] = m.group(1)
+        exe = c.data("gbstage/vnni_kat")
+        if exe is None or sums.get("vnni_kat") != sha256(exe):
+            p.append("gbstage/vnni_kat does not match inject\\kat\\SHA256SUMS")
+    except OSError as e:
+        p.append(f"inject\\kat\\SHA256SUMS unreadable ({e})")
+    for n in ("zsmalloc.ko", "zram.ko"):
+        try:
+            if c.data("gbstage/lib/modules/" + n) != rd_host(os.path.join(HOST["modules"], n)):
+                p.append(f"gbstage/lib/modules/{n} is not the staged inject\\native\\modules copy")
+        except OSError as e:
+            p.append(f"inject\\native\\modules\\{n} unreadable ({e})")
+    try:
+        if c.data("gbstage/gb_vnni_kat.sh") != be_const("GB_VNNI_KAT_SH"):
+            p.append("gbstage/gb_vnni_kat.sh differs from build_esp.py")
+        rc = (c.data("gbstage/etc/init/gb.rc") or b"")
+        frag = be_const("KAT_RC")
+        if rc.count(frag) != 1 or not rc.endswith(frag):
+            p.append("the KAT gb.rc does not end with exactly one KAT fragment")
+    except (OSError, KeyError, ValueError, SyntaxError) as e:
+        p.append(f"build_esp.py KAT constants unreadable ({e.__class__.__name__})")
     return p
 
 
 ALL, NATIVE, VMS = "all", "native", "vm"
 CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("V5", v5, NATIVE),
           ("V6", v6, ALL), ("V7", v7, ALL), ("V8", v8, NATIVE), ("V8b", v8b, NATIVE), ("V9", v9, ALL),
-          ("V10", v10, ALL), ("V11", v11, ALL), ("V12", v12, NATIVE), ("V13", v13, NATIVE), ("V14", v14, ALL),
+          ("V10", v10, ALL), ("V11", v11, ALL), ("V12", v12, ALL), ("V13", v13, NATIVE), ("V14", v14, ALL),
           ("V15", v15, NATIVE), ("V16", v16, NATIVE), ("V17", v17, ALL), ("V18", v18, ALL), ("V19", v19, NATIVE),
-          ("V20", v20, NATIVE), ("V21", v21, NATIVE), ("V22", v22, NATIVE), ("V23", v23, ALL), ("V24", v24, VMS)]
+          ("V20", v20, NATIVE), ("V21", v21, NATIVE), ("V22", v22, NATIVE), ("V23", v23, ALL), ("V24", v24, VMS),
+          ("V25", v25, ALL), ("V26", v26, ALL), ("V27", v27, ALL), ("V28", v28, ALL)]
 
 
 def run_checks(c, only=None):
@@ -1565,7 +1794,8 @@ def esp_report(rep, files, info, a, super_guid, part_size, label):
         except (OSError, ValueError, struct.error) as e:
             rep.bad("V17", f"--compare-export {a.compare_export}: {e}")
     c = Ctx(files, info=info, kind=a.expect_tree, super_guid=super_guid, boot=a.boot, part_size=part_size,
-            krel_file=a.krel, no_gfxdriver=a.no_gfxdriver, compare=compare)
+            krel_file=a.krel, no_gfxdriver=a.no_gfxdriver, compare=compare,
+            bringup_test=getattr(a, "expect_bringup_test", False))
     print(f"{label}: tree {c.kind}, slot {c.slot}, krel {c.krel}, {len(c.cpio)} cpio entries, "
           f"{len(files)} ESP files" + (f", free {info['free'] / MiB:.1f} MiB" if info and 'free' in info else ""),
           flush=True)
@@ -1738,7 +1968,9 @@ def main(argv=None):
     ap.add_argument("--esp", help="verify an ESP image file instead of a disk image")
     ap.add_argument("--boot", choices=["usb", "internal"], help="--esp: the entry's gb.boot= value")
     ap.add_argument("--super-guid", help="--esp: the super GUID every boot_part_uuid must name")
-    ap.add_argument("--expect-tree", choices=["auto", "native", "vm", "vmtest-gfx"], default="auto")
+    ap.add_argument("--expect-tree", choices=["auto", "native", "vm", "vmtest-gfx", "vmtest-kat"], default="auto")
+    ap.add_argument("--expect-bringup-test", action="store_true",
+                    help="--esp: the R-12b test ESP (build_usb.py --bringup-test): gb/gb.cfg and gb.overlay=1 expected")
     ap.add_argument("--krel", help="file whose first line is the expected kernel release")
     ap.add_argument("--no-gfxdriver", action="store_true", help="the image was built with GB_GFXDRIVER=0")
     ap.add_argument("--compare-export", metavar="ESP", help="an export EFI-SYSTEM.img that must hold the same tree")
@@ -1750,8 +1982,8 @@ def main(argv=None):
         return extract_mode(*a.extract)
     if a.esp and a.img:
         ap.error("give either IMG or --esp FILE")
-    if not a.esp and (a.boot or a.super_guid):
-        ap.error("--boot and --super-guid are only used with --esp")
+    if not a.esp and (a.boot or a.super_guid or a.expect_bringup_test):
+        ap.error("--boot, --super-guid and --expect-bringup-test are only used with --esp")
     if a.super_guid:
         try:
             uuid.UUID(a.super_guid)

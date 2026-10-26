@@ -114,8 +114,8 @@ The k14 krel differs from k13's (`6.18.21-android17-5-g3938c8d97142-dirty-ab1630
 * Copy `K14.md` to `kernel\K14.md`.
 * In `kernel\README.md`, after the build #13 paragraph (line ~26), add:
 
-  > Build #14 ([scripts/kbuild14_native.sh](scripts/kbuild14_native.sh)) is build #13 plus 40 nouveau-only patches
-  > ([patches/k14](patches/k14)): the 37 linux-6.18.y nouveau fixes v6.18.21..v6.18.57 (without the DRM-core
+  > Build #14 ([scripts/kbuild14_native.sh](../../../kernel/scripts/kbuild14_native.sh)) is build #13 plus 40 nouveau-only patches
+  > ([patches/k14](../../../kernel/patches/k14/)): the 37 linux-6.18.y nouveau fixes v6.18.21..v6.18.57 (without the DRM-core
   > `drm/client` parameter change) and local patches N1-N3 ([K14.md](K14.md)). `.config` and `vmlinux.symvers` are
   > identical to build #13. It records the k13 working tree as branch `k13-native`, builds branch `k14-nouveau`
   > into `/build/dist14` (`BUILD_NUMBER=16302714`) and restores the k13 tree afterwards. Stage it with

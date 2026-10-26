@@ -420,6 +420,10 @@ def t0(ctx):
         res.check(facts.get("efiboot_img_bytes") == ctx.record.get("efiboot_img_bytes"),
                   "efiboot.img bytes == build record (%s)" % ctx.record.get("efiboot_img_bytes"))
         res.check(facts.get("bootx64_sha256") == ctx.record.get("grub_efi_sha256"), "BOOTX64.EFI == build record")
+        # WAVE3 item 1 (TA-7): the installer kernel needs no 8250.nr_uarts (records before wave 3 lack the key)
+        ru, rec = facts.get("installer_8250_runtime_uarts"), ctx.record.get("kernel_8250_runtime_uarts")
+        res.check(isinstance(ru, int) and ru >= 1 and rec in (None, ru),
+                  "installer kernel CONFIG_SERIAL_8250_RUNTIME_UARTS %s >= 1, == build record (%s)" % (ru, rec))
         fs = subprocess.run([sys.executable, "-I", C.FORBIDDEN_SCAN, r"C:\GB-x86\iso\installer"],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         res.check(fs.returncode == 0 and b"FORBIDDEN-SCAN OK" in fs.stdout, "forbidden_scan.py on installer\\: OK")
@@ -1671,7 +1675,8 @@ def t8(ctx):
         rc, out = ps(os.path.join(test, "run_image_tests.ps1"), "-Image", os.path.join(base, "cycle_small.img"),
                      "-ExportDir", r"D:\gb-test\export_small", "-Tag", "iso_t8", "-DeleteImage", "-LogDir", lg,
                      log_path=os.path.join(lg, "run_image_tests.out.log"), timeout=6 * 3600)
-        res.check("SUMMARY 'iso_t8': 25 passed, 0 failed" in out, "run_image_tests.ps1: 25 passed, 0 failed")
+        # 57 = the 25 cases of wave 2 + the 32 slot-aware -UpdateEspOnly cases WAVE3_PLAN 5.4 added (W3 (1)-(6))
+        res.check("SUMMARY 'iso_t8': 57 passed, 0 failed" in out, "run_image_tests.ps1: 57 passed, 0 failed")
         rc, out = ps(os.path.join(test, "test_import_iso_state.ps1"), "-WorkDir", os.path.join(base, "import"),
                      "-LogDir", lg, log_path=os.path.join(lg, "test_import_iso_state.out.log"), timeout=6 * 3600)
         m = re.search(r"SUMMARY import-iso: (\d+) passed, (\d+) failed", out)

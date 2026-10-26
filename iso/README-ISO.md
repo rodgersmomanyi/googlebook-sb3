@@ -20,13 +20,14 @@ options:
 Every destructive step asks you to type a confirmation, and the installer refuses disks it must not touch (see
 [The menu](#the-installer-menu)).
 
-**Current build** (2026-10-25, build `20261025-205346-63e3bd38`): 7,471,783,936 bytes, SHA-256
-`e0067b125bf9e72ca65f960f40934369e8fc9ad71e6b204f10b618999a7c01fc`. It carries the USB image `db700318…` (the Wave 2
-image with the review fix to the audio diagnostics) and a fresh dual-boot export (new GUIDs). Only its two ESP objects
-differ from the previous ISO `76fbb7ee…`. Re-run and passed: the static test (T0), the raw-ISO tests (T7, T2e) and
-the whole-disk tests (T1a bit-exact, T1b onto a larger disk). The dual-boot install/uninstall tests (groups G1-G4:
-T3n(f), T3n(e), T3, T3n(d), T4, T4b, T9) still have to be re-run once D: has enough free space (about 33 GB plus the
-10 GB reserve): until then, use option 1 only, and do not use option 2 or 3.
+**Current build** (2026-10-26, build `20261026-062920-107b7e70`): 7,471,886,336 bytes, SHA-256
+`b1c355b0f796b46b3f14ed2e153355c339e58e237983f63638fd58b8275c770a`. It carries the Wave 3 USB image `377310ee…`
+(kernel build #15, the Surface Aggregator serial fix `8250.nr_uarts=4`, the sound and touchpad fixes and the
+boot-log summary: README-FLASH.md, "What is new") and a fresh dual-boot export (new GUIDs). Only
+its two ESP objects differ from the previous ISO `e0067b12…`. The **full** test suite passed on this build in
+VMware: all 38 tests (T0-T10, including T1c and the dual-boot install, ESP update and uninstall groups G1-G4:
+T3n(f), T3n(e), T3, T3n(d), T4, T4b, T9), `OVERALL PASS`. All four options can be used; everything was still tested
+only in VMware and on disk image files, never on the real laptop.
 
 ---------------------------------------------------------------------------------------------------------------------
 
@@ -296,6 +297,25 @@ Do these in Windows, in this order:
 
 ## After a dual-boot install
 
+* **First boot: what to check.** The installed system is the same as the USB stick's (option 1 writes that stick
+  image itself), so the first-boot checklist of README-FLASH.md section 6 applies to both. After the first boot
+  (wait for the 15-minute log), open `\gblog\boot1-t900.txt` on the Googlebook ESP (for a dual-boot install,
+  `C:\GB-build\native\dualboot\README_DUALBOOT.md`, "First boot, logs, checks", says how to read it from Windows) and check its first screen, the `== summary` block:
+  * `serial 8250:` shows `Serial: 8250/16550 driver, 4 ports`, `serial errors: dw-apb-uart -22: 0`, and
+    `serial surface_serial_hub bound:` names a device (keyboard base, touchpad, batteries, charger, detach);
+  * `inputs (Surface Aggregator HID, bus 0019):` lists the keyboard and the touchpad;
+  * `audio cards:` lists `sofhdadsp` and `audio DRAS:` counts more than 0 lines naming it (sound);
+  * `-- firmware load failures (dmesg)` is empty (note any `Direct firmware load for … failed` name, for example
+    Bluetooth `ibt-…`) and `firmware i915 DMC:` names a DMC file;
+  * `fs-verity:` says `ext4 feature present` with no `FS_STAT_ENABLE_VERITY_FAILED` / `Failed to run tune2fs`
+    (the first boot sets fs-verity on the Googlebook data partition once, permanently);
+  * `apgetty:` says `desktop.apgetty.enable=0` and `init.svc.apgetty` is not `running`;
+  * `-- gb_vnni` shows `emulated <n> … irqon <n> …` with both numbers equal (the kernel's instruction emulator);
+  * `i915 white veil:` and `HWUI Vulkan queueCount abort lines:` (report the counts; a washed-out picture has an
+    opt-in fix, README-FLASH.md section 8), `gb_slotsync HOLD:` empty, `-- ESP bring-up` says `absent`.
+
+  Before you share a log anywhere, remove serial numbers, Wi-Fi names and account addresses from its full `getprop`
+  and `logcat` parts (the summary has none).
 * **Windows stays the default.** To boot Googlebook once:
   * from Windows: elevated `C:\GB-build\native\dualboot\Restart-ToGooglebook.ps1` (it finds the entry by its name
     "Googlebook OS"), or
@@ -349,7 +369,8 @@ NVIDIA kernel modules and the Vulkan driver, about 60 MB): Googlebook copies and
 NVIDIA driver, so leave both files where they are. Every ISO built with a fresh export (Wave 2, and its review
 rebuild, DESIGN 13.4 and 13.8) carries **new** dual-boot GUIDs: it cannot remove a dual-boot install made with an
 earlier ISO; remove such an install with that earlier ISO's option 3 or with `uninstall_dualboot.ps1 -Force`. The
-earlier ISOs are kept in `D:\GB-iso\prev\` (`1718bcc1…`) and `D:\GB-iso\prev\w2-76fbb7ee\` (`76fbb7ee…`).
+earlier ISOs are kept in `D:\GB-iso\prev\` (`1718bcc1…`, before Wave 2) and `C:\GB-x86\out\prev\iso-w2fix-e0067b12\`
+(`e0067b12…`, the Wave 2 review ISO; moved to C: for disk space). The Wave 2 ISO `76fbb7ee…` is no longer kept.
 
 ---------------------------------------------------------------------------------------------------------------------
 
@@ -441,7 +462,10 @@ python -I C:\GB-x86\iso\build\build_iso.py               # full build
   * `--keep-nx-compat` leaves the kernel's NX flag set.
   * `--keep-work` keeps the builder's work directory.
 * **Disk space:** D: needs about 15.5 GiB free during a build. A fresh export needs about 15 GiB on C: for a while.
-  The builder keeps a chunk cache (about 7 GiB) and `/var/tmp/gbiso/last/googlebook-sb3-installer.iso`.
+  The builder keeps a chunk cache (about 7 GiB) and `/var/tmp/gbiso/last/googlebook-sb3-installer.iso`. The build
+  needs 25 GiB free on the builder's `/`. The cache is keyed by the USB image's sha256, so a new USB image cannot
+  reuse an older image's cache (`/var/tmp/gbiso/cache/<old sha>-*`); a successful build removes the older caches, and
+  removing one by hand beforehand frees the space when the preflight reports less than 25 GiB.
 * `--test-tiny-payload` is a pipeline test only. It writes `D:\GB-iso\pipeline-test\` and its ISO cannot install
   Googlebook.
 
@@ -451,7 +475,10 @@ python -I C:\GB-x86\iso\build\build_iso.py               # full build
 
 * **Not yet tested on the real Surface Book 3.** Everything was tested in VMware and in equivalents of Ventoy and
   Rufus. Untested on the real hardware:
-  * the Surface keyboard driver stack in the installer (have a wired USB keyboard ready)
+  * the Surface keyboard driver stack in the installer (have a wired USB keyboard ready). The installer's Ubuntu
+    kernel starts the 8250 serial driver that the Surface Aggregator needs by itself
+    (`CONFIG_SERIAL_8250_RUNTIME_UARTS=32`, checked when the ISO is built and by T0), so, unlike the Googlebook
+    kernel, it needs no `8250.nr_uarts=` boot option
   * the console font size on the real panel (16x32 is expected; 32x64 cannot work on this kernel)
   * whether `surface_charger`/`surface_battery` report the charger. If they report nothing, the installer asks you
     to type `AC-OK`; if they report "on battery" while the charger is plugged in, use the Windows scripts.

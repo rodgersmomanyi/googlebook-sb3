@@ -12,14 +12,19 @@
 # Legacy fallback: with snd_intel_dspcfg.dsp_driver=1 on the cmdline, it loads snd-hda-intel (blocklisted for
 # modalias autoload in vendor_dlkm) and points the HAL config at the PCH card. Before that, every Intel (0x8086)
 # HDA function (class 0x0403*) gets driver_override=snd_hda_intel; no attribute of an NVIDIA (0x10de) function is
-# ever written here (gb_power keeps those driverless). GB_ROOT exists for the test harness only (a fake /sys and
-# /dev/kmsg; init never sets it).
+# ever written here (gb_power keeps those driverless). snd_hda_intel's ID table also matches the NVIDIA HDA function
+# (02:00.1), so the module is registered with PCI driver autoprobe off (/sys/bus/pci/drivers_autoprobe, a bus-wide
+# switch; the kernel's driver registration honours it, a hot-added device's probe does not) and only the Intel
+# function(s) are then probed by name; autoprobe is restored at once. If autoprobe cannot be switched off,
+# snd_hda_intel is not loaded (fail closed: no legacy audio rather than an NVIDIA probe). A PCI driver that another
+# loader registered during that window gets the driverless non-NVIDIA functions probed. GB_ROOT exists for the test
+# harness only (a fake /sys, /dev/kmsg and /vendor/bin/modprobe; init never sets it).
 exec >"${GB_ROOT:-}/dev/kmsg" 2>&1
 L() { echo "GB_AUDIO: $*"; }
 SYS=${GB_ROOT:-}/sys
 TM=/vendor/bin/tinymix
 VM=/vendor/lib/modules
-MP=/vendor/bin/modprobe
+MP=${GB_ROOT:-}/vendor/bin/modprobe
 HAL=vendor.audio-hal-aidl
 DSP=$(cat "$SYS/module/snd_intel_dspcfg/parameters/dsp_driver" 2>/dev/null)
 ID=sofhdadsp
@@ -53,6 +58,39 @@ hda_override() {  # legacy mode only: snd_hda_intel may bind the Intel HDA funct
     esac
   done
 }
+pci_drivers() { for x in "$SYS"/bus/pci/drivers/*; do [ -d "$x" ] && printf '%s ' "${x##*/}"; done; }
+hda_legacy_load() {  # legacy mode only: register snd_hda_intel with PCI autoprobe off, then probe the Intel HDA only
+  AP=$SYS/bus/pci/drivers_autoprobe
+  ap=$(cat "$AP" 2>/dev/null)
+  before=" $(pci_drivers)"                     # (taken before the switch: a driver registered after it is "new")
+  case $ap in
+    1) if ! echo 0 > "$AP"; then L "drivers_autoprobe: cannot switch it off: snd_hda_intel not loaded"; return 1; fi ;;
+    0) ;;                                      # already off (left as found)
+    *) L "drivers_autoprobe unreadable ('$ap'): snd_hda_intel not loaded"; return 1 ;;
+  esac
+  $MP -d $VM snd_hda_intel || L "modprobe snd_hda_intel failed"
+  if [ "$ap" = 1 ] && ! echo 1 > "$AP"; then L "drivers_autoprobe: restoring 1 failed"; fi
+  for d in "$SYS"/bus/pci/devices/*; do       # the Intel HDA function(s), by name (driver_override: snd_hda_intel)
+    [ "$(cat "$d/vendor" 2>/dev/null)" = 0x8086 ] || continue
+    case "$(cat "$d/class" 2>/dev/null)" in 0x0403*) ;; *) continue ;; esac
+    [ -e "$d/driver" ] && continue
+    if echo "${d##*/}" > "$SYS/bus/pci/drivers_probe"; then L "probe ${d##*/} (snd_hda_intel)"; else L "probe ${d##*/} failed"; fi
+  done
+  new=
+  for x in $(pci_drivers); do
+    case "$before" in *" $x "*) ;; *) [ "$x" = snd_hda_intel ] || new="$new $x" ;; esac
+  done
+  [ -n "$new" ] || return 0
+  # another loader registered a PCI driver while autoprobe was off: give the driverless non-NVIDIA functions the
+  # probe that registration would have done (an NVIDIA function is never probed here)
+  L "PCI drivers registered while autoprobe was off:$new: probing the driverless non-NVIDIA functions"
+  for d in "$SYS"/bus/pci/devices/*; do
+    [ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] && continue
+    [ -e "$d/driver" ] && continue
+    echo "${d##*/}" > "$SYS/bus/pci/drivers_probe" 2>/dev/null && L "probe ${d##*/}"
+  done
+  return 0
+}
 wait_for() {  # wait_for <seconds> <command...>
   w=$1; shift; i=0
   while ! "$@" && [ "$i" -lt "$w" ]; do sleep 1; i=$((i+1)); done
@@ -78,7 +116,7 @@ $MP -a -d $VM snd_hda_codec_alc269 snd_hda_codec_intelhdmi || L "modprobe codec 
 
 if [ "$ID" = PCH ]; then
   hda_override
-  $MP -d $VM snd_hda_intel || L "modprobe snd_hda_intel failed"
+  hda_legacy_load
 elif ! wait_for 30 sof_loaded; then
   if dmesg | grep -q -E "snd[_a-z0-9]*: (disagrees about version of symbol|Unknown symbol)"; then
     L "vendor SOF modules reject the preloaded HDA modules: swapping in the vendor_dlkm copies"

@@ -43,8 +43,9 @@ for f in usr/bin/ntfsls usr/bin/ntfscat lib/modules/$KREL/modules.builtin lib/mo
          opt/gb/lib/gbinstall.py opt/gb/lib/gb/run.py opt/gb/bin/gbinstall.sh opt/gb/bin/gbmirror.sh; do
   [ -e "$ST/$f" ] || { echo "mk_initramfs: missing /$f"; exit 1; }
 done
+# the same names as stage_initramfs.py MODULE_DENY (DESIGN 13.1, 13.9: since Wave 2b also the dGPU stack here)
 denied=$(find -L "$ST/lib/modules/$KREL" -name '*.ko' -printf '%f\n' | sed 's/\.ko$//; s/-/_/g' |
-         grep -E '^(spi_intel.*|mtd.*|efi_test|efi_pstore|tpm.*)$' || true)
+         grep -E '^(spi_intel.*|mtd.*|efi_test|efi_pstore|tpm.*|nouveau|nvidia.*|drm_gpuvm|drm_exec|gpu_sched|drm_ttm_helper|mxm_wmi|i2c_nvidia_gpu|nova_core|nova_drm|snd_hda_intel)$' || true)
 [ -z "$denied" ] || { echo "mk_initramfs: denied modules present: $denied"; exit 1; }
 
 echo "== smoke tests (chroot of the staging tree, nothing mounted inside)"

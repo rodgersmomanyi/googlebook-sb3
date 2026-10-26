@@ -6,6 +6,9 @@ Card "HDA Intel PCH", id "PCH". ALC274 analog is PCM 0 (playback + capture). Onl
 guaranteed, so only Speaker is declared on it; the codec's Auto-Mute moves the sound to the headphone jack
 when one is plugged in. The HDMI PCMs follow the usual Intel HDMI codec numbering (3, 7, 8). That numbering
 is INFERRED; check it with /proc/asound/pcm.
+Mic CaptureMixerElem (wave 3, item 2): added as in lapis's sof-soundwire Mic section; DRAS's required field set
+is INFERRED from its strings, not its source. "Capture" is the HDA generic parser's capture control. Idea: gbOS86
+(github.com/linuxkid473/gbos-x86 @f8a5c1a, HANDOFF.md:96-104), which mirrored sof-soundwire field for field.
 -->
 	<SoundCardName>hw:PCH</SoundCardName>
 	<HiFi>
@@ -14,6 +17,7 @@ is INFERRED; check it with /proc/asound/pcm.
 		</Speaker>
 		<Mic>
 			<CapturePCM>hw:PCH,0</CapturePCM>
+			<CaptureMixerElem>Capture</CaptureMixerElem>
 			<JackDev>HDA Intel PCH Mic</JackDev>
 		</Mic>
 		<HDMI1>

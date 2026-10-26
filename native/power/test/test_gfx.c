@@ -2036,6 +2036,142 @@ static void test_r12_markers(void) {
   CHECK(!strstr(ec.log, "REQ"), "no LATCH_REQUEST after the resume '%s'", ec.log);
   drop(c);
 }
+/* ---- wave 2b: the ESP lock r3 (INTERFACES 5.4, section 30 E-1) ---- */
+static int g_hk_stage[4];
+static int g_hk_mode;   /* 1: a live holder re-creates the lock right before our rename; 2: also a newcomer's empty
+                           directory right after it, gone after 3 put-back retries; 3: an ownerless re-creation + newcomer */
+static void esp_hook(int stage) {
+  char p[PATH_MAX];
+  g_hk_stage[stage]++;
+  if (stage == 0 && g_hk_mode) {
+    rm("/dev/gb_esp.lock/owner");
+    rmdir(rpath(p, sizeof p, "/dev/gb_esp.lock"));
+    mkdirs(rpath(p, sizeof p, "/dev/gb_esp.lock"));
+    if (g_hk_mode != 3) put("/dev/gb_esp.lock/owner", "4300 gb_bootlog 30\n");
+  }
+  if (stage == 1 && g_hk_mode >= 2) mkdirs(rpath(p, sizeof p, "/dev/gb_esp.lock"));
+  if (stage == 2 && g_hk_mode == 2 && g_hk_stage[2] == 3) rmdir(rpath(p, sizeof p, "/dev/gb_esp.lock"));
+}
+static void test_w2b_esp_lock(void) {
+  char line[96], own[64], p[PATH_MAX], q[PATH_MAX], d[PATH_MAX], o[PATH_MAX + 8];
+  snprintf(own, sizeof own, "%d gb_power ", (int)getpid());
+  /* a steal in progress (a live .stale.<pid> directory): back off; our directory goes, the stealer's stays */
+  set_root("tree_w2b_busy");
+  put("/proc/4301/comm", "sh\n");
+  mkdirs(rpath(p, sizeof p, "/dev/gb_esp.lock.stale.4301"));
+  CHECK(esp_lock_try(line, sizeof line) == 0 && !line[0] && !exists("/dev/gb_esp.lock") && exists("/dev/gb_esp.lock.stale.4301"),
+        "W2B-1 steal in progress: going on without the lock, our new directory removed, the stealer's kept");
+  /* a leftover of a dead stealer, and one with our own pid: not busy */
+  set_root("tree_w2b_dead");
+  mkdirs(rpath(p, sizeof p, "/dev/gb_esp.lock.stale.4302"));
+  snprintf(q, sizeof q, "/dev/gb_esp.lock.stale.%d", (int)getpid());
+  mkdirs(rpath(p, sizeof p, "%s", q));
+  CHECK(esp_lock_try(line, sizeof line) == 1 && !strncmp(line, own, strlen(own)) && !strcmp(get("/dev/gb_esp.lock/owner"), line),
+        "W2B-2 dead stealer / own pid: not busy, lock taken '%s'", line);
+  esp_unlock(line);
+  CHECK(!exists("/dev/gb_esp.lock") && !g_esp_rel.line[0], "W2B-2 released at once");
+  /* the owner file is created exclusively: one already in our new directory is neither removed nor overwritten */
+  set_root("tree_w2b_excl");
+  rpath(d, sizeof d, ESP_LOCK);
+  snprintf(o, sizeof o, "%s/owner", d);
+  put("/dev/gb_esp.lock/owner", "4300 gb_bootlog 30\n");
+  CHECK(esp_claim(d, o, line, sizeof line) == 0 && !line[0] && !strcmp(get("/dev/gb_esp.lock/owner"), "4300 gb_bootlog 30"),
+        "W2B-3 an owner file already there: not ours, kept '%s'", get("/dev/gb_esp.lock/owner"));
+  rm("/dev/gb_esp.lock/owner");
+  rmdir(d);
+  CHECK(esp_claim(d, o, line, sizeof line) == 0 && !line[0] && !exists("/dev/gb_esp.lock"),
+        "W2B-3 our new directory moved away (ENOENT): not ours, nothing created");
+  /* release: our lock moved away by a steal in progress -> retried from the status tick until it is back */
+  set_root("tree_w2b_rel");
+  put("/proc/4303/comm", "sh\n");
+  mkdirs(rpath(p, sizeof p, "/dev"));
+  rpath(p, sizeof p, ESP_LOCK);
+  rpath(q, sizeof q, ESP_LOCK ".stale.4303");
+  CHECK(esp_lock_try(line, sizeof line) == 1, "W2B-4 taken");
+  rename(p, q);
+  esp_unlock(line);
+  CHECK(!strcmp(g_esp_rel.line, line) && exists("/dev/gb_esp.lock.stale.4303"), "W2B-4 moved away at release: release pending");
+  esp_release_retry(T + 1000);
+  CHECK(g_esp_rel.line[0] != 0, "W2B-4 still away after 1 s: still pending");
+  rename(q, p);                                   /* the stealer puts it back */
+  esp_release_retry(T + 2000);
+  CHECK(!g_esp_rel.line[0] && !exists("/dev/gb_esp.lock") && !exists("/dev/gb_esp.lock.stale.4303"), "W2B-4 put back: released");
+  CHECK(esp_lock_try(line, sizeof line) == 1, "W2B-5 taken");
+  rename(p, q);
+  esp_unlock(line);
+  esp_release_retry(T + ESP_REL_MS);
+  CHECK(!g_esp_rel.line[0] && exists("/dev/gb_esp.lock.stale.4303") && !exists("/dev/gb_esp.lock"),
+        "W2B-5 not back within %d s: given up, left alone", ESP_REL_MS / 1000);
+  /* the steal: the lock changed meanwhile -> put back without replacing; a newcomer in the way -> retried until it
+   * backs off; an ownerless moved directory with a newcomer in the way -> removed */
+  for (int mode = 1; mode <= 3; mode++) {
+    char tn[32];
+    snprintf(tn, sizeof tn, "tree_w2b_steal%d", mode);
+    set_root(tn);
+    g_esp_hook = esp_hook;                        /* (set_root clears it) */
+    memset(g_hk_stage, 0, sizeof g_hk_stage);
+    g_hk_mode = mode;
+    put("/proc/4300/comm", "sh\n");
+    put("/dev/gb_esp.lock/owner", "4399 gb_nouveau 50\n");   /* dead pid: stale */
+    int r = esp_lock_try(line, sizeof line);
+    snprintf(q, sizeof q, "/dev/gb_esp.lock.stale.%d", (int)getpid());
+    if (mode == 1)
+      CHECK(r == 0 && !strcmp(get("/dev/gb_esp.lock/owner"), "4300 gb_bootlog 30") && !exists(q) && !g_hk_stage[2],
+            "W2B-6 re-created meanwhile: put back at once (r %d, retries %d)", r, g_hk_stage[2]);
+    if (mode == 2)
+      CHECK(r == 0 && !strcmp(get("/dev/gb_esp.lock/owner"), "4300 gb_bootlog 30") && !exists(q) && g_hk_stage[2] == 3,
+            "W2B-7 a newcomer's directory in the way: put back after %d retries (r %d)", g_hk_stage[2], r);
+    if (mode == 3)
+      CHECK(r == 0 && !exists(q) && exists("/dev/gb_esp.lock") && !exists("/dev/gb_esp.lock/owner"),
+            "W2B-8 an ownerless moved directory, a newcomer in the way: removed, the newcomer's kept (r %d)", r);
+  }
+  g_esp_hook = NULL;
+  g_hk_mode = 0;
+}
+/* ---- wave 3: the ESP lock r4 (INTERFACES 5.4 r4; wave 2b review L1, L2, L4) ---- */
+static void test_w3_esp_lock(void) {
+  char line[96], p[PATH_MAX], q[PATH_MAX], ol[64];
+  /* L1: while a steal is in progress there is no mkdir at all */
+  set_root("tree_w3_busy");
+  g_esp_hook = esp_hook;
+  memset(g_hk_stage, 0, sizeof g_hk_stage);
+  g_hk_mode = 0;
+  put("/proc/4311/comm", "sh\n");
+  mkdirs(rpath(p, sizeof p, "/dev/gb_esp.lock.stale.4311"));
+  CHECK(esp_lock_try(line, sizeof line) == 0 && !line[0] && g_hk_stage[3] == 0 && !exists("/dev/gb_esp.lock"),
+        "W3-1 steal in progress: no mkdir (%d), going on without the lock", g_hk_stage[3]);
+  rmdir(rpath(p, sizeof p, "/dev/gb_esp.lock.stale.4311"));
+  CHECK(esp_lock_try(line, sizeof line) == 1 && g_hk_stage[3] == 1, "W3-1 no steal any more: one mkdir, taken");
+  esp_unlock(line);
+  g_esp_hook = NULL;
+  /* L2: a lock naming our own pid while we hold none is stale (a put-back that came after our release gave up) */
+  set_root("tree_w3_self");
+  snprintf(ol, sizeof ol, "%d gb_power 7\n", (int)getpid());
+  put("/dev/gb_esp.lock/owner", ol);
+  CHECK(esp_lock_try(line, sizeof line) == 1 && line[0] && !strcmp(get("/dev/gb_esp.lock/owner"), line),
+        "W3-2 own pid in a lock we do not hold: stolen as stale, taken '%s'", line);
+  esp_unlock(line);
+  CHECK(!exists("/dev/gb_esp.lock"), "W3-2 released");
+  CHECK(ESP_REL_MS >= 7000, "W3-3 the release retry (%d ms) outlasts a stealer's 5 s put-back budget", ESP_REL_MS);
+  /* L4: the load window is open while a live stealer has gb_nouveau's lock moved into its .stale.<pid> directory */
+  set_root("tree_w3_window");
+  put("/proc/4300/comm", "sh\n");
+  put("/proc/4312/comm", "sh\n");
+  put("/dev/gb_esp.lock.stale.4312/owner", "4300 gb_nouveau 95\n");
+  CHECK(nouveau_window_open() && load_window_open(), "W3-4 gb_nouveau's lock moved away by a live stealer: window open");
+  rename(rpath(p, sizeof p, "/dev/gb_esp.lock.stale.4312"), rpath(q, sizeof q, "/dev/gb_esp.lock.stale.4313"));
+  CHECK(!nouveau_window_open(), "W3-4 the same in the directory of a dead stealer (4313): not a window");
+  rename(rpath(p, sizeof p, "/dev/gb_esp.lock.stale.4313"), rpath(q, sizeof q, "/dev/gb_esp.lock.stale.4312"));
+  put("/dev/gb_esp.lock.stale.4312/owner", "4300 gb_bootlog 95\n");
+  CHECK(!nouveau_window_open(), "W3-4 a moved gb_bootlog lock: not a window");
+  put("/dev/gb_esp.lock.stale.4312/owner", "4399 gb_nouveau 95\n");
+  CHECK(!nouveau_window_open(), "W3-4 a moved lock of a dead gb_nouveau: not a window");
+  rm("/dev/gb_esp.lock.stale.4312/owner");
+  rmdir(rpath(p, sizeof p, "/dev/gb_esp.lock.stale.4312"));
+  snprintf(q, sizeof q, "/dev/gb_esp.lock.stale.%d/owner", (int)getpid());
+  put(q, "4300 gb_nouveau 95\n");
+  CHECK(!nouveau_window_open(), "W3-4 our own .stale directory is not a steal in progress");
+}
 #define GROUP(id, fn) do { int c0_ = checks, f0_ = fails; fn(); \
     printf("%s %s: %d checks, %d failures\n", id, #fn, checks - c0_, fails - f0_); } while (0)
 static void test_gfx_all(void) {
@@ -2071,4 +2207,8 @@ static void test_fix_all(void) {                  /* review fix pass (INTERFACES
   GROUP("GP-R6", test_r6_compute_window);
   GROUP("GP-R8", test_r8_faults);
   GROUP("GP-R12", test_r12_markers);
+}
+static void test_w2b_all(void) {                  /* Wave 2b (INTERFACES 30) */
+  GROUP("GP-W2B-1", test_w2b_esp_lock);
+  GROUP("GP-W3-1", test_w3_esp_lock);
 }

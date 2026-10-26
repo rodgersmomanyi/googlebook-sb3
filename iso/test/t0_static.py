@@ -23,6 +23,7 @@ import zlib
 T = "/var/tmp/gbiso/test"
 MNT = T + "/mnt/t0"
 KREL = "6.8.0-147-generic"
+KCONFIG = "/boot/config-" + KREL     # the config of the kernel BUILD copied (remote.sh kernel: /boot/vmlinuz-$KREL)
 MiB = 1 << 20
 TYPE_ESP = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 GRUB_ENTRIES = [("gb_normal", "n"), ("gb_basic", "b"), ("gb_serial", "s"), ("gb_serial_nocd", "d"),
@@ -30,7 +31,7 @@ GRUB_ENTRIES = [("gb_normal", "n"), ("gb_basic", "b"), ("gb_serial", "s"), ("gb_
 TEST_IDS = ("gb_serial", "gb_serial_nocd", "gb_serial_ntfs")
 # == build/builder/stage_initramfs.py MODULE_DENY (DESIGN 13.1; tests\w2b\test_iso_static.py asserts the equality)
 DENY = ("spi_intel*", "mtd*", "efi_test", "efi_pstore", "tpm*", "nouveau", "nvidia*", "drm_gpuvm", "drm_exec",
-        "gpu_sched")
+        "gpu_sched", "drm_ttm_helper", "mxm_wmi", "i2c_nvidia_gpu", "nova_core", "nova_drm", "snd_hda_intel")
 FONTS = ("usr/share/consolefonts/gb-ter-32x64.psf", "usr/share/consolefonts/Lat15-TerminusBold32x16.psf.gz",
          "usr/share/consolefonts/Lat15-Terminus16.psf.gz")
 checks, facts = [], {}
@@ -293,6 +294,7 @@ def tree_checks(build_id):
     facts["vmlinuz_dllcharacteristics"] = "0x%04x" % dc if dc is not None else None
     check(dc is not None and not dc & 0x0100, "/boot/vmlinuz DllCharacteristics %s has 0x0100 clear"
           % facts["vmlinuz_dllcharacteristics"])
+    kconfig_checks(vml)
     efi = open(os.path.join(r, "EFI/BOOT/BOOTX64.EFI"), "rb").read()
     dc = pe_dllchar(efi)
     facts["bootx64_dllcharacteristics"] = "0x%04x" % dc if dc is not None else None
@@ -306,6 +308,30 @@ def tree_checks(build_id):
         check(facts["esp_bootx64_sha256"] == facts["bootx64_sha256"], "ESP image BOOTX64.EFI == ISO tree copy")
     grub_checks(open(os.path.join(r, "boot/grub/grub.cfg"), encoding="utf-8").read(), build_id)
     initrd_checks(os.path.join(r, "boot/initrd.img"))
+
+
+def kconfig_checks(vml, config_path=KCONFIG):
+    """WAVE3 item 1 (TA-7): the ISO kernel is KREL (the setup-header version string of its /boot/vmlinuz) and that
+    KREL's config on the builder has CONFIG_SERIAL_8250_RUNTIME_UARTS >= 1, so the installer's 8250 driver (and the
+    Surface Aggregator UART behind 8250_dw) registers without a cmdline token. Our native GKI has 0 there and needs
+    8250.nr_uarts (build_usb.native_cmdline); grub.cfg's gb_args do not, as long as this holds."""
+    ver = None
+    if len(vml) > 0x210 and vml[0x202:0x206] == b"HdrS":
+        off = struct.unpack_from("<H", vml, 0x20E)[0] + 0x200
+        ver = vml[off:off + 256].split(b"\0")[0].split(b" ")[0].decode("ascii", "replace")
+    facts["installer_kernel_version"] = ver
+    check(ver == KREL, "/boot/vmlinuz setup-header version %r == KREL %s" % (ver, KREL))
+    ru = None
+    try:
+        with open(config_path, encoding="ascii", errors="replace") as f:
+            for ln in f:
+                if ln.startswith("CONFIG_SERIAL_8250_RUNTIME_UARTS="):
+                    ru = ln.split("=", 1)[1].strip()
+    except OSError as e:
+        ru = "unreadable (%s)" % e.__class__.__name__
+    facts["installer_8250_runtime_uarts"] = int(ru) if ru and ru.isdigit() else ru
+    check(bool(ru) and ru.isdigit() and int(ru) >= 1,
+          "%s: CONFIG_SERIAL_8250_RUNTIME_UARTS=%s >= 1 (no 8250.nr_uarts needed)" % (config_path, ru))
 
 
 def grub_checks(cfg, build_id):

@@ -15,28 +15,36 @@ them. You have to get the lapis image yourself (see [Requirements](#requirements
 ## Status
 
 Build tested: lapis **CL3B.260622.271.R1** (installed from the recovery image) updated in the VM by OTA to
-**CL3B.260622.276.R4**; our GKI kernel **android17-6.18 (6.18.21)**, built with Kleaf: build #13, and for native images
-build #14 (#13 plus nouveau backports and hardening, same config and KMI).
+**CL3B.260622.276.R4**; our GKI kernel **android17-6.18 (6.18.21)**, built with Kleaf. The current kernel is
+**build #15** (wave 3, 2026-10-26) for both the VM and the native tree: build #13 plus the nouveau backports and
+hardening of build #14, the reworked `#UD` AVX-VNNI emulator and an opt-in i915 gamma switch, with the same config and
+KMI as #13 ([kernel/K15.md](kernel/K15.md)). Build #15 was boot-tested in throwaway VMware VMs: the VM tree, where
+its emulator passed a known-answer test of 9,235 cases, and the native tree. The long-running test VM still runs
+build #13.
 
 | Area | VMware VM | Native Surface Book 3 |
 |---|---|---|
 | Boot to the desktop, user sign-in | **works** (first boot is slow: dexopt) | untested on hardware (the native tree's module loading and services were boot-tested in VMware) |
-| Display | **works**: vmwgfx (patched), 2560x1600 @ 320 dpi | untested: i915 (Gen11 Iris Plus 8086:8A52) + DMC firmware, stock lapis composer |
+| Display | **works**: vmwgfx (patched), 2560x1600 @ 320 dpi | untested: i915 (Gen11 Iris Plus 8086:8A52) + DMC firmware, stock lapis composer; an opt-in fix for a grey, washed-out "white veil" picture (`i915.gb_ignore_user_gamma`, off by default, set only through `gb\gb.cfg`: [FLASHING.md](docs/FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)) |
 | GPU / 3D | **works**: VMware SVGA3D through Mesa gallium `svga` 26.3 (patched) as the system GLES driver, SkiaGL; Vulkan is SwiftShader (CPU) | untested: lapis's own Mesa ANV (Vulkan) + ANGLE on i915 |
-| Pointer / keyboard | **works**: seamless absolute mouse (`gb_absmouse` + vmmouse + mini VMware Tools `gb_vmtools`), wheel, VMware keyboard | untested: SAM base keyboard + touchpad (`surface_hid`, `hid-surface` drops the Fn "gamepad" button), IDC files |
+| Pointer / keyboard | **works**: seamless absolute mouse (`gb_absmouse` + vmmouse + mini VMware Tools `gb_vmtools`), wheel, VMware keyboard | untested: SAM base keyboard + touchpad (`surface_hid`, `hid-surface` drops the Fn "gamepad" button), IDC files (touchpad `Change_Timeout` 0.02, so quick flicks move the pointer). The Surface Aggregator's serial link needs `8250.nr_uarts=4` on the kernel command line; native entries carry it since wave 3 (older images dropped it: [FLASHING.md](docs/FLASHING.md#images-built-before-wave-3-no-keyboard-base)) |
 | Touchscreen + pen | n/a | untested: IPTS (linux-surface driver, MEI 8086:34E4) + `iptsd` 3.1.1 for Android (end-to-end tested on the builder with a fake HID device); pen top button key layouts |
 | Batteries | **works**: Windows' combined level (both packs), updated live, via `gb_hostbatt` -> guestinfo -> `gb_vmtools` -> `test_power` | untested: `gb_power` sums clipboard + base battery into one Android battery (unit-tested) |
 | Charger / AC | **works** (host AC state, live) | untested: `surface_charger` mirrored by `gb_power` |
 | Detach (DTX) | n/a | untested: `gb_power` handles detach requests like `surface-dtx-daemon` (with the NVIDIA driver loaded it moves apps to Intel, unbinds and removes the GPU first, and refuses while apps still use it); tablet mode from `surface_dtx` |
 | NVIDIA GTX 1650 Max-Q (TU117, in the base) | not visible to the guest; VMware uses it on the host to render the VM | untested: **graphics switching**, default mode **Auto**. With the base attached, nouveau loads after boot and games plus the apps you choose render on NVK (Mesa's NVIDIA Vulkan driver) through a per-app driver package; detached, everything runs on Intel. The system UI always stays on Intel. Quick Settings tile and Settings page "Graphics" (Auto / Intel only / NVIDIA, per-app **Use NVIDIA** / **Always Intel**), an automatic self-test, detach refused with "Close apps and detach" while apps use the GPU, D3cold when idle, a local LLM compute service on NVK, and recovery with `gb.nouveau=0` or the crash-loop guard. [NVIDIA.md](docs/NVIDIA.md) |
-| Audio | **works**: VMware HD Audio through lapis's HDA drivers (low-latency `sound.*` VMX settings); or the guest's sound in the scrcpy window | untested: SOF (Ice Lake DSP 8086:34C8) + ALC274 with lapis's vendor modules and our card configs |
+| Audio | **works**: VMware HD Audio through lapis's HDA drivers (low-latency `sound.*` VMX settings); or the guest's sound in the scrcpy window | untested: SOF (Ice Lake DSP 8086:34C8) + ALC274 with lapis's vendor modules and our card configs (DRAS `<soundcard>` = the ALSA card id `sofhdadsp`) |
 | Wi-Fi / Bluetooth / network | VM networking via vmxnet3 (NAT) with a link watchdog (`gb_netwatch`); Bluetooth disabled | untested: AX201 (iwlwifi, firmware -77) and Intel BT (8087:0026) with our signed GKI modules; USB / SurfaceDock Ethernet (r8152) |
 | Remote window | **works** (optional): network ADB + `host\Googlebook-scrcpy.cmd` (screen, keyboard/mouse, clipboard, audio) | n/a |
 | Sensors | n/a | untested: ISH accelerometer/gyro and APDS-9960 light sensor presented as ChromeOS EC (`cros-ec-*`) IIO devices, the only kind lapis's sensors HAL accepts; auto-rotate overlay (QEMU-tested) |
 | Cameras (IPU4P, 8086:8A19) | n/a | untested: our IPU4P port of the Linux ipu6 driver + OV5693 (front), OV8865 + DW9719 (rear), and libcamera's simple pipeline with the software ISP as the Android camera HAL (tested against vimc only). Needs Intel's IPU4P firmware from your own Windows driver package ([INPUTS.md](docs/INPUTS.md#firmware-native-only)) |
 | Power / volume buttons, lid | VMware power button = clean shutdown | untested: `soc_button_array` (MSHW0040), `surface_gpe` |
 | Platform profile, CPU power limits | n/a | untested: `surface_platform_profile`, set by `gb_power` (`persist.vendor.gb.perf_profile`); `gb_hw.sh` restores the Surface firmware's PL1/PL2 |
-| OTA system updates | **works** (one update so far, .271 -> .276): the A/B update installs and the VM boots the new slot; `gb_slotsync` switches the boot entry (see [OTA.md](docs/OTA.md) for what was observed) | same mechanism; untested on hardware |
+| OTA system updates | **works** (one update so far, .271 -> .276): the A/B update installs and the VM boots the new slot; `gb_slotsync` switches the boot entry (see [OTA.md](docs/OTA.md) for what was observed). Since wave 3 it first compares the new slot's kernel interface (KMI) with our kernel's and holds the switch if they differ ([OTA.md](docs/OTA.md#kernel-check-before-the-switch)) | same mechanism, plus the notification "System update held" when it holds; untested on hardware |
+| AVX-VNNI (Ice Lake lacks it; parts of lapis use it) | **works**: our kernel emulates the VEX instructions on `#UD`. Build #15's reworked emulator passed a known-answer test of 9,235 cases in a throwaway VM; counter `/sys/kernel/gb_vnni/summary` | same kernel; the boot-log summary shows the counter; untested on hardware |
+| Boot logs and triage | serial console log (`serial0.log`) and `gbsh.py` | `gblog\` on the stick's boot partition at 40 s to 15 min, even with a black screen; each file starts with a one-screen `== summary`. Symptom table and issue template: [FLASHING.md](docs/FLASHING.md#7-troubleshooting-symptom-log-line-boot-option) |
+| Hardware bring-up without a rebuild | n/a | opt-in `gb\gb.cfg` on the boot partition, read only on a boot with `gb.overlay=1`: module options, Android properties, input/audio config files, each checked against an allow-list (tested in VMware): [NATIVE.md](docs/NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg) |
+| Google apps | lapis's own Play services are used unchanged. Google sign-in and Play installs are expected to work, and on-device AI (AICore: Magic Pointer, on-device Gemini) is expected to be refused, because the device cannot pass hardware key attestation: both from gbOS86's report on lapis, not tested separately here | same expectations; untested on hardware. [NATIVE.md](docs/NATIVE.md#google-apps) |
 | Screen lock PIN / hardware-backed keys | **no**: software KeyMint, no Gatekeeper/Weaver (no Trusty/GSC) | same |
 
 Details per device, with the kernel config, firmware and userspace pieces behind each line:
@@ -79,6 +87,8 @@ system, vendor and product partitions are used unmodified. [docs/ARCHITECTURE.md
 | Run it in VMware on Windows | [docs/VMWARE.md](docs/VMWARE.md) |
 | Boot the Surface Book 3 natively from USB (`build_usb.py`) | [docs/NATIVE.md](docs/NATIVE.md) |
 | Check, flash and boot the USB stick image (`verify_image.py`, Rufus) | [docs/FLASHING.md](docs/FLASHING.md) |
+| First boot: what to check in the boot-log summary, symptom table, reporting a result | [docs/FLASHING.md](docs/FLASHING.md#first-boot-checklist), [issue template](.github/ISSUE_TEMPLATE/native-boot-report.md) |
+| Try a module option, property or input/audio config for one boot, without a rebuild (`gb\gb.cfg`) | [docs/FLASHING.md](docs/FLASHING.md#8-bring-up-configuration-gbgbcfg) |
 | What each Surface Book 3 device needs, and what to test first | [docs/DEVICE-STATUS.md](docs/DEVICE-STATUS.md) |
 | Use the NVIDIA GPU: graphics modes, detach, self-test, compute service, recovery | [docs/NVIDIA.md](docs/NVIDIA.md) |
 | Install next to Windows on the internal NVMe | [native/dualboot/README_DUALBOOT.md](native/dualboot/README_DUALBOOT.md) |
@@ -106,7 +116,8 @@ vm/                  VMware .vmx template, lapis.vmdk descriptor generator
 inject/              our text configs for the overlay tree (fstab, VINTF manifest, sepolicy CIL, audio, ADB, native manifests)
 guest/               guest daemons in C (gb_vmtools, gb_absmouse, gb_layout, gb_slotsync, vkenum) + NDK build script
 host/                Windows helpers (gb_hostbatt battery bridge, scrcpy launcher)
-kernel/              kernel patches (incl. patches/k14: nouveau backports), config deltas, Kleaf build scripts, pinned manifest
+kernel/              kernel patches (incl. patches/k14: nouveau backports, patches/k15: build #15), config deltas, Kleaf
+                     build scripts, pinned manifest, tools/ (the AVX-VNNI emulator's known-answer test, sources only)
 graphics/            Mesa svga build + patches, SwiftShader build notes, minigbm patcher, EGL/AHB probes
 native/              Surface Book 3 components: audio, iptsd, power, sensors, hw-gap-audit, dualboot, camera-*, and the
                      NVIDIA stack: nouveau-kernel, nvk-android, gfx-driver-pkg, gpu-compute, gpu-ui, dgpu (spec)
@@ -115,6 +126,7 @@ builder/             builder VM cloud-init template and helpers
 tools/               frametime (host-side frame cadence measurement)
 legacy/              the first bring-up ISO builder (historical)
 docs/                architecture, VMware, native, flashing, device status, NVIDIA, installer ISO, OTA, drivers, inputs
+.github/             issue template for native boot reports
 ```
 
 ### Environment variables
@@ -161,6 +173,9 @@ Native mode is built to leave the Surface's firmware, TPM and Windows alone:
   display always stays on Intel ([NVIDIA.md](docs/NVIDIA.md#safety-rails-and-recovery)).
 * Security model: SELinux runs **permissive**, there is no hardware-backed keystore (software KeyMint) and no lock
   screen credential storage (Gatekeeper/Weaver are absent). Do not keep sensitive data in it.
+* The optional bring-up file `gb\gb.cfg` is read only on a boot whose command line has `gb.overlay=1` (no shipped
+  entry has it), only from the boot disk's own ESP, read-only, and every setting is checked against an allow-list;
+  nothing from the ESP is executed ([NATIVE.md](docs/NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg)).
 
 ## Licenses
 
@@ -168,12 +183,36 @@ Our own code and docs: **Apache-2.0** ([LICENSE](LICENSE)). Kernel patches are *
 parts derived from linux-surface, iptsd, Mesa, libcamera, tinyalsa and AOSP keep their licenses. The NVIDIA firmware
 licence text and WHENCE excerpt come from linux-firmware. See [LICENSES.md](LICENSES.md).
 
-## Acknowledgements and prior art
+## Credits
+
+### gbOS86
+
+[gbOS86 / gbos-x86](https://github.com/linuxkid473/gbos-x86) boots Googlebook OS on other x86 PCs. Wave 3 of this
+project (2026-10) compared notes with it (at commit `f8a5c1a`) and took the findings and ideas below. **Ideas and
+facts only: no gbos-x86 code is included in this repository or in anything it builds**, and the implementation of
+each item is our own (gbos-x86 has no top-level licence, so its files are not reusable here). Each file we touched
+names its source.
+
+| From gbOS86 | What we did with it | Where |
+|---|---|---|
+| `8250.nr_uarts`: with `CONFIG_SERIAL_8250_RUNTIME_UARTS=0` the LPSS UART fails with `-22` (their Surface Laptop 7 fix) | native entries keep `8250.nr_uarts=4`; on the Surface Book 3 that UART carries the Surface Aggregator (base keyboard, touchpad, batteries, charger, detach) | `build_usb.py`, [NATIVE.md](docs/NATIVE.md) |
+| DRAS matches `<soundcard>` against the ALSA card id, not the name | `sofhdadsp`, plus the Mic field set of lapis's own configs | [native/audio](native/audio/) |
+| A review of AVX-VNNI `#UD` emulation (IRQ state, VEX upper bits, XSAVE init state) | three defects confirmed in our emulator and fixed in kernel build #15, with a known-answer test | [kernel/K15.md](kernel/K15.md) |
+| The i915 "white veil" cause and its gamma fix | the opt-in `i915.gb_ignore_user_gamma` (off by default) | [kernel/patches/0005](kernel/patches/), [FLASHING.md](docs/FLASHING.md#7-troubleshooting-symptom-log-line-boot-option) |
+| Touchpad `gestureProp.Change_Timeout` (issue #17) | 0.02 in our touchpad IDC | `native/hw-gap-audit` |
+| Userdata fs-verity for Play updates (issue #17) | the native fstab names `fsverity` (Android already enables it by itself) | [INPUTS.md](docs/INPUTS.md#userdata-fs-verity) |
+| The HWUI-on-Vulkan abort signature | counted by the NVK self-test and the boot-log summary | [NVIDIA.md](docs/NVIDIA.md#status-and-what-to-test-first) |
+| Firmware pinning | `fw_coverage.py` and the pinned-source table | [INPUTS.md](docs/INPUTS.md#firmware-native-only) |
+| Their update flow and ESP configuration (gbos86.com docs) | `install_dualboot.ps1 -UpdateEspOnly` checks; the opt-in `gb\gb.cfg` | [README_DUALBOOT.md](native/dualboot/README_DUALBOOT.md), [NATIVE.md](docs/NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg) |
+| Checking the kernel interface before trusting a new slot (porting notes) | gb_slotsync's KMI check, "System update held" | [OTA.md](docs/OTA.md#kernel-check-before-the-switch) |
+| Their log and install pages, their boot snapshot's section list (names only), apgetty off natively | the boot-log `== summary`, the symptom table, the issue template, `desktop.apgetty.enable=0` | [FLASHING.md](docs/FLASHING.md) |
+| What Google's apps do on lapis; the recovery-image checksums | the Google apps expectations; the `.271` checksum (re-hashed by us) and the `.276` one (marked third-party) | [NATIVE.md](docs/NATIVE.md#google-apps), [INPUTS.md](docs/INPUTS.md) |
+
+### Other projects and prior art
 
 [linux-surface](https://github.com/linux-surface/linux-surface) (Surface Aggregator, IPTS, DTX knowledge),
 [iptsd](https://github.com/linux-surface/iptsd), [Mesa](https://mesa3d.org) (svga and NVK), the Linux nouveau
 driver and [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git),
 [llama.cpp](https://github.com/ggml-org/llama.cpp), [SwiftShader](https://github.com/google/swiftshader),
 [libcamera](https://libcamera.org), and the other projects that boot Googlebook OS on non-Googlebook PCs:
-[gbOS86 / gbos-x86](https://github.com/linuxkid473/gbos-x86), [Project Churro](https://github.com/alesimula/project-churro)
-and gbrunch.
+[Project Churro](https://github.com/alesimula/project-churro) and gbrunch.

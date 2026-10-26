@@ -5,7 +5,8 @@ our GKI build, *lapis* = lapis's vendor_ramdisk / vendor_dlkm), **firmware**, an
 our component). Module load order: `stage_kernel.py` (`VM_MODS`, `NATIVE_EARLY`, `NATIVE_LATE`; `NATIVE_OPTIN` is
 staged in the dGPU payload and loaded only by the nouveau policy); kernel config: [kernel/config/gki_defconfig.diff](../kernel/config/gki_defconfig.diff)
 plus the component config lines that `kernel/scripts/kbuild13_native.sh` adds (build #13). Native images run build
-#14 (`kernel/scripts/kbuild14_native.sh`: build #13 plus nouveau-only patches, same config and KMI). The full
+#15 (`kernel/scripts/kbuild15_native.sh`: build #14, which is build #13 plus nouveau-only patches, plus the reworked
+AVX-VNNI emulator and the opt-in i915 gamma switch; same config and KMI as #13, [kernel/K15.md](../kernel/K15.md)). The full
 device-by-device audit, with ACPI evidence and a first-boot checklist: [DEVICE-STATUS.md](DEVICE-STATUS.md). The
 NVIDIA stack in detail: [NVIDIA.md](NVIDIA.md).
 
@@ -39,7 +40,7 @@ off-device (the test is named). **opt-in** = in the native tree but off until a 
 | Internal NVMe | PCI behind root port 00:1d.0 | built-in | - | boot by `androidboot.boot_part_uuid` | untested on hardware (internal install) |
 | USB stick boot | xHCI 00:14.0 / Thunderbolt xHCI 00:0d.0 | built-in | - | `gb.boot=usb` drops the vold `usb` entry | untested on hardware |
 | USB Ethernet adapters, SurfaceDock | USB | ours: `usbnet`, `cdc_ether`, `cdc_ncm`, `r8152`, `ax88179_178a`, `mii`, `cdc-acm` | `rtl_nic/rtl815[36]*.fw` (optional PHY patches, you fetch them) | EthernetTracker | untested on hardware |
-| Serial IO: LPSS UART/I2C, GPIO | PCI 34A8 / 34C5 / 34E8-34EB, INT3455 | lapis only: `intel-lpss(-pci)`, `mfd-core`, `pinctrl-intel(-platform)` in its first stage, `pinctrl-icelake`, `i2c-designware` from vendor_dlkm. Our builds of them are never loaded: preloading them broke lapis's first stage in the VM test of build #13 | - | - | untested on hardware |
+| Serial IO: LPSS UART/I2C, GPIO | PCI 34A8 / 34C5 / 34E8-34EB, INT3455 | lapis only: `intel-lpss(-pci)`, `mfd-core`, `pinctrl-intel(-platform)` in its first stage, `pinctrl-icelake`, `i2c-designware` from vendor_dlkm. Our builds of them are never loaded: preloading them broke lapis's first stage in the VM test of build #13. The 8250 core is built in with `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, so the native command line keeps `8250.nr_uarts=4` (wave 3): without it the UART that carries the Surface Aggregator fails with `-22` | - | - | untested on hardware |
 | Cameras: front OV5693, rear OV8865 (+ DW9719 focus), IR OV7251 | IPU4P PCI 8086:8A19 | no upstream Linux driver; ours (build #13): the IPU4P port of the ipu6 driver (`intel-ipu6`, `intel-ipu6-isys`, [native/camera-kernel](../native/camera-kernel)) + `ov5693`, `ov8865`, `ov7251`, `dw9719`, `ipu-bridge`, `intel_skl_int3472_common`/`_discrete`, `v4l2-cci`, loaded by gbinit before lapis's own copies | `intel/ipu/ipu4p_fw.bin`: Intel's, from your Windows camera driver, not included ([INPUTS.md](INPUTS.md#firmware-native-only)) | ours: libcamera 0.7.2 simple pipeline + software ISP as `camera.sb3.so` (`ro.hardware.camera=sb3`, [native/camera-userspace](../native/camera-userspace)) | untested on hardware (the kernel side is built in #13; the HAL was tested against vimc) |
 | TPM, SPI-NOR, gsmi | - | blacklisted on the command line | - | - | intentionally off |
 

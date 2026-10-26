@@ -4,8 +4,9 @@
 # Contract: C:\GB-build\native\dgpu\INTERFACES.md v1.2, sections 2.2, 3, 4, 5, 6.4-6.5, 7 (this file is 7.1-7.8,
 # with 7.2-v12, 7.2a and the v1.2 notes of 7.3, 7.5, 7.7), 22.2 (graphics modes) and the review fix pass 29 (R-1, R-2,
 # R-7, R-10, R-11: clean shutdown, Intel switch during gb_power's rebind guard, suspend-safe windows, wakelock,
-# node permissions, rmmod deadline).
-#   gb_nouveau.sh auto          service gb_nouveau: sys.boot_completed=1, the gfx_mode=auto|nvidia triggers after
+# node permissions, rmmod deadline); the ESP lock follows 5.4 as of r3 (Wave 2b: back-off while a steal is in
+# progress, exclusive owner file, put-back without replacing, release waits for a put-back).
+#   gb_nouveau.sh auto         service gb_nouveau: sys.boot_completed=1, the gfx_mode=auto|nvidia triggers after
 #                               vendor.gb.nouveau.booted=1, gb_power hot attach (INTERFACES 23.7)
 #   gb_nouveau.sh off           service gb_nouveau_off: the gfx_mode=intel trigger after booted=1, gb_power
 #                               reconcile_off() (INTERFACES 23.6)
@@ -140,7 +141,7 @@ rd() {                                   # V = first line of $1 (sysfs/procfs at
 }
 
 lsdir() {                                # LS = basenames in directory $1, sorted (C locale); the only glob in here
-  LS=
+  LS=                                    # besides steal_busy's "$LOCK".stale.* (INTERFACES 5.4 r3)
   set +f
   for _ls_e in "$1"/*; do
     [ -e "$_ls_e" ] || [ -L "$_ls_e" ] || continue
@@ -361,10 +362,25 @@ apply_perms() {                          # INTERFACES 7.5 (v1.2): render 0660 (g
 
 # ---------------------------------------------------------------- ESP lock and ESP mount check (INTERFACES 5.4)
 
+steal_busy() {                           # 0 = another live process is in the middle of a steal (INTERFACES 5.4 r3):
+  # a directory gb_esp.lock.stale.<pid> of a live pid other than ours (it may put a moved lock back at any moment)
+  _sb_r=1
+  set +f
+  for _sb_e in "$LOCK".stale.*; do
+    _sb_p=${_sb_e##*.}
+    case $_sb_p in '' | *[!0-9]*) continue ;; esac
+    [ "$_sb_p" != "$$" ] && [ -d "$_sb_e" ] && [ -d "$R/proc/$_sb_p" ] && { _sb_r=0; break; }
+  done
+  set -f
+  return $_sb_r
+}
+
 steal_lock() {                           # $1 = stale owner line seen, $2 = inode seen; 0 = removed, retry mkdir
   # INTERFACES 5.4: never "rm owner; rmdir" a lock in place (two stealers would both win). Rename it away first:
   # only one waiter can rename a given directory. Then check that what was moved is the lock judged stale (same
-  # inode, same owner line); a lock that a live holder re-created meanwhile is put back.
+  # inode, same owner line); anything else is put back (r3): never over an entry in the way (toybox mv -T refuses
+  # anyway; the -e check makes GNU mv do the same), (r4) retried every 0.05 s for up to 5 s while newcomers do not
+  # mkdir (they see our .stale. directory); a moved directory without an owner file that cannot go back is removed.
   _st=$LOCK.stale.$$
   rm -rf "$_st" 2>/dev/null
   mv -T "$LOCK" "$_st" 2>/dev/null || return 1      # another waiter won, or the lock is gone: retry mkdir
@@ -376,56 +392,94 @@ steal_lock() {                           # $1 = stale owner line seen, $2 = inod
     rmdir "$_st" 2>/dev/null
     return 0
   fi
-  if mv -T "$_st" "$LOCK" 2>/dev/null; then
-    log "ESP lock: the lock changed while stealing it (owner '$(san "$_ol2" 60)'): put back"
-  else
-    log "ESP lock: the lock changed while stealing it and could not be put back (left as ${_st##*/})"
-  fi
+  _sl_n=0
+  while :; do
+    if [ ! -e "$LOCK" ] && mv -T "$_st" "$LOCK" 2>/dev/null; then
+      log "ESP lock: the lock changed while stealing it (owner '$(san "$_ol2" 60)'): put back"
+      return 1
+    fi
+    if [ ! -e "$_st/owner" ] && rmdir "$_st" 2>/dev/null; then
+      log "ESP lock: the lock changed while stealing it: the moved directory had no owner and another is in place: removed"
+      return 1
+    fi
+    [ $_sl_n -ge 100 ] && break          # r4 (wave 2b review L1): every 0.05 s for up to 5 s, not once per poll
+    sleep 0.05
+    _sl_n=$((_sl_n + 1))
+  done
+  log "ESP lock: the lock changed while stealing it and could not be put back (left as ${_st##*/})"
   return 1
 }
 
-lock_esp() {                             # $1 = max wait (s); INTERFACES 5.4
+lock_esp() {                             # $1 = max wait (s); INTERFACES 5.4 (r4)
   _w=0
   _miss=0
+  _lk_b=0
   while :; do
-    mkdir "$LOCK" 2>/dev/null && break
-    _ino=$(stat -c %i "$LOCK" 2>/dev/null)
-    _ol=
-    [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
-    _o=${_ol%% *}
-    _stale=0
-    if [ -n "$_ol" ]; then
-      _miss=0
-      case $_o in '' | *[!0-9]*) _stale=1 ;; *) [ -d "$R/proc/$_o" ] || _stale=1 ;; esac
+    if [ $_lk_b -lt 5 ] && steal_busy; then   # r4 (L1): a steal is in progress: no mkdir at all (our directory
+      _lk_b=$((_lk_b + 1))                    # would block its put-back); only consecutive back-off polls count
+      [ $_lk_b = 1 ] && log "ESP lock: a steal is in progress: backing off"
+    elif mkdir "$LOCK" 2>/dev/null; then
+      if [ $_lk_b -lt 5 ] && steal_busy; then
+        rmdir "$LOCK" 2>/dev/null        # r3: a steal is in progress; rmdir only removes an empty directory (ours)
+        _lk_b=$((_lk_b + 1))
+        [ $_lk_b = 1 ] && log "ESP lock: a steal is in progress: backing off"
+      else
+        up_ms
+        OWNLINE="$$ gb_nouveau $UPS"
+        # r3: the owner file is created exclusively (noclobber): if a stealer put a lock back in place of our new
+        # directory, its owner file is there and stays; that lock is not ours
+        if (set -C; printf '%s\n' "$OWNLINE" > "$LOCK/owner") 2>/dev/null; then
+          LOCKED=1
+          return 0
+        fi
+        log "ESP lock: another lock took the place of ours before its owner was written: waiting"
+        OWNLINE=
+      fi
     else
-      _miss=$((_miss + 1))
-      [ $_miss -ge 5 ] && _stale=1     # the owner file is written right after mkdir; 5 s without it = dead holder
-    fi
-    if [ $_stale = 1 ] && [ -n "$_ino" ]; then
-      _miss=0
-      steal_lock "$_ol" "$_ino" && continue
+      _lk_b=0                            # r4 (L1): a poll that finds the lock held resets the back-off count
+      _ino=$(stat -c %i "$LOCK" 2>/dev/null)
+      _ol=
+      [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
+      _o=${_ol%% *}
+      _stale=0
+      if [ -n "$_ol" ]; then
+        _miss=0
+        # r4 (L2): our own pid while we hold nothing = a put-back that landed after a release of ours gave up
+        case $_o in '' | *[!0-9]*) _stale=1 ;; "$$") _stale=1 ;; *) [ -d "$R/proc/$_o" ] || _stale=1 ;; esac
+      else
+        _miss=$((_miss + 1))
+        [ $_miss -ge 5 ] && _stale=1   # the owner file is written right after mkdir; 5 s without it = dead holder
+      fi
+      if [ $_stale = 1 ] && [ -n "$_ino" ]; then
+        _miss=0
+        steal_lock "$_ol" "$_ino" && continue
+      fi
     fi
     [ $_w -ge "$1" ] && return 1
     sleep 1
     _w=$((_w + 1))
   done
-  up_ms
-  OWNLINE="$$ gb_nouveau $UPS"
-  printf '%s\n' "$OWNLINE" > "$LOCK/owner"
-  LOCKED=1
-  return 0
 }
 
 unlock_esp() {                           # only our own lock (a lock stolen from us is somebody else's now)
   [ "$LOCKED" = 1 ] || return 0
-  _ol=
-  [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
-  if [ "$_ol" = "$OWNLINE" ]; then
-    rm -f "$LOCK/owner"
-    rmdir "$LOCK" 2>/dev/null
-  else
+  _ul_n=0
+  while :; do
+    _ol=
+    [ -r "$LOCK/owner" ] && IFS= read -r _ol < "$LOCK/owner"
+    if [ "$_ol" = "$OWNLINE" ]; then
+      rm -f "$LOCK/owner"
+      rmdir "$LOCK" 2>/dev/null
+      break
+    fi
+    if [ $_ul_n -lt 7 ] && steal_busy; then   # r3: a stealer moved our lock away; it puts it back within moments (r4: 7 polls > its 5 s budget)
+      sleep 1
+      _ul_n=$((_ul_n + 1))
+      continue
+    fi
     log "ESP lock: not ours any more at release (owner '$(san "$_ol" 60)'): left alone"
-  fi
+    break
+  done
   LOCKED=0
 }
 

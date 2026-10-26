@@ -88,6 +88,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -1080,7 +1081,9 @@ static void detaching_flag(int on) {
  * and writes "<pid> gb_nouveau <uptime>" into the root-only owner file. Properties are untrusted, so this is read. */
 #define ESP_LOCK "/dev/gb_esp.lock"
 static int pid_alive(int pid) { char p[PATH_MAX]; return pid > 0 && !access(rpath(p, sizeof p, "/proc/%d", pid), F_OK); }
-/* 1 = a live process holds the lock (name = its owner name), 0 = stale (dead pid), -1 = no owner file, -2 = garbage */
+/* 1 = a live process holds the lock (name = its owner name), 0 = stale (dead pid, or (5.4 r4, wave 2b review L2) our
+ * own pid: gb_power asks only while it holds no lock, so such a lock is a put-back that landed after an earlier release
+ * of ours gave up), -1 = no owner file, -2 = garbage */
 static int esp_owner(char *name, size_t n, int *pid_out, char *line, size_t ln) {
   char p[PATH_MAX], b[128], nm[32] = "";
   int pid = 0;
@@ -1091,12 +1094,34 @@ static int esp_owner(char *name, size_t n, int *pid_out, char *line, size_t ln) 
   if (sscanf(b, "%d %31s", &pid, nm) != 2 || pid <= 0) return -2;
   if (pid_out) *pid_out = pid;
   snprintf(name, n, "%s", nm);
-  return pid_alive(pid) ? 1 : 0;
+  return pid != (int)getpid() && pid_alive(pid) ? 1 : 0;
 }
-/* gb_nouveau.sh's load window: a live owner named gb_nouveau */
+/* gb_nouveau.sh's load window: a live owner named gb_nouveau, in the lock itself or (5.4 r4, wave 2b review L4) in the
+ * directory /dev/gb_esp.lock.stale.<pid> of a live stealer (pid other than ours): a steal in progress has moved the
+ * lock there for a moment (milliseconds, at most its 5 s put-back budget) and puts it back, so the window is still
+ * open and a detach is refused with N15 */
 static int nouveau_window_open(void) {
-  char nm[32];
-  return esp_owner(nm, sizeof nm, NULL, NULL, 0) == 1 && !strcmp(nm, "gb_nouveau");
+  char nm[32], d[PATH_MAX], p[PATH_MAX + 300], b[128];
+  if (esp_owner(nm, sizeof nm, NULL, NULL, 0) == 1 && !strcmp(nm, "gb_nouveau")) return 1;
+  DIR *dp = opendir(rpath(d, sizeof d, "/dev"));
+  if (!dp) return 0;
+  const char *pre = "gb_esp.lock.stale.";
+  size_t pl = strlen(pre);
+  int open_ = 0;
+  for (struct dirent *e; !open_ && (e = readdir(dp));) {
+    if (strncmp(e->d_name, pre, pl)) continue;
+    const char *q = e->d_name + pl;
+    if (!*q || strspn(q, "0123456789") != strlen(q) || strlen(q) > 9 || atoi(q) == (int)getpid() || !pid_alive(atoi(q)))
+      continue;
+    int pid = 0;
+    snprintf(p, sizeof p, "%s/%s/owner", d, e->d_name);
+    nm[0] = 0;
+    if (read_text(p, b, sizeof b) > 0 && sscanf(b, "%d %31s", &pid, nm) == 2 && pid > 0 && !strcmp(nm, "gb_nouveau") &&
+        pid_alive(pid))
+      open_ = 1;
+  }
+  closedir(dp);
+  return open_;
 }
 /* (v1.2) also while gb_power's own rebind guard watches the kernel's re-probe (23.8, review B7): detach -> N15 */
 static int load_window_open(void) { return nouveau_window_open() || rb_pending(); }
@@ -1109,9 +1134,71 @@ static void boot_id(char *out, size_t n) {
   char p[PATH_MAX];
   if (read_text(rpath(p, sizeof p, "/proc/sys/kernel/random/boot_id"), out, n) <= 0) snprintf(out, n, "unknown");
 }
+/* (5.4 r3) 1 = another live process is in the middle of a steal: a directory /dev/gb_esp.lock.stale.<pid> of a live
+ * pid other than ours exists (it may put a moved lock back at any moment) */
+static int esp_steal_busy(void) {
+  char d[PATH_MAX], p[PATH_MAX + 300];
+  DIR *dp = opendir(rpath(d, sizeof d, "/dev"));
+  if (!dp) return 0;
+  const char *pre = "gb_esp.lock.stale.";
+  size_t pl = strlen(pre);
+  int busy = 0;
+  for (struct dirent *e; !busy && (e = readdir(dp));) {
+    if (strncmp(e->d_name, pre, pl)) continue;
+    const char *q = e->d_name + pl;
+    if (!*q || strspn(q, "0123456789") != strlen(q) || strlen(q) > 9 || atoi(q) == (int)getpid()) continue;
+    struct stat st;
+    snprintf(p, sizeof p, "%s/%s", d, e->d_name);
+    busy = !stat(p, &st) && S_ISDIR(st.st_mode) && pid_alive(atoi(q));
+  }
+  closedir(dp);
+  return busy;
+}
+/* rename(2) that never replaces an existing entry (RENAME_NOREPLACE; toybox mv -T refuses an existing target too) */
+static int esp_rename_noreplace(const char *from, const char *to) {
+  if (!syscall(__NR_renameat2, AT_FDCWD, from, AT_FDCWD, to, 1u /* RENAME_NOREPLACE */)) return 0;
+  if (errno != ENOSYS && errno != EINVAL) return -1;
+  struct stat st;
+  if (!lstat(to, &st)) { errno = EEXIST; return -1; }
+  return rename(from, to);
+}
+static void ms_sleep(int ms) {
+  struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+  while (nanosleep(&ts, &ts) && errno == EINTR) {}
+}
+/* unit tests only: races injected into the steal (stage 0 before the rename away, 1 after it, 2 before each put-back
+ * retry, (wave 3) 3 right before the mkdir of the lock); NULL in the daemon */
+static void (*g_esp_hook)(int stage);
+/* acquire step 3 (5.4 r3): the owner file of the directory we just created, O_EXCL. 1 = held, 0 = not ours (an owner
+ * file is already there, or the directory was moved away: nothing is removed), -1 = error */
+static int esp_claim(const char *d, const char *o, char *line, size_t ln) {
+  char b[112];
+  snprintf(line, ln, "%d gb_power %lld", (int)getpid(), uptime_s());
+  int l = snprintf(b, sizeof b, "%s\n", line);
+  int fd = open(o, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    int e = errno;
+    line[0] = 0;
+    if (e == EEXIST || e == ENOENT) {
+      LOGI("ESP lock: another lock took the place of ours before its owner was written: going on without it");
+      return 0;
+    }
+    LOGW("ESP lock: owner file: %s", strerror(e));
+    rmdir(d);                                     /* our empty directory: no owner file to remove */
+    return -1;
+  }
+  int ok = write(fd, b, l) == l;
+  if (close(fd)) ok = 0;
+  if (!ok) { LOGW("ESP lock: owner file: %s", strerror(errno)); unlink(o); rmdir(d); line[0] = 0; return -1; }
+  return 1;
+}
 /* ESP lock without waiting (5.4, rebind guard 23.8): 1 = acquired (line = the owner line written), 0 = a live process
- * (or one that is just taking it) holds it, -1 = error. A stale lock (dead owner pid, garbage owner) is stolen with the
- * atomic rename of 5.4: rename away, check inode + owner line, remove; a re-created lock is put back. */
+ * (or one that is just taking it) holds it, or a steal is in progress (r3), -1 = error. (r4, wave 2b review L1) While a
+ * steal is in progress there is no mkdir at all (our directory would block the stealer's put-back). A stale lock (dead
+ * owner pid, garbage owner, r4: our own pid) is stolen with the atomic rename of 5.4: rename away, check inode + owner
+ * line, remove; anything else is put back without replacing an entry in the way (r3; gb_power never sleeps a poll: up
+ * to 10 tries 20 ms apart, newcomers do not mkdir meanwhile), and a moved directory without an owner that cannot go
+ * back is removed. The owner file is created O_EXCL: an existing one belongs to somebody else and is never removed. */
 static int esp_lock_try(char *line, size_t ln) {
   char d[PATH_MAX], o[PATH_MAX + 8], sd[PATH_MAX + 32], so[PATH_MAX + 48];
   rpath(d, sizeof d, ESP_LOCK);
@@ -1120,15 +1207,18 @@ static int esp_lock_try(char *line, size_t ln) {
   snprintf(so, sizeof so, "%s/owner", sd);
   line[0] = 0;
   for (int round = 0; round < 3; round++) {
+    if (esp_steal_busy()) {                       /* r4: no mkdir while a steal is in progress */
+      LOGI("ESP lock: a steal is in progress: going on without it");
+      return 0;
+    }
+    if (g_esp_hook) g_esp_hook(3);
     if (!mkdir(d, 0700)) {
-      char b[112];
-      snprintf(line, ln, "%d gb_power %lld", (int)getpid(), uptime_s());
-      int l = snprintf(b, sizeof b, "%s\n", line);
-      int fd = open(o, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-      int ok = fd >= 0 && write(fd, b, l) == l;
-      if (fd >= 0 && close(fd)) ok = 0;
-      if (!ok) { LOGW("ESP lock: owner file: %s", strerror(errno)); unlink(o); rmdir(d); line[0] = 0; return -1; }
-      return 1;
+      if (esp_steal_busy()) {                     /* a steal started between the check and our mkdir */
+        rmdir(d);                                 /* only an empty directory goes: ours */
+        LOGI("ESP lock: a steal is in progress: going on without it");
+        return 0;
+      }
+      return esp_claim(d, o, line, ln);
     }
     if (errno != EEXIST) { LOGW("ESP lock: mkdir %s: %s", d, strerror(errno)); return -1; }
     char nm[32], cur[128];
@@ -1139,7 +1229,9 @@ static int esp_lock_try(char *line, size_t ln) {
     if (stat(d, &st)) continue;                   /* released meanwhile: mkdir again */
     unlink(so);                                   /* an own leftover of an earlier steal */
     rmdir(sd);
-    if (rename(d, sd)) continue;                  /* somebody else stole or released it: mkdir again */
+    if (g_esp_hook) g_esp_hook(0);
+    if (esp_rename_noreplace(d, sd)) continue;    /* somebody else stole or released it: mkdir again */
+    if (g_esp_hook) g_esp_hook(1);
     char again[128] = "";
     read_text(so, again, sizeof again);
     if (!stat(sd, &s2) && s2.st_ino == st.st_ino && !strcmp(again, cur)) {
@@ -1148,20 +1240,44 @@ static int esp_lock_try(char *line, size_t ln) {
       rmdir(sd);
       continue;
     }
-    if (rename(sd, d)) LOGW("ESP lock: could not put back a re-created lock: %s", strerror(errno));
+    for (int n = 0;; n++) {
+      if (!esp_rename_noreplace(sd, d)) { LOGI("ESP lock: the lock changed while stealing it: put back"); break; }
+      if (access(so, F_OK) && !rmdir(sd)) { LOGI("ESP lock: the lock changed while stealing it: an ownerless moved directory removed"); break; }
+      if (n >= 9) { LOGW("ESP lock: could not put back a re-created lock (left as %s)", strrchr(sd, '/') + 1); break; }
+      if (g_esp_hook) g_esp_hook(2);
+      ms_sleep(20);
+    }
     return 0;
   }
   return 0;
 }
-static void esp_unlock(const char *line) {
+/* (5.4 r3) release: only our own line. While a steal is in progress (a stealer moved our lock away and puts it back
+ * within moments) the release is retried from the status tick for up to ESP_REL_MS instead of sleeping in the loop.
+ * (r4, wave 2b review L2) 8 s: longer than a sleeping stealer's put-back budget (5 s of 50 ms tries) plus its start-up,
+ * like the 7 polls of the other users. */
+#define ESP_REL_MS 8000
+static struct { char line[96]; long long until; } g_esp_rel;
+static int esp_release_now(const char *line, int final) {
   char p[PATH_MAX], cur[128] = "";
-  if (!line || !line[0]) return;
   if (read_text(rpath(p, sizeof p, ESP_LOCK "/owner"), cur, sizeof cur) > 0 && !strcmp(cur, line)) {
     unlink(p);
     if (rmdir(rpath(p, sizeof p, ESP_LOCK))) LOGW("ESP lock: rmdir: %s", strerror(errno));
-  } else {
-    LOGW("ESP lock is not ours any more (owner '%s'): left alone", cur);
+    return 1;
   }
+  if (!final && esp_steal_busy()) return 0;
+  LOGW("ESP lock is not ours any more (owner '%s'): left alone", cur);
+  return 1;
+}
+static void esp_unlock(const char *line) {
+  if (!line || !line[0]) return;
+  if (esp_release_now(line, 0)) return;
+  snprintf(g_esp_rel.line, sizeof g_esp_rel.line, "%s", line);
+  g_esp_rel.until = now_ms() + ESP_REL_MS;
+  LOGI("ESP lock: moved away by a steal in progress at release: retrying for %d s", ESP_REL_MS / 1000);
+}
+static void esp_release_retry(long long t) {
+  if (!g_esp_rel.line[0]) return;
+  if (esp_release_now(g_esp_rel.line, t >= g_esp_rel.until)) g_esp_rel.line[0] = 0;
 }
 static void mark_used(const char *why) {
   if (!g_used) {
@@ -4266,6 +4382,7 @@ static void status_tick(long long t) {
   }
   watchdog(t);
   rb_check(t);                                    /* (v1.2) after the watchdog: rpm-error latches first */
+  esp_release_retry(t);                           /* (5.4 r3) a release deferred by a steal in progress */
   reconcile_off(t);
   resume_check();
   powerctl_check();
@@ -4281,7 +4398,8 @@ static void status_tick(long long t) {
   publish_state(t);
   nq_flush();
   while (waitpid(-1, NULL, WNOHANG) > 0) {}      /* reap finished workers (a stuck one stays) */
-  int fast = g_inv.nouveau_bound || dec_running() || g_wk.busy || g_rs.active || rb_active() || g_st.running || g_pend.kind;
+  int fast = g_inv.nouveau_bound || dec_running() || g_wk.busy || g_rs.active || rb_active() || g_st.running || g_pend.kind ||
+             g_esp_rel.line[0];
   g_tick_due = t + (fast ? TICK_FAST_MS : TICK_SLOW_MS);
 }
 

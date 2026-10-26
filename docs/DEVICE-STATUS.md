@@ -3,7 +3,8 @@
 Every device of the Surface Book 3 13.5" (i7-1065G7) and what drives it when Googlebook OS ("lapis") boots natively
 (`gb.hw=native`). This is the hardware audit from `native/hw-gap-audit` (2026-10-24, kernel build #11), updated for
 **kernel build #13**, the **NVIDIA graphics switching** stack with **kernel build #14** (native images, 2026-10-25),
-and the native tree as `build_esp.py` assembles it from `inject/native/components/*.json`. The audit covered every
+the **wave 3** fixes with **kernel build #15** (native images, 2026-10-26), and the native tree as `build_esp.py`
+assembles it from `inject/native/components/*.json`. The audit covered every
 device in the Windows inventory: the live PnP list, the HID hardware IDs and
 the ACPI tables of a Surface Book 3 (read from `HKLM\HARDWARE\ACPI`, decompiled with iasl; the dumps are not part
 of this repository).
@@ -54,6 +55,19 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
   hardening). The v1 opt-in property `persist.vendor.gb.nouveau` is retired.
 * **Audit files in the default build:** `gb_hw.sh` (CPU power limits), the keyboard/touchpad IDCs, the pen key
   layouts and `excluded-input-devices.xml` are now in the native tree (`inject/native/components/hw.json`).
+* **Wave 3, 2026-10-26 (kernel build #15; findings from gbOS86, credited in the README):**
+  * Row 12: the native command line keeps `8250.nr_uarts=4`. Without it the Surface Aggregator's UART never
+    registered, so every earlier image would have had no base keyboard, touchpad, batteries, charger or detach
+    ([FLASHING.md](FLASHING.md#images-built-before-wave-3-no-keyboard-base) has the one-boot workaround).
+  * Row 39: DRAS's `<soundcard>` is now the ALSA card id `sofhdadsp`. Row 19: the touchpad IDC sets
+    `gestureProp.Change_Timeout = 0.02`.
+  * Row 14: kernel build #15 adds the opt-in "white veil" switch `i915.gb_ignore_user_gamma` (off). Build #15 also
+    reworks the `#UD` AVX-VNNI emulator ([kernel/K15.md](../kernel/K15.md)); nouveau is unchanged from #14.
+  * Every boot log starts with a one-screen `== summary` ([FLASHING.md](FLASHING.md#first-boot-checklist)); the
+    serial login console (`apgetty`) is off natively; the native fstab asks for fs-verity on userdata; the opt-in
+    `gb\gb.cfg` bring-up config can change module options, properties and input/audio files for one boot.
+  * Rows 37-38: `native/nouveau-kernel/tools/fw_coverage.py` pins every staged firmware file to its package
+    ([INPUTS.md](INPUTS.md#firmware-native-only)).
 
 ## 1. Platform, CPU, firmware interfaces
 
@@ -70,14 +84,14 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 | 9 | TPM 2.0 NTC0702 | none: CONFIG_TCG_TPM off; lapis tpm/tpm_tis* listed in `module_blacklist` | – | Software KeyMint + stubs | Off by design | `build_usb.py` NATIVE_BLACKLIST [V]. Keeps Android away from the Windows/BitLocker TPM. |
 | 10 | SPI flash controller 34A4 | `spi_intel_pci`/`spi_intel`/`spi_nor`/`mtd` blacklisted | – | fwupd/flashrom/futility stubbed | Off by design | Protects the UEFI flash [V, build_usb.py, build_esp.py stubs]. |
 | 11 | Intel ME 34E0 | `mei_me` (built in); lapis `mei_hdcp` (optional, i915 HDCP) | – | – | Expected | – |
-| 12 | Serial IO: I2C 34C5/34E8-34EB, UART 34A8, GPIO INT3455 | lapis first stage: `intel-lpss-pci`, `8250_dw`, `pinctrl-intel`; ueventd: `pinctrl-icelake`, `idma64`, `i2c-designware-*` | – | – | Expected | The UART carries the Surface Aggregator. Our builds of these modules are never loaded (see "Changes since the audit"): loading ours natively breaks lapis's first stage and every lapis module linked to them. |
+| 12 | Serial IO: I2C 34C5/34E8-34EB, UART 34A8, GPIO INT3455 | lapis first stage: `intel-lpss-pci`, `8250_dw`, `pinctrl-intel`; ueventd: `pinctrl-icelake`, `idma64`, `i2c-designware-*` | – | – | Expected | The UART carries the Surface Aggregator. Our builds of these modules are never loaded (see "Changes since the audit"): loading ours natively breaks lapis's first stage and every lapis module linked to them. **Wave 3:** the native command line keeps `8250.nr_uarts=4`: our GKI has `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, so without it the 8250 driver never registers and `8250_dw` fails this UART with `-22` (no base keyboard, touchpad, batteries, charger, detach). Check: `Serial: 8250/16550 driver, 4 ports` in dmesg (checklist 19). Credit: gbOS86's Surface Laptop 7 finding. |
 | 13 | Motherboard resources (PNP0C02, INT3F0D); EPC INT0E0C; CoEx INT3519; 3x MAX34417 power monitors | – | – | – | N/A | All are disabled by `_STA`/NVS on this SKU and absent from Windows PnP [V]. |
 
 ## 2. Display and GPU
 
 | # | Device | Linux driver | Firmware | Android side | Status | Notes |
 |---|---|---|---|---|---|---|
-| 14 | Intel Iris Plus 8A52 (00:02.0) | `i915.ko` + video/wmi/drm helpers (ours, gbinit) | `i915/icl_dmc_ver1_09.bin` staged (GuC/HuC optional) | lapis Mesa ANV (gfx11 + i915 backend), ANGLE, minigbm (i915 table includes 0x8a52), hwc3-drm | Ready | Uses lapis's stock graphics stack; the VMware-only overrides stay out of the native tree. |
+| 14 | Intel Iris Plus 8A52 (00:02.0) | `i915.ko` + video/wmi/drm helpers (ours, gbinit) | `i915/icl_dmc_ver1_09.bin` staged (GuC/HuC optional) | lapis Mesa ANV (gfx11 + i915 backend), ANGLE, minigbm (i915 table includes 0x8a52), hwc3-drm | Ready | Uses lapis's stock graphics stack; the VMware-only overrides stay out of the native tree. **Wave 3:** if the picture looks grey and washed out ("white veil", drm_hwcomposer logs `Missing optional LOG_GAMMA_LUT`), kernel build #15 has the opt-in switch `i915.gb_ignore_user_gamma` (default 0), set only through `GB_MODOPTS_i915=gb_ignore_user_gamma=3` in `gb\gb.cfg` ([NATIVE.md](NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg)); INFERRED for this panel (gbOS86 confirmed the cause on another i915 laptop). Checklist 21. |
 | 15 | Internal panel "Surface Calibrated Panel" MEI96A2, 3000x2000 eDP, backlight | i915 → `intel_backlight` | – | hwc3-drm drives `/sys/class/backlight/*` [V, strings]; lights HAL disabled (`ro.vendor.lights.backlight.enabled=false`) [V]; lapis `init.device-x86.rc` chowns `intel_backlight` [V] | Ready + **New here** | `gb_hw.sh boot` also chowns every other backlight to system (for example `acpi_video0`, if it ever appears). Brightness keys arrive only as keyboard HID consumer keys: ACPI `BRTN` has no caller, so there are no duplicate ACPI events [V, DSDT]. If the panel flickers, try `i915.enable_psr=0` (untested). |
 | 16 | External display: base USB-C (DP alt mode) and Surface Connect / SurfaceDock DP | i915 DDI | – | – | Ready [I] | The USB-C port sits behind the base USB hub (`XHC.RHUB.HS02.PRT1`, `_UPC` type 0x09) [V], so DP comes through a mux in the base that the EC/PD controller drives. There is no OS UCSI (row 33). Expected to work as a plain DP connector. Unverified. |
 | 17 | NVIDIA GTX 1650 Max-Q 10DE:1F91 (base, behind 00:1d.4; its HDA function stays driverless); MSHW0216 "IHV GPU Power Controller"; MSHW0153 hot-plug | **nouveau** (build #14 = #13 + 37 linux-6.18.y nouveau backports + hardening N1-N3; `runpm=1 modeset=2`, headless), in no boot-time load list: `gb_nouveau.sh` loads it after `sys.boot_completed` when the base is attached and the graphics mode is Auto/NVIDIA (default Auto), and binds it again on reattach. Intel mode: no driver, D3cold. `gb_power` owns detach (refcnt gate, unbind + PCI remove in a worker), rescan and the re-bind guard. `surface_hotplug`. MSHW0216: no Linux driver anywhere | `nvidia/tu117` (30 files, GSP-RM 570.144, 535.113.01 fallback; linux-firmware tag 20260916, with WHENCE + `LICENCE.nvidia`) in the `gb/dgpu-<krel>.erofs` payload on the ESP, mounted at `/odm/dgpu`; you fetch it | **Per-app NVIDIA graphics:** the driver package GbGfxDriver (`ro.gfx.driver.0`, Android's updatable-driver settings decided by gb_power) gives games and **Use NVIDIA** apps a shim that puts NVK (Mesa 26.3 + our Android patches) first. HWUI, SurfaceFlinger and the system UI stay on ANV. QS tile and Settings page "Graphics" (GbGpu). Automatic self-test (`nvk_probe`) before the first NVIDIA app. Compute service `gb_gpu_compute` (llama.cpp on NVK, UNIX socket). | Ready, untested on hardware | Everything runs headless: the dGPU has no display outputs, and its frames are composed by Intel. Apps switch GPU only when restarted, and detach is refused while apps hold the dGPU ("Close apps and detach"). Battery life depends on D3cold being reached when idle; check row 46 and the checklist. Recovery without a shell: `gb.nouveau=0` in the boot menu. Details: [NVIDIA.md](NVIDIA.md). |
@@ -87,7 +101,7 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 | # | Device | Linux driver | Android side | Status | Notes |
 |---|---|---|---|---|---|
 | 18 | Base keyboard, SAM HID **045E:09AE** (keyboard, system control, consumer control) [V, Windows HW IDs] | surface_aggregator → registry → hub → `surface_hid` → `hid-surface` (build #13) | **New here:** `vup/usr/idc/Microsoft_Surface_045E_09AE_Keyboard.idc` (`device.internal=1`, `keyboard.builtIn=1`), matched by name so the consumer/system-control siblings do not grab keyboard id 0 | Ready | The SAM firmware reports Fn as BTN_0 (linux-surface patch 0016, written for these exact IDs). It can stick, and on Android a key in [BTN_MISC, BTN_MOUSE) makes EventHub classify the keyboard as a gamepad. Fixed by `native/hw-gap-audit/kernel/0001-HID-surface-...patch`. Media, volume and brightness keys are standard HID usages that Generic.kl already maps, so no custom .kl is needed [V, Generic.kl]. The keyboard backlight is handled by the EC: no LED class device exists, so Android shows no keyboard-backlight control [I]. |
-| 19 | Precision touchpad, SAM HID **045E:09AF** [V] | `surface_hid` → hid-multitouch (built in, Win8 PTP) | **New here:** `Microsoft_Surface_045E_09AF_Touchpad.idc` (`touch.deviceType=touchPad`, internal) → TouchpadInputMapper gestures | Ready + **New here** | Palm rejection uses the PTP confidence bit (MT_TOOL_PALM). hid-multitouch (class WIN_8, `export_all_inputs`) also turns the two vendor collections (FF07:0001 "Navigation Accessory", FF05:0004 "USP Encapsulation") into "Microsoft Surface 045E:09AF UNKNOWN" inputs that carry only BTN_MISC/ABS_MISC codes, which Android sees as a gamepad. **New:** `vup/etc/excluded-input-devices.xml` hides them by exact name, keeping lapis's "Power Button" entry. The legacy "... Mouse" sibling should stay silent in PTP mode; it is not excluded. |
+| 19 | Precision touchpad, SAM HID **045E:09AF** [V] | `surface_hid` → hid-multitouch (built in, Win8 PTP) | **New here:** `Microsoft_Surface_045E_09AF_Touchpad.idc` (`touch.deviceType=touchPad`, internal) → TouchpadInputMapper gestures | Ready + **New here** | Palm rejection uses the PTP confidence bit (MT_TOOL_PALM). hid-multitouch (class WIN_8, `export_all_inputs`) also turns the two vendor collections (FF07:0001 "Navigation Accessory", FF05:0004 "USP Encapsulation") into "Microsoft Surface 045E:09AF UNKNOWN" inputs that carry only BTN_MISC/ABS_MISC codes, which Android sees as a gamepad. **New:** `vup/etc/excluded-input-devices.xml` hides them by exact name, keeping lapis's "Power Button" entry. The legacy "... Mouse" sibling should stay silent in PTP mode; it is not excluded. **Wave 3:** the IDC sets `gestureProp.Change_Timeout = 0.02` (Android's 200 ms default ignores quick flicks; gbos-x86 issue #17 confirmed 0.02 on lapis). Checklist 20. |
 | 20 | Base vendor HID **045E:09A6**: "Surface HID Color", "Base v3 Firmware Update" (CFU), USP encapsulation, "Surface UCM UCSI HID Client" [V] | hid-generic, hidraw only | – | Gap (UCSI) / Off by design (CFU) | No Linux driver exists for UCSI-over-SAM-HID (see row 33). The firmware-update collection must never be used; fwupd is stubbed. |
 | 21 | Touchscreen + pen, IPTS 8086:34E4 | `ipts.ko` (MEI 34E4 ID patched) | iptsd + IDCs (`native/iptsd`) | Ready | iptsd tested end-to-end on the builder against a fake IPTS uhid device. |
 | 22 | Surface Pen top button: BLE HOGP **045E:0921** (Win+F20 click, F19 double-click, F18 hold) | Android BT HID host → uhid (built in) → hid-generic | **New here:** `vup/usr/keylayout/Vendor_045e_Product_0921.kl` (F20 → STYLUS_BUTTON_TAIL, F19 → SYSRQ, F18 → ASSIST; META dropped) + `Surface_Slim_Pen_2_Keyboard.kl` (name match) | Ready [I] | The pen must be paired in Android's Bluetooth settings. The 0921 ID comes from a published Linux uhid log of this pen model, not from a pen paired on the test machine. STYLUS_BUTTON_TAIL opens the default notes app (SystemUI). |
@@ -121,8 +135,8 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 | # | Device | Linux driver | Firmware | Status | Notes |
 |---|---|---|---|---|---|
 | 37 | Wi-Fi AX201 160 MHz 8086:34F0 | lapis `iwlwifi`/`iwlmvm` + our signed libarc4/ptp/pps_core/rfkill (gbinit) | iwlwifi-Qu-b0/Qu-c0/QuZ-a0-hr-b0-77 staged | Ready | dmesg shows which stepping loaded. |
-| 38 | Bluetooth 8087:0026 (USB, HS10) | lapis `btusb`/`btintel` + our `bluetooth.ko` | `intel/ibt-19-*` staged (expected ibt-19-32-4) | Ready | – |
-| 39 | SST DSP 34C8 + Realtek ALC274 + Intel display audio | lapis SOF modules, dsp_driver=3 | sof-icl.ri + topologies staged | Ready | `native/audio`. |
+| 38 | Bluetooth 8087:0026 (USB, HS10) | lapis `btusb`/`btintel` + our `bluetooth.ko` | `intel/ibt-19-*` staged (expected ibt-19-32-4) | Ready | **Wave 3:** `ibt-19-*` is the legacy-mode name family (`19` = hw_variant 0x13, printed in decimal). If the controller boots in TLV mode it asks for an `intel/ibt-<cnvi>-<cnvr>.sfi` name instead (gbOS86 saw `ibt-0040-1050.sfi` on another laptop), which is not staged: the boot-log summary's firmware-failure lines then name the file to add (checklist 23; [INPUTS.md](INPUTS.md#firmware-native-only)). |
+| 39 | SST DSP 34C8 + Realtek ALC274 + Intel display audio | lapis SOF modules, dsp_driver=3 | sof-icl.ri + topologies staged | Ready | `native/audio`. **Wave 3:** DRAS's `<soundcard>` is the ALSA card id `sofhdadsp` (gbOS86: DRAS matches the id, not the name), and the Mic section carries `CaptureMixerElem` like lapis's sof-soundwire config (INFERRED field set). Checklist 22. |
 | 40 | Headphone jack (clipboard) with detection | ALC274 jack → "sof-hda-dsp Headphone" input | – | Ready | `native/audio` (JackDev). |
 | 41 | DP/HDMI audio (dock, USB-C) | SOF iDisp PCMs 3/4/5 | – | Ready | Needs i915 bound. Without i915, SOF probe defers and no audio works at all. |
 
@@ -182,6 +196,17 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 17. Intel only mode: the dGPU stays in D3cold across a reboot. Compare idle battery drain with Auto mode.
 18. The `[NVIDIA test]` boot entry once (follow its on-screen suspend prompts), then keep the whole `gblog\` folder:
     it holds the dGPU power and PM-stress report.
+19. (Wave 3, row 12) Serial / Surface Aggregator: the boot-log summary shows `Serial: 8250/16550 driver, 4 ports`,
+    `dw-apb-uart -22: 0` and a bound `surface_serial_hub`; base keyboard, touchpad and both batteries work.
+20. (Wave 3, row 19) Touchpad flicks: a short, fast swipe moves the pointer at once (`gestureProp.Change_Timeout`).
+21. (Wave 3, row 14) White veil: the summary's `drmhwc LOG_GAMMA_LUT lines:` count. If the panel looks washed out,
+    try `GB_MODOPTS_i915=gb_ignore_user_gamma=3` with `gb.overlay=1` once and compare (Night Light stops with it).
+22. (Wave 3, row 39) Sound: `audio cards:` lists `sofhdadsp`, and DRAS's logcat opens it.
+23. (Wave 3, rows 37-38) Firmware: the summary's `-- firmware load failures (dmesg)` part is empty. Note every
+    `Direct firmware load for ... failed` name (Bluetooth `intel/ibt-...` especially) in your report.
+24. (Wave 3) The rest of the summary as in [FLASHING.md, First-boot checklist](FLASHING.md#first-boot-checklist):
+    fs-verity present, apgetty off, the `-- gb_vnni` counter (`irqon` equals `emulated`), no HWUI abort lines, no
+    `gb_slotsync HOLD:` line.
 
 ## Cross-component notes
 

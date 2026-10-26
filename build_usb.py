@@ -9,7 +9,8 @@ whose androidboot.boot_devices name the Surface Book 3's two xHCI controllers, s
 Native images also carry the NVIDIA test entry gb-<slot>-nvtest and the dGPU payload gb/dgpu-<krel>.erofs.
 
 Usage: python -I build_usb.py [--out FILE] [--userdata-gib N] [--esp-mib 512] [--export DIR] [--sparse]
-                              [--vm-test [--vm-test-gfx]] [--esp-only FILE [--super-guid G]]
+                              [--vm-test [--vm-test-gfx | --vm-test-kat]] [--esp-only FILE [--super-guid G]
+                              [--bringup-test DIR]]
   The image is written to <out>.part (sha256 computed while writing), checked with verify_image.py, and only then
   renamed to <out>, with <out>.sha256 = "<hex>  <name>". A failed check keeps the .part file and writes no sidecar.
   --sparse      NTFS sparse file: all-zero 1 MiB blocks are not allocated (same content and sha256)
@@ -17,6 +18,11 @@ Usage: python -I build_usb.py [--out FILE] [--userdata-gib N] [--esp-mib 512] [-
                 verify_image.py --esp, exit (checkpoints; --super-guid fixes the GUID for determinism checks)
   --vm-test-gfx test-only: the VM tree plus GbGpu and the gfx driver package (build_esp.vm_test_gfx_cpio); the output
                 must be below D:\\gb-w2test\\
+  --vm-test-kat test-only (WAVE3_PLAN 6.4): the VM tree plus the VNNI known-answer test (inject\\kat\\vnni_kat, the
+                staged zram/zsmalloc, build_esp.vm_test_kat_cpio); the output must be below D:\\gb-w3test\\
+  --bringup-test DIR  test-only (WAVE3_PLAN R-12b), with --esp-only: the native ESP plus DIR\\gb.cfg -> gb/gb.cfg,
+                DIR\\overlay\\** -> gb/overlay/** and gb.overlay=1 in the entries (never a shipped ESP); the output
+                must be below D:\\gb-w3test\\
 Flash the .img with Rufus (DD image mode), balenaEtcher or dd to a USB drive of at least 32 GB.
 """
 import argparse, hashlib, importlib.util, os, struct, subprocess, sys, uuid, zlib
@@ -33,9 +39,12 @@ VERIFY_IMAGE = os.path.join(HERE, "verify_image.py")
 DEFAULT_OUT = os.path.join(HERE, "out", "googlebook-sb3-usb.img")
 VMTEST_OUT = os.path.join(HERE, "out", "googlebook-sb3-vmtest.img")
 VMTEST_GFX_ROOT = "D:\\gb-w2test"                 # --vm-test-gfx images only below this (throwaway checks)
+W3TEST_ROOT = "D:\\gb-w3test"                     # --vm-test-kat / --bringup-test outputs only below this (wave 3)
 TITLE_NATIVE = "Googlebook OS - Surface Book 3 (USB)"
 TITLE_VM = "Googlebook OS - USB image layout (VM test)"
 TITLE_VM_GFX = "Googlebook OS - USB image layout (VM test, gfx components)"
+TITLE_VM_KAT = "Googlebook OS - USB image layout (VM test, KAT)"
+BRINGUP_MAX = 8 * MiB                             # --bringup-test: the test inputs' total size
 
 # Surface Book 3 PCI paths (Windows DEVPKEY_Device_LocationPaths): PCH xHCI PCI(1400), Thunderbolt xHCI PCI(0D00),
 # internal NVMe behind root port PCI(1D00). first-stage init matches the first PCI device under pci0000:00.
@@ -69,8 +78,13 @@ NATIVE_BLACKLIST = ("tpm,tpm_tis,tpm_tis_core,tpm_tis_spi,tpm_tis_i2c_cr50,spi_i
 
 
 def native_cmdline(boot_devices, boot, part_uuid=None):
-    """Kernel command line for bare metal. Dropped: the VMware serial console/earlycon and 8250.nr_uarts (on the
-    Surface the LPSS UART carries the Surface Aggregator link) and the virtual display mode. Added:
+    """Kernel command line for bare metal. Kept from CMDLINE: 8250.nr_uarts=4 (WAVE3_PLAN item 1). Our GKI has
+    CONFIG_SERIAL_8250_RUNTIME_UARTS=0, and with nr_uarts=0 serial8250_init() returns -ENODEV before it registers the
+    8250 uart driver, so the LPSS UART that carries the Surface Aggregator (base keyboard/touchpad, batteries, charger,
+    detach) could never register (dw-apb-uart probe -22). Once registered, the driver grows the port table on demand,
+    so any value >= 1 works; 4 is the Kconfig default and the VM's value. Finding: gbOS86 HANDOFF.md:423 (Surface
+    Laptop 7; github.com/linuxkid473/gbos-x86). Dropped: the VMware serial console/earlycon (never console=ttyS* or
+    earlycon natively: the serdev core owns that UART) and the virtual display mode. Added:
     efi_pstore.pstore_disable=1 (kernel panics must not be written into the Surface's UEFI NVRAM),
     firmware_class.path with /odm/firmware first (Surface firmware, present before the /vendor overlay),
     iommu.passthrough=1 (IPTS touch DMA faults under the IOMMU), reboot=pci (Surface Book 3 hangs on other reboot
@@ -79,7 +93,7 @@ def native_cmdline(boot_devices, boot, part_uuid=None):
     The disk that holds this install's partitions: with part_uuid, androidboot.boot_part_uuid (strict: only that
     disk's partitions get /dev/block/by-name links, so a USB stick and an internal install never mix); otherwise the
     non-strict androidboot.boot_devices PCI paths."""
-    drop = ("console=ttyS0", "earlycon=", "video=Virtual-1", "8250.nr_uarts", "firmware_class.path=")
+    drop = ("console=ttyS0", "earlycon=", "video=Virtual-1", "firmware_class.path=")
     base = " ".join(a for a in be.CMDLINE.split() if not a.startswith(drop))
     disk = f"androidboot.boot_part_uuid={part_uuid.lower()}" if part_uuid else f"androidboot.boot_devices={boot_devices}"
     return (f"{base} firmware_class.path=/odm/firmware,/vendor/firmware efi_pstore.pstore_disable=1 "
@@ -119,11 +133,24 @@ def parse_args(argv=None):
                          "image structure (GPT, slots, first-boot formatting) in VMware before flashing")
     ap.add_argument("--vm-test-gfx", action="store_true",
                     help="with --vm-test: add GbGpu and the gfx driver package to the VM tree (throwaway VM check)")
+    ap.add_argument("--vm-test-kat", action="store_true",
+                    help="with --vm-test: add the VNNI known-answer test to the VM tree (throwaway VM check, R-13)")
     ap.add_argument("--esp-only", metavar="FILE", help="build and check only the ESP, written to FILE")
     ap.add_argument("--super-guid", metavar="G", help="with --esp-only: use this super partition GUID")
+    ap.add_argument("--bringup-test", metavar="DIR",
+                    help="with --esp-only (native): add DIR\\gb.cfg + DIR\\overlay and gb.overlay=1 (R-12b test ESP)")
     a = ap.parse_args(argv)
     if a.vm_test_gfx and not a.vm_test:
         ap.error("--vm-test-gfx needs --vm-test")
+    if a.vm_test_kat and not a.vm_test:
+        ap.error("--vm-test-kat needs --vm-test")
+    if a.vm_test_kat and a.vm_test_gfx:
+        ap.error("--vm-test-kat and --vm-test-gfx are separate test images")
+    if a.bringup_test is not None:
+        if not a.esp_only or a.vm_test:
+            ap.error("--bringup-test is a native --esp-only test variant (no --vm-test)")
+        if not os.path.isfile(os.path.join(a.bringup_test, "gb.cfg")):
+            ap.error(f"--bringup-test: {a.bringup_test}\\gb.cfg is missing")
     if a.super_guid is not None:
         if not a.esp_only:
             ap.error("--super-guid is accepted only with --esp-only")
@@ -138,6 +165,9 @@ def parse_args(argv=None):
     written = a.esp_only or a.out
     if a.vm_test_gfx and (not _below(written, VMTEST_GFX_ROOT) or a.export):
         ap.error(f"--vm-test-gfx output must be below {VMTEST_GFX_ROOT}\\ (and no --export): {written}")
+    for flag, on in (("--vm-test-kat", a.vm_test_kat), ("--bringup-test", a.bringup_test is not None)):
+        if on and (not _below(written, W3TEST_ROOT) or a.export):
+            ap.error(f"{flag} output must be below {W3TEST_ROOT}\\ (and no --export): {written}")
     for p in filter(None, (a.out, a.esp_only, a.export)):
         if os.path.normcase(os.path.realpath(p)) == os.path.normcase(os.path.realpath(be.LAPIS)):
             ap.error("refusing to write lapis.bin")
@@ -196,6 +226,23 @@ class ImageWriter:
             n -= k
 
 
+def bringup_files(d):
+    """--bringup-test (WAVE3_PLAN R-12b): {ESP path: bytes} for d\\gb.cfg and every file below d\\overlay. Test inputs
+    only (they may hold names the bring-up must refuse); at most BRINGUP_MAX bytes, regular files only."""
+    out = {"gb/gb.cfg": open(os.path.join(d, "gb.cfg"), "rb").read()}
+    root = os.path.join(d, "overlay")
+    for dp, _, fs in os.walk(root):
+        for n in sorted(fs):
+            p = os.path.join(dp, n)
+            if os.path.islink(p) or not os.path.isfile(p):
+                sys.exit(f"--bringup-test: {p} is not a regular file")
+            out["gb/overlay/" + os.path.relpath(p, root).replace("\\", "/")] = open(p, "rb").read()
+    if sum(len(v) for v in out.values()) > BRINGUP_MAX:
+        sys.exit(f"--bringup-test: {d} holds more than {BRINGUP_MAX >> 20} MiB")
+    print(f"bring-up test ESP: {len(out)} file(s) from {d}: {sorted(out)}", flush=True)
+    return out
+
+
 def run_verify(args):
     if os.environ.get("GB_GFXDRIVER") == "0":     # build_esp's bisect opt-out: the tree has no gfx driver package
         args = args + ["--no-gfxdriver"]
@@ -224,13 +271,23 @@ def main(argv=None):
         usb_cmdline = f"{be.CMDLINE} gb.hw=vm androidboot.boot_part_uuid={super_guid}"
         if a.vm_test_gfx:
             tree, title, kind = be.vm_test_gfx_cpio(), TITLE_VM_GFX, "vmtest-gfx"
+        elif a.vm_test_kat:
+            try:                            # refuses unless inject\kat and the staged zram/zsmalloc match (2.7)
+                tree = be.vm_test_kat_cpio()
+            except RuntimeError as e:
+                sys.exit(f"--vm-test-kat: {e}")
+            title, kind = TITLE_VM_KAT, "vmtest-kat"
         else:
             tree, title, kind = be.INJECT_CPIO, TITLE_VM, "vm"
         files = be.slot_files(usb_cmdline, tree, title, timeout=4)
         min_free = 0
     else:
         usb_cmdline = native_cmdline(USB_BOOT_DEVICES, "usb", part_uuid=super_guid)
+        if a.bringup_test is not None:      # R-12b only: never a shipped ESP (verify_image --expect-bringup-test)
+            usb_cmdline += " gb.overlay=1"
         files = be.slot_files(usb_cmdline, be.INJECT_CPIO_NATIVE, TITLE_NATIVE, timeout=4, native=True)
+        if a.bringup_test is not None:
+            files.update(bringup_files(a.bringup_test))
         min_free, kind = be.native_min_free(files), "native"
     esp = be.make_esp(files, a.esp_mib * MiB, min_free=min_free)
     print(f"super GUID: {super_guid}", flush=True)
@@ -240,7 +297,8 @@ def main(argv=None):
         with open(a.esp_only, "wb") as f:
             f.write(esp)
         print(f"wrote ESP {a.esp_only}: {len(esp):,} B, sha256 {hashlib.sha256(esp).hexdigest()}", flush=True)
-        rc = run_verify(["--esp", a.esp_only, "--boot", "usb", "--super-guid", super_guid, "--expect-tree", kind])
+        rc = run_verify(["--esp", a.esp_only, "--boot", "usb", "--super-guid", super_guid, "--expect-tree", kind]
+                        + (["--expect-bringup-test"] if a.bringup_test is not None else []))
         if rc != 0:
             sys.exit(f"verify_image.py --esp reports problems (exit {rc})")
         return

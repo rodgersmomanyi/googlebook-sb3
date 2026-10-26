@@ -10,8 +10,10 @@ The same ESP layout and initrd format as the VM, but the boot entries pass `gb.h
 native tree (`/gbnative`). See [ARCHITECTURE.md](ARCHITECTURE.md) for the tree and [DRIVERS.md](DRIVERS.md) for every
 device. In short:
 
-* **Kernel:** native images run kernel build #14 (build #13 plus nouveau-only patches; the same config and KMI, so
-  every module and lapis vendor module behaves as with #13). The VM keeps whatever kernel its ESP was last built with.
+* **Kernel:** native images run kernel build #15 (wave 3): build #14 (build #13 plus nouveau-only patches) plus the
+  reworked `#UD` VNNI emulator and the opt-in i915 gamma switch. The config, KMI and exports are the same as #13, so
+  every module and lapis vendor module behaves as with #13 ([kernel/K15.md](../kernel/K15.md)). The VM keeps
+  whatever kernel its ESP was last built with.
 * **Kernel modules** (our build; lapis's Google-signed GKI modules are refused by our kernel), loaded by `gbinit`
   from `modules.load` before Android starts, in dependency order (`stage_kernel.py`, `NATIVE_EARLY`):
   Wi-Fi/Bluetooth helpers (`libarc4`, `pps_core`, `ptp`, `rfkill`, `bluetooth`, `btbcm`, `hidp`, `rfcomm`), zram,
@@ -128,6 +130,11 @@ The same layout can also be installed from a bootable installer ISO that you bui
 * `reboot=pci` (the Surface Book 3 hangs with other reboot methods, per linux-surface).
 * `iommu.passthrough=1` (IPTS DMA faults under the IOMMU; replaces linux-surface's IOMMU quirk).
 * `snd_intel_dspcfg.dsp_driver=3` (SOF; the kernel's built-in table has no Ice Lake entry).
+* `8250.nr_uarts=4` is kept natively (wave 3): the GKI is built with `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, so
+  without it `serial8250_init()` gives up before the 8250 driver registers, and the LPSS UART that carries the
+  Surface Aggregator (base keyboard, touchpad, batteries, charger, detach) fails with `-22`. No `console=ttyS*` or
+  `earlycon` is added natively (the serdev core owns that UART). Finding credit: gbOS86 (their Surface Laptop 7 fix,
+  github.com/linuxkid473/gbos-x86 @f8a5c1a, HANDOFF.md:423).
 * NVIDIA: nouveau is never part of the boot (no load list), loads only after Android is up, and every boot that
   loads it sets `kernel.panic=30` (the base command line keeps `panic=0`). The crash-loop guard and the `gb.nouveau=0`
   kill switch recover a bad start without a shell ([NVIDIA.md](NVIDIA.md#safety-rails-and-recovery)).
@@ -142,9 +149,73 @@ The same layout can also be installed from a bootable installer ISO that you bui
 * **AVX-IFMA**: our #UD emulator covers AVX-VNNI only; lapis's libinput is reported to use VEX AVX-IFMA too, which
   Ice Lake lacks (prior-art finding, unverified here).
 * An OTA to a lapis build with a different kernel KMI could make lapis's vendor modules incompatible with our
-  kernel ([OTA.md](OTA.md)).
+  kernel. gb_slotsync now checks the new slot's GKI before it moves the boot default and holds the update when the
+  KMI differs ([OTA.md](OTA.md#kernel-check-before-the-switch)).
 * The NVIDIA stack (automatic driver start, per-app NVK rendering, detach gating, compute) has never run on a real
   GTX 1650: the first boot with the base attached is its first real test. Expect to need the recovery steps in
   [NVIDIA.md](NVIDIA.md). In the VM, VMware itself renders on the host GPU.
 * **Cameras** need the IPU4P firmware (Intel's, from your Windows driver; [INPUTS.md](INPUTS.md#firmware-native-only)).
   Without it the ipu6 driver probes without firmware and no camera appears; everything else is unaffected.
+
+## Bring-up configuration on the ESP (`gb\gb.cfg`)
+
+For hardware bring-up without rebuilding the image: a small, opt-in configuration file on the boot partition that
+gbinit applies to the `/odm` tree before Android starts (wave 3; design idea from gbOS86's
+[how it works](https://gbos86.com/docs/how-it-works); the code is ours).
+
+* **Off by default, one boot at a time.** It runs only when the kernel command line carries both `gb.hw=native` and
+  `gb.overlay=1`. No shipped entry has `gb.overlay=1`: press `e` on the entry in the systemd-boot menu and append
+  ` gb.overlay=1` for one boot (recommended). Never put it into the default entry: gb_slotsync copies the default
+  entry's options into the next slot's entry. A hand-made extra entry file (`loader\entries\gb-<x>-bringup.conf`)
+  is not recommended: it names `/initrd-<x>.img`, which pins slot `<x>`, and gb_slotsync never updates it, so after
+  a system update switched slots it would boot the previous build over a `/data` the newer build already used (a
+  downgrade, which needs a data wipe). If you make one anyway, delete or re-make it after every system update.
+* **Files.** `gb\gb.cfg` on the ESP. Its first line must be exactly `# gb.cfg v1`. `KEY=VALUE` lines, `#` comments,
+  printable ASCII, at most 4 KiB and 64 lines; CRLF line endings (Notepad) are fine. A **format error** (the first
+  line, a byte that is not printable ASCII, the size or line limits, a line that is not `KEY=VALUE`, a key given
+  twice, a malformed value, `gb_ignore_user_gamma` outside 0-7, too many or too large overlay files): nothing is
+  applied (one log line). A **refused setting** (an unknown key, a denied property, a module that is not in
+  `modules.load`, an overlay path outside the list below): only that one is skipped, with a log line, and the rest
+  is applied. Keys:
+  * `GB_MODOPTS_<module>=<name>=<value> [...]`: options appended to that module's line in `modules.load` (1-8
+    tokens, `[a-z0-9_]+=[A-Za-z0-9_.,:-]+`, <= 200 characters; the module must be in `modules.load`). Example:
+    `GB_MODOPTS_i915=gb_ignore_user_gamma=3` (the white-veil switch, [FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)).
+  * `GB_SKIPMOD=<name>,<name>`: those `modules.load` lines are commented out for this boot.
+  * `GB_PROP_<1..16>=<prop>=<value>`: one line appended to `/odm/etc/build.prop`. Only `ro.`, `persist.`,
+    `vendor.` and `debug.` names; the graphics-switching, adb, boot, build, product, crypto, USB, zygote and
+    privapp properties are refused, and so are the properties the image itself guards.
+* **Overlay.** `gb\overlay\<path>` replaces `/odm/<path>` only for input and audio configuration:
+  `usr/idc/*.idc`, `usr/keylayout/*.kl`, `usr/keychars/*.kcm`, `vup/etc/audio/<dir>/*.xml` and
+  `vup/etc/data/hal_configs/audio_default.xml`. Regular files only, at most 64 files, 256 KiB each, 4 MiB in total;
+  each is created 0644, root-owned. Everything else is refused with a log line: rc files, SELinux policy, VINTF,
+  `build.prop`, fstab, libraries, binaries, firmware, modules. Nothing from the ESP is ever executed.
+* **Which ESP.** Only the boot disk's own ESP: the disk whose GPT holds the partition GUID named by
+  `androidboot.boot_part_uuid`, its `EFI-SYSTEM` partition, mounted read-only (`ro,nosuid,nodev,noexec`). Any doubt
+  (no such token, the GUID missing or found twice) means: skipped, logged. A USB stick with a different partition
+  GUID is never read (two sticks written from the same image share their GUIDs: keep only one plugged in).
+* **Log and recovery.** `/odm/gbinit_bringup.log`, shown in the `gblog\` summary. The whole step runs under a 40 s
+  timeout and the boot always continues. If a boot with `gb.overlay=1` misbehaves, boot the normal entry again, or
+  rename `gb\gb.cfg` from Windows.
+* **Trust.** Secure Boot is off for this project, so whoever can write the ESP already controls the kernel and the
+  initrd; this adds nothing beyond that. If signed boot is ever adopted, `gb.cfg` becomes unsigned input and must go.
+  It is the one ESP access outside the ESP lock (read-only, at rdinit, before any lock user exists; INTERFACES 5.4).
+* **Updates.** `install_dualboot.ps1 -UpdateEspOnly` rewrites the whole ESP and so removes `gb\gb.cfg` and
+  `gb\overlay\`; it copies them out first and says where ([README_DUALBOOT.md](../native/dualboot/README_DUALBOOT.md)).
+  gb_slotsync never touches them.
+
+## Google apps
+
+What to expect from Google's apps on this unofficial port (lapis keeps its own Play services; nothing here adds or
+changes Google software):
+
+* **Google sign-in and Play Store installs work** (gbOS86's report on lapis; INFERRED for this port, not re-tested
+  natively).
+* **AICore-based features (Magic Pointer, on-device Gemini, other on-device AI) are refused.** They need hardware
+  key attestation, and this device cannot pass it: the boot state is orange (unlocked, our own kernel), SELinux is
+  permissive, and KeyMint is the AOSP software implementation. INFERRED from gbOS86's report (github.com/linuxkid473/
+  gbos-x86 @f8a5c1a, HANDOFF.md:159-167,193-200); not re-tested here.
+* **Play updates of some apps use fs-verity**: Android itself enables it on `/data` at the first boot, natively and in
+  the VM (the VM's `/data` already has it); the native fstab also names `fsverity` (wave 3). See
+  [INPUTS.md](INPUTS.md#userdata-fs-verity).
+* Google binaries are never part of this repository or of anything it builds for distribution; the recovery-image
+  checksums are in [INPUTS.md](INPUTS.md#the-os-image-required-obtain-it-yourself).

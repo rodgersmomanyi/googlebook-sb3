@@ -560,6 +560,11 @@ ehci/uhci/ohci, sd_mod, sr_mod, cdrom, vfat/fat, nls_cp437, loop, efivarfs, dm_m
 8250, i8042, atkbd, evdev, ata_piix, virtio_blk, squashfs, simpledrm/fbcon (TER16x32 font built in; firmware fb is
 off, so simpledrm is the only display driver), ACPI AC adapter, TPM (tcg tis/crb — their initcalls are blacklisted on
 the command line, 2.2).
+(Wave 3, item 1) This kernel's `CONFIG_SERIAL_8250_RUNTIME_UARTS` is 32, so its 8250 driver registers and `8250_dw`
+binds the Surface Aggregator's LPSS UART with no command-line help; unlike the native GKI (`RUNTIME_UARTS=0`, whose
+boot entries therefore carry `8250.nr_uarts=4`), the installer needs no `8250.nr_uarts`. `remote.sh kernel` refuses a
+build whose `/boot/config-6.8.0-147-generic` has 0, the build record keeps the value (`kernel_8250_runtime_uarts`)
+and T0 re-checks it (13.10).
 
 `installer\etc\modules.list` (names, load order; INSTALLER owns, this is the initial content):
 
@@ -1741,7 +1746,7 @@ kind=iso9660 dev=/dev/sda1 disk=sda`; verify OK; T2e. After power-off the ISO's 
 the drive with more free space (>= 30 GiB free required, else SKIPPED): `test\test_bcd_parse.ps1` (`SUMMARY bcd-parse:
 0 failed`); `test\run_edge_tests.ps1 -WorkDir <dir> -ExportDir D:\gb-test\export_small` (`SUMMARY edge cases: 56
 passed, 0 failed`); `test\run_image_tests.ps1 -Image <dir>\cycle_small.img -ExportDir D:\gb-test\export_small -Tag
-iso_t8 -DeleteImage` (`SUMMARY 'iso_t8': 25 passed, 0 failed`); `test\test_import_iso_state.ps1` (0 failed; includes
+iso_t8 -DeleteImage` (`SUMMARY 'iso_t8': 57 passed, 0 failed`: 25 + the 32 cases of WAVE3_PLAN 5.4); `test\test_import_iso_state.ps1` (0 failed; includes
 the stale-pointer case of 4.6). All run with `powershell -NoProfile -ExecutionPolicy Bypass -File ...`.
 
 `summary.txt`: one line per test `PASS|FAIL|SKIPPED|INCONCLUSIVE <id> <reason>` and the build id; overall PASS only if
@@ -1997,9 +2002,11 @@ hold changes: the k14 kernel, the `[NVIDIA test]` boot entry and the dGPU payloa
 ### 13.1 Installer module denylist (BUILD, TEST)
 
 `build\builder\stage_initramfs.py` `MODULE_DENY` = `spi_intel*`, `mtd*`, `efi_test`, `efi_pstore`, `tpm*`,
-`nouveau`, `nvidia*`, `drm_gpuvm`, `drm_exec`, `gpu_sched` (fnmatch, names with `-` read as `_`): the installer never
-loads the NVIDIA stack. None of the new names is in the resolved set of the last build (20261025-085013: 34 names ->
-46 `.ko`; `installer\etc\modules.list` = storage, file systems, HID, Surface), so the module set does not change. T0's
+`nouveau`, `nvidia*`, `drm_gpuvm`, `drm_exec`, `gpu_sched`, and since 13.9 also `drm_ttm_helper`, `mxm_wmi`,
+`i2c_nvidia_gpu`, `nova_core`, `nova_drm`, `snd_hda_intel` (fnmatch, names with `-` read as `_`): the installer never
+loads the NVIDIA stack or a helper of it. None of the new names is in the resolved set of the last build
+(20261025-085013: 34 names -> 46 `.ko`; `installer\etc\modules.list` = storage, file systems, HID, Surface), so the
+module set does not change. `build\builder\mk_initramfs.sh`'s own `.ko` gate names the same modules since 13.9. T0's
 `DENY` (`test\t0_static.py`) is the same tuple; `C:\GB-x86\tests\w2b\test_iso_static.py` asserts the equality (both
 read with `ast`). T0 records the list as `facts["module_deny"]`; its check "no denylisted .ko in the initrd" uses it.
 
@@ -2089,3 +2096,63 @@ export's `EFI-SYSTEM.img`; `verify_image.py` (with `--krel`) passes on both of t
 trees are identical. ISO tests re-run and passed: T0 (64), T7 (8), T2e (8), T1a (10), T1b (38). Groups G1-G4
 (T3-build, T3n(f), T3n(e), T3, T3n(d), T4, T4b, T9) need about 33 GB free on D: plus the 10 GB floor and wait for
 disk space.
+
+### 13.9 Wave 2b source fixes (2026-10-26; the outputs are rebuilt after this)
+
+The low findings of the Wave 2 safety review, applied to the sources only (no output was rebuilt by this step):
+* `MODULE_DENY` / T0's `DENY` (13.1) gain `drm_ttm_helper` (the fifth opt-in module of INTERFACES 6.2), `mxm_wmi`
+  (nouveau's MXM helper), `i2c_nvidia_gpu` (the NVIDIA GPU's USB-C/I2C function driver), `nova_core`, `nova_drm` (the
+  new NVIDIA drivers, absent from 6.8.0-147) and `snd_hda_intel` (its ID table binds the NVIDIA HDA function). The
+  builder kernel's `modinfo -F depends nouveau` is `drm_display_helper, ttm, mxm-wmi, drm_gpuvm, i2c-algo-bit,
+  gpu-sched, drm_exec, video, wmi, drm_ttm_helper`; the shared helpers (`ttm`, `drm_display_helper`, `i2c-algo-bit`,
+  `video`, `wmi`) also serve i915 and stay allowed. None of the 46 resolved modules of build 20261025-205346-63e3bd38
+  matches the new list (`C:\GB-x86\tests\w2b\test_iso_static.py` S1b), so the initramfs does not change. The second
+  gate in `mk_initramfs.sh` (a `.ko` regex that still named only the five pre-Wave-2 patterns) now names the same
+  16 entries (S1c), and the STAGE-JSON summary records `module_deny`, so a build log shows the list that ran.
+* The native tree changes (ESP lock protocol INTERFACES 5.4 r3 in every lock user, gb_bootlog's lock fallback and
+  free-space check, gb_slotsync's default-entry match, gb_audio.sh's legacy HDA load), so the USB image, the export and
+  the ISO must be rebuilt (13.4 again) and the ISO suite re-run.
+
+### 13.10 Wave 3 (WAVE3_PLAN; sources only, the outputs are rebuilt after it)
+
+* Item 1: the native boot entries now keep `8250.nr_uarts=4` (`build_usb.native_cmdline`), so every export's
+  `manifest.cmdline` and the export/USB entries change: a fresh export (`--new-export`) and a new ISO are required, and
+  cross-check 8 compares them token for token as before. The installer itself needs no token (3.3): `remote.sh kernel`
+  stops the build if `/boot/config-6.8.0-147-generic` has `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, the build record
+  keeps `kernel_8250_runtime_uarts`, and T0 checks that the ISO's `/boot/vmlinuz` is `6.8.0-147-generic` (its
+  setup-header version) and that this config value is >= 1 (`t0_static.kconfig_checks`, fact
+  `installer_8250_runtime_uarts`; gbtests T0 compares it with the record when the record has it).
+* Items 4, 8, 11, 12 and k15 change the native tree (native-only fstab with `fsverity`, the gb_bootlog summary,
+  apgetty off, the gated `/gbbringup.sh`), so the USB image, the export and the ISO are rebuilt and the FULL suite is
+  re-run (WAVE3 R-11). `verify_image.py` gains V25-V28 and the source comparison in V12; build_iso's preflight runs it
+  as before.
+
+### 13.11 Wave 3 rebuild (2026-10-26, WAVE3_PLAN R-05 .. R-11)
+
+k15 was staged (R-05), the USB image rebuilt (R-07), and the ISO built with a fresh export (13.4 again:
+`--new-export`, new GUIDs; a reused export fails cross-check 8 on the k15 payload names, as designed). The installer
+itself needs no serial token: the record has `kernel_8250_runtime_uarts` 32, and T0 checks it (3.3, 13.10).
+
+| item | review rebuild (`e0067b12...`) | Wave 3 |
+|---|---|---|
+| ISO | 7,471,783,936 B, build 20261025-205346-63e3bd38 | 7,471,886,336 B (`b1c355b0...`, build 20261026-062920-107b7e70) |
+| `esp-usb` / `esp-internal` raw sha256 | `043a9a9c...` / `1ae31291...` | `5f87dbff...` / `41014cc2...` (536,870,912 B each) |
+| `esp-usb` / `esp-internal` chunk (zstd -9) | 116,439,228 / 116,439,223 B | 116,490,289 / 116,490,283 B |
+| other payload objects | 11 | the same 11 (raw sha256 and size unchanged; 27 of 29 chunks shared) |
+| `initrd-<slot>.img` | 57,833,741 B | 57,845,993 B (k15 modules, `/gbbringup.sh`) |
+| `gb/dgpu-<krel>.erofs` | 60,260,352 B (k14) | 60,260,352 B (k15, sha256 `dc9da255...`) |
+| USB ESP used / free | 160.5 / 343.6 MiB | 160.6 / 343.5 MiB; `native_min_free` 199.2 MiB |
+| USB image | `db700318...` | `377310ee...`, 28,814,885,376 B |
+| export | created 2026-10-25T22:54:42, new dual-boot GUIDs | created 2026-10-26T08:30:11, new dual-boot GUIDs |
+| installer initrd | 11,678,685 B | 11,678,562 B |
+
+Both ESP objects extracted from the built ISO have the sha256 of the USB image's EFI-SYSTEM partition and of the
+export's `EFI-SYSTEM.img`; `verify_image.py --krel` (k15) passes on the USB image (with `--compare-export`) and on
+the export ESP, and the USB and export native trees are identical (`compare_native.py`). The builder's chunk cache
+of the superseded image (`db7003187a168610-...`, 7.0 GiB) was removed before the build: the preflight needs 25 GiB
+free on the builder's `/` and found 23.9 GiB; `prune-cache` would have removed it after the build anyway.
+
+FULL suite (WAVE3 R-11, `run_all.py --with-t1c`): `OVERALL PASS` (2026-10-26 10:10-11:39, 89 min; every id: T0 67 checks, T1a 10, T1b 38, T1c 35, T1d(n) 41, T1d(y) 43, T2a-T2j, T3n(a/b/c), T4n, T4nb, G1-G4 with T3 110, T4 11, T4b 78, T9 30, T5, T6, T6m, T6n, T6g, T7, T2e, T7b, T10 17, T8 6; D: never below 15.3 GB free). The first full run failed only T8, on a stale
+expectation: `run_image_tests.ps1` passed all 57 cases (the 25 of Wave 2 plus the 32 slot-aware `-UpdateEspOnly`
+cases of WAVE3_PLAN 5.4), while gbtests T8 still required the text `25 passed`; T8 now requires `57 passed, 0 failed`
+(7.x T8 text above). The rerun is the run of record.

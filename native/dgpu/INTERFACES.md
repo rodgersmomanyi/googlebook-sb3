@@ -1,6 +1,8 @@
 # dGPU (NVIDIA TU117) shared interface spec
 
-Version 1.2 (revision r2: the review fix pass of section 29), 2026-10-25. The source of truth for the six Wave 1
+Version 1.2 (revision r4: the Wave 3 errata of section 31, 2026-10-26, on top of r3: the Wave 2b errata of section
+30, 2026-10-26, on top of r2: the review fix pass of section 29, 2026-10-25; the r3 text is kept byte for byte in
+`INTERFACES-v1.2r3.md`, sha256 `7cd4ed25...`, the r2 text in `INTERFACES-v1.2r2.md`, sha256 `a2345c08...`). The source of truth for the six Wave 1
 implementers and for the wave 1b (graphics switching) implementers. It is derived from `NVIDIA_PLAN.md` (sections 1-13, same scratchpad `nvresearch/` folder) and,
 for v1.2, from `GRAPHICS_SWITCHING_REQ.md` (same folder, "REQ") and the user's decisions D1-D8 of 2026-10-25 (quoted in
 section 22.1). Where it differs from the plan, the reason is in section 19 (`D-n` numbers are cited inline). If this
@@ -159,7 +161,7 @@ Each artifact is listed with its sha256 in the producer's integration file.
 | Name | Value | Used by |
 |---|---|---|
 | ESP lock wait, loader | 120 s, then `refused:esp` | gb_nouveau.sh |
-| ESP lock wait, log writers | 600 s, then proceed without the lock (bootlog: logs matter most; v1 said "steal", which would also break a live holder's lock) or skip this cycle (slotsync) | gb_bootlog, gb_slotsync (Wave 2) |
+| ESP lock wait, log writers | 600 s, then proceed without the lock (bootlog: logs matter most; v1 said "steal", which would also break a live holder's lock; r3: only when the holder is another log writer, else that snapshot is skipped, 5.4) or skip this cycle (slotsync) or give up (audiodiag) | gb_bootlog, gb_slotsync, gb_audiodiag (Wave 2) |
 | Health window | 30 s after the last insmod returns; (R-7) counted in seconds slept (CLOCK_MONOTONIC), so a system suspend does not count | gb_nouveau.sh |
 | Clean mark | 120 s after the last insmod returns; (R-7) counted the same way | gb_nouveau.sh |
 | Kernel panic timeout on opt-in boots | 30 s (`/proc/sys/kernel/panic`) | gb_nouveau.sh (pending user approval, section 20) |
@@ -313,6 +315,7 @@ before use (6.5).
 | `notify/` | dir | 0770 root:shell | root (queue writers), shell (gb_notify deletes) | gb_notify | Notification queue (section 12.1). The only shell-writable directory root writes into: O_EXCL / noclobber creation only. |
 | `payload/` | dir | 0700 root:root | | | Checked before use: a real directory (no symlink), owner root, mode 0700; else removed and re-created. |
 | `payload/dgpu.erofs` | file | 0640 root:root | gb_nouveau.sh stage | kernel (mount) | Verified copy of the ESP payload (D8: moved from `/data/vendor/gb/dgpu.erofs`). Temp name `dgpu.erofs.tmp`. |
+| `audiodiag/` (Wave 2 erratum, r3) | dir | 0700 root:root | `gb_audiodiag.sh` (creates it; no rc file does) | `gb_audiodiag.sh` | Local collection `t<T>/` (text + test recordings) before the copy to `gblog\` on the ESP; at most 3 older ones kept. Checked like `payload/` before every run (a real directory, owner root, mode 0700; else removed and re-created; symlinks inside are never copied). Older images used `/data/local/tmp/gb_audiodiag` (left behind, unused). |
 | `compute_allow` | file | 0644 root:root | gb_power (only) | gb_gpu_compute, gb_power | Compute client allowlist, section 11.3. |
 | `gfx_app_prefs` (v1.2) | file | 0644 root:root | gb_power (only; tmp + rename with `O_CREAT\|O_EXCL\|O_NOFOLLOW`, like `allow_save()`) | gb_power | Per-app choices: lines `<pkg> intel` or `<pkg> nvidia` (`pkg_name_ok()` syntax), sorted, unique, <= 128, `#` comments. Seeded once from `/odm/etc/gb/gfx_app_prefs.default` when the file does not exist. 24.2. |
 | `gfx_catalog` (v1.2) | file | 0644 root:root | gb_power (from GbGpu's `apps-commit`) | gb_power | App catalog: first line `# pkgs <mtime_ns> <size>` (the packages.list stamp at commit), then `<pkg> g` (game) or `<pkg> a` (other launchable non-system app), sorted, <= 512. Kept across boots so the opt-in list is right before GbGpu runs. 24.3. |
@@ -385,29 +388,88 @@ design). Hence: payload holds libraries, modules and firmware only; every execut
 
 ### 5.4 ESP lock (mutual exclusion around ESP mounts and nouveau load windows)
 
-Lock = the directory `/dev/gb_esp.lock` (root only). Acquire: `mkdir /dev/gb_esp.lock` succeeds, then write
-`/dev/gb_esp.lock/owner` = `<pid> <name> <uptime_s>` (remember this exact line). Release: only if `owner` still holds
-the line you wrote, remove `owner`, `rmdir` (a lock stolen from you belongs to someone else now). Poll interval 1 s.
+Lock = the directory `/dev/gb_esp.lock` (root only). Owner line = `<pid> <name> <uptime_s>`. Poll interval 1 s.
+**(r3, Wave 2b; r4, Wave 3)** Every lock user (gb_nouveau.sh, gb_dgpu_report.sh, gb_bootlog, gb_audiodiag.sh in mksh;
+gb_slotsync and gb_power in C) follows exactly these steps; "busy" means: a directory `/dev/gb_esp.lock.stale.<p>` exists
+whose `<p>` is a number other than the caller's own pid and `/proc/<p>` exists (another process is in the middle of a
+steal and may put a moved lock back at any moment).
+
+**Acquire.**
+0. (r4, Wave 3; wave 2b review L1) If "busy" and the back-off count is below 5: count a back-off and go to step 4 -
+   **no `mkdir` at all** while a steal is in progress (a newcomer's empty directory would block the stealer's
+   put-back). The count holds only **consecutive** back-off polls: a poll that finds the lock held (step 1 fails)
+   resets it to 0.
+1. `mkdir /dev/gb_esp.lock`. If it fails (the lock exists), judge it (stale lock below); a stale lock is stolen and
+   after a successful steal step 0 runs again at once; otherwise go to step 4.
+2. (r3) If "busy" (a steal started between step 0 and the `mkdir`) and the back-off count is below 5: `rmdir
+   /dev/gb_esp.lock` (rmdir only removes an empty directory: our new one, never a lock with an owner file), count a
+   back-off and go to step 4. After 5 consecutive back-offs a leftover is ignored (a steal takes milliseconds; 5 s
+   means a dead or stuck stealer, the same assumption as the 5-poll rule below).
+3. Create `/dev/gb_esp.lock/owner` **exclusively** (`O_CREAT|O_EXCL|O_NOFOLLOW`; mksh `set -C`) with the owner line and
+   remember that line: the lock is held. (r3) If the create fails the lock is not ours and nothing is removed (for
+   example a stealer put a lock back in place of our new directory, so its owner file is there).
+4. Wait: after the holder's maximum wait (table) give up as the table says; otherwise sleep 1 s and go to step 0.
 
 **Stale lock (v1.1, atomic steal).** A lock is stale when its owner pid no longer exists (`/proc/<pid>` missing), its
-owner field is not a number, or it has had no `owner` file for 5 consecutive polls. A waiter that judges it stale
+owner field is not a number, (r4, wave 2b review L2) its owner pid is the caller's own pid (acquire runs only while the
+caller holds nothing, so such a lock is a put-back that landed after the caller's own release gave up), or it has had
+no `owner` file for 5 consecutive polls. A waiter that judges it stale
 records the lock directory's inode (`stat -c %i`) together with the owner line it read, then:
 1. renames the lock away: `mv -T /dev/gb_esp.lock /dev/gb_esp.lock.stale.<own pid>` (rename(2); only one waiter can
    win, a failed rename means somebody else stole or released it: retry `mkdir` at once);
 2. if the renamed directory has the recorded inode **and** the recorded owner line, it is the stale lock: remove its
    `owner`, `rmdir` it, retry `mkdir`;
-3. otherwise a live holder re-created the lock in between: put it back with `mv -T ... /dev/gb_esp.lock` (log it if
-   that fails) and keep waiting.
-Never `rm owner; rmdir` the lock in place to steal it (two stealers would both win). C users (gb_slotsync) do the same
-with `rename(2)`/`stat(2)`. gb_power reads the owner file: a live `<pid> gb_nouveau ...` owner = the nouveau load
-window is open (10.3).
+3. otherwise something else was moved (a live holder re-created the lock in between): put it back to
+   `/dev/gb_esp.lock` **without replacing** an entry in the way (r3: toybox `mv -T` refuses an existing target; shell
+   users test `[ ! -e ]` first so GNU mv in the tests does the same; C uses `renameat2(RENAME_NOREPLACE)`). (r3) If
+   something is in the way: a moved directory **without** an owner file is removed instead (an empty directory of a
+   holder between `mkdir` and its owner write; that holder's write fails or lands in the new directory); otherwise
+   the put-back is retried (r4) every 50 ms for up to 5 s (100 tries; r3: once per poll for 5 polls) while
+   newcomers do not `mkdir` (acquire step 0 sees our `.stale.<pid>` directory), then logged and left. Then keep
+   waiting.
+Never `rm owner; rmdir` the lock in place to steal it (two stealers would both win). gb_power reads the owner file: a
+live `<pid> gb_nouveau ...` owner = the nouveau load window is open (10.3).
+
+**Release.** Only if `owner` still holds the line you wrote: remove `owner`, `rmdir`. (r3) Otherwise, while "busy"
+(r4: at most **7** polls, longer than a stealer's 5 s put-back budget plus its start-up; r3: 5), sleep 1 s and read
+again: a stealer that moved our lock away puts it back within moments. If it is still not our line: log it and leave
+it (a lock stolen from you belongs to someone else now; if it is our own line put back later, our next acquire
+judges it stale, above).
+
+**gb_power** never sleeps a poll in its loop (heartbeat, 10.x): it takes the lock only if acquire steps 0-3 succeed at
+once (a held lock or "busy" = go on without it, r4: no `mkdir` while busy), retries a put-back up to 10 times 20 ms
+apart, and retries a release that found its lock moved away by a steal in progress from its status tick for up to
+(r4) 8 s (r3: 6 s). (r4, wave 2b review L4) Its load-window test (10.3, `nouveau_window_open()`) also reads the
+`owner` file inside every live stealer's `/dev/gb_esp.lock.stale.<p>` (p other than its own pid): a live
+`<pid> gb_nouveau ...` owner there is a load window too (the lock is only moved for the moment of a steal), so a detach
+then is refused with N15 as well.
+
+**Residual (r3, r4).** The 5-poll rules assume that a steal (rename away, check, put back) finishes within 5 s. A
+stealer stalled for longer between its rename and its put-back can still leave two holders or an orphaned lock (the
+pre-r3 protocol could do that in an ordinary three-way race: a stale lock, two stealers and a newcomer). (r4) The Wave
+2b review found two more paths without a stalled stealer (L1: newcomers' back-off directories blocked put-backs that
+were retried once per poll, and a back-off count over the whole wait let a newcomer claim while a live lock was moved
+away; L2: a release gave up just before a late put-back, leaving an orphan that names a live daemon). Acquire step 0,
+the consecutive count, the 50 ms put-back retries, the 7-poll release and the own-pid stale rule address them; a
+put-back that still lands after the release gave up leaves a lock that names the releaser, which the releaser's next
+acquire steals (own-pid rule) and which the other users treat as held until then. The ESP-mount check before every
+insmod (below) still blocks the dangerous case.
+
+**Exception: the rdinit bring-up mount (Wave 3, lead decision D-b; WAVE3_PLAN contract 2.3).** `/gbbringup.sh`, run by
+GBINIT (the rdinit script) only on a boot whose command line carries `gb.hw=native` **and** `gb.overlay=1`, mounts this
+boot's ESP **read-only** (`ro,nosuid,nodev,noexec`) on `/gbbu/esp` **without** the lock, reads `gb\gb.cfg` and
+`gb\overlay\`, and unmounts it before GBINIT runs `exec /init`. That is the only ESP mount outside the lock. It is safe
+because it runs in the rdinit environment before Android's init starts, so none of the six lock users above can exist
+yet (they are init services, started after `/data` and `sys.boot_completed`), it is a single process, it never writes,
+and GBINIT lazily unmounts `/gbbu/esp` on every exit status (timeout 40 s). `/dev/gb_esp.lock` is not used there.
 
 | Holder | Holds it while | Max wait to acquire |
 |---|---|---|
 | gb_nouveau.sh `auto` | from before payload staging until the health check ends (`loading=1` .. `loading=0`) | 120 s, then `refused:esp` |
 | gb_dgpu_report.sh `test` | PM stress and suspend-test phases (`vendor.gb.dgpu.busy=1`) | 120 s, then skip the phase |
-| gb_bootlog (Wave 2) | each ESP mount + write + `sync` + umount | 600 s, then proceed without the lock (logs matter most) |
+| gb_bootlog (Wave 2) | each ESP mount + write + `sync` + umount | 600 s, then: (r3) if the live holder is `gb_slotsync`, `gb_audiodiag` or `gb_bootlog`, proceed without the lock (logs matter most); any other holder (`gb_nouveau`, `gb_power`, `gb_dgpu_report`: a dGPU window, or an unknown name) skips this snapshot |
 | gb_slotsync (Wave 2) | each `sync_once` ESP mount | 600 s, then skip this cycle (it retries every 60 s) |
+| gb_audiodiag.sh (Wave 2) | the copy of one collection to the ESP | 600 s, then give up (the files stay in `audiodiag/`) |
 | (v1.2) gb_nouveau.sh `auto`, bind path (7.2a) | from before the marker until the health check ends (owner name `gb_nouveau`, so it is a load window for gb_power) | 120 s, then `refused:esp` |
 | (v1.2) gb_power, rebind guard (23.8) | from the rebind trigger until the rebind watch ends; owner line `<pid> gb_power <uptime_s>` | never waits (the kernel probe cannot be held back): it takes the lock if free (with the atomic stale steal of this section), else proceeds and logs who holds it |
 | (v1.2) `gb_dgpu_report.sh selftest` (25.3) | the whole self-test; owner name `gb_dgpu_report` | 120 s, then `verdict=error reason=esp` |
@@ -481,7 +543,11 @@ the tool, so copy both together):
    `PAYLOAD FAIL <reason>` and exit 1 (usage: exit 2).
 
 Two runs on the same tree MUST give byte-identical images (NP-21: 60,260,352 bytes with the k14 modules, the 8a ICD
-and the two compute libraries, sha256 `1d7277b1...`).
+and the two compute libraries, sha256 `1d7277b1...`). **(Wave 2 erratum, r3)** The Wave 2 images ship the payload
+`22080f8c...` (also 60,260,352 bytes): the Wave 2 image audit rebuilt it byte for byte with `make_dgpu_payload.sh`
+from the pinned inputs of `build_esp.py`'s payload step, and its 43 files match INTERFACES 6.2 and every pinned source.
+NP-21's inputs were never recorded, so `1d7277b1...` cannot be traced; `22080f8c...` is the reference for the Wave 2
+inputs.
 
 ### 6.4 Modes on the device
 
@@ -1254,6 +1320,14 @@ runs as **user shell** (the identity `adb shell cmd notification post` uses) and
     global <key>`. Any other key, value, src or pairing: logged and dropped. No other Settings key can ever be written
     through the queue.
   (v1.2) The tag whitelist gains `gb_gfx`.
+  (Wave 3, lead decision D-a) The tag whitelist gains `gb_update`; its producer is **gb_slotsync** (root, C): when an
+  OTA completed into the other slot but that slot's GKI has a different KMI generation than the running kernel (or its
+  version cannot be read), it holds the systemd-boot default and posts N22/N23 once per (slot, release), only after
+  the held slot's initrd and entries are on the ESP (r4, E-14: the text says "(slot X) is in the boot menu"). It writes the
+  message exactly as above (`<epoch_ms>-<pid>-<n>.msg` via an exclusive `.tmp`, `O_NOFOLLOW`, `fchmod 0644`,
+  `rename`) and sets `vendor.gb.notify` with `__system_property_set`; without `/data/vendor/gb/notify` (a tree without
+  the nouveau component, e.g. the VM) it logs to kmsg only. The kmsg line is the contract of WAVE3_PLAN 2.6:
+  `gb_slotsync: HOLD slot <x>: <reason>; default stays gb-<cur>`.
   Failures are logged to kmsg (`gb_notify: `) and dropped.
 
 ### 12.2 Catalog (exact strings; `<...>` substituted, truncated to fit 200 characters)
@@ -1295,9 +1369,12 @@ meaning; review B2):
 | N06 (R-8) | gb_dgpu | NVIDIA GPU fault | The NVIDIA GPU is not responding to power management (<reason>). Graphics are set to Intel only. Restart, then detach. | gb_power: `rpm-error`, `d0-idle` when they latch, and for every detach press they refuse (replaces the N06 text above) |
 | N08 (R-9) | gb_dtx | Can't detach yet | unchanged | gb_power: only for a refusal without app holders (a GPU-user service) while GbGpu has declared `ui-caps notify`; always while GbGpu is absent or has not |
 | N21 (R-4) | gb_gfx | Switched to Intel graphics | The system restarted unexpectedly twice while the NVIDIA GPU was in use, so graphics were set to Intel only. Choose Auto in Settings > System > Graphics to try again. | gb_power: two `dgpu_session` endings in a row (23.10a), unless N19 set Intel in the same check |
+| N22 (Wave 3) | gb_update | System update held | Kernel mismatch: the update (slot <X>) needs kernel <tkmi>, this system runs <rkmi>. Startup stays on slot <Y>; (slot <X>) is in the boot menu. | gb_slotsync: an OTA completed into slot <x> whose boot_<x> GKI has another KMI generation (`<maj>.<min>-android<N>-<gen>`, each cut to 24 characters) than `uname -r`: the default stays gb-<cur> (lead decision D-a; a new GKI sublevel or build with the same KMI switches as before, logged only) |
+| N23 (Wave 3) | gb_update | System update held | Kernel check failed: the kernel version of the update (slot <X>) could not be checked. Startup stays on slot <Y>; (slot <X>) is in the boot menu. | gb_slotsync: boot_<x>'s kernel version cannot be read (no boot header v3/v4, no bzImage `HdrS`, a bad pointer, an unprintable string) or the running release cannot be parsed: fail closed, held |
 
 `<holders>` = comma-separated app labels or `comm` names (max 5, then `and N more`). `<why>` = `bind`, `d3cold` or
-`dmesg`. `<reason>` = `fault_reason`. (v1.2) `<why>` adds `rebind`; N18's `<reason>` is the record's `reason`
+`dmesg`. `<reason>` = `fault_reason`. (Wave 3) `<X>`/`<Y>` = the target and the running slot letter (upper case);
+`<tkmi>`/`<rkmi>` = the KMI generations of the target slot's GKI and of the running kernel. (v1.2) `<why>` adds `rebind`; N18's `<reason>` is the record's `reason`
 (<= 40 characters). All `gb_gfx` posts replace each other (one tag), so attach/detach cycles never stack.
 
 Shell-posted notifications appear under the Shell app's notification channel (platform behaviour); that is accepted.
@@ -1734,6 +1811,13 @@ on post-fs-data
   `title   <base title> (slot <X>) [NVIDIA test]` and `options <base options> gb.nouveau=test`. Written by build_esp for
   native ESPs (USB, internal, ISO payloads) and replicated for the other slot by gb_slotsync (whose title rewrite keys
   on `(slot `). Never the default entry. Not in the VM ESP.
+* (r4, E-14) The other slot's `gb-<x>.conf` / `gb-<x>-nvtest.conf` stay in the menu only while they match that slot:
+  gb_slotsync removes them (and `gb/slot_<x>.stamp`) before it rebuilds `initrd-<x>.img`, and with no switch pending
+  it checks them once per boot and whenever the slot's GPT bootable state changes: they are removed when the slot is
+  not bootable (priority 0, or no tries left and not successful: update_engine is writing it, or it failed) or the
+  stamp does not match the slot's current `init_boot_<x>`/`vendor_boot_<x>` + the ESP's `gb/inject.gz` and
+  `gb/bootconfig_extra` (or `initrd-<x>.img` is missing), and only after the running slot is the default. The next
+  update into that slot writes them again. `initrd-<x>.img` itself is left in place.
 * `loader/entries/gb-<x>-gfxtest.conf` (P8 builds only): title suffix `[NVIDIA app graphics test]`, options
   `<base options> gb.nouveau=once gb.gfxdriver=1`. **(v1.2) Retired:** build_esp writes no gfxtest entry and
   gb_slotsync copies only `-nvtest` (integration `gfx-switching.md` W2G-04). App graphics are gated by the automatic
@@ -2958,3 +3042,41 @@ gb_power.c` `c1986aad...`, `nouveau-kernel\native\gb_nouveau.sh` `0e8db795...`, 
   ever built or installed (Wave 2 has not run; 28 E5), so no device carries that property.
 
 Acceptance tests of r2: `1b\TASKS_1B.md` section 12 (NP-R*, GP-R*, GD-R*, UI-R*).
+
+## 30. Wave 2b errata (v1.2 r3, 2026-10-26)
+
+Source: the Wave 2 safety review's findings that Wave 2 left unapplied (low and informational), applied to the sources
+by the Wave 2b fix step; the outputs are rebuilt after it. Normative text is edited in place and marked "(r3)".
+
+| # | Change (sections) | Finding | Components |
+|---|---|---|---|
+| E-1 | ESP lock protocol r3: back-off while a steal is in progress ("busy"), exclusive owner file, put-back that never replaces an entry (retried 5 polls; an ownerless moved directory is removed), release waits up to 5 polls for a put-back; one step list for all six users; gb_power's non-sleeping variant (5.4) | safety review 4 (three-way race: stale lock + two stealers + newcomer; the shell put-back replaced a newcomer's empty directory with GNU mv and refused with toybox, the C put-back orphaned the holder's lock; gb_power and gb_slotsync unlinked another lock's owner file when their O_EXCL create failed) | nouveau-policy (gb_nouveau.sh, gb_dgpu_report.sh), gb-power, gb_slotsync, gb_bootlog (build_esp.py), audio (gb_audiodiag.sh) |
+| E-2 | gb_bootlog after 600 s goes on without the lock only when the holder is another log writer (gb_slotsync, gb_audiodiag, gb_bootlog); any other holder (a dGPU window or an unknown name) skips that snapshot (2.3, 5.4) | safety review 3 | build_esp.py |
+| E-3 | gb_bootlog and gb_audiodiag fail closed when `df` gives no free-space number (nothing is written); the free KiB is the third field from the end of df's last line; a CRLF `gblog\bootcount` keeps its number | safety review 8 (a, b) | build_esp.py, audio |
+| E-4 | gb_slotsync matches the loader.conf `default` line as a whole line (`default gb-<x>`, ignoring a CR and trailing blanks; not `gb-<x>-nvtest`, not `#default`) and rewrites every `default` line otherwise | safety review 5 | gb_slotsync |
+| E-5 | Legacy audio (`dsp_driver=1`): snd_hda_intel is registered with `/sys/bus/pci/drivers_autoprobe=0`, then only the Intel HDA function(s) are probed by name and autoprobe is restored; no autoprobe switch = no legacy load (fail closed); other PCI drivers registered in that window get the driverless non-NVIDIA functions probed. No NVIDIA attribute is written (2.2: the NVIDIA HDA function stays driverless at that load; a later hot add is still unbound by gb_power, 10.1) | safety review 7 | audio (gb_audio.sh) |
+| E-6 | 5.1 row `audiodiag/` (0700 root:root, checked like `payload/`) | Wave 2 fix report (erratum request) | docs |
+| E-7 | 6.3: the shipped payload `22080f8c...` is the reference for the Wave 2 inputs (NP-21's `1d7277b1...` untraceable) | Wave 2 image audit | docs |
+| E-8 | verify_image.py's forbidden build.prop list gains `persist.vendor.gb.nouveau` (== build_esp `_BAD_PROP`) | safety review 8 (c) | pipeline |
+| E-9 | Installer `MODULE_DENY` gains `drm_ttm_helper`, `mxm_wmi`, `i2c_nvidia_gpu`, `nova_core`, `nova_drm`, `snd_hda_intel`; `mk_initramfs.sh`'s second `.ko` gate (it still named only the pre-Wave-2 patterns) names the same 16 entries; the build log records the list that ran (ISO DESIGN 13.1, 13.9) | safety review 6 | installer ISO |
+
+Not changed: the rest of the 5.4 holder table; the payload, the boot entries and every name, property and socket
+command of v1.2 r2.
+
+## 31. Wave 3 errata (v1.2 r4, 2026-10-26)
+
+Source: WAVE3_PLAN.md (`C:\GB-build\native\dgpu\w3\`), the lead's R-02 decisions D-a..D-f and the Wave 2b review's
+LOW findings L1-L5. Normative text is edited in place and marked "(r4)" / "(Wave 3)".
+
+| # | Change (sections) | Source | Components |
+|---|---|---|---|
+| E-10 | ESP lock r4: no `mkdir` while a steal is in progress, only consecutive back-off polls count (acquire step 0); put-back retried every 50 ms for up to 5 s; release waits 7 polls (gb_power: 8 s); a lock naming the caller's own pid is stale (5.4) | Wave 2b review L1, L2 (D-f) | gb_nouveau.sh, gb_dgpu_report.sh, gb_audiodiag.sh, gb_slotsync, gb_power (AUX); gb_bootlog in build_esp.py (PIPELINE, the same steps) |
+| E-11 | gb_power's load-window test also reads a live stealer's `.stale.<pid>/owner` (5.4, 10.3) | Wave 2b review L4 | gb-power |
+| E-12 | The rdinit read-only ESP mount of `/gbbringup.sh` is the one exception to "every ESP mount inside the lock" (5.4) | lead decision D-b; WAVE3_PLAN 2.3 | build_esp.py GBINIT (PIPELINE) |
+| E-13 | Notification tag `gb_update`, producer gb_slotsync, catalog N22/N23 (12.1, 12.2): an OTA held because its GKI's KMI generation differs from the running kernel's, or cannot be read. A GKI change within the same KMI is **not** held (it switches, logged), which changes WAVE3_PLAN 2.6: the HOLD reasons are `KMI <t> != running <r>`, `cannot read boot_<x> kernel version` and `cannot parse the running kernel release '<r>'`; the prefix `gb_slotsync: HOLD slot ` is unchanged | lead decision D-a | gb_slotsync, gb_notify.sh |
+| E-14 | gb_slotsync (wave 3 fix phase): the HOLD notification N22/N23 is posted only after the held slot's initrd and entries were written (a failed or interrupted rebuild posts nothing; the next tick retries); a rebuild first removes the slot's older `gb-<x>[-nvtest].conf` and stamp; with no switch pending the non-running slot's entries are removed when stale or the slot is not bootable (16); a HOLD still in effect is logged again once per boot with the same contract line `gb_slotsync: HOLD slot <x>: <reason>; default stays gb-<cur>` (12.1) | wave 3 safety review MEDIUM (stale other-slot entry + notification before the build); wave 3 consistency review LOW (HOLD line rarely in gblog) | gb_slotsync |
+| E-15 | KAT (test-only, WAVE3_PLAN 3.5 / 6.4, contract 2.7): `vnni_kat --all` runs every case including the zram-swapped page (`--zram` is the same flag); without it the case is reported as `SKIP zram`, with no active swap as `SKIP zram_noswap`. The counter deltas are compared exactly with the program's own counts; another process's emulations (seen in the summary's comm/RIP list) lead to up to 3 quiet re-runs, else `FAIL case=counter_foreign` | wave 3 consistency review M2, M3 | vnni_kat (KERNEL); gb_vnni_kat.sh (PIPELINE, unchanged: it already passes `--all`) |
+| E-16 | KAT service script (test-only, the `vmtest-kat` tree): `gb_vnni_kat.sh` waits, at most 600 s, until the system-wide `emulated` total of `/sys/kernel/gb_vnni/summary` has not changed for 5 s in a row, logs `gb_vnni_kat: quiet wait <w> s (emulated total <n>, unchanged for <q> s)`, then runs `vnni_kat --all` (after 600 s it runs anyway and E-15 decides). Reason: at `sys.boot_completed=1` lapis's own processes (system_server threads, dex2oat64, surfaceflinger, init) emulate VEX AVX-VNNI in bursts (about 2.1e8 emulations in the first 200 s of a VMware boot), so the 3 back-to-back quiet re-runs of E-15 all saw foreign emulations; 77 s later the same binary passed with exact counters | wave 3 build phase, R-13 early run | gb_vnni_kat.sh in build_esp.py (PIPELINE) |
+
+Not changed: every other rule of 5.4 (the holder table, the 600 s rules, the ESP-mount check before insmod), the
+queue format of 12.1, and N01-N21.
