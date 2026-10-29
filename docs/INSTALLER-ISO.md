@@ -22,12 +22,14 @@ Every destructive step asks you to type a confirmation. The installer refuses di
 [The installer menu](#the-installer-menu)).
 
 **Status.** Tested in VMware only, never on the real Surface Book 3. Rufus and Ventoy themselves were never run;
-equivalent stick layouts were tested in VMware. The last ISO built and tested is the wave 3 build (2026-10-26):
+equivalent stick layouts were tested in VMware. The last ISO built and tested is the wave 5 build (2026-10-29):
 kernel build #15, the native tree with the wave 3 fixes (the keyboard base's `8250.nr_uarts=4` among them, see
-[Boot entries](#boot-entries-and-the-nvidia-payload)) and a fresh dual-boot export with new GUIDs. The full test suite
-(`iso/test/run_all.py`, all 38 test ids: static, whole disk, dual boot install and uninstall, media and the Windows
-side) passed on it, so all four options were exercised in VMware. Run the suite again on every ISO you build before
-you use options 2 and 3 on a real disk.
+[Boot entries](#boot-entries-and-the-nvidia-payload)), the wave 4/5 software Gatekeeper, the VNNI libz patch, the OTA
+gate and the wave 5 readiness fixes, and a fresh dual-boot export with new GUIDs. Its VMware test subset passed
+(2026-10-30: T0 static, T1a/T1b whole disk, T3 dual-boot install with its refusal cases, T4 uninstall; 264 checks, 0
+failed). The full suite (`iso/test/run_all.py`, all 38 test ids: static, whole disk, dual boot install and uninstall,
+media and the Windows side) last passed on the wave 3 build (2026-10-26), so all four options were exercised in
+VMware. Run the suite again on every ISO you build before you use options 2 and 3 on a real disk.
 
 A dual-boot install made with an older ISO (built from another export, with other GUIDs) is removed with that older
 ISO or with `uninstall_dualboot.ps1 -Force`, not with a newer one. ISOs built before wave 3 also lack the

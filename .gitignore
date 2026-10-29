@@ -214,6 +214,10 @@ cache/
 archive/
 native/*/out/
 native/*/evidence/
+native/*/*/evidence/
+native/*/*/*/prev/
+# patched Google libz copies made by vnni_prepare.py from your own lapis image (never commit; wave 5)
+inject/vnni/
 native/dgpu/1b/evidence/
 kernel/patches/k14/evidence/
 native/*/native/v[0-9]*/

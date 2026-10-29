@@ -23,7 +23,10 @@ SSH = ["ssh", "-i", KEY, "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout
 DIST = "/build/dist"
 ARCHIVE = os.path.join(HERE, "archive", "module-backups")
 
-VM_MODS = ["drm_sysfb_helper", "efidrm", "drm_ttm_helper", "vmwgfx", "psmouse", "vmxnet3", "ac", "battery", "test_power"]
+VM_MODS = ["drm_sysfb_helper", "efidrm", "drm_ttm_helper", "vmwgfx", "psmouse", "vmxnet3", "ac", "battery", "test_power",
+           # W4 (dgpu\w4\VM_UPGRADE.md 2.2(a)): zram for lapis's mmd in the VM tree (build_esp.py VM_ZRAM); zram needs
+           # zsmalloc. The same signed files as the native set's (NATIVE_EARLY), staged into inject\modules too.
+           "zsmalloc", "zram"]
 
 # gbinit, before Android init (order matters: dependencies first)
 NATIVE_EARLY = [

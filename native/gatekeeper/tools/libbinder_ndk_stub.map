@@ -1,0 +1,35 @@
+LIBBINDER_NDK {
+  global:
+    AIBinder_Class_define;
+    AIBinder_new;
+    AIBinder_getCallingUid;
+    AServiceManager_addService;
+    ABinderProcess_setThreadPoolMaxThreadCount;
+    ABinderProcess_joinThreadPool;
+    AParcel_readInt32;
+    AParcel_readInt64;
+    AParcel_readByteArray;
+    AParcel_writeInt32;
+    AParcel_writeInt64;
+    AParcel_writeByteArray;
+    AParcel_writeString;
+    AParcel_getDataPosition;
+    AParcel_setDataPosition;
+    AParcel_writeStatusHeader;
+    AStatus_newOk;
+    AStatus_fromExceptionCode;
+    AStatus_fromServiceSpecificError;
+    AStatus_delete;
+  local:
+    *;
+};
+
+LIBBINDER_NDK30 {
+  global:
+    AIBinder_markVintfStability;
+} LIBBINDER_NDK;
+
+LIBBINDER_NDK31 {
+  global:
+    AParcel_markSensitive;
+} LIBBINDER_NDK30;

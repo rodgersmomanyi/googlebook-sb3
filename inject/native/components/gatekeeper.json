@@ -1,0 +1,20 @@
+{
+ "name": "gatekeeper",
+ "source": "${GB_BUILD}\\native\\gatekeeper",
+ "comment": "Software Gatekeeper HAL (wave 4, user decision 2026-10-26), BOTH trees: build_esp.py packs these two files and the rc into the native tree through this manifest and into the VM tree (gbstage) from the same manifest. Design ${GB_BUILD}\\native\\dgpu\\w4\\GATEKEEPER.md (section 7). Identical to the reviewed draft ${GB_BUILD}\\native\\gatekeeper\\component\\gatekeeper.json except this comment. Needs the Trusty Gatekeeper VINTF fragment bound to the empty manifest (gb.rc early-init), so IGatekeeper/default is declared once.",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\gatekeeper\\out\\android\\android.hardware.gatekeeper-service.gb",
+   "dest": "vup/bin/hw/android.hardware.gatekeeper-service.gb",
+   "mode": "0o100755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\gatekeeper\\vintf\\android.hardware.gatekeeper-service.gb.xml",
+   "dest": "etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml",
+   "mode": "0644"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\gatekeeper\\rc\\gb_gatekeeper.rc"
+ ]
+}

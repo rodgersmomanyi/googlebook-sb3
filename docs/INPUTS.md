@@ -55,6 +55,8 @@ build, VM builds included: to build without a component (for example a VM-only w
 | `inject/keymint/bin/android.hardware.security.keymint-service` | AOSP pure-software KeyMint from the **Android 16 (API 36) x86_64 emulator system image** `x86_64-36_r02.zip` (Android SDK manager), `/vendor/bin/hw/` of its vendor image | `5d00dedd8fe091d9309786188eb7ab52` |
 | `inject/keymint/lib64/` `lib_android_keymaster_keymint_utils.so`, `libcppbor.so`, `libcppcose_rkp.so`, `libkeymaster_messages.so`, `libkeymaster_portable.so`, `libkeymint.so`, `libpuresoftkeymasterdevice.so`, `libsoft_attestation_cert.so` | same image, `/vendor/lib64/` | `b3732033...`, `c5afcb34...`, `b6d52563...`, `c16c431a...`, `7145fd71...`, `f3d6ad5f...`, `2956888f...`, `a7835a9e...` |
 | `inject/keymint/lib64/libcrypto.so` | the Android 16 BoringSSL matching that KeyMint (same emulator image) | `f23f33b71a1b08d13f5ced2ad3db7846` |
+| `inject/keymint/native/bin/android.hardware.security.keymint-service`, `inject/keymint/native/lib64/<name>_gbkm16.so` (the nine libraries above), `inject/keymint/native/SHA256SUMS` (native tree only) | made from the ten files above on the builder: `sh keymint_native_graft.sh <dir with bin/ lib64/> <new dir>` (patchelf 0.18.0: private sonames `lib<x>_gbkm16.so`, only `--set-soname` / `--replace-needed`, never stripped), then copy `bin/`, `lib64/` and `SHA256SUMS` to `inject/keymint/native/` and run `python -I verify_keymint_graft.py` (must print `VERIFY_GRAFT: OK`) | written by the script into `SHA256SUMS`; `build_esp.py` refuses other bytes |
+| `inject/keymint/native/lapis_linkref.json.gz` (native tree only) | **your lapis image**: `python -I linkref_prepare.py` (reads lapis.bin read-only, uses the builder) writes the library and symbol names of the boot slot's vendor/system ELFs, pinned to their sha256; re-run it whenever lapis.bin's vendor/system or boot slot change (`python -I linkref_prepare.py --check` tells you) | never commit it |
 | `inject/vendor_gfx/libminigbm_gralloc.so`, `libgbm.so` (VM only) | **your lapis vendor partition** (`/vendor/lib64/`), patched by [graphics/minigbm/patch_minigbm.py](../graphics/minigbm/patch_minigbm.py) | stock `86508927...` / `af2b19c9...` -> patched `a6b29a58...` / `805fdf74...` |
 | `inject/vmaudio/Generic_vmware/volume_curves.xml`, `native/audio/tree/vup/etc/audio/{sof-hda-dsp_sb3,PCH_sb3_legacy}/volume_curves.xml` | **your lapis vendor partition**: `/vendor/etc/audio/sof-soundwire_cs42l43_cs35l56/volume_curves.xml` (AOSP-licensed, copied unchanged) | `dd0d9898d2b2cf108c753381412447ba` |
 | `native/audio/modules/*.ko` (8 HDA codec modules, native) | **your lapis vendor_dlkm** (`carve_lp.py` + `native/audio/src/refresh_modules.sh`) | must match the booted build |
@@ -62,6 +64,10 @@ build, VM builds included: to build without a component (for example a VM-only w
 
 To get files out of your vendor image: `carve_lp.py OUTDIR vendor_a` (or the active slot) writes `vendor_a.img`
 (EROFS); mount it read-only on the builder (`sudo mount -o ro,loop vendor_a.img /mnt/v`).
+
+The native tree does not replace any of lapis's own `/vendor/lib64` libraries with the KeyMint graft: the graft runs
+on private copies (`lib<x>_gbkm16.so`), and `build_esp.py` refuses a native tree in which any vendor program would no
+longer link (`link_closure.py`, checked against `lapis_linkref.json.gz`).
 
 ## Firmware (native only)
 

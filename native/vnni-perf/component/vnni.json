@@ -1,0 +1,20 @@
+{
+  "name": "vnni",
+  "source": "${GB_BUILD}/native/vnni-perf",
+  "comment": "DRAFT native-tree component for the VEX AVX-VNNI libz patch. NOT installed into inject/native/components by this step (that file set belongs to wave 4 / the pipeline). build_esp.py should run patcher/vnni_patch.py on the slot it is building (libz.so + build.prop of system and vendor in the in-root) with --odm-root and --out-rc, and emit this component ONLY with the files and rc that run produced (see INTEGRATION.md). The src paths below are the patched copies for build CL3B.260622.276.R4 / 16658739, and rc_files points at the rc generated for exactly that build: every bind in it is gated on ro.system.build.fingerprint / ro.vendor.build.fingerprint, because gb_slotsync reuses the same initrd (and so this /odm tree and rc) for an A/B OTA'd slot holding a different build. Never replace it with an ungated 'on early-init' bind.",
+  "files": [
+    {
+      "src": "${GB_BUILD}/native/vnni-perf/out/patched/system/lib64/libz.so",
+      "dest": "vnni/system_libz.so",
+      "mode": "0644"
+    },
+    {
+      "src": "${GB_BUILD}/native/vnni-perf/out/patched/vendor/lib64/libz.so",
+      "dest": "vnni/vendor_libz.so",
+      "mode": "0644"
+    }
+  ],
+  "rc_files": [
+    "${GB_BUILD}/native/vnni-perf/component/vnni.rc"
+  ]
+}

@@ -69,4 +69,46 @@ ok "0x606 fallback still snapshots" "$(grep -o 'pl1_uw=[0-9]*' $T/root/dev/gb_hw
 # 11 diag runs without errors on the fake tree
 mktree; mkmsr 120 200 0; run rapl-snapshot >/dev/null; out=$(run diag 2>&1); echo "$out" | grep -q "backlight: intel_backlight max=7500" && ok "diag backlight line" 1 1 || ok "diag backlight line" 0 1
 echo "$out" | grep -q "powercap intel-rapl:0 name=package-0 pl1=15000000" && ok "diag powercap line after restore" 1 1 || ok "diag powercap line after restore" 0 1
+# 12-15 (readiness A-H1, A-M1) power button / volume rocker binding and the posture override. Fake kernel: the
+# soc_button_array bind file is a FIFO whose reader binds MSHW0040:00 (driver link + 2 gpio-keys inputs) only when
+# INT3455:00 has a driver, like the driver core + soc_button_array (a missing GPIO controller gives -ENODEV).
+# The full matrix (timeouts, insmod, re-probe, diag retry, posture, privacy, mutants): fixprep\platform\tests.
+mkdir -p $T/bin4
+cat > $T/bin4/getprop <<EOF
+#!/bin/sh
+cat "$T/p4_\$1" 2>/dev/null; exit 0
+EOF
+cat > $T/bin4/cmd <<EOF
+#!/bin/sh
+echo "cmd \$*" >> "$T/cmd4.log"
+[ "\$2" = print-states ] && printf "  DeviceState{identifier=0, name='CLOSED'},\n  DeviceState{identifier=2, name='OPEN'},\n"
+exit 0
+EOF
+printf '#!/bin/sh\nexit 0\n' > $T/bin4/dumpsys; chmod +x $T/bin4/*
+btree() {   # $1 = INT3455:00 bound, $2 = MSHW0040:00 present, $3 = MSHW0040:00 already bound (1/0)
+  mktree; B=$T/root/sys/bus/platform; mkdir -p $B/drivers/soc_button_array $B/drivers/icelake-pinctrl $B/devices/INT3455:00
+  [ "$1" = 1 ] && ln -s $B/drivers/icelake-pinctrl $B/devices/INT3455:00/driver
+  [ "$2" = 1 ] && mkdir -p $B/devices/MSHW0040:00
+  [ "$3" = 1 ] && ln -s $B/drivers/soc_button_array $B/devices/MSHW0040:00/driver &&
+    mkdir -p $B/devices/MSHW0040:00/gpio-keys.1.auto/input/input1 $B/devices/MSHW0040:00/gpio-keys.2.auto/input/input2
+  mkfifo $B/drivers/soc_button_array/bind; : > $T/binds.log
+  ( while read -r l < $B/drivers/soc_button_array/bind; do echo "$l" >> $T/binds.log
+      if [ -e $B/devices/INT3455:00/driver ] && [ -d "$B/devices/$l" ] && [ ! -e "$B/devices/$l/driver" ]; then
+        ln -s $B/drivers/soc_button_array "$B/devices/$l/driver"
+        mkdir -p "$B/devices/$l/gpio-keys.1.auto/input/input1" "$B/devices/$l/gpio-keys.2.auto/input/input2"
+      fi; done ) & FK=$!
+}
+brun() { PATH=$T/bin4:$T/bin:$PATH GB_HW_ROOT=$T/root GB_HW_LOG=- GB_HW_BTN_WAIT=1 timeout 60 mksh "$GB" "$@"; }
+btree 1 1 0; out=$(brun buttons); kill $FK 2>/dev/null
+ok "buttons: unbound, GPIO controller bound -> bound with 1 bind write" "$(cat $T/root/dev/gb_hw/buttons)/$(wc -l < $T/binds.log)" "bound inputs=2 waited_ms=0 binds=1/1"
+btree 1 1 1; out=$(brun buttons); kill $FK 2>/dev/null
+ok "buttons: already bound -> nothing written" "$(wc -l < $T/binds.log)" "0"
+btree 0 1 0; out=$(brun buttons); kill $FK 2>/dev/null
+ok "buttons: GPIO controller never bound -> FAILED after a bounded wait, exit 0" "$(cat $T/root/dev/gb_hw/buttons)" "FAILED gpio=unbound pinctrl=no inputs=0 waited_ms=1000 binds=3"
+btree 1 0 0; out=$(brun buttons); kill $FK 2>/dev/null
+ok "buttons: no MSHW0040 (VM) -> absent, nothing written" "$(cat $T/root/dev/gb_hw/buttons)/$(wc -l < $T/binds.log)" "absent/0"
+: > $T/cmd4.log; out=$(brun posture)
+ok "posture: unset -> no cmd" "$(wc -l < $T/cmd4.log)" "0"
+echo open > $T/p4_vendor.gb.posture; out=$(brun posture)
+ok "posture: vendor.gb.posture=open -> cmd device_state state 2" "$(grep -c -x 'cmd device_state state 2' $T/cmd4.log)" "1"
 echo "== $pass passed, $fail failed"; rm -rf $T; [ $fail -eq 0 ]

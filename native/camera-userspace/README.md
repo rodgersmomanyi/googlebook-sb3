@@ -10,7 +10,8 @@ line).
   from the CPU debayer, minigbm gralloc layouts, all streams from one processed stream, firmware camera location and
   stride probing, IPU4P driver names in the simple pipeline, read-only DMA heaps. LGPL-2.1-or-later.
 * `build-scripts/`: dependencies (static libjpeg-turbo, libexif), configure, `apply_patches.sh` + `patchers/`,
-  `stage.sh` (renames the NDK libc++ to `libc++_lcam.so`, strips RUNPATHs, re-signs the IPA module).
+  `stage.sh` (strips with `llvm-strip` first, then runs `patchelf` with `--page-size` to rename NDK `libc++_shared.so`
+  to `libc++_lcam.so` and drop RUNPATHs, re-signs `ipa_soft_simple.so`, and enforces the `PT_LOAD` page-congruence gate).
 * `config/`: HAL and IPA tuning files (CC0; the sensor tunings are uncalibrated starters).
 * `hosttest/`: HAL test harness (`hal_test.cpp`, `fake_hw.c`) run against vimc on the builder; `tools/lcam_probe.cpp`
   (shipped as `/odm/bin/lcam-probe` to list the cameras on the device).

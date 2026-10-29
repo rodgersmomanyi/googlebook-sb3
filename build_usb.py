@@ -9,8 +9,9 @@ whose androidboot.boot_devices name the Surface Book 3's two xHCI controllers, s
 Native images also carry the NVIDIA test entry gb-<slot>-nvtest and the dGPU payload gb/dgpu-<krel>.erofs.
 
 Usage: python -I build_usb.py [--out FILE] [--userdata-gib N] [--esp-mib 512] [--export DIR] [--sparse]
-                              [--vm-test [--vm-test-gfx | --vm-test-kat]] [--esp-only FILE [--super-guid G]
-                              [--bringup-test DIR]]
+                              [--vm-test [--vm-test-gfx | --vm-test-kat | --vm-test-rehearsal | --vm-test-nogk |
+                                          --vm-test-w5 [--vnni-off]]]
+                              [--esp-only FILE [--super-guid G] [--bringup-test DIR]]
   The image is written to <out>.part (sha256 computed while writing), checked with verify_image.py, and only then
   renamed to <out>, with <out>.sha256 = "<hex>  <name>". A failed check keeps the .part file and writes no sidecar.
   --sparse      NTFS sparse file: all-zero 1 MiB blocks are not allocated (same content and sha256)
@@ -18,8 +19,22 @@ Usage: python -I build_usb.py [--out FILE] [--userdata-gib N] [--esp-mib 512] [-
                 verify_image.py --esp, exit (checkpoints; --super-guid fixes the GUID for determinism checks)
   --vm-test-gfx test-only: the VM tree plus GbGpu and the gfx driver package (build_esp.vm_test_gfx_cpio); the output
                 must be below D:\\gb-w2test\\
-  --vm-test-kat test-only (WAVE3_PLAN 6.4): the VM tree plus the VNNI known-answer test (inject\\kat\\vnni_kat, the
-                staged zram/zsmalloc, build_esp.vm_test_kat_cpio); the output must be below D:\\gb-w3test\\
+  --vm-test-kat test-only (WAVE3_PLAN 6.4): the VM tree plus the VNNI known-answer test (inject\\kat\\vnni_kat,
+                build_esp.vm_test_kat_cpio; since W4 it waits for the VM tree's own mmd zram swap); the output must be
+                below D:\\gb-w3test\\
+  --vm-test-rehearsal  test-only (W4, dgpu\\w4\\VM_UPGRADE.md 2.3): EXACTLY the VM tree that GB_WRITE_LAPIS=1
+                build_esp.py writes into lapis.bin (build_esp.INJECT_CPIO: Gatekeeper, zram, fsverity), for the
+                throwaway rehearsal VM; also writes <output>.vmtree.sha256 (the gb/inject.gz sha256 the user-VM preview
+                must match: verify_image --expect-inject-sha256); the output must be below D:\\gb-w4test\\
+  --vm-test-nogk  test-only (W4 rehearsal, GATEKEEPER.md 9.5): that VM tree WITHOUT the Gatekeeper (binary, VINTF
+                fragment, rc block; build_esp.vm_test_nogk_cpio), the stand-in for a pre-W4 ESP in the fix-forward and
+                rollback tests on the throwaway rehearsal disk; the output must be below D:\\gb-w4test\\
+  --vm-test-w5  test-only (W5, the VNNI libz patch measurement): EXACTLY the VM tree GB_WRITE_LAPIS=1 build_esp.py
+                writes into lapis.bin (build_esp.INJECT_CPIO: Gatekeeper, zram, fsverity, the fingerprint-gated libz
+                binds); also writes <output>.vmtree.sha256 (the W5 VM-tree record the user-VM preview must match);
+                the output must be below D:\\gb-w5test\\
+  --vnni-off    with --vm-test-w5 only: the same tree with gb.vnni=0 on the entry (gbinit deletes /odm/vnni: no bind,
+                stock libz under emulation) and the title "(VM test, W5, VNNI off)": the measurement baseline
   --bringup-test DIR  test-only (WAVE3_PLAN R-12b), with --esp-only: the native ESP plus DIR\\gb.cfg -> gb/gb.cfg,
                 DIR\\overlay\\** -> gb/overlay/** and gb.overlay=1 in the entries (never a shipped ESP); the output
                 must be below D:\\gb-w3test\\
@@ -40,10 +55,16 @@ DEFAULT_OUT = os.path.join(HERE, "out", "googlebook-sb3-usb.img")
 VMTEST_OUT = os.path.join(HERE, "out", "googlebook-sb3-vmtest.img")
 VMTEST_GFX_ROOT = "D:\\gb-w2test"                 # --vm-test-gfx images only below this (throwaway checks)
 W3TEST_ROOT = "D:\\gb-w3test"                     # --vm-test-kat / --bringup-test outputs only below this (wave 3)
+W4TEST_ROOT = "D:\\gb-w4test"                     # --vm-test-rehearsal / --vm-test-nogk outputs only below this (W4)
+W5TEST_ROOT = "D:\\gb-w5test"                     # --vm-test-w5 outputs only below this (W5, VNNI measurement)
 TITLE_NATIVE = "Googlebook OS - Surface Book 3 (USB)"
 TITLE_VM = "Googlebook OS - USB image layout (VM test)"
 TITLE_VM_GFX = "Googlebook OS - USB image layout (VM test, gfx components)"
 TITLE_VM_KAT = "Googlebook OS - USB image layout (VM test, KAT)"
+TITLE_VM_REHEARSAL = "Googlebook OS - USB image layout (VM test, W4 rehearsal)"
+TITLE_VM_NOGK = "Googlebook OS - USB image layout (VM test, no Gatekeeper)"
+TITLE_VM_W5 = "Googlebook OS - USB image layout (VM test, W5)"
+TITLE_VM_W5_OFF = "Googlebook OS - USB image layout (VM test, W5, VNNI off)"     # verify_image VNNI_OFF_TITLE
 BRINGUP_MAX = 8 * MiB                             # --bringup-test: the test inputs' total size
 
 # Surface Book 3 PCI paths (Windows DEVPKEY_Device_LocationPaths): PCH xHCI PCI(1400), Thunderbolt xHCI PCI(0D00),
@@ -135,6 +156,14 @@ def parse_args(argv=None):
                     help="with --vm-test: add GbGpu and the gfx driver package to the VM tree (throwaway VM check)")
     ap.add_argument("--vm-test-kat", action="store_true",
                     help="with --vm-test: add the VNNI known-answer test to the VM tree (throwaway VM check, R-13)")
+    ap.add_argument("--vm-test-rehearsal", action="store_true",
+                    help="with --vm-test: exactly the VM tree build_esp.py writes into lapis.bin (W4 rehearsal VM)")
+    ap.add_argument("--vm-test-nogk", action="store_true",
+                    help="with --vm-test: that VM tree without the Gatekeeper (W4 rehearsal: the pre-W4 stand-in)")
+    ap.add_argument("--vm-test-w5", action="store_true",
+                    help="with --vm-test: exactly the VM tree build_esp.py writes into lapis.bin (W5 VNNI measurement)")
+    ap.add_argument("--vnni-off", action="store_true",
+                    help="with --vm-test-w5: the same tree, gb.vnni=0 on the entry (the measurement baseline)")
     ap.add_argument("--esp-only", metavar="FILE", help="build and check only the ESP, written to FILE")
     ap.add_argument("--super-guid", metavar="G", help="with --esp-only: use this super partition GUID")
     ap.add_argument("--bringup-test", metavar="DIR",
@@ -146,6 +175,17 @@ def parse_args(argv=None):
         ap.error("--vm-test-kat needs --vm-test")
     if a.vm_test_kat and a.vm_test_gfx:
         ap.error("--vm-test-kat and --vm-test-gfx are separate test images")
+    for flag, on in (("--vm-test-rehearsal", a.vm_test_rehearsal), ("--vm-test-nogk", a.vm_test_nogk),
+                     ("--vm-test-w5", a.vm_test_w5)):
+        if on and not a.vm_test:
+            ap.error(f"{flag} needs --vm-test")
+    if a.vnni_off and not a.vm_test_w5:
+        ap.error("--vnni-off is a --vm-test-w5 test variant only (gb.vnni=0 never goes into another entry)")
+    variants = [f for f, on in (("--vm-test-gfx", a.vm_test_gfx), ("--vm-test-kat", a.vm_test_kat),
+                                 ("--vm-test-rehearsal", a.vm_test_rehearsal), ("--vm-test-nogk", a.vm_test_nogk),
+                                 ("--vm-test-w5", a.vm_test_w5)) if on]
+    if len(variants) > 1:
+        ap.error(f"{' and '.join(variants)} are separate test images")
     if a.bringup_test is not None:
         if not a.esp_only or a.vm_test:
             ap.error("--bringup-test is a native --esp-only test variant (no --vm-test)")
@@ -168,6 +208,11 @@ def parse_args(argv=None):
     for flag, on in (("--vm-test-kat", a.vm_test_kat), ("--bringup-test", a.bringup_test is not None)):
         if on and (not _below(written, W3TEST_ROOT) or a.export):
             ap.error(f"{flag} output must be below {W3TEST_ROOT}\\ (and no --export): {written}")
+    for flag, on in (("--vm-test-rehearsal", a.vm_test_rehearsal), ("--vm-test-nogk", a.vm_test_nogk)):
+        if on and (not _below(written, W4TEST_ROOT) or a.export):
+            ap.error(f"{flag} output must be below {W4TEST_ROOT}\\ (and no --export): {written}")
+    if a.vm_test_w5 and (not _below(written, W5TEST_ROOT) or a.export):
+        ap.error(f"--vm-test-w5 output must be below {W5TEST_ROOT}\\ (and no --export): {written}")
     for p in filter(None, (a.out, a.esp_only, a.export)):
         if os.path.normcase(os.path.realpath(p)) == os.path.normcase(os.path.realpath(be.LAPIS)):
             ap.error("refusing to write lapis.bin")
@@ -277,10 +322,18 @@ def main(argv=None):
             except RuntimeError as e:
                 sys.exit(f"--vm-test-kat: {e}")
             title, kind = TITLE_VM_KAT, "vmtest-kat"
+        elif a.vm_test_rehearsal:       # exactly the tree build_esp.py writes into lapis.bin (the object, not a copy)
+            tree, title, kind = be.INJECT_CPIO, TITLE_VM_REHEARSAL, "vm"
+        elif a.vm_test_nogk:
+            tree, title, kind = be.vm_test_nogk_cpio(), TITLE_VM_NOGK, "vmtest-nogk"
+        elif a.vm_test_w5:              # (W5) exactly the user-VM tree; --vnni-off: the kill switch on the entry
+            tree, title, kind = be.INJECT_CPIO, (TITLE_VM_W5_OFF if a.vnni_off else TITLE_VM_W5), "vm"
+            if a.vnni_off:
+                usb_cmdline += " gb.vnni=0"
         else:
             tree, title, kind = be.INJECT_CPIO, TITLE_VM, "vm"
         files = be.slot_files(usb_cmdline, tree, title, timeout=4)
-        min_free = 0
+        min_free = be.vm_min_free(files)        # (W4) as for the user's VM ESP: an OTA's second initrd must fit
     else:
         usb_cmdline = native_cmdline(USB_BOOT_DEVICES, "usb", part_uuid=super_guid)
         if a.bringup_test is not None:      # R-12b only: never a shipped ESP (verify_image --expect-bringup-test)
@@ -291,6 +344,20 @@ def main(argv=None):
         min_free, kind = be.native_min_free(files), "native"
     esp = be.make_esp(files, a.esp_mib * MiB, min_free=min_free)
     print(f"super GUID: {super_guid}", flush=True)
+    record = None
+    if a.vm_test_rehearsal or a.vm_test_nogk or a.vm_test_w5:   # the tree's identity (the user-VM preview is compared)
+        record = be.vm_tree_record(tree)
+        assert record.split()[0].decode() == hashlib.sha256(files["gb/inject.gz"]).hexdigest(), "gb/inject.gz"
+        if a.vm_test_rehearsal or a.vm_test_w5:
+            assert tree is be.INJECT_CPIO and record == be.vm_tree_record(), "the rehearsal tree is not INJECT_CPIO"
+        print("VM tree: " + record.decode().replace("\n", "; "), flush=True)
+    tree_args = ["--expect-inject-sha256", record.split()[0].decode()] if record else []
+
+    def write_record(path):
+        if record:
+            with open(path + ".vmtree.sha256", "wb") as f:
+                f.write(record)
+            print(f"wrote {path}.vmtree.sha256", flush=True)
 
     if a.esp_only:
         os.makedirs(os.path.dirname(os.path.abspath(a.esp_only)), exist_ok=True)
@@ -298,9 +365,10 @@ def main(argv=None):
             f.write(esp)
         print(f"wrote ESP {a.esp_only}: {len(esp):,} B, sha256 {hashlib.sha256(esp).hexdigest()}", flush=True)
         rc = run_verify(["--esp", a.esp_only, "--boot", "usb", "--super-guid", super_guid, "--expect-tree", kind]
-                        + (["--expect-bringup-test"] if a.bringup_test is not None else []))
+                        + (["--expect-bringup-test"] if a.bringup_test is not None else []) + tree_args)
         if rc != 0:
             sys.exit(f"verify_image.py --esp reports problems (exit {rc})")
+        write_record(a.esp_only)
         return
 
     # (name, type, size bytes, source, gpt attributes) - source: bytes, ("lapis", name) or None (blank)
@@ -376,13 +444,14 @@ def main(argv=None):
     print(f"wrote {part}: {total_lba * SECTOR / 2**30:.2f} GiB"
           + (f", {out.skipped / 2**30:.2f} GiB of zero blocks left unallocated (sparse)" if a.sparse else ""), flush=True)
     print(f"image sha256: {hexd}", flush=True)
-    rc = run_verify([part, "--expect-tree", kind])
+    rc = run_verify([part, "--expect-tree", kind] + tree_args)
     if rc != 0:
         sys.exit(f"verify_image.py reports problems (exit {rc}): kept {part}, no sidecar written")
     os.replace(part, a.out)
     with open(a.out + ".sha256", "w", encoding="ascii", newline="\n") as f:
         f.write(f"{hexd}  {os.path.basename(a.out)}\n")
     print(f"wrote {a.out} and {a.out}.sha256")
+    write_record(a.out)
     print(f"boot entry gb-{be.SLOT}: {usb_cmdline}")
 
 

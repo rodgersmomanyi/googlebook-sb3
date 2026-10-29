@@ -1,7 +1,9 @@
 # NVIDIA GTX 1650 Max-Q (dGPU) on Googlebook OS
 
 The Surface Book 3 13.5" has an NVIDIA GTX 1650 Max-Q (TU117, PCI `10DE:1F91`) in its keyboard base, behind root
-port `00:1d.4`. Native Googlebook OS images can use it for apps, the way Optimus works on Windows: games and the apps
+port `00:1d.4`. The 15" model's GTX 1660 Ti (TU116) or Quadro RTX 3000 (TU106) is not supported: the
+image has no firmware for those chips, so the probe fails, graphics stay on Intel and a "NVIDIA GPU problem"
+notification appears (a model gate that skips the probe there is planned). Native Googlebook OS images can use it for apps, the way Optimus works on Windows: games and the apps
 you choose render on NVIDIA, while the screen and the system UI always stay on the Intel GPU. The images also include
 a local compute service (LLM inference on the GPU). This page covers what you get, how switching works, what happens
 when you detach the screen, and how to recover from a bad driver start.
@@ -268,9 +270,9 @@ Hardware checks for the first sessions with the base attached:
    never gets NVK): report it with the `gblog\` folder. Do not set `ro.hwui.use_vulkan` or `debug.hwui.renderer`
    yourself (the image must not override them, and the bring-up config refuses them); the supported workaround is
    **Intel only**. Signature: gbOS86 (github.com/linuxkid473/gbos-x86 @f8a5c1a, usb/hook.sh:489-492).
-9. (Wave 3) Colours: the screen is always driven by Intel, also in NVIDIA mode. A grey, washed-out picture ("white
-   veil") is therefore an i915 matter, not an NVIDIA one; kernel build #15 has an opt-in switch for it
-   ([FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)).
+9. (Wave 3; wave 5) Colours: the screen is always driven by Intel, also in NVIDIA mode. A grey, washed-out picture
+   ("white veil") is therefore an i915/composer matter, not an NVIDIA one. Wave-5 images set the composer's sRGB
+   defaults natively. See [FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option).
 
 Diagnostics: `adb shell gb_dgpu_check.sh` (read-only snapshot, works as the shell user),
 `getprop | grep -E 'vendor.gb.(gfx|nouveau|dgpu|compute)'`, and the `gblog\` boot reports (with the nouveau load

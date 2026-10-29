@@ -20,14 +20,21 @@ options:
 Every destructive step asks you to type a confirmation, and the installer refuses disks it must not touch (see
 [The menu](#the-installer-menu)).
 
-**Current build** (2026-10-26, build `20261026-062920-107b7e70`): 7,471,886,336 bytes, SHA-256
-`b1c355b0f796b46b3f14ed2e153355c339e58e237983f63638fd58b8275c770a`. It carries the Wave 3 USB image `377310ee…`
-(kernel build #15, the Surface Aggregator serial fix `8250.nr_uarts=4`, the sound and touchpad fixes and the
-boot-log summary: README-FLASH.md, "What is new") and a fresh dual-boot export (new GUIDs). Only
-its two ESP objects differ from the previous ISO `e0067b12…`. The **full** test suite passed on this build in
-VMware: all 38 tests (T0-T10, including T1c and the dual-boot install, ESP update and uninstall groups G1-G4:
-T3n(f), T3n(e), T3, T3n(d), T4, T4b, T9), `OVERALL PASS`. All four options can be used; everything was still tested
-only in VMware and on disk image files, never on the real laptop.
+**Current build** (2026-10-29, build `20261029-214311-0aac11da`): 7,472,459,776 bytes, SHA-256
+`8aa73f17927a84120660eb86bc6e1802eac0ed5dcdf426044c9c0ceaa5f42d4d`. It carries the Waves 4 and 5 USB image `b2714a63…`
+(the software lock-screen Gatekeeper, the VNNI `libz` patch for a faster start, the OTA gate and the
+native-readiness fixes: README-FLASH.md, "What is new") and a fresh dual-boot export (new GUIDs;
+made with `build_internal.py` on D: and then reused by `build_iso.py`, which ran all its export cross-checks and
+`verify_image.py` on it, so that C: stayed above its free-space floor). Only its two ESP objects differ from the
+previous ISO `b1c355b0…`; its 11 other payload objects are byte-identical.
+**Performance:** the system it installs started about 47 % faster in VMware with the VNNI patch (first boot until
+"boot completed" 587.7 s → 313.6 s, later boots 226.0 s → 118.0 s; README-FLASH.md). **Tests:** this build passed its VMware
+test subset on 2026-10-30 (T0, T1a, T1b, T3 with T3-build and the refusal cases T3n(d-f), T4: 264 checks, 0
+failed; option 1 wrote a disk byte-identical to the USB image `b2714a63…`; the dual-boot install left Windows'
+partitions and boot entries byte-identical, and the uninstall restored the GPT). The full suite was not re-run on
+this build. The previous ISO `b1c355b0…` (Wave 3) passed the full suite (all 38
+tests, `OVERALL PASS`) and is kept in `D:\GB-iso\prev\iso-w3-b1c355b0\`. Everything was still tested only in VMware
+and on disk image files, never on the real laptop.
 
 ---------------------------------------------------------------------------------------------------------------------
 
@@ -369,8 +376,11 @@ NVIDIA kernel modules and the Vulkan driver, about 60 MB): Googlebook copies and
 NVIDIA driver, so leave both files where they are. Every ISO built with a fresh export (Wave 2, and its review
 rebuild, DESIGN 13.4 and 13.8) carries **new** dual-boot GUIDs: it cannot remove a dual-boot install made with an
 earlier ISO; remove such an install with that earlier ISO's option 3 or with `uninstall_dualboot.ps1 -Force`. The
-earlier ISOs are kept in `D:\GB-iso\prev\` (`1718bcc1…`, before Wave 2) and `C:\GB-x86\out\prev\iso-w2fix-e0067b12\`
-(`e0067b12…`, the Wave 2 review ISO; moved to C: for disk space). The Wave 2 ISO `76fbb7ee…` is no longer kept.
+earlier ISOs are kept in `D:\GB-iso\prev\iso-w3-b1c355b0\` (`b1c355b0…`, Wave 3), `D:\GB-iso\prev\` (`1718bcc1…`,
+before Wave 2) and `C:\GB-x86\out\prev\iso-w2fix-e0067b12\` (`e0067b12…`, the Wave 2 review ISO; moved to C: for disk
+space). The Wave 2 ISO `76fbb7ee…` is no longer kept. Since Waves 4 and 5 the ESP also carries the software
+Gatekeeper (lock-screen PIN): if a PIN is set on an install, clear it before an ESP update from an older ISO puts a
+tree without it on that install (README-FLASH.md, "What is new").
 
 ---------------------------------------------------------------------------------------------------------------------
 
@@ -462,10 +472,17 @@ python -I C:\GB-x86\iso\build\build_iso.py               # full build
   * `--keep-nx-compat` leaves the kernel's NX flag set.
   * `--keep-work` keeps the builder's work directory.
 * **Disk space:** D: needs about 15.5 GiB free during a build. A fresh export needs about 15 GiB on C: for a while.
+  When C: cannot spare that, make the export elsewhere (`set GB_SLOT=<the image's slot>` and
+  `python -I -B C:\GB-build\native\dualboot\build_internal.py --out <new folder on D:>`), move the old
+  `work\export\` aside, copy only that export's `manifest.json` and `EFI-SYSTEM.img` into a new `work\export\` and
+  build without `--new-export`: the reused export then gets every export cross-check and `verify_image.py` (the
+  2026-10-29 build was made this way).
   The builder keeps a chunk cache (about 7 GiB) and `/var/tmp/gbiso/last/googlebook-sb3-installer.iso`. The build
   needs 25 GiB free on the builder's `/`. The cache is keyed by the USB image's sha256, so a new USB image cannot
   reuse an older image's cache (`/var/tmp/gbiso/cache/<old sha>-*`); a successful build removes the older caches, and
-  removing one by hand beforehand frees the space when the preflight reports less than 25 GiB.
+  removing one by hand beforehand frees the space when the preflight reports less than 25 GiB. If that is still not
+  enough (2026-10-29: 23.9 GiB), the builder's `last/` copy of the previous ISO can go too, after checking that its
+  sha256 equals the ISO kept on Windows: a successful build replaces it anyway.
 * `--test-tiny-payload` is a pipeline test only. It writes `D:\GB-iso\pipeline-test\` and its ISO cannot install
   Googlebook.
 

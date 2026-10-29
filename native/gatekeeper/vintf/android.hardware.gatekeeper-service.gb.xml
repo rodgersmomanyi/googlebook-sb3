@@ -1,0 +1,31 @@
+<!--
+    SPDX-License-Identifier: Apache-2.0
+    gb_gatekeeper (C:\GB-build\native\gatekeeper): ODM device-manifest fragment, installed as
+    /odm/etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml (libvintf
+    VintfObject::fetchOdmHalFragments). Same two instances as AOSP's nonsecure Gatekeeper APEX
+    (hardware/interfaces/gatekeeper/aidl/software/*.xml); both are in the Android 17 framework
+    compatibility matrix 202604 (IGatekeeper/default V1, ISharedSecret regex-instance .*).
+    override="true" on BOTH HALs: libvintf stops at the first fragment it cannot add and then the
+    whole device manifest fails (VintfObject::addDirectoryManifests), so no vendor AIDL HAL would
+    be declared. A second IGatekeeper/default (an OTA renaming lapis's Trusty fragment
+    /vendor/etc/vintf/manifest/android.hardware.gatekeeper-service.trusty.xml defeats gb.rc's
+    empty bind mount) or a vendor ISharedSecret/gatekeeper (lapis's vendor_service_contexts
+    already labels that name) would otherwise fail with "Conflicting FqInstance". With override,
+    libvintf first removes every earlier device-manifest HAL of the same name
+    (HalManifest::add). Trade-off: a future live vendor ISharedSecret instance would be
+    undeclared too; lapis R1 declares none in its device manifest, and our KeyMint's
+    ISharedSecret/default is in the framework manifest, which this does not touch.
+    (override on sharedsecret added by the W4 review, C:\GB-build\native\dgpu\w4\REVIEW.md GK-6.)
+-->
+<manifest version="9.0" type="device">
+    <hal format="aidl" override="true">
+        <name>android.hardware.gatekeeper</name>
+        <version>1</version>
+        <fqname>IGatekeeper/default</fqname>
+    </hal>
+    <hal format="aidl" override="true">
+        <name>android.hardware.security.sharedsecret</name>
+        <version>1</version>
+        <fqname>ISharedSecret/gatekeeper</fqname>
+    </hal>
+</manifest>

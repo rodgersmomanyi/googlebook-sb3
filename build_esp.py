@@ -49,10 +49,13 @@ GENERIC, VENDOR, VBC = slot_ramdisks(SLOT)
 BUSYBOX = open(os.path.join(HERE, "inject", "busybox"), "rb").read()
 FSTAB   = open(os.path.join(HERE, "inject", "fstab.android-desktop"), "rb").read()
 def _with_fsverity(fstab):
-    """Native-only fstab (WAVE3_PLAN item 4, [W3R-06]): `fsverity` appended to the fs_mgr flags of the one userdata
-    line. The VM tree keeps FSTAB byte-identical: in the user's VM fs_mgr would run `tune2fs -O verity` on the existing
-    /data at its next mount, a permanent superblock change that needs the user's decision. Natively the flag takes
-    effect once, at the next boot, on the existing /data (a tune2fs failure only logs). Idea: gbOS86 issue #17
+    """The fstab of BOTH trees (WAVE3_PLAN item 4 [W3R-06] for native; W4 for the VM, user decision 2026-10-26,
+    dgpu\\w4\\VM_UPGRADE.md 2.2(b)): `fsverity` appended to the fs_mgr flags of the one userdata line. The flag is
+    redundant on lapis but harmless: lapis's fs_mgr already enables ext4 verity on /data without it (every VM-tree and
+    native boot log shows "Enabling ext4 verity on /dev/block/by-name/userdata" with the plain fstab; likely AOSP's
+    rule for ro.product.first_api_level >= 30, lapis reports 37: INFERRED), and the user's VM /data already has
+    RO_COMPAT_VERITY set (ro_compat 0x807b), so fs_mgr's tune_verity() changes nothing there. On a /data without the
+    feature it runs `tune2fs -O verity` once (one-way; a failure only logs). Idea: gbOS86 issue #17
     (github.com/linuxkid473/gbos-x86); code ours."""
     out, n = [], 0
     for ln in fstab.split(b"\n"):
@@ -63,7 +66,8 @@ def _with_fsverity(fstab):
         out.append(ln)
     assert n == 1, "userdata line not found exactly once"
     return b"\n".join(out)
-FSTAB_NATIVE = _with_fsverity(FSTAB)
+FSTAB_VERITY = _with_fsverity(FSTAB)
+FSTAB_NATIVE = FSTAB_VERITY             # (wave 3 name; since W4 the VM tree ships the same bytes)
 ODMCIL  = open(os.path.join(HERE, "inject", "odm_sepolicy.cil"), "rb").read()
 ODMPRE  = open(os.path.join(HERE, "inject", "precompiled_sepolicy"), "rb").read()
 SEMAN   = open(os.path.join(HERE, "inject", "se_manifest.xml"), "rb").read()
@@ -113,6 +117,44 @@ _KMLIBS = ["lib_android_keymaster_keymint_utils.so", "libcppbor.so", "libcppcose
            # against android17 BoringSSL, so give it the matching android16 libcrypto.
            "libcrypto.so"]
 KMLIBS = [(n, open(os.path.join(HERE, "inject", "keymint", "lib64", n), "rb").read()) for n in _KMLIBS]
+# (W5, readiness C-2) The NATIVE tree ships the same graft with private sonames (lib<x>_gbkm16.so; the service binary
+# needs only those), made on the builder by keymint_native_graft.sh (patchelf --no-sort --page-size 16384
+# --set-soname/--replace-needed, never stripped; verify_keymint_graft.py proves only the names changed and checks
+# SHA256SUMS). So the native /vendor overlay no longer replaces lapis's /vendor/lib64/libcrypto.so (the android16
+# copy lacks 58 symbols lapis's android17 libssl.so needs: wpa_supplicant and hostapd could not link = no Wi-Fi, no
+# hotspot; rkp_factory_extraction_tool64, cbfstool and elogtool could not link either) nor lapis's
+# lib_android_keymaster_keymint_utils.so / libkeymaster_messages.so, while the graft still runs on its android16
+# BoringSSL (the ComputeHmac reason above). crossystem stays stubbed natively too (no vboot firmware). The VM tree keeps
+# KM_BIN/KMLIBS (the user's VM has no Wi-Fi; change it only with a rehearsal). link_closure.py gates the native overlay
+# at build time (native_cpio(); inject\keymint\native\lapis_linkref.json.gz from linkref_prepare.py).
+_KMN = os.path.join(HERE, "inject", "keymint", "native")
+def _km_native():
+    """(service binary, [(lib name, bytes)]) of inject\\keymint\\native, each file checked against its SHA256SUMS."""
+    import hashlib
+    with open(os.path.join(_KMN, "SHA256SUMS"), encoding="utf-8") as f:
+        sums = {l.split()[1]: l.split()[0] for l in f if l.strip() and not l.startswith("#")}
+    names = ["bin/android.hardware.security.keymint-service"] + ["lib64/" + n[:-3] + "_gbkm16.so" for n in _KMLIBS]
+    assert sorted(sums) == sorted(names), f"inject\\keymint\\native\\SHA256SUMS lists {sorted(sums)}"
+    assert sorted(os.listdir(os.path.join(_KMN, "lib64"))) == sorted(n[6:] for n in names[1:]), \
+        "inject\\keymint\\native\\lib64 must hold exactly the 9 lib<x>_gbkm16.so files"
+    data = {}
+    for n in names:
+        with open(os.path.join(_KMN, *n.split("/")), "rb") as f:
+            data[n] = f.read()
+    for n, d in data.items():
+        assert hashlib.sha256(d).hexdigest() == sums[n], f"inject\\keymint\\native\\{n}: not the SHA256SUMS bytes"
+    return data[names[0]], [(n[6:], data[n]) for n in names[1:]]
+KM_BIN_NATIVE, KMLIBS_NATIVE = _km_native()
+_lc_spec = _ilu.spec_from_file_location("link_closure", os.path.join(HERE, "link_closure.py"))
+LC = _ilu.module_from_spec(_lc_spec); _lc_spec.loader.exec_module(LC)
+LINKREF = os.path.join(_KMN, "lapis_linkref.json.gz")       # linkref_prepare.py writes it, pinned to lapis.bin's slot
+def _check_links(ents):
+    """(C-2) No lapis vendor ELF may resolve worse with the native /vendor overlay; every overlay ELF, wpa_supplicant,
+    hostapd and the KeyMint service must link (link_closure.py N0-N5, against the boot slot's vendor/system)."""
+    probs, rep = LC.check_native(ents, LAPIS, SLOT, LINKREF, HERE)
+    print("native link closure: " + "; ".join(rep), flush=True)
+    assert not probs, ("native link-closure gate (link_closure.py):\n  " + "\n  ".join(probs[:60])
+                       + (f"\n  ... {len(probs) - 60} more" if len(probs) > 60 else ""))
 # Patched minigbm gralloc libs (komeda backend renamed -> vmwgfx, so minigbm uses the dumb-buffer path
 # on the vmwgfx DRM device; stock minigbm has no vmwgfx backend -> the allocator aborts "Failed to
 # initialize driver"). Overlaid onto /vendor/lib64/.
@@ -232,9 +274,13 @@ GBINIT = (b"#!/busybox sh\n"
           b"/busybox mkdir -p /proc /sys /odm\n"
           b"/busybox mount -t proc proc /proc\n"
           b"/busybox mount -t sysfs sysfs /sys\n"
-          # HWTOK: the explicit token gb.hw=native (never the DMI fallback); OV: gb.overlay=1 (the ESP bring-up, below)
-          b"HW=; USB=0; HWTOK=0; OV=0\n"
-          b"for a in $(/busybox cat /proc/cmdline); do case \"$a\" in gb.hw=*) HW=${a#gb.hw=}; HWTOK=0; [ \"$HW\" = native ] && HWTOK=1;; gb.boot=usb) USB=1;; gb.overlay=1) OV=1;; esac; done\n"
+          # HWTOK: the explicit token gb.hw=native (never the DMI fallback); OV: gb.overlay=1 (the ESP bring-up, below);
+          # (W5) VN=0: the token gb.vnni=0, the kill switch of the VNNI libz patch (below, after the /odm copy)
+          b"HW=; USB=0; HWTOK=0; OV=0; VN=1\n"
+          b"for a in $(/busybox cat /proc/cmdline); do case \"$a\" in gb.hw=*) HW=${a#gb.hw=}; HWTOK=0; [ \"$HW\" = native ] && HWTOK=1;; gb.boot=usb) USB=1;; gb.overlay=1) OV=1;; gb.vnni=0) VN=0;; esac; done\n"
+          # (W5b) OG: the OTA gate's tokens (below, after the /odm copy): gb.otagate=0 = off (every injection as built,
+          # whatever the build), gb.otagate=force = the unvalidated path on the validated build (tests); exact tokens only
+          b"OG=; for a in $(/busybox cat /proc/cmdline); do case \"$a\" in gb.otagate=0) OG=0;; gb.otagate=force) OG=force;; esac; done\n"
           b"if [ -z \"$HW\" ]; then\n"
           b"  case \"$(/busybox cat /sys/class/dmi/id/sys_vendor 2>/dev/null)\" in *VMware*) HW=vm;; *) HW=native;; esac\n"
           b"fi\n"
@@ -244,6 +290,35 @@ GBINIT = (b"#!/busybox sh\n"
           b"/busybox umount /proc\n"
           b"/busybox mount -t tmpfs tmpfs /odm\n"
           b"/busybox cp -a $SRC/. /odm/\n"
+          # (W5) VNNI libz patch kill switch: without /odm/vnni every fingerprint-gated bind in gb.rc fails harmlessly
+          # (init logs it and goes on) and the stock libz runs under k15's VEX AVX-VNNI emulation, which is correct
+          b"[ \"$VN\" = 0 ] && /busybox rm -rf /odm/vnni\n"
+          # (W5b) OTA gate (C:\GB-build\native\ota-gating\DESIGN.md; OTA_CLASSES below). build_esp writes the init_boot
+          # ramdisk fingerprint of the build this ESP was built for into /odm/etc/gb/ota_validated. This boot's own init_boot
+          # ramdisk (the slot systemd-boot started: after an A/B OTA gb_slotsync reuses this cpio with the new slot's
+          # ramdisks) carries its fingerprint in /system/etc/ramdisk/build.prop. The same build: nothing changes. Another or
+          # an unreadable one ("unvalidated"): the build-specific injections that are not needed to boot (OTA_CLASSES
+          # "skip": /odm/vnni, the patched libz) are removed from this /odm copy, ro.vendor.gb.ota_gate=unvalidated goes
+          # into /odm/etc/build.prop (/odm/etc/init/gb_otagate.rc then starts gb_otagate at boot_completed: a kmsg line
+          # and the gb_update notification) and everything needed to boot stays as built (OTA_CLASSES "keep"/"always").
+          # A tree without ota_validated (built without the gate): nothing happens. No step can stop this script before
+          # exec /init.
+          b"if [ -f /odm/etc/gb/ota_validated ]; then\n"
+          b"  FV=$(/busybox sed -n 's/^ro\\.bootimage\\.build\\.fingerprint=//p' /odm/etc/gb/ota_validated | /busybox tail -n 1)\n"
+          b"  FB=$(/busybox sed -n 's/^ro\\.bootimage\\.build\\.fingerprint=//p' /system/etc/ramdisk/build.prop 2>/dev/null"
+          b" | /busybox tr -d '\\r' | /busybox tail -n 1)\n"
+          b"  OS=unvalidated\n"
+          b"  [ -n \"$FV\" ] && [ \"$FB\" = \"$FV\" ] && OS=validated\n"
+          b"  [ \"$OG\" = force ] && OS=unvalidated\n"
+          b"  [ \"$OG\" = 0 ] && OS=off\n"
+          b"  if [ \"$OS\" = unvalidated ]; then\n"
+          b"    /busybox rm -rf /odm/vnni\n"
+          b"    echo >> /odm/etc/build.prop\n"
+          b"    echo \"ro.vendor.gb.ota_gate=unvalidated\" >> /odm/etc/build.prop\n"
+          b"  fi\n"
+          b"  { echo \"state=$OS\"; echo \"validated=$FV\"; echo \"booted=${FB:-unknown}\"; echo \"token=${OG:-none}\"; }"
+          b" > /odm/etc/gb/ota_state\n"
+          b"fi\n"
           b"/busybox mkdir -p /odm/etc\n"
           b"echo \"$HW\" > /odm/etc/gb_hw\n"
           # Booted from a USB stick: keep vold from treating that stick as a removable 'USB drive' (it would offer to
@@ -346,8 +421,8 @@ gpt_count() {   # $1 node, $2 disk name: how often W is a partition GUID in its 
   $B dd if=$1 bs=$lbs skip=$lba count=$nb 2>/dev/null | $B hexdump -v -e "$esz/1 \"%02x\" \"\n\"" | $B head -n $cnt |
     $B cut -c33-64 | $B grep -c -x "$W"
 }
-scan() {        # DISK = the matching disk, NHIT = matches over all disks (1 = found)
-  DISK=; NHIT=0
+scan() {        # DISK = the matching disk, NHIT = matches over all disks (1 = found), SIG = every whole disk's name,
+  DISK=; NHIT=0; SIG=   # device number, size and match count (what the settle loop below compares between scans)
   for k in $($B ls $S/class/block 2>/dev/null); do
     case $k in ''|*[!a-z0-9]*|loop*|ram*|zram*) continue;; esac
     [ -e $S/class/block/$k/partition ] && continue
@@ -356,16 +431,25 @@ scan() {        # DISK = the matching disk, NHIT = matches over all disks (1 = f
     [ -e $G/dev/$k ] || $B mknod -m 0600 $G/dev/$k b ${d%%:*} ${d#*:} 2>/dev/null || continue
     c=$(gpt_count $G/dev/$k $k)
     case $c in ''|*[!0-9]*) c=0;; esac
+    sz=$($B cat $S/class/block/$k/size 2>/dev/null)
+    case $sz in *[!0-9]*) sz=x;; esac
+    SIG="$SIG $k:$d:$sz:$c"
     [ $c -gt 0 ] && { NHIT=$((NHIT + c)); DISK=$k; }
   done
 }
-i=0
+# (wave 4, wave 3 audit LOW-1) a disk may appear after the first match (USB storage enumerates late, usb-storage waits
+# delay_use first): rescan every 0.5 s until the whole-disk set (names, device numbers, sizes, matches) has not changed
+# over 4 rescans (2 s), and only then require exactly one match over all disks. At most 30 rescans (15 s); GBINIT's
+# "timeout 40" bounds everything.
+i=0; last=-; same=0
 while :; do
   scan
-  [ $NHIT -ge 1 ] && break
-  [ $i -ge 20 ] && break
+  if [ "$SIG" = "$last" ]; then same=$((same + 1)); else same=0; last=$SIG; fi
+  [ $NHIT -ge 1 ] && [ $same -ge 4 ] && break
+  [ $i -ge 30 ] && break
   $B sleep 0.5; i=$((i + 1))
 done
+[ $NHIT -ge 1 ] && [ $same -lt 4 ] && out "the block devices did not settle within 15 s: skipped"
 [ $NHIT = 1 ] || out "the boot partition GUID was found $NHIT times (one disk needed): skipped"
 P=; NP=0
 for p in $($B ls $S/class/block/$DISK 2>/dev/null); do
@@ -431,6 +515,7 @@ prop() {      # $1 GB_PROP_<n>, $2 <prop>=<value>
     ro.hardware.vulkan*|ro.hardware.egl*|ro.hwui.use_vulkan*|debug.hwui.renderer*|ro.vendor.gb.gfx_default*|\
     persist.vendor.gb.gfx_mode*|persist.vendor.gb.nouveau*|ro.gfx.*|ro.vendor.gb.*|persist.vendor.gb.*|\
     ro.debuggable*|ro.secure*|ro.adb.*|persist.adb.*|service.adb.*|ro.boot.*|ro.build.*|ro.product.*|ro.crypto.*|\
+    ro.system.build.*|ro.vendor.build.*|ro.*.build.fingerprint*|\
     persist.sys.usb.*|sys.usb.*|ro.zygote*|ro.control_privapp_permissions*)
       log "line $n: $1 refused: $p is a denied property"; return 0;;
   esac
@@ -505,35 +590,48 @@ if [ -z "$fatal" ] && [ -e $O ]; then
 fi
 [ -z "$fatal" ] || out "refused, nothing applied: $fatal"
 
-# ---- phase 2: apply the plan
+# ---- phase 2: apply the plan. (wave 4, wave 3 audit LOW-2) Every file is written whole to "<file>.gbbu" next to it and
+# then renamed over the file (mv -f -T, one rename on the /odm tmpfs): a kill by GBINIT's "timeout 40" leaves the old
+# or the new file, never a half-written modules.load, build.prop or overlay file.
 na=0
 if [ -n "$($B ls $PLAN | $B grep -E '^(opt|skip)\.')" ]; then
-  : > $ML.new
-  while IFS= read -r line || [ -n "$line" ]; do
+  $B rm -f $ML.gbbu; ok=1; n1=0
+  : > $ML.gbbu || ok=0
+  while [ $ok = 1 ] && { IFS= read -r line || [ -n "$line" ]; }; do
     set -- $line
-    case ${1:-} in ''|'#'*) printf '%s\n' "$line" >> $ML.new; continue;; esac
+    case ${1:-} in ''|'#'*) printf '%s\n' "$line" >> $ML.gbbu || ok=0; continue;; esac
     b=${1%.ko}; b=$(printf '%s' "$b" | $B tr - _)
-    if [ -e $PLAN/skip.$b ]; then printf '#%s\n' "$line" >> $ML.new; log "modules.load: $1 commented out"; na=$((na + 1)); continue; fi
+    if [ -e $PLAN/skip.$b ]; then printf '#%s\n' "$line" >> $ML.gbbu || ok=0; log "modules.load: $1 commented out"; n1=$((n1 + 1)); continue; fi
     if [ -e $PLAN/opt.$b ]; then
-      IFS= read -r x < $PLAN/opt.$b; line="$line $x"; log "modules.load: $1 gets options $x"; na=$((na + 1))
+      IFS= read -r x < $PLAN/opt.$b; line="$line $x"; log "modules.load: $1 gets options $x"; n1=$((n1 + 1))
     fi
-    printf '%s\n' "$line" >> $ML.new
+    printf '%s\n' "$line" >> $ML.gbbu || ok=0
   done < $ML
-  $B cat $ML.new > $ML && $B rm -f $ML.new || log "modules.load: rewrite FAILED"
+  if [ $ok = 1 ] && $B chmod 0644 $ML.gbbu && $B mv -f -T $ML.gbbu $ML; then na=$((na + n1))
+  else $B rm -f $ML.gbbu; log "modules.load: rewrite FAILED (left unchanged)"; fi
 fi
-for ix in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-  [ -f $PLAN/prop.$ix ] || continue
-  [ -s $BP ] && [ "$($B tail -c 1 $BP | $B od -A n -t x1 | $B tr -d ' \n')" != 0a ] && echo >> $BP
-  $B cat $PLAN/prop.$ix >> $BP && { log "build.prop: appended GB_PROP_$ix"; na=$((na + 1)); }
-done
+props=
+for ix in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do [ -f $PLAN/prop.$ix ] && props="$props $ix"; done
+if [ -n "$props" ]; then
+  $B rm -f $BP.gbbu; ok=1
+  if [ -e $BP ]; then $B cat $BP > $BP.gbbu || ok=0; else : > $BP.gbbu || ok=0; fi
+  if [ $ok = 1 ] && [ -s $BP.gbbu ] && [ "$($B tail -c 1 $BP.gbbu | $B od -A n -t x1 | $B tr -d ' \n')" != 0a ]; then
+    echo >> $BP.gbbu || ok=0
+  fi
+  for ix in $props; do [ $ok = 1 ] && { $B cat $PLAN/prop.$ix >> $BP.gbbu || ok=0; }; done
+  if [ $ok = 1 ] && $B chmod 0644 $BP.gbbu && $B mv -f -T $BP.gbbu $BP; then
+    for ix in $props; do log "build.prop: appended GB_PROP_$ix"; na=$((na + 1)); done
+  else $B rm -f $BP.gbbu; log "build.prop: rewrite FAILED (left unchanged)"; fi
+fi
 while IFS= read -r rel; do
   dst=$ODM/$rel; dd=${dst%/*}; q=$dd; sl=0
   while [ "$q" != "$ODM" ] && [ -n "$q" ]; do [ -L "$q" ] && sl=1; q=${q%/*}; done
   if [ $sl = 1 ] || [ -L "$dst" ]; then log "overlay: refused $rel (a symlink on the destination path)"; continue; fi
   if [ -e "$dst" ] && [ ! -f "$dst" ]; then log "overlay: refused $rel (the destination is not a regular file)"; continue; fi
-  if $B mkdir -p "$dd" && $B cat "$O/$rel" > "$dst" && $B chmod 0644 "$dst"; then
+  if $B mkdir -p "$dd" && $B rm -f "$dst.gbbu" && $B cat "$O/$rel" > "$dst.gbbu" && $B chmod 0644 "$dst.gbbu" &&
+     $B mv -f -T "$dst.gbbu" "$dst"; then
     log "overlay: applied $rel"; na=$((na + 1))
-  else log "overlay: FAILED $rel"; fi
+  else $B rm -f "$dst.gbbu"; log "overlay: FAILED $rel"; fi
 done < $PLAN/overlay
 out "done: $na change(s) applied"
 """
@@ -720,6 +818,36 @@ SHOWHOME = (b"#!/system/bin/sh\n"
           # idle: send KEYCODE_WAKEUP every 25s forever. WAKEUP only (no HOME) so it never disrupts whatever
           # app is in the foreground. This service intentionally never exits.
           b"while :; do /system/bin/sleep 25; /system/bin/input keyevent 224; done\n")
+# W4 rehearsal finding (2026-10-26, dgpu\w4\evidence\rehearsal): init's `stdio_to_kmsg` points a service's stdout/stderr
+# at /dev/kmsg_debug and falls back to /dev/null when that node is missing. lapis's init creates /dev/kmsg_debug only on
+# debuggable builds; lapis is a user build (ro.debuggable=0; no /dev/kmsg_debug, measured on the rehearsal VM), so every
+# stdio_to_kmsg service (gb_gatekeeper, gb_keymint, gb_bootok, gb_vkenum, ... and lapis's prng_seeder) wrote into
+# /dev/null: none of their lines reached dmesg, serial0.log or gb_bootlog (GATEKEEPER.md 9.2 step 1 and 8.1 rely on
+# them). Measured fix: a root-only node (0600 root:root, label kmsg_debug_device from plat_file_contexts) made a
+# restarted gb_gatekeeper's "starting" / "registered" lines appear in dmesg, i.e. init opens it as root before it drops
+# privileges; no world-writable node is needed. Both trees, first thing at early-init (the earliest stdio_to_kmsg
+# services, gb_keymint and gb_gatekeeper, start with class early_hal at late-fs). Checked by _check_vm/_check_native
+# and verify_image V29.
+GB_KMSGDBG_SVC = (b"service gb_kmsgdbg /system/bin/toybox mknod -m 0600 /dev/kmsg_debug c 1 11\n"
+                  b"    user root\n"
+                  b"    group root\n"
+                  b"    seclabel u:r:shell:s0\n"
+                  b"    oneshot\n"
+                  b"    disabled\n"
+                  b"\n")
+GB_KMSGDBG_EARLY = b"    exec_start gb_kmsgdbg\n    restorecon /dev/kmsg_debug\n"
+
+def _with_kmsgdbg(rc):
+    """gb.rc with the gb_kmsgdbg service first and its two lines right after the first `on early-init`."""
+    assert b"on early-init\n" in rc and b"gb_kmsgdbg" not in rc
+    return GB_KMSGDBG_SVC + rc.replace(b"on early-init\n", b"on early-init\n" + GB_KMSGDBG_EARLY, 1)
+
+def _has_kmsgdbg(rc):
+    """True if rc holds the gb_kmsgdbg service once and its two lines once, right after the first `on early-init`."""
+    i = rc.find(b"on early-init\n")
+    return (rc.count(GB_KMSGDBG_SVC) == 1 and rc.count(GB_KMSGDBG_EARLY) == 1 and i >= 0
+            and rc[i + len(b"on early-init\n"):].startswith(GB_KMSGDBG_EARLY))
+
 GB_RC = (
          # Software KeyMint HAL (binary + impl libs provided by the /vendor overlay below).
          b"service gb_keymint /vendor/bin/hw/android.hardware.security.keymint-service\n"
@@ -1032,6 +1160,7 @@ GB_RC = (
          b"    start gb_showhome\n"
          b"    start gb_dexopt\n"
          b"    start gb_cpus\n")
+GB_RC = _with_kmsgdbg(GB_RC)                    # stdio_to_kmsg works on the user build (see GB_KMSGDBG_SVC)
 
 # GPU rendering switch (enable by creating inject/mesa/ENABLE_SKIAGL; delete it to roll back to SwiftShader/SkiaVk):
 # system EGL = Mesa svga (host GPU via VMware SVGA3D) instead of ANGLE, SurfaceFlinger + HWUI on SkiaGL. Needs the
@@ -1118,6 +1247,57 @@ if _BATT_MODS[0] == "test_power.ko":
               b"    exec_start gb_battunbind\n")
 print(f"host battery: {'composite via gb_hostbatt + test_power' if _BATT_MODS[0] == 'test_power.ko' else 'VMware ACPI (first host battery only)'}", flush=True)
 
+# zram for lapis's own memory daemon in the VM (W4, user decision 2026-10-26; dgpu\w4\VM_UPGRADE.md 2.2(a)). lapis's
+# mmd_setup aborted on every VM boot ("zram setup failed: failed to write zram disk size": no zram device; lapis's own
+# Google-signed /system/lib/modules/zram.ko is not loaded, and our kernel enforces module signatures). The VM tree now
+# loads our k15-signed zsmalloc.ko + zram.ko (stage_kernel.py VM_MODS -> inject\modules) at early-init and does nothing
+# else: mmd sizes zram0 itself after boot_completed (mmd.zram.size=150%), runs mkswap and swapon, and creates its 8 GiB
+# writeback file on /data only while /data has >= 8 GiB free (lapis props). A disksize write here would make mmd's own
+# write fail (EBUSY on an initialised device) and abort it again, so the shipped VM gb.rc never writes zram0/disksize
+# (_check_vm, verify_image V28). Required: a VM build without the two staged modules stops here.
+VM_ZRAM = ("zsmalloc.ko", "zram.ko")                     # load order (zram depends on zsmalloc)
+for _m in VM_ZRAM:
+    _p = os.path.join(HERE, "inject", "modules", _m)
+    assert os.path.isfile(_p), f"inject\\modules\\{_m} missing: stage it with stage_kernel.py (VM_MODS, W4)"
+    MODS.append((_m, open(_p, "rb").read()))
+_vm_insmod = b"    insmod /odm/lib/modules/vmwgfx.ko\n"
+assert GB_RC.count(_vm_insmod) == 1
+GB_RC = GB_RC.replace(_vm_insmod, _vm_insmod + b"".join(b"    insmod /odm/lib/modules/" + _m.encode() + b"\n"
+                                                        for _m in VM_ZRAM), 1)
+# W4 rehearsal finding (2026-10-26, dgpu\w4\evidence\rehearsal; 1 boot of 17 on the throwaway VM): lapis's vendor service
+# insmod_sh_desktop_earlyinit (/vendor/etc/init/init.insmod.rc; its early-init action runs BEFORE this file's) does
+# `modprobe -a -d /system/lib/modules -d /vendor/lib/modules zram` (/vendor/etc/init.insmod.common.cfg). That is
+# lapis's Google-signed zram.ko, which our kernel refuses ("zram: Cannot use protected symbol ...", err -13). While
+# its attempt is in flight our early-init `insmod /odm/lib/modules/zram.ko` fails with EBUSY ("Device or resource
+# busy"), no zram0 exists and mmd_setup aborts as before W4 ("failed to write zram disk size"). gb_zram, started at
+# post-fs-data (that vendor service ends within about 1 s of early-init; it still waits up to 10 s for it), loads our
+# zsmalloc.ko / zram.ko only if they are missing and logs one line either way. It never sizes, formats or enables zram
+# (mmd's job after boot_completed). Checked by _check_vm and verify_image V28.
+GB_ZRAM_SH = (b"#!/system/bin/sh\n"
+              b"exec >/dev/kmsg 2>&1\n"
+              b"n=0; while [ \"$(/system/bin/getprop init.svc.insmod_sh_desktop_earlyinit)\" = running ] && [ $n -lt 20 ]; do "
+              b"/system/bin/sleep 0.5; n=$((n+1)); done\n"
+              b"if [ -e /sys/block/zram0 ]; then echo \"gb_zram: zram0 present (early-init insmod)\"; exit 0; fi\n"
+              b"echo \"gb_zram: zram0 missing at post-fs-data (lapis's own modprobe of zram raced our early-init insmod): "
+              b"loading ours\"\n"
+              b"for m in zsmalloc zram; do\n"
+              b"  [ -d /sys/module/$m ] || /system/bin/insmod /odm/lib/modules/$m.ko || echo \"gb_zram: insmod $m.ko FAILED\"\n"
+              b"done\n"
+              b"if [ -e /sys/block/zram0 ]; then echo \"gb_zram: zram0 present now\"; else echo \"gb_zram: zram0 still missing\"; fi\n")
+GB_ZRAM_RC = (b"\n"
+              b"service gb_zram /system/bin/sh /odm/gb_zram.sh\n"
+              b"    user root\n"
+              b"    group root\n"
+              b"    seclabel u:r:shell:s0\n"
+              b"    oneshot\n"
+              b"    disabled\n"
+              b"\n"
+              b"on post-fs-data\n"
+              b"    start gb_zram\n")
+GB_RC += GB_ZRAM_RC
+print("VM zram (mmd): ON (zsmalloc.ko + zram.ko at early-init, gb_zram fallback at post-fs-data; lapis's mmd sizes and "
+      "enables it)", flush=True)
+
 # Sound in the VM: VMware virtual HD Audio (vmx sound.virtualDev = "hdaudio") on lapis's legacy snd-hda-intel stack.
 # The lapis audio HAL (DRAS) is configured for the Googlebook's SoundWire card, so the VM tree overrides
 # hal_configs/audio_default.xml with the "Generic" card and its config dir (inject\vmaudio\Generic_vmware);
@@ -1184,6 +1364,452 @@ GB_SLOTSYNC_RC = (b"\n"
 GB_RC += GB_SLOTSYNC_RC
 print(f"slot follower (gb_slotsync): {'ON' if SLOTSYNC_BIN else 'off'}", flush=True)
 
+# ---------------- OTA gate, both trees (wave 5b) ----------------
+# After a Google A/B OTA, gb_slotsync boots the new slot with THIS initrd's /odm tree (it reuses /gb/inject.gz), so every
+# injection built and tested for one build also meets the next one. Design, the classification and its evidence:
+# C:\GB-build\native\ota-gating\DESIGN.md. Every file of the /vendor overlay upper layer (/odm/vup), of /odm/vnni,
+# /odm/etc/selinux and /odm/etc/vintf, and every rc bind source below /odm has exactly one class (first match in
+# OTA_CLASSES; an unclassified one stops the build, _check_otagate):
+#   skip    build-specific and not needed to boot: GBINIT removes it from /odm on a build that is not the validated one
+#   keep    build-specific but needed to boot (or for the VM's display): applied whatever the build, named in
+#           gb_otagate's kmsg line (skipping one would turn a possibly stale injection into a certain failure)
+#   always  build-independent (our own code and configuration, LLNDK/NDK-only binaries, neutralising stubs over Google
+#           binaries, masks): applied whatever the build
+# The validated build is the ro.bootimage.build.fingerprint of the boot slot's init_boot ramdisk (GENERIC), packed as
+# /odm/etc/gb/ota_validated; GBINIT compares it with this boot's ramdisk (the slot systemd-boot started), so the next
+# ESP update re-validates. A different or unreadable build: "unvalidated" (GBINIT), tokens gb.otagate=0 (off: all as
+# built) and gb.otagate=force (the unvalidated path on the validated build, for tests). The gate's files are new paths
+# in both trees (ota_validated, gb_otagate.sh and its own rc file etc/init/gb_otagate.rc); gb.rc is not changed.
+OTA_PROP = b"ro.bootimage.build.fingerprint"
+OTA_RAMDISK_PROP = "system/etc/ramdisk/build.prop"      # in the generic (init_boot) ramdisk, i.e. at / when gbinit runs
+OTA_VALIDATED = "etc/gb/ota_validated"
+OTA_STATE = "etc/gb/ota_state"                           # written by GBINIT at boot (never packed)
+OTA_SCRIPT = "gb_otagate.sh"
+OTA_RC_FILE = "etc/init/gb_otagate.rc"
+OTA_FP_SAFE = set(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:+,@~")   # init/sed/sh-safe
+# (C-2, fixprep keymint-wifi) the native KeyMint graft may ship with private sonames lib<x>_gbkm16.so: same class
+OTA_KM_NATIVE = tuple("vup/lib64/" + _n[:-3] + "_gbkm16.so" for _n in _KMLIBS)
+OTA_CLASSES = (
+    # skip: removed by GBINIT on an unvalidated build (its unvalidated branch must remove exactly these roots)
+    ("vnni/*", "skip", "VNNI libz patch"),               # patched Google libz; its binds are also fingerprint-gated
+    # keep: build-specific, needed to boot or for the VM display
+    ("vup/bin/hw/android.hardware.security.keymint-service", "keep", "KeyMint graft"),
+) + tuple((_p, "keep", "KeyMint graft") for _p in tuple("vup/lib64/" + _n for _n in _KMLIBS) + OTA_KM_NATIVE) + (
+    ("etc/se_manifest.xml", "keep", "system_ext VINTF"),             # bind over /system_ext/etc/vintf/manifest.xml
+    ("etc/fstab.android-desktop", "keep", "fstab"),                  # bind over /vendor/etc/fstab.android-desktop
+    ("etc/selinux/odm_sepolicy.cil", "keep", "SELinux"),             # OTA-robust form (ota_safe_cil)
+    ("etc/selinux/precompiled_sepolicy", "keep", "SELinux"),         # 1 byte: forces init's compile
+) + tuple(("vup/lib64/" + _n, "keep", "VM graphics") for _n in _VGFX) + (
+    ("vup/lib64/egl/*", "keep", "VM graphics"),                      # Mesa svga (system EGL in the VM)
+    # always: neutralising stubs and masks over Google files (content ours, whatever the Google file is)
+    ("vup/bin/hw/android.hardware.security.secretkeeper.trusty", "always", "stub"),
+    ("vup/bin/hw/android.hardware.gatekeeper-service.trusty", "always", "stub"),
+    ("vup/bin/hw/touchpad-inhibitor", "always", "stub"),
+    ("vup/bin/hw/vendor.google.desktop.charge-control-hal", "always", "stub"),
+    ("vup/bin/hw/vendor.google.desktop.futility-executor", "always", "stub"),
+    ("vup/bin/storage_metrics_service", "always", "stub"),
+    ("vup/bin/crossystem", "always", "stub"),
+    ("vup/bin/fwupd-binder", "always", "stub"), ("vup/bin/fwupd_blocking_update", "always", "stub"),
+    ("vup/bin/fwupdmgr", "always", "stub"), ("vup/bin/flashrom", "always", "stub"), ("vup/bin/futility", "always", "stub"),
+    ("vup/bin/ectool", "always", "stub"), ("vup/bin/init.adbd-killer.sh", "always", "stub"),
+    ("vup/bin/android-desktop-install", "always", "stub"),
+    ("empty_vintf.xml", "always", "mask"), ("gb_noop.sh", "always", "stub"), ("gb_sleeper.sh", "always", "stub"),
+    ("gb_fw_stub.sh", "always", "stub"),
+    # always: our own HALs, daemons and tools (static, or LLNDK/NDK-only: ota-gating evidence elf_deps.tsv)
+    ("vup/bin/hw/android.hardware.gatekeeper-service.gb", "always", "Gatekeeper"),
+    ("etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml", "always", "Gatekeeper"),
+    ("vup/bin/gb_*", "always", "own"), ("vup/bin/tiny*", "always", "own"), ("vup/bin/iptsd*", "always", "own"),
+    ("vup/bin/nvk_probe", "always", "own"), ("vup/bin/egl_probe", "always", "own"),
+    ("vup/lib64/hw/vulkan.intel.so", "always", "own"),              # pastel: no private dependency
+    ("vup/lib64/hw/vulkan.nouveau.so", "always", "own"),            # symlink into the dGPU payload
+    # always: our own configuration (stable formats; the values are ours)
+    ("vup/etc/permissions/*", "always", "config"), ("vup/usr/idc/*", "always", "config"),
+    ("vup/usr/keylayout/*", "always", "config"), ("vup/etc/audio/*", "always", "config"),
+    ("vup/etc/data/hal_configs/audio_default.xml", "always", "config"),
+    ("vup/etc/excluded-input-devices.xml", "always", "config"), ("vup/overlay/*", "always", "config"),
+)
+assert all(c in ("skip", "keep", "always") for _p, c, _l in OTA_CLASSES)
+
+
+def ota_safe_cil(raw):
+    """(W5b OTA gate) inject\\odm_sepolicy.cil in its OTA-robust form: every `(typepermissive T)` line becomes
+    `(optional gb_ota_T (typepermissive T))`. Our 1-byte /odm precompiled_sepolicy has no .sha256 companions, so init
+    compiles the split policy with secilc at every boot, this file included (serial log: "Compiling SELinux policy"). In the
+    plain form one type that a later Google build removes or renames fails that compile ("Failed to resolve
+    typepermissive statement") -> init LOG(FATAL) -> a reboot loop on that build. In this form only that type's optional
+    block is disabled. lapis .276's own secilc compiles both forms to the byte-identical policy (sha256 ab621323...,
+    with or without an extra unknown type; ota-gating evidence sepolicy_secilc.txt), so the validated build is unchanged.
+    Only (typepermissive T) lines are accepted (fail closed)."""
+    out, seen = [], set()
+    for ln in raw.split(b"\n"):
+        ln = ln.rstrip(b"\r")
+        if not ln.strip():
+            continue
+        m = re.fullmatch(rb"\(typepermissive ([A-Za-z0-9_-]+)\)", ln)
+        assert m and m.group(1) not in seen, f"odm_sepolicy.cil: unexpected or repeated line {ln[:80]!r}"
+        seen.add(m.group(1))
+        out.append(b"(optional gb_ota_" + m.group(1) + b" (typepermissive " + m.group(1) + b"))\n")
+    assert out, "odm_sepolicy.cil: no typepermissive line"
+    return b"".join(out)
+ODMCIL_RAW = ODMCIL                             # inject\odm_sepolicy.cil as read above
+ODMCIL = ota_safe_cil(ODMCIL_RAW)               # (W5b) both trees pack the OTA-robust form (ota_safe_cil)
+
+# (W5 final, safety audit SA-1) lapis's user build ignores androidboot.selinux=permissive: getenforce prints Enforcing,
+# and only the per-type list in odm_sepolicy.cil makes the domains permissive. These domains must stay in that list:
+# the VNNI relabel/bind steps (init, vendor_init), ueventd, the Gatekeeper and KeyMint grafts and their keystore/
+# gatekeeperd clients, system_server, zygote and the console shell. _check_otagate refuses a cil without one of them.
+OTA_REQUIRED_PERMISSIVE = ("init", "vendor_init", "ueventd", "hal_gatekeeper_default", "gatekeeperd", "keystore",
+                           "hal_keymint_default", "system_server", "zygote", "shell")
+
+
+def ota_cil_missing(cil):
+    """(W5 final, SA-1) The OTA_REQUIRED_PERMISSIVE types that the OTA-robust cil text `cil` does not make permissive."""
+    have = set(re.findall(rb"^\(optional gb_ota_([A-Za-z0-9_-]+) \(typepermissive \1\)\)$", cil, re.M))
+    return [t for t in OTA_REQUIRED_PERMISSIVE if t.encode() not in have]
+
+
+def _ramdisk_files(rd):
+    """{path: bytes} of the regular files of a boot ramdisk: legacy LZ4 (lapis's init_boot), gzip or a plain newc cpio."""
+    if rd[:4] == b"\x02\x21\x4c\x18":
+        import lz4.block as _lz4b                          # (W5b) host Python's lz4 (build_esp runs on the host only)
+        buf, o = bytearray(), 0
+        while o + 4 <= len(rd):
+            if rd[o:o + 4] == b"\x02\x21\x4c\x18":
+                o += 4
+                continue
+            n = struct.unpack_from("<I", rd, o)[0]
+            if n == 0 or o + 4 + n > len(rd):
+                break
+            buf += _lz4b.decompress(rd[o + 4:o + 4 + n], uncompressed_size=8 << 20)
+            o += 4 + n
+        buf = bytes(buf)
+    elif rd[:2] == b"\x1f\x8b":
+        buf = gzip.decompress(rd)
+    else:
+        buf = rd
+    files, o = {}, 0
+    while True:
+        assert buf[o:o + 6] in (b"070701", b"070702"), f"ramdisk: no newc cpio header at offset {o}"
+        f = [int(buf[o + 6 + 8 * i:o + 14 + 8 * i], 16) for i in range(13)]
+        mode, fsz, nsz = f[1], f[6], f[11]
+        name = buf[o + 110:o + 110 + nsz - 1].decode("utf-8", "replace")
+        o = (o + 110 + nsz + 3) & ~3
+        data = buf[o:o + fsz]
+        o = (o + fsz + 3) & ~3
+        if name == "TRAILER!!!":
+            return files
+        if (mode & 0o170000) == 0o100000:
+            files[name] = data
+
+
+def ota_build_fingerprint(generic):
+    """The ro.bootimage.build.fingerprint of a generic (init_boot) ramdisk by GBINIT's own rule (the value of the last
+    line starting with "<prop>=" in system/etc/ramdisk/build.prop, every CR removed). Fail closed: missing, empty or
+    with a character outside OTA_FP_SAFE stops the build."""
+    bp = _ramdisk_files(generic).get(OTA_RAMDISK_PROP)
+    assert bp is not None, f"OTA gate: the boot slot's init_boot ramdisk has no {OTA_RAMDISK_PROP}"
+    vals = [ln[len(OTA_PROP) + 1:].replace(b"\r", b"") for ln in bp.split(b"\n") if ln.startswith(OTA_PROP + b"=")]
+    assert vals and vals[-1] and set(vals[-1]) <= OTA_FP_SAFE, \
+        f"OTA gate: {OTA_PROP.decode()} of the init_boot ramdisk is {vals[-1:]!r} (non-empty, safe characters only)"
+    return vals[-1]
+
+
+OTA_FP = ota_build_fingerprint(GENERIC)
+OTA_VALIDATED_BYTES = OTA_PROP + b"=" + OTA_FP + b"\n"
+OTA_SKIP_LABELS = sorted({_l for _p, c, _l in OTA_CLASSES if c == "skip"})
+OTA_KEEP_LABELS = sorted({_l for _p, c, _l in OTA_CLASSES if c == "keep"})
+# GBINIT's two OTA gate pieces (literal copies, checked by _check_otagate): the token scan (while /proc is mounted) and
+# the gate itself (right after the /odm copy and the VNNI kill switch, before the bring-up and the module loading)
+OTA_GBINIT_TOKENS = (b"OG=; for a in $(/busybox cat /proc/cmdline); do case \"$a\" in gb.otagate=0) OG=0;; "
+                     b"gb.otagate=force) OG=force;; esac; done\n")
+OTA_GBINIT_UNVALIDATED = (b"  if [ \"$OS\" = unvalidated ]; then\n"
+                          b"    /busybox rm -rf /odm/vnni\n"
+                          b"    echo >> /odm/etc/build.prop\n"
+                          b"    echo \"ro.vendor.gb.ota_gate=unvalidated\" >> /odm/etc/build.prop\n"
+                          b"  fi\n")
+assert GBINIT.count(OTA_GBINIT_TOKENS) == 1 and GBINIT.count(OTA_GBINIT_UNVALIDATED) == 1, "GBINIT: the OTA gate"
+# gb_otagate.sh (both trees): kmsg line + the gb_update notification; nothing else. Text <= 200 printable (INTERFACES 12.1).
+# Two services run it at boot_completed on an unvalidated build: gb_otagate (root) writes the kmsg line and, where
+# gb_notify ships and its queue exists (native), queues the message like every other producer; gb_otagate_post (user
+# shell, the identity gb_notify posts with; INTERFACES D6: posting as uid 0 is unverified) posts it directly everywhere
+# else (the VM tree has no gb_notify). Notifications with the same tag replace each other, so a double post is one.
+OTA_TITLE = b"System update not validated"
+OTA_TEXT = (b"Build $B is not the build this boot setup was made for ($V). Paused until the next ESP update: "
+            + ", ".join(OTA_SKIP_LABELS).encode() + b".")
+assert len(OTA_TITLE) <= 40 and len(OTA_TEXT.replace(b"$B", b"x" * 24).replace(b"$V", b"x" * 24)) <= 200 \
+    and all(32 <= c <= 126 for c in OTA_TITLE + OTA_TEXT), "gb_otagate: notification title/text limits (12.1)"
+GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
+                 b"# gb_otagate (OTA gate, wave 5b). /odm/etc/init/gb_otagate.rc starts it at boot_completed only when gbinit\n"
+                 b"# found that this boot's build is not the one the ESP was built for (ro.vendor.gb.ota_gate=unvalidated;\n"
+                 b"# /odm/etc/gb/ota_state). Service gb_otagate (root): one kmsg line, and the \"System update not validated\"\n"
+                 b"# notification (tag gb_update, INTERFACES 12.1) queued for gb_notify where gb_notify and its queue exist\n"
+                 b"# (native). Service gb_otagate_post (argument post, user shell): posts it directly everywhere else (VM).\n"
+                 b"# It changes nothing else. Test hooks (never set by init): GB_ROOT (path prefix), GB_TEST_PATH.\n"
+                 b"LC_ALL=C; export LC_ALL\n"
+                 b"PATH=${GB_TEST_PATH:+$GB_TEST_PATH:}/system/bin:/vendor/bin; export PATH\n"
+                 b"R=${GB_ROOT:-}\n"
+                 b"set -f\n"
+                 b"S=$R/odm/etc/gb/ota_state\n"
+                 b"Q=$R/data/vendor/gb/notify\n"
+                 b"log1() { { printf 'gb_otagate: %s\\n' \"$*\" >> \"$R/dev/kmsg\"; } 2>/dev/null || "
+                 b"log -t gb_otagate -p w \"$*\" 2>/dev/null; return 0; }\n"
+                 b"val() { sed -n \"s/^$1=//p\" \"$S\" 2>/dev/null | tail -n 1 | tr -cd ' -~' | cut -c1-120; }\n"
+                 b"[ -f \"$S\" ] && [ \"$(val state)\" = unvalidated ] || exit 0\n"
+                 # the build id field of a fingerprint (brand/product/device:release/ID/incremental:type/tags), <= 24
+                 b"bid() { _b=$(printf '%s' \"$1\" | cut -d/ -f4 | tr -cd 'A-Za-z0-9._-' | cut -c1-24); "
+                 b"printf '%s' \"${_b:-unknown}\"; }\n"
+                 b"B=$(bid \"$(val booted)\"); V=$(bid \"$(val validated)\")\n"
+                 b"TITLE='" + OTA_TITLE + b"'\n"
+                 b"TEXT=\"" + OTA_TEXT + b"\"\n"
+                 # the gb_notify queue is used only where gb_notify ships (native tree) and its queue is a real directory
+                 b"qok() { [ -f \"$R/odm/vup/bin/gb_notify.sh\" ] && [ -d \"$Q\" ] && [ ! -L \"$Q\" ]; }\n"
+                 b"if [ \"${1:-}\" = post ]; then\n"
+                 b"  qok && exit 0\n"
+                 b"  timeout 20 cmd notification post -t \"$TITLE\" gb_update \"$TEXT\" > /dev/null 2>&1 || "
+                 b"log1 \"cmd notification post failed\"\n"
+                 b"  exit 0\n"
+                 b"fi\n"
+                 b"log1 \"UNVALIDATED build: booted $(val booted), ESP built for $(val validated) (token $(val token)); "
+                 b"skipped: " + ", ".join(OTA_SKIP_LABELS).encode() + b"; kept as built (needed to boot): "
+                 + ", ".join(OTA_KEEP_LABELS).encode() + b"; update the ESP to re-validate\"\n"
+                 b"if qok; then\n"
+                 b"  ms=\"$(date +%s)000\"; f=$Q/$ms-$$-1.msg\n"
+                 b"  set -C\n"
+                 b"  if printf 'kind=notify\\ntag=gb_update\\ntitle=%s\\ntext=%s\\n' \"$TITLE\" \"$TEXT\" > \"$f.tmp\" 2>/dev/null &&\n"
+                 b"     mv \"$f.tmp\" \"$f\" 2>/dev/null; then\n"
+                 b"    setprop vendor.gb.notify \"$ms\" 2>/dev/null || log1 \"setprop vendor.gb.notify failed\"\n"
+                 b"    log1 \"notification queued for gb_notify\"\n"
+                 b"  else\n"
+                 b"    rm -f \"$f.tmp\" 2>/dev/null; log1 \"cannot queue the notification\"\n"
+                 b"  fi\n"
+                 b"else\n"
+                 b"  log1 \"no gb_notify queue: gb_otagate_post posts the notification\"\n"
+                 b"fi\n"
+                 b"exit 0\n")
+# /odm/etc/init/gb_otagate.rc (both trees; init parses every file of /odm/etc/init). ro.vendor.* is an actionable
+# property for /odm rc files; the property comes from /odm/etc/build.prop only when gbinit appended it.
+OTA_RC = (b"# ---- OTA gate (wave 5b; build_esp OTA_RC, C:\\GB-build\\native\\ota-gating\\DESIGN.md) ----\n"
+          b"# gbinit appends ro.vendor.gb.ota_gate=unvalidated to /odm/etc/build.prop when this boot's build is not the\n"
+          b"# one the ESP was built for; gb_otagate then logs it and the gb_update notification is posted.\n"
+          b"service gb_otagate /system/bin/sh /odm/" + OTA_SCRIPT.encode() + b"\n"
+          b"    user root\n"
+          b"    group root shell\n"
+          b"    seclabel u:r:shell:s0\n"
+          b"    oneshot\n"
+          b"    disabled\n"
+          b"\n"
+          b"service gb_otagate_post /system/bin/sh /odm/" + OTA_SCRIPT.encode() + b" post\n"
+          b"    user shell\n"
+          b"    group shell\n"
+          b"    seclabel u:r:shell:s0\n"
+          b"    oneshot\n"
+          b"    disabled\n"
+          b"\n"
+          b"on property:sys.boot_completed=1 && property:ro.vendor.gb.ota_gate=unvalidated\n"
+          b"    start gb_otagate\n"
+          b"    start gb_otagate_post\n")
+assert OTA_RC.count(b"\non ") == 1 and b"ro.vendor.gb.ota_gate" not in GB_RC, "OTA gate rc: one trigger, not in gb.rc"
+print(f"OTA gate: ON in both trees (validated build {OTA_FP.decode()}; skip on another build: "
+      f"{', '.join(OTA_SKIP_LABELS)})", flush=True)
+
+# ---------------- Software Gatekeeper, both trees (wave 4) ----------------
+# User decision 2026-10-26: a software lock-screen PIN (a convenience lock, not a hardware boundary). Design, review and
+# device tests: C:\GB-build\native\dgpu\w4\GATEKEEPER.md (7: integration; 9.2/9.5: tests), REVIEW.md. ONE component
+# for both trees: inject\native\components\gatekeeper.json (= the reviewed draft C:\GB-build\native\gatekeeper\
+# component\gatekeeper.json except its comment). The native tree gets it through the component loader below; the VM
+# tree gets the same two files and the same rc text (same "# ---- component gatekeeper ----" framing) here.
+# Invariants (_check_gatekeeper, verify_image V29): the binary, the ODM VINTF fragment and the rc stanza ship together
+# or not at all (a declared IGatekeeper/default without the service hangs gatekeeperd and LockSettingsService = boot;
+# a service without the fragment cannot register); the binary is the accepted build (its out\android\SHA256SUMS line,
+# out\ACCEPTANCE.txt version >= 0.2.0 = W4-GK-1..3), links only LLNDK libraries; the fragment is byte-identical to the
+# reviewed one (override="true" on both HALs, review GK-6); exactly one "interface aidl ...IGatekeeper/default" line.
+# Kept as before: the empty bind over lapis's Trusty Gatekeeper fragment (gb.rc early-init), GBINIT's whiteout of its
+# .rc and SK_STUB over its binary (one declaration only: ours), Weaver undeclared (LockSettingsService then takes its
+# Gatekeeper branch). No SELinux change: hal_gatekeeper_default(_exec) and gatekeeper_vendor_data_file are lapis types
+# and already typepermissive in inject\odm_sepolicy.cil.
+import json as _json, hashlib as _hl
+GK_MANIFEST = os.path.join(HERE, "inject", "native", "components", "gatekeeper.json")
+GK_BIN_DEST = "vup/bin/hw/android.hardware.gatekeeper-service.gb"
+GK_VINTF_DEST = "etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml"
+GK_VINTF_SHA256 = "48cd680b721996e57c4b93acce4d842d9f14e0cd3dbd9cda75e1fe3b3216b77b"   # the reviewed fragment (GK-6)
+GK_MIN_VERSION = (0, 2, 0)                                # W4-GK-1 (must before a real PIN), W4-GK-2, W4-GK-3
+GK_LLNDK = ("libbinder_ndk.so", "libc.so", "libdl.so", "liblog.so", "libm.so")
+GK_IFACE = b"interface aidl android.hardware.gatekeeper.IGatekeeper/default"
+GK_TRUSTY_BIND = (b"    mount none /odm/empty_vintf.xml "
+                  b"/vendor/etc/vintf/manifest/android.hardware.gatekeeper-service.trusty.xml bind\n")
+GK_WEAVER_BIND = (b"    mount none /odm/empty_vintf.xml "
+                  b"/vendor/etc/vintf/manifest/android.hardware.weaver-service.android-desktop.xml bind\n")
+GK_TRUSTY_WHITEOUT = b"/busybox mknod /odm/vup/etc/init/android.hardware.gatekeeper-service.trusty.rc c 0 0\n"
+GK_RC_LINES = (b"service gb_gatekeeper /vendor/bin/hw/android.hardware.gatekeeper-service.gb\n", b"    class early_hal\n",
+               b"    user hsm\n", b"    group hsm\n", b"    seclabel u:r:hal_gatekeeper_default:s0\n",
+               b"    " + GK_IFACE + b"\n",
+               b"    interface aidl android.hardware.security.sharedsecret.ISharedSecret/gatekeeper\n",
+               b"    stdio_to_kmsg\n", b"    onrestart restart gatekeeperd\n",
+               b"on post-fs-data\n    mkdir /data/vendor/gatekeeper 0700 hsm hsm\n")
+
+def _elf_dynamic(data):
+    """(interpreter, [DT_NEEDED names]) of an ELF64 x86-64 little-endian file, from its program headers."""
+    assert data[:4] == b"\x7fELF" and data[4] == 2 and data[5] == 1 and struct.unpack_from("<H", data, 18)[0] == 62, \
+        "not an x86-64 ELF64 LE file"
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    loads, dyn, interp = [], None, None
+    for i in range(phnum):
+        p_type, _, p_off, p_vaddr, _, p_filesz = struct.unpack_from("<IIQQQQ", data, phoff + i * phentsize)
+        if p_type == 1:
+            loads.append((p_vaddr, p_off, p_filesz))
+        elif p_type == 2:
+            dyn = (p_off, p_filesz)
+        elif p_type == 3:
+            interp = data[p_off:p_off + p_filesz].split(b"\0")[0].decode()
+    assert dyn is not None, "no PT_DYNAMIC"
+    tags = [struct.unpack_from("<qQ", data, dyn[0] + 16 * k) for k in range(dyn[1] // 16)]
+    strtab = [v for t, v in tags if t == 5]
+    assert len(strtab) == 1, "no single DT_STRTAB"
+    off = [o + strtab[0] - va for va, o, sz in loads if va <= strtab[0] < va + sz]
+    assert off, "DT_STRTAB outside every PT_LOAD"
+    needed = []
+    for t, v in tags:
+        if t == 0:
+            break
+        if t == 1:
+            needed.append(data[off[0] + v:data.index(b"\0", off[0] + v)].decode())
+    return interp, needed
+
+def _gatekeeper_inputs(manifest=GK_MANIFEST):
+    """(binary, VINTF fragment, rc text, the gb.rc block) of the gatekeeper component after the GATEKEEPER.md 7.5 checks."""
+    with open(manifest, encoding="utf-8") as fh:
+        m = _json.load(fh)
+    assert m.get("name") == "gatekeeper" and set(m) <= {"name", "source", "comment", "files", "rc_files"}, \
+        f"{manifest}: name gatekeeper, keys name/source/comment/files/rc_files only"
+    files = {e["dest"]: e for e in m["files"]}
+    assert set(files) == {GK_BIN_DEST, GK_VINTF_DEST} and len(m["files"]) == 2 and len(m["rc_files"]) == 1, manifest
+    assert files[GK_BIN_DEST]["mode"] in ("0o100755", "0755") and files[GK_VINTF_DEST]["mode"] in ("0644", "0o100644")
+    bsrc = files[GK_BIN_DEST]["src"]
+    gbin = open(bsrc, "rb").read()
+    sums = {}
+    for ln in open(os.path.join(os.path.dirname(bsrc), "SHA256SUMS"), "rb").read().decode("ascii").splitlines():
+        if ln.strip():
+            h, n = ln.split(None, 1)
+            sums[n.strip().lstrip("*")] = h.lower()
+    assert sums.get(os.path.basename(bsrc)) == _hl.sha256(gbin).hexdigest(), \
+        f"{bsrc}: sha256 differs from its SHA256SUMS line (not the accepted build)"
+    acc = open(os.path.join(os.path.dirname(os.path.dirname(bsrc)), "ACCEPTANCE.txt"), "rb").read().decode("utf-8")
+    ver = re.search(r"^version: (\d+)\.(\d+)\.(\d+)$", acc, re.M)
+    assert ver and tuple(int(x) for x in ver.groups()) >= GK_MIN_VERSION, \
+        f"gatekeeper ACCEPTANCE.txt: version {ver.group(0) if ver else '?'} < {'.'.join(map(str, GK_MIN_VERSION))}"
+    assert f"sha256: {_hl.sha256(gbin).hexdigest()}  {os.path.basename(bsrc)}" in acc.splitlines(), \
+        "gatekeeper ACCEPTANCE.txt does not name this binary's sha256"
+    interp, needed = _elf_dynamic(gbin)
+    assert interp == "/system/bin/linker64" and needed and set(needed) <= set(GK_LLNDK), \
+        f"gatekeeper binary: interpreter {interp}, NEEDED {needed} (LLNDK only: {GK_LLNDK})"
+    vintf = open(files[GK_VINTF_DEST]["src"], "rb").read()
+    assert _hl.sha256(vintf).hexdigest() == GK_VINTF_SHA256, "the gatekeeper VINTF fragment is not the reviewed one"
+    rc = open(m["rc_files"][0], "rb").read()
+    assert b"\r" not in rc and rc.isascii() and rc.endswith(b"\n"), "gb_gatekeeper.rc: LF-only ASCII"
+    assert all(rc.count(s) == 1 for s in GK_RC_LINES), "gb_gatekeeper.rc lacks a GATEKEEPER.md 7.3 line"
+    return gbin, vintf, rc, b"\n# ---- component gatekeeper ----\n" + rc
+
+GK_BIN, GK_VINTF, GK_RC, GK_RC_BLOCK = _gatekeeper_inputs()
+GB_RC += GK_RC_BLOCK                                      # the VM tree (native: the component loader, same block)
+print(f"software Gatekeeper: ON in both trees (binary sha256 {_hl.sha256(GK_BIN).hexdigest()[:16]}..., "
+      f"{len(GK_BIN):,} B)", flush=True)
+
+# ---------------- VNNI libz patch, both trees (wave 5) ----------------
+# k15 emulates VEX AVX-VNNI (#UD) on Ice Lake; ~2.48e8 emulations in the first ~7 min of a VM boot came almost all from
+# libz.so's adler32_simd_ (C:\GB-build\native\vnni-perf\MEASURE.md). vnni_prepare.py (run on demand, never here) carves
+# the boot slot's system/vendor from lapis.bin read-only, checks each libz.so against vnni-perf\patcher\manifest.json
+# (orig_sha256), runs vnni_patch.py (a 2-byte dispatch edit: adler32 takes its scalar path) and writes
+# inject\vnni\<id>\{system/lib64/libz.so, vendor/lib64/libz.so, manifest.json}. This file only PACKS every such folder
+# into both trees as /odm/vnni/<id>/ and appends to both gb.rc files, after the /vendor overlay action, one init-builtin
+# bind per target, gated EXACTLY on the partition's build fingerprint (init loads ro.<partition>.build.fingerprint from
+# the verified partition's own build.prop before early-init): gb_slotsync reuses this initrd for an A/B OTA's new slot,
+# whose fingerprint differs, so a stale patched libz is never bound over another build (INTEGRATION.md 3). No service.
+# Kill switch: gb.vnni=0 on the kernel command line makes GBINIT delete /odm/vnni (the binds then fail harmlessly).
+# Checks: _vnni_inputs (each file == its manifest's patched_sha256, each (orig, patched, bind, gate) pair a deployable
+# target of the reviewed patcher manifest, gates unique, nothing else in a folder), _check_vnni, verify_image V31.
+# Patched Google binaries are never published (collect.py excludes inject\vnni). Idea credit: gbOS86; code ours.
+VNNI_DIR = os.path.join(HERE, "inject", "vnni")
+VNNI_PATCHER_MANIFEST = os.path.join(os.environ.get("GB_BUILD") or (HERE if os.path.isdir(os.path.join(HERE, "native")) else r"C:\GB-build"), "native", "vnni-perf", "patcher", "manifest.json")
+VNNI_FORMAT = "gb-vnni-1"
+VNNI_ODM = "/odm/vnni"
+VNNI_BINDS = {"/system/lib64/libz.so": "ro.system.build.fingerprint",     # bind target -> its gate property
+              "/vendor/lib64/libz.so": "ro.vendor.build.fingerprint"}
+VNNI_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+VNNI_FP_RE = r"[^/]+/[^/]+/[^/:]+:[^/]+/([^/]+)/([^:/]+):[^/]+/[^/]+"
+VNNI_PROP_SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:+,@~"   # == vnni_patch _PROP_SAFE
+VNNI_RC_HEAD = (b"\n# ---- vnni libz patch (wave 5) ----\n"
+                b"# Each bind fires only on the exact build it was patched for: init loads ro.<partition>.build.fingerprint\n"
+                b"# from the verified partition's build.prop before early-init, and gb_slotsync reuses this initrd after an\n"
+                b"# A/B OTA. gb.vnni=0 on the kernel command line makes gbinit delete /odm/vnni: every bind below then fails\n"
+                b"# harmlessly and the stock libz stays under k15's emulation.\n")
+# GBINIT's kill switch (pre-W5 text, W5 text): tests revert these three edits to compare with the pre-W5 GBINIT
+VNNI_GBINIT_EDITS = ((b"HW=; USB=0; HWTOK=0; OV=0\n", b"HW=; USB=0; HWTOK=0; OV=0; VN=1\n"),
+                     (b" gb.overlay=1) OV=1;; esac; done\n", b" gb.overlay=1) OV=1;; gb.vnni=0) VN=0;; esac; done\n"),
+                     (b"/busybox cp -a $SRC/. /odm/\n",
+                      b"/busybox cp -a $SRC/. /odm/\n[ \"$VN\" = 0 ] && /busybox rm -rf /odm/vnni\n"))
+assert all(GBINIT.count(_new) == 1 for _old, _new in VNNI_GBINIT_EDITS), "GBINIT: the gb.vnni=0 kill switch"
+
+def _vnni_action(ident, t):
+    """The init action of one target: the reviewed vnni_patch.rc_block form (restorecon the source, bind it over the
+    stock library, relabel, remount the bind read-only in init's mount namespace only; the inode stays writable through
+    the rw /odm tmpfs), source /odm/vnni/<id>/<file>, gated on the exact fingerprint."""
+    src, dst = f"{VNNI_ODM}/{ident}/{t['file']}", t["bind"]
+    return (f"on early-init && property:{t['gate_prop']}={t['gate_value']}\n"
+            f"    restorecon {src}\n"
+            f"    mount none {src} {dst} bind\n"
+            f"    restorecon {dst}\n"
+            f"    mount none none {dst} remount bind ro\n").encode()
+
+def _vnni_inputs(vdir=VNNI_DIR, patcher_manifest=VNNI_PATCHER_MANIFEST):
+    """([(path below /odm, bytes, mode)], the gb.rc block, [ids]) of every inject\\vnni\\<id>\\ folder (vnni_prepare.py's
+    output); ([], b"", []) without one. Any folder that does not check out stops the build (fail closed)."""
+    names = sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []
+    if not names:
+        return [], b"", []
+    with open(patcher_manifest, encoding="utf-8") as fh:
+        pm = _json.load(fh)
+    allowed = {(t["orig_sha256"], t["patched_sha256"], t["deploy"]["bind"], t["deploy"]["gate_prop"], t["path"])
+               for t in pm["targets"] if t.get("deploy")}
+    files, actions, gates = [], [], set()
+    for n in names:
+        d = os.path.join(vdir, n)
+        assert os.path.isdir(d) and re.fullmatch(VNNI_ID_RE, n), \
+            f"inject\\vnni\\{n}: only <id> folders written by vnni_prepare.py belong here (move others elsewhere)"
+        mraw = open(os.path.join(d, "manifest.json"), "rb").read()
+        m = _json.loads(mraw.decode("utf-8"))
+        assert m.get("format") == VNNI_FORMAT and m.get("id") == n and m.get("targets"), \
+            f"inject\\vnni\\{n}\\manifest.json: format {VNNI_FORMAT}, id {n}, at least one target"
+        if m.get("slot") and m.get("slot") != SLOT:
+            print(f"WARNING: inject\\vnni\\{n} was prepared for slot _{m.get('slot')}, current SLOT is _{SLOT} "
+                  f"(run vnni_prepare.py --check-slot)", flush=True)
+        have = {os.path.relpath(os.path.join(dp, f), d).replace("\\", "/") for dp, _, fs in os.walk(d) for f in fs}
+        want = {"manifest.json"} | {t["file"] for t in m["targets"]}
+        assert have == want, f"inject\\vnni\\{n}: files {sorted(have)} != manifest {sorted(want)}"
+        for t in m["targets"]:
+            data = open(os.path.join(d, *t["file"].split("/")), "rb").read()
+            assert _hl.sha256(data).hexdigest() == t["patched_sha256"] and len(data) == t["size"] and data[:4] == b"\x7fELF", \
+                f"inject\\vnni\\{n}\\{t['file']}: not the patched_sha256 of its manifest"
+            assert (t["orig_sha256"], t["patched_sha256"], t["bind"], t["gate_prop"], t["file"]) in allowed, \
+                f"inject\\vnni\\{n}\\{t['file']}: not a deployable target of {patcher_manifest} (orig/patched/bind/gate)"
+            assert VNNI_BINDS.get(t["bind"]) == t["gate_prop"] and t["file"] == t["bind"].lstrip("/"), t["bind"]
+            v = t["gate_value"]
+            assert (v and v != "*" and v == m["fingerprints"].get(t["gate_prop"])
+                    and all(c in VNNI_PROP_SAFE for c in v) and re.fullmatch(VNNI_FP_RE, v)), \
+                f"inject\\vnni\\{n}: gate value {v!r} (the partition's fingerprint, init-safe characters only)"
+            assert (t["gate_prop"], v) not in gates, f"inject\\vnni\\{n}: a second folder for {t['gate_prop']}={v}"
+            gates.add((t["gate_prop"], v))
+            files.append((f"vnni/{n}/{t['file']}", data, 0o100644))
+            actions.append(_vnni_action(n, t))
+        files.append((f"vnni/{n}/manifest.json", mraw, 0o100644))
+    return files, VNNI_RC_HEAD + b"\n".join(actions), names
+
+VNNI_FILES, VNNI_RC_BLOCK, VNNI_IDS = _vnni_inputs()
+GB_RC += VNNI_RC_BLOCK                  # after the gatekeeper block: the VM gb.rc's last block (native: after _COMP_RC)
+_nb = VNNI_RC_BLOCK.count(b"\non early-init && property:")
+print("VNNI libz patch: " + (f"ON in both trees ({', '.join(VNNI_IDS)}; {_nb} fingerprint-gated binds)" if VNNI_IDS
+                             else "off (no inject\\vnni\\<id> folder: run vnni_prepare.py)"), flush=True)
+
 # ---------------- Native mode (gb.hw=native): Surface Book 3 on bare metal ----------------
 # gbinit copies /gbnative instead of /gbstage. Shared with the VM: the software KeyMint graft, Trusty/GSC stubs, the
 # crossystem stub, the fstab, VINTF masks and the RescueParty/checkpoint fixes. Left out: everything VMware-specific
@@ -1246,6 +1872,10 @@ GB_MODULES_SH = (b"#!/system/bin/sh\n"
 # be read (fail closed). (Wave 3) Each snapshot starts with a "== summary" triage block (item 8). The dgpu section is read-only
 # (cached sysfs attributes, node metadata, gb_power hello/status/get-mode). The text between #@@functions-begin and
 # #@@functions-end is sourced by the test harness (tests\w2a), with the GB_BOOTLOG_* overrides init never sets.
+# (Wave 5, native-readiness B-1, C-3, A-L1, C-4; A-H1, A-M1, B-3, C-1, C-2) The summary reads the kernel log from a
+# copy the first snapshot keeps in /dev (no avc lines) plus the current dump, counts the real threadtime drmhwc line, and
+# adds the -517, buttons, posture, dsp_driver, PSR, Wi-Fi, Bluetooth, camera and linker lines; the wave 3 lines keep
+# their order and prefixes (hwtest\analyze_gblog.py keys on them).
 GB_BOOTLOG_SH = rb"""#!/system/bin/sh
 # gb_bootlog (native): kernel + Android logs to <boot partition>\gblog\boot<N>-t<T>.txt at T = 40, 90, 180, 420, 900 s.
 # Each snapshot is collected in /dev first; the ESP is locked (INTERFACES 5.4 r3) and mounted rw,flush only for the
@@ -1338,18 +1968,42 @@ prune() {   # once per boot, right after N is known
   done
 }
 rdf() { v=-; [ -r "$1" ] && v=$(head -c 600 "$1"); echo "$v"; }
+# (wave 5) summary helpers. nmatch: grep -c that prints 0 for a missing file too. kts: the kernel timestamps of a dmesg
+# dump. probe: can bionic load and link a binary (C-1, C-2: one library that cannot link stops a HAL)? It runs the
+# binary's version/usage option, which prints and exits before doing anything else (wpa_supplicant -v, hostapd -v,
+# lcam-probe -h): "ok" when an output line starts with $3, else FAILED with the linker's line or the first line.
+nmatch() { v=$(grep -c "$@" 2>/dev/null); echo "${v:-0}"; }
+kts() { sed -n 's/^[^[]*\[ *\([0-9][0-9]*\.[0-9][0-9]*\)\].*/\1/p' "$1" 2>/dev/null; }
+probe() {
+  [ -x "$r$1" ] || { echo absent; return 0; }
+  v=$(timeout 5 "$r$1" "$2" 2>&1 < /dev/null); e=$?
+  if printf '%s\n' "$v" | grep -q -F 'CANNOT LINK'; then
+    echo "FAILED: $(printf '%s\n' "$v" | grep -m1 -F 'CANNOT LINK' | cut -c1-200)"
+  elif printf '%s\n' "$v" | grep -q "^$3"; then echo ok
+  else echo "FAILED (exit $e): $(printf '%s\n' "$v" | head -n 1 | cut -c1-200)"; fi
+}
 # (wave 3, item 8) one-screen triage, tied to the DEVICE-STATUS checklist. Read-only and bounded: dmesg and logcat -d
 # (dump and exit, never a streaming logcat: [W3R-14]) once each into /dev, then fixed greps. It prints no serial
-# numbers, SSIDs or account names (input device names only for the Surface Aggregator bus 0019, no Uniq/Phys lines,
-# only the two apgetty properties of getprop). Section list idea: gbOS86 hwdetect.sh (names only); code ours.
-# GB_BOOTLOG_ROOT: test harness only (a fake /proc, /sys, /odm).
+# numbers, SSIDs or account names (input device names only for the Surface Aggregator bus 0019 and, in the posture
+# line, for the internal Surface, button, lid and IPTS devices; no Uniq/Phys lines; network interface names but no
+# addresses; only named getprop properties). Section list idea: gbOS86 hwdetect.sh (names only); code ours.
+# (wave 5) Besides the dumps it starts only dumpsys device_state and dumpsys input (read-only) and the three probes.
+# GB_BOOTLOG_ROOT: test harness only (a fake /proc, /sys, /odm, /vendor).
 summary() {
   r=${GB_BOOTLOG_ROOT:-}
   echo '== summary (triage; the full logs follow)'
   dmesg > "$T.dm" 2>/dev/null; timeout 20 logcat -d -b all > "$T.lc" 2>/dev/null     # (dmesg never blocks)
+  # (wave 5, A-L1) a permissive boot floods the 1 MiB kernel ring with avc lines (thousands from getprop alone), so the
+  # boot's first lines are gone within minutes. The first snapshot keeps a copy without avc lines ($T.dm0, in /dev
+  # until the last snapshot); every kernel-log line below comes from K = that copy + this dump's lines it does not hold.
+  [ -s "$T.dm0" ] || grep -v -F 'avc:' "$T.dm" > "$T.dm0" 2>/dev/null
+  K=$T.dk
+  { cat "$T.dm0"; grep -v -F 'avc:' "$T.dm" | awk -v f="$T.dm0" 'FILENAME == f { s[$0] = 1; next } !($0 in s)' "$T.dm0" -; } > "$K" 2>/dev/null
+  k1=$(kts "$T.dm" | head -n 1); k2=$(kts "$T.dm0" | head -n 1); k3=$(kts "$T.dm0" | tail -n 1)
+  echo "kernel log: this dump from ${k1:-?} s ($(nmatch -F 'avc:' "$T.dm") avc lines), the first snapshot's copy without avc lines ${k2:-?}-${k3:-?} s: the kernel lines below come from both"
   # item 1: 8250 / Surface Aggregator (base keyboard/touchpad, batteries, charger, detach)
-  echo "serial 8250: $(grep -m1 -F 'Serial: 8250/16550 driver' "$T.dm" || echo 'no 8250 banner')"
-  echo "serial errors: dw-apb-uart -22: $(grep -c -E 'dw-apb-uart.*-22' "$T.dm"), failed to setup IRQ: $(grep -c -F 'failed to setup IRQ' "$T.dm")"
+  echo "serial 8250: $(grep -m1 -F 'Serial: 8250/16550 driver' "$K" || echo 'no 8250 banner')"
+  echo "serial errors: dw-apb-uart -22: $(grep -c -E 'dw-apb-uart.*-22' "$K"), failed to setup IRQ: $(grep -F 'failed to setup IRQ' "$K" | grep -c -v -E -- '-517|EPROBE_DEFER')"
   b=; for x in "$r"/sys/bus/serial/drivers/surface_serial_hub/*; do
     case ${x##*/} in module|'*') continue;; esac; [ -L "$x" ] && b="$b ${x##*/}"
   done
@@ -1357,13 +2011,46 @@ summary() {
   echo '-- /proc/tty/driver/serial'; timeout 5 cat "$r/proc/tty/driver/serial" 2>&1 | head -n 40
   echo '-- serial bus devices'; ls -l "$r/sys/bus/serial/devices" 2>&1; ls "$r/sys/bus/serdev/devices" 2>/dev/null
   echo "inputs (Surface Aggregator HID, bus 0019): $(awk '/^I:/ { b = ($2 == "Bus=0019") } /^N:/ && b { sub(/^N: Name=/, ""); printf "%s; ", $0 }' "$r/proc/bus/input/devices" 2>/dev/null)"
+  # (wave 5, A-L1) -517 = a probe deferred and retried later, not an error: on the SB3 surface_hotplug's first probe
+  # (in gbinit, before lapis's pinctrl-icelake) logs it; the Surface Aggregator's deferral is silent
+  echo "deferred probes (-517, retried later; expected on the SB3): $(grep -c -E -- '-517([^0-9]|$)|EPROBE_DEFER' "$K") line(s): $(grep -E -- '-517([^0-9]|$)|EPROBE_DEFER' "$K" | sed -e 's/^[^]]*\] //' -e 's/: .*//' | sort -u | head -n 6 | tr '\n' ';')"
+  # (wave 5, A-H1) power button and volume keys: soc_button_array on MSHW0040 needs lapis's INT3455 pinctrl, which
+  # ueventd loads after gbinit, and gb_hw binds it again at boot. Two gpio-keys inputs = power + volume work
+  d=$r/sys/bus/platform/devices/MSHW0040:00; x=absent
+  if [ -e "$d" ]; then x=$(readlink "$d/driver" 2>/dev/null); if [ -n "$x" ]; then x="bound to ${x##*/}"; else x='NOT bound'; fi; fi
+  if [ -e "$r/sys/bus/platform/drivers/icelake-pinctrl/INT3455:00" ]; then b=bound; else b='not bound'; fi
+  echo "buttons: MSHW0040 $x; INT3455 pinctrl $b; gpio-keys inputs: $(nmatch -F 'N: Name="gpio-keys"' "$r/proc/bus/input/devices"); $(grep -F 'gb_hw: buttons:' "$K" | tail -n 1 | sed 's/^[^]]*\] //')"
+  # (wave 5, A-M1) posture: lapis's device-state policy disables built-in input in CLOSED; on the kernel side lapis's
+  # touchpad-inhibitor and gb_power's studio mode set /sys/class/input/*/inhibited. Internal device names only
+  x=$(timeout 5 dumpsys device_state 2>/dev/null | sed -n -E "s/^ *(mCommittedState|mBaseState|mOverrideState)=.*name='([^']*)'.*/\1=\2/p; s/^ *(mCommittedState|mBaseState|mOverrideState)=Optional\.empty.*/\1=none/p" | tr '\n' ' ')
+  timeout 10 dumpsys input > "$T.di" 2>/dev/null
+  b='n/a (no input service)'
+  if grep -q -F 'Event Hub State' "$T.di"; then
+    b=$(awk '/^ *(Device )?-?[0-9]+: / { n = $0; sub(/^ *(Device )?-?[0-9]+: /, "", n); next }
+      /^ *Enabled: false/ && n != "" { if (n ~ /^(Microsoft Surface|gpio-keys|Lid Switch|Power Button|IPTS)/) s[n] = 1; else o[n] = 1; n = "" }
+      END { for (k in s) printf "%s;", k; c = 0; for (k in o) c++; if (c) printf "+%d other;", c }' "$T.di")
+  fi
+  l=
+  for d in "$r"/sys/class/input/input*/inhibited; do
+    [ "$(cat "$d" 2>/dev/null)" = 1 ] || continue
+    n=$(cat "${d%/inhibited}/name" 2>/dev/null)
+    case $n in 'Microsoft Surface'*|gpio-keys|'Lid Switch'|'Power Button'|IPTS*) l="$l$n;";; *) l="$l(another device);";; esac
+  done
+  echo "posture: ${x:-device_state n/a }| disabled by Android: ${b:-none} | inhibited by the kernel: ${l:-none}"
+  # the opt-in recovery (gb\gb.cfg GB_PROP_1=vendor.gb.posture=open with gb.overlay=1, or persist.vendor.gb.posture):
+  # gb_hw's last override action, not the device_state/input report its 'posture' mode logs after it (same prefix)
+  # nor its diag report ('gb_hw: diag: posture:')
+  echo "posture override: vendor.gb.posture=$(getprop vendor.gb.posture) persist.vendor.gb.posture=$(getprop persist.vendor.gb.posture); $(grep -F 'gb_hw: posture: ' "$K" | grep -v -E 'gb_hw: posture: (device_state|input) ' | tail -n 1 | sed 's/^[^]]*\] //')"
   # item 2: the DRAS card id
   echo "audio cards: $(grep -F ']: ' "$r/proc/asound/cards" 2>/dev/null | tr -s ' ' | tr '\n' ';')"
   echo "audio DRAS: logcat lines naming sofhdadsp: $(grep -c -F sofhdadsp "$T.lc")"
   grep -i -E 'dras|soundcard' "$T.lc" | grep -F -e sofhdadsp -e sof-hda-dsp | tail -n 3
+  # (wave 5, C-4) dsp_driver is a built-in, read-only kernel parameter: gb.cfg cannot change it, the boot menu can (=1
+  # for one boot: the legacy HDA driver, FLASHING.md "No sound"); gb_audio's last lines say which path it took
+  echo "audio dsp_driver=$(cat "$r/sys/module/snd_intel_dspcfg/parameters/dsp_driver" 2>/dev/null || echo -) (3 SOF, 1 legacy HDA); gb_audio: $(grep -F 'GB_AUDIO: ' "$K" | grep -v -F "GB_AUDIO: mixer '" | tail -n 2 | sed 's/^[^]]*\] //' | tr '\n' ' ')"
   # firmware
-  echo '-- firmware load failures (dmesg)'; grep -i -E 'Direct firmware load.*failed|Failed to load' "$T.dm" | tail -n 12
-  echo "firmware i915 DMC: $(grep -m1 -i -E 'i915.*DMC' "$T.dm" || echo 'no DMC line')"
+  echo '-- firmware load failures (dmesg)'; grep -i -E 'Direct firmware load.*failed|Failed to load' "$K" | tail -n 12
+  echo "firmware i915 DMC: $(grep -m1 -i -E 'i915.*DMC' "$K" || echo 'no DMC line')"
   echo "swaps: $(tail -n +2 "$r/proc/swaps" 2>/dev/null | tr -s ' ' | tr '\n' ';')"
   n=0; l=
   for d in "$r"/sys/bus/pci/devices/*; do
@@ -1373,20 +2060,39 @@ summary() {
   echo "pci functions without a driver: $n$l"
   # item 3: the #UD AVX-VNNI emulator counter (the k15 sysfs node, WAVE3_PLAN contract 2.2)
   echo '-- gb_vnni'; timeout 5 cat "$r/sys/kernel/gb_vnni/summary" 2>&1 | head -n 17
-  # item 10: i915 white veil (the default-off fix is set only through gb.cfg GB_MODOPTS_i915)
-  echo "i915 white veil: drmhwc LOG_GAMMA_LUT lines: $(grep -c -F 'drmhwc: Missing optional LOG_GAMMA_LUT' "$T.lc"), gb_ignore_user_gamma=$(cat "$r/sys/module/i915/parameters/gb_ignore_user_gamma" 2>/dev/null || echo -)"
+  # item 10: i915 white veil (the default-off fix is set only through gb.cfg GB_MODOPTS_i915). (wave 5, B-1) drmhwc logs
+  # tag and text apart: threadtime gives "V drmhwc  : Missing optional ...", never "drmhwc: Missing"; B-2: the
+  # composer's own switches that select that fallback
+  echo "i915 white veil: drmhwc LOG_GAMMA_LUT lines: $(grep -c -E 'drmhwc[^:]*: Missing optional LOG_GAMMA_LUT property' "$T.lc"), gb_ignore_user_gamma=$(cat "$r/sys/module/i915/parameters/gb_ignore_user_gamma" 2>/dev/null || echo -), hwc: use_log_gamma_lut=$(getprop vendor.hwc.use_log_gamma_lut) persistent_hdr=$(getprop vendor.hwc.drm.persistent_hdr) force_color_mode=$(getprop vendor.hwc.drm.force_color_mode)"
   echo "i915 modules.load: $(grep -E '^#?i915\.ko' "$r/odm/lib/modules/modules.load" 2>/dev/null); gbinit: $(grep -F i915.ko "$r/odm/gbinit_modules.log" 2>/dev/null | tr '\n' ' ')"
+  # (wave 5, B-3) panel self refresh / pipe underruns (flicker, ghost images): GB_MODOPTS_i915=enable_psr=0 enable_fbc=0
+  echo "i915 PSR/underrun lines: $(grep -c -E 'i915 .*(FIFO underrun|Selective fetch area calculation failed|PSR.*(error|fail))' "$K")"
   # item 18: HWUI on a one-queue-per-family Vulkan backend (literal of WAVE3 2.4; gbOS86 hook.sh:489-492)
   echo "HWUI Vulkan queueCount abort lines: $(grep -c -F 'queueFamilyProperties.queueCount < kRequestedQueueCount' "$T.lc")"
   # item 13: gb_slotsync HOLD (WAVE3 2.6)
-  echo "gb_slotsync HOLD: $(grep -F 'gb_slotsync: HOLD slot ' "$T.dm" | tail -n 2 | tr '\n' ' ')"
+  echo "gb_slotsync HOLD: $(grep -F 'gb_slotsync: HOLD slot ' "$K" | tail -n 2 | tr '\n' ' ')"
   # item 11: apgetty off natively; item 4: fs-verity on /data
   echo "apgetty: desktop.apgetty.enable=$(getprop desktop.apgetty.enable) init.svc.apgetty=$(getprop init.svc.apgetty)"
-  echo "fs-verity: ext4 feature $([ -e "$r/sys/fs/ext4/features/verity" ] && echo present || echo absent); $(grep -E 'Enabling ext4 verity|FS_STAT_ENABLE_VERITY_FAILED|Failed to run tune2fs' "$T.dm" | tail -n 2 | tr '\n' ' ')"
-  # item 12: the ESP bring-up log (absent = the feature was off this boot)
+  echo "fs-verity: ext4 feature $([ -e "$r/sys/fs/ext4/features/verity" ] && echo present || echo absent); $(grep -E 'Enabling ext4 verity|FS_STAT_ENABLE_VERITY_FAILED|Failed to run tune2fs' "$K" | tail -n 2 | tr '\n' ' ')"
+  # (wave 5, C-3) Wi-Fi, Bluetooth, cameras and linker failures (C-1, C-2 otherwise show only deep in logcat). Interface
+  # names, firmware and HAL lines only: no SSID, MAC or device name. The kernel lines are printed as they are, so the
+  # hwtest analyzer finds them even after the ring has wrapped
+  l=; for d in "$r"/sys/class/net/wlan*; do [ -e "$d" ] && l="$l${d##*/} "; done
+  echo "wifi: ${l:-no wlan interface }| wpa_supplicant=$(getprop init.svc.wpa_supplicant) wifi_hal=$(getprop init.svc.vendor.wifi_hal_legacy) | link: wpa_supplicant $(probe /vendor/bin/hw/wpa_supplicant -v 'wpa_supplicant v'); hostapd $(probe /vendor/bin/hw/hostapd -v 'hostapd v')"
+  grep -E 'iwlwifi .*(loaded firmware version|no suitable firmware found|Failed to start RT ucode|Microcode SW error)' "$K" | tail -n 2
+  l=; for d in "$r"/sys/class/bluetooth/*; do [ -e "$d" ] && l="$l${d##*/} "; done
+  echo "bluetooth: ${l:-no controller }| hal=$(getprop init.svc.vendor.bluetooth-desktop)"
+  grep -E 'Bluetooth: hci[0-9]+: (Found device firmware|Firmware loaded in|Firmware already loaded|Device booted in|Failed to load Intel firmware|Failed to send firmware)' "$K" | tail -n 3
+  echo "camera: provider=$(getprop init.svc.vendor.camera-provider-2-7-legacy-wrapper), exits seen: $(grep -c -E 'init: Service .vendor\.camera-provider-2-7-legacy-wrapper. \(pid [0-9]+\) (exited|received signal|killed)' "$K"), HAL load failures: $(grep -c -F 'Could not load camera HAL module' "$T.lc") | lcam-probe link: $(probe /odm/bin/lcam-probe -h 'usage: ')"
+  grep -E 'intel-ipu6 .*(hardware version|Connected [0-9]+ camera|firmware|authenticat|error|fail)|Found supported sensor' "$K" | tail -n 3
+  # (a probe of a binary that cannot link adds one such logcat line per snapshot: later counts include them)
+  echo "linker: CANNOT LINK lines: $(grep -c -F 'CANNOT LINK EXECUTABLE' "$T.lc") logcat, $(grep -c -F 'CANNOT LINK EXECUTABLE' "$K") kernel; dlopen failed lines outside /data: $(grep -F 'dlopen failed' "$T.lc" | grep -c -v -F '/data/')"
+  echo '-- linker failures (most frequent first)'
+  grep -h -E 'CANNOT LINK EXECUTABLE|dlopen failed' "$T.lc" "$K" | grep -v -F '/data/' | sed -e 's/^.*\(CANNOT LINK EXECUTABLE\)/\1/' -e 's/^.*\(dlopen failed\)/\1/' | cut -c1-240 | sort | uniq -c | sort -rn | head -n 4
+  # item 12: the ESP bring-up log (absent = the feature was off this boot); stays the last block (analyze_gblog)
   echo '-- ESP bring-up (/odm/gbinit_bringup.log)'
   if [ -f "$r/odm/gbinit_bringup.log" ]; then tail -n 40 "$r/odm/gbinit_bringup.log"; else echo 'absent (gb.overlay=1 not set)'; fi
-  rm -f "$T.dm" "$T.lc"
+  rm -f "$T.dm" "$T.lc" "$K" "$T.di"
 }
 snapshot() {
   summary
@@ -1474,6 +2180,7 @@ for t in 40 90 180 420 900; do
   fi
   sync; umount "$M"; unlock; rm -f "$T"
 done
+rm -f "$T.dm0"      # (wave 5) the first snapshot's kernel-log copy (summary)
 """
 assert b"\r" not in GB_BOOTLOG_SH
 
@@ -1600,6 +2307,7 @@ GB_RC_NATIVE = (
          b"    start gb_provision\n"
          b"    start gb_ui\n"
          b"    start gb_dexopt\n")
+GB_RC_NATIVE = _with_kmsgdbg(GB_RC_NATIVE)      # stdio_to_kmsg works on the user build (see GB_KMSGDBG_SVC)
 
 ODM_BUILD_PROP_NATIVE = (b"# GB native (Surface Book 3) overrides (loaded after /vendor/build.prop)\n"
                          b"ro.surface_flinger.supports_background_blur=1\n"
@@ -1611,7 +2319,16 @@ ODM_BUILD_PROP_NATIVE = (b"# GB native (Surface Book 3) overrides (loaded after 
                          b"ro.surface_flinger.use_color_management=false\n"
                          # first native boots: plain primary-plane commits; re-enable after i915 plane testing
                          b"vendor.hwc.drm.ctm=0\n"
-                         b"ro.vendor.hwc.use_overlay_planes=false\n")
+                         b"ro.vendor.hwc.use_overlay_planes=false\n"
+                         # (wave 5, B-2) white veil: lapis's vendor build.prop sets the Google xe panel's colour mode
+                         # (force_color_mode=13 = DISPLAY_BT2020, persistent_hdr, use_log_gamma_lut). With
+                         # enable_color_pipeline=false hwc3-drm clears GAMMA_LUT, but it bakes a BT.709->BT.2020 gamut
+                         # matrix into the CRTC CTM and tags eDP BT2020_RGB: pale colours on the SB3's sRGB panel. These
+                         # are the composer's compiled defaults: SDR, SurfaceFlinger's (sRGB) colour mode, CTM = SF's
+                         # colour matrix only, so Night Light keeps working. Opt back for one boot with gb.cfg GB_PROP_<n>.
+                         b"vendor.hwc.drm.force_color_mode=-1\n"
+                         b"vendor.hwc.drm.persistent_hdr=false\n"
+                         b"vendor.hwc.use_log_gamma_lut=false\n")
 
 def cpio_newc(entries):
     out = bytearray(); ino = [0]
@@ -1647,7 +2364,7 @@ _entries = [
     ('gbstage/gb_ui.sh', 0o100755, GB_UI_SH),
 ] +([('gbstage/vkenum', 0o100755, VKENUM)] if VKENUM is not None else []) + [
     ('gbstage/etc', 0o040755, None),
-    ('gbstage/etc/fstab.android-desktop', 0o100644, FSTAB),
+    ('gbstage/etc/fstab.android-desktop', 0o100644, FSTAB_VERITY),    # W4: + fsverity, as natively (2.2(b))
     ('gbstage/etc/se_manifest.xml', 0o100644, SEMAN),
     ('gbstage/etc/init', 0o040755, None),
     ('gbstage/etc/init/gb.rc', 0o100644, GB_RC),
@@ -1743,6 +2460,7 @@ if SLOTSYNC_BIN:
     _entries.append(('gbstage/vup/bin/gb_slotsync', 0o100755, SLOTSYNC_BIN))
 if _BATT_MODS[0] == "test_power.ko":
     _entries.append(('gbstage/gb_battunbind.sh', 0o100755, GB_BATTUNBIND_SH))
+_entries.append(('gbstage/gb_zram.sh', 0o100755, GB_ZRAM_SH))     # (W4 rehearsal) the zram load-race fallback
 if VMAUDIO:
     _have = {p for p, _, _ in _entries}
     for _d in ("gbstage/vup/etc", "gbstage/vup/etc/data", "gbstage/vup/etc/data/hal_configs", "gbstage/vup/etc/audio",
@@ -1785,6 +2503,18 @@ def _mode_of(e):
     m = int(str(e["mode"]).replace("0o", ""), 8)
     return m if m > 0o7777 else 0o100000 | m
 
+# the software Gatekeeper's two files in the VM tree (its rc block is already in GB_RC; the native tree: components)
+_add_entry(_entries, "gbstage/" + GK_BIN_DEST, GK_BIN, 0o100755)
+_add_entry(_entries, "gbstage/" + GK_VINTF_DEST, GK_VINTF, 0o100644)
+# (W5) the VNNI libz patch: the same /odm/vnni/<id>/ files in both trees (its rc block: GB_RC above, the native gb.rc below)
+for _p, _d, _m in VNNI_FILES:
+    _add_entry(_entries, "gbstage/" + _p, _d, _m)
+# (W5b) the OTA gate, the same three files in both trees: the validated build, the notifier script and its rc file
+for _t in ("gbstage/", "gbnative/"):
+    for _p, _d, _m in ((OTA_VALIDATED, OTA_VALIDATED_BYTES, 0o100644), (OTA_SCRIPT, GB_OTAGATE_SH, 0o100755),
+                       (OTA_RC_FILE, OTA_RC, 0o100644)):
+        _add_entry(_entries, _t + _p, _d, _m)
+
 # Native components built and reviewed separately under native/<name> (GB_BUILD) (iptsd touch/pen, gb_power battery/
 # detach/dGPU/profile, audio, nouveau policy, NVK, compute, the GPU UI and the per-app graphics driver package). Each
 # manifest inject\native\components\<name>.json lists
@@ -1800,8 +2530,10 @@ _KNOWN = {"name", "source", "comment", "files", "payload", "symlinks", "rc_files
 # never in any build.prop line of a component (PLAN invariant 1, INTERFACES 4 and 14, W2G-03: no build-time default)
 _BAD_PROP = ("ro.hardware.vulkan", "ro.hardware.egl", "ro.hwui.use_vulkan", "debug.hwui.renderer",
              "ro.vendor.gb.gfx_default", "persist.vendor.gb.gfx_mode", "persist.vendor.gb.nouveau")
-# the ESP bring-up refuses every _BAD_PROP name as a GB_PROP (contract 2.3); keep its deny pattern in step
-assert all((_b + "*").encode() in GB_BRINGUP_SH for _b in _BAD_PROP), "GB_BRINGUP_SH deny list lacks a _BAD_PROP name"
+# the ESP bring-up refuses every _BAD_PROP name as a GB_PROP (contract 2.3) plus the VNNI gate/build prefixes (F4)
+assert all((_b + "*").encode() in GB_BRINGUP_SH for _b in _BAD_PROP + (
+    "ro.system.build.", "ro.vendor.build.", "ro.*.build.fingerprint")), \
+    "GB_BRINGUP_SH deny list lacks a _BAD_PROP or VNNI gate name"
 def _xv(o):
     """Repository: expand ${GB_HOME} / ${GB_BUILD} in every string of a component manifest."""
     if isinstance(o, str):
@@ -1837,6 +2569,8 @@ def _load_manifest(m, mf):
         rc += b"\n# ---- component " + m["name"].encode() + b" ----\n" + m["rc_text"].encode() + b"\n"
     for l in m.get("build_prop", []):            # native /odm/etc/build.prop additions
         assert not l.startswith(_BAD_PROP), f"{mf}: {l} is not allowed (invariant 1, W2G-03)"
+        assert l.split("=", 1)[0].strip() not in VNNI_BINDS.values() and not l.startswith(("ro.system.build.", "ro.vendor.build.")), \
+            f"{mf}: {l} overrides a VNNI gate/build property"
         prop += l.encode() + b"\n"
     return files, payload, links, rc, prop
 
@@ -1853,16 +2587,49 @@ for _mf in sorted(_glob.glob(os.path.join(NATIVE_DIR, "components", "*.json"))):
         assert _d not in dict(PAYLOAD_FILES), f"{_mf}: payload {_d} twice"
     _COMP_FILES += _f; PAYLOAD_FILES += _p; _COMP_LINKS += _s; _COMP_RC += _r; ODM_BUILD_PROP_NATIVE += _l
     NATIVE_COMPONENTS.append(_m["name"])
+# (W5, C-1) bionic maps every PT_LOAD of a library or program page-wise, so each one needs a power-of-two p_align,
+# p_offset == p_vaddr modulo max(p_align, 4 KiB page) and to lie inside the file. patchelf followed by llvm-strip broke
+# this in every wave-3 camera ELF (VM-1: 'cannot find "n34_0_Box_C" from verneed[0]', the provider restarting every
+# 5 s); no component file or dGPU payload file may ship like that again (verify_image V12b: every ELF of the image).
+def _ptload_problems(data):
+    """[problem, ...] of the PT_LOAD headers of an x86-64 ELF64 executable or shared object; [] for any other file."""
+    if data[:4] != b"\x7fELF" or len(data) < 64 or data[4] != 2 or data[5] != 1 or \
+            struct.unpack_from("<HH", data, 16) not in ((2, 62), (3, 62)):
+        return []
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    if phentsize < 56 or phoff + phnum * phentsize > len(data):
+        return ["program headers outside the file"]
+    probs, loads = [], 0
+    for i in range(phnum):
+        f = struct.unpack_from("<IIQQQQQQ", data, phoff + i * phentsize)
+        p_type, p_off, p_vaddr, p_filesz, p_align = f[0], f[2], f[3], f[5], f[7]
+        if p_type == 1:
+            loads += 1
+            if p_align & (p_align - 1) or (p_off - p_vaddr) % max(p_align, 4096) or p_off + p_filesz > len(data):
+                probs.append(f"PT_LOAD {i}: offset {p_off:#x} vaddr {p_vaddr:#x} filesz {p_filesz:#x} "
+                             f"align {p_align:#x}")
+    return probs if loads else ["no PT_LOAD"]
+for _d, _b in [(_x[0], _x[1]) for _x in _COMP_FILES] + PAYLOAD_FILES:
+    _bad = _ptload_problems(_b)
+    assert not _bad, f"native component file {_d}: bionic cannot map it ({'; '.join(_bad[:2])}); re-stage it (C-1)"
 # ro.gfx.driver.0 comes from the native build.prop exactly when the driver package ships (INTERFACES 4, W2G-01)
 assert ODM_BUILD_PROP_NATIVE.count(b"ro.gfx.driver.0=") == (1 if "gfxdriver" in NATIVE_COMPONENTS else 0), \
     "ro.gfx.driver.0 must be set exactly once, and only with the gfxdriver component"
 for _l in ODM_BUILD_PROP_NATIVE.decode().splitlines():
     assert not _l.startswith(_BAD_PROP), f"native build.prop: {_l} is not allowed (invariant 1, W2G-03)"
+# (wave 5, B-2) the native composer colour switches: each exactly once, after the component lines too (a later line
+# with the same name would win at boot)
+for _l in ("vendor.hwc.drm.force_color_mode=-1", "vendor.hwc.drm.persistent_hdr=false", "vendor.hwc.use_log_gamma_lut=false"):
+    assert [x for x in ODM_BUILD_PROP_NATIVE.decode().splitlines() if x.split("=")[0] == _l.split("=")[0]] == [_l], \
+        f"native build.prop: exactly one {_l} (B-2 white veil)"
 # HWUI and the retired v1.1 graphics/opt-in switches (INTERFACES 3, 4, 14, 16): never in the native rc. The
 # persist.vendor.gb.nouveau= trigger is the v1.1 one; finding it means a half-integrated manifest set.
 for _bad in (b"debug.hwui.renderer", b"gb.gfxdriver", b"gb_gfxdriver"):
     assert _bad not in GB_RC_NATIVE + GB_SLOTSYNC_RC + _COMP_RC, f"native gb.rc must not contain {_bad.decode()}"
 assert b"persist.vendor.gb.nouveau=" not in _COMP_RC, "native gb.rc: the v1.1 persist.vendor.gb.nouveau trigger"
+# W4: the software Gatekeeper ships in the native tree through its component, with the VM tree's rc block byte for byte
+assert "gatekeeper" in NATIVE_COMPONENTS and _COMP_RC.count(GK_RC_BLOCK) == 1, "native: the gatekeeper component"
 print(f"native components: {', '.join(NATIVE_COMPONENTS) or 'none'} ({len(_COMP_FILES)} files, "
       f"{len(PAYLOAD_FILES)} payload files, {len(_COMP_LINKS)} symlinks)", flush=True)
 
@@ -1871,10 +2638,11 @@ for _p, _d, _m in [
         ("gb_ui.sh", GB_UI_SH, 0o100755), ("gb_dexopt.sh", GB_DEXOPT_SH, 0o100755),
         ("gb_noop.sh", b"#!/system/bin/sh\nexit 0\n", 0o100755), ("gb_sleeper.sh", GB_SLEEPER, 0o100755), ("gb_fw_stub.sh", GB_FW_STUB, 0o100755),
         ("empty_vintf.xml", EMPTY_VINTF, 0o100644),
-        ("etc/fstab.android-desktop", FSTAB_NATIVE, 0o100644), ("etc/se_manifest.xml", SEMAN, 0o100644),
-        ("etc/init/gb.rc", GB_RC_NATIVE + GB_SLOTSYNC_RC + _COMP_RC, 0o100644), ("etc/build.prop", ODM_BUILD_PROP_NATIVE, 0o100644),
+        ("etc/fstab.android-desktop", FSTAB_VERITY, 0o100644), ("etc/se_manifest.xml", SEMAN, 0o100644),
+        ("etc/init/gb.rc", GB_RC_NATIVE + GB_SLOTSYNC_RC + _COMP_RC + VNNI_RC_BLOCK, 0o100644),   # (W5) vnni last
+        ("etc/build.prop", ODM_BUILD_PROP_NATIVE, 0o100644),
         ("etc/selinux/odm_sepolicy.cil", ODMCIL, 0o100644), ("etc/selinux/precompiled_sepolicy", ODMPRE, 0o100644),
-        ("vup/bin/hw/android.hardware.security.keymint-service", KM_BIN, 0o100755),
+        ("vup/bin/hw/android.hardware.security.keymint-service", KM_BIN_NATIVE, 0o100755),    # (C-2) private sonames
         ("vup/bin/hw/android.hardware.security.secretkeeper.trusty", SK_STUB, 0o100755),
         ("vup/bin/hw/android.hardware.gatekeeper-service.trusty", SK_STUB, 0o100755),
         ("vup/bin/hw/touchpad-inhibitor", SK_STUB, 0o100755),
@@ -1888,10 +2656,10 @@ for _p, _d, _m in [
         ("vup/bin/hw/vendor.google.desktop.futility-executor", GB_REFUSE, 0o100755),
         ("vup/bin/init.adbd-killer.sh", b"#!/system/bin/sh\nexit 0\n", 0o100755),
         ("vup/bin/android-desktop-install", GB_REFUSE, 0o100755)] + (
-        [("vup/bin/gb_slotsync", SLOTSYNC_BIN, 0o100755)] if SLOTSYNC_BIN else []) + _COMP_FILES:
+        [("vup/bin/gb_slotsync", SLOTSYNC_BIN, 0o100755)] if SLOTSYNC_BIN else []) + _COMP_FILES + VNNI_FILES:
     _add_native(_p, _d, _m)
 _add_native("vup/etc", None)
-for _n, _d in KMLIBS:
+for _n, _d in KMLIBS_NATIVE:        # (C-2) lib<x>_gbkm16.so: no stock /vendor/lib64 library is replaced
     _add_native("vup/lib64/" + _n, _d)
 # ---- dGPU payload (INTERFACES 6; W2-08): ESP:/gb/dgpu-<krel>.erofs ----
 # The TU117 firmware (+ WHENCE/LICENCE), the 5 opt-in modules, the NVK ICD and the compute libraries live in one erofs
@@ -2120,8 +2888,130 @@ def _check_common(ents, label):
         assert not path.startswith(("gbnative/priv-app", "gbstage/priv-app")), f"{label}: {path} (no priv-app, W2-10)"
         assert not _BAD_NAME.search(path), f"{label}: {path} looks like a backup or a superseded file (W2-13)"
 
+def _check_gatekeeper(ents, tree, label, present=True):
+    """GATEKEEPER.md 7.5 on one tree ("gbstage" or "gbnative"): with present=True the binary (0755), the reviewed VINTF
+    fragment (0644, the only ODM VINTF fragment) and the rc block (once, the only IGatekeeper/default interface line)
+    are all there, byte for byte the component's; present=False (the test-only no-Gatekeeper tree) none of them. Either
+    way the Trusty Gatekeeper stays masked (empty bind over its fragment, SK_STUB binary, GBINIT whiteout of its .rc)
+    and Weaver undeclared."""
+    d = {p: (m, x) for p, m, x in ents}
+    rc = d[f"{tree}/etc/init/gb.rc"][1]
+    b, v = d.get(f"{tree}/{GK_BIN_DEST}"), d.get(f"{tree}/{GK_VINTF_DEST}")
+    frags = sorted(p for p, (m, x) in d.items() if p.startswith(f"{tree}/etc/vintf/") and x is not None)
+    if present:
+        assert b == (0o100755, GK_BIN), f"{label}: {GK_BIN_DEST} missing, not 0755 or not the accepted binary"
+        assert v == (0o100644, GK_VINTF), f"{label}: {GK_VINTF_DEST} missing, not 0644 or not the reviewed fragment"
+        assert rc.count(GK_RC_BLOCK) == 1 and rc.count(b"service gb_gatekeeper ") == 1, f"{label}: the gatekeeper rc block"
+        assert frags == [f"{tree}/{GK_VINTF_DEST}"], f"{label}: ODM VINTF fragments {frags}"
+    else:
+        assert b is None and v is None and not frags and b"gb_gatekeeper" not in rc, f"{label}: a Gatekeeper part left"
+    assert rc.count(GK_IFACE) == (1 if present else 0), f"{label}: {rc.count(GK_IFACE)} IGatekeeper/default lines"
+    assert rc.count(GK_TRUSTY_BIND) == 1 and rc.count(GK_WEAVER_BIND) == 1, f"{label}: Trusty/Weaver VINTF binds"
+    assert d.get(f"{tree}/vup/bin/hw/android.hardware.gatekeeper-service.trusty") == (0o100755, SK_STUB), \
+        f"{label}: the Trusty Gatekeeper binary must stay the sleep stub"
+    assert d.get("gbinit", (0, b""))[1].count(GK_TRUSTY_WHITEOUT) == 1, f"{label}: GBINIT's Trusty .rc whiteout"
+    # (W4 rehearsal) gb_gatekeeper's stderr (stdio_to_kmsg) reaches dmesg only through the root-only /dev/kmsg_debug
+    assert _has_kmsgdbg(rc), f"{label}: gb.rc must create /dev/kmsg_debug first thing at early-init (gb_kmsgdbg)"
+
+def _check_vnni(ents, tree, label):
+    """(W5) the VNNI libz patch in one tree ("gbstage" or "gbnative"): exactly VNNI_FILES below <tree>/vnni/ (0644, byte
+    for byte); no libz.so* entry outside <tree>/vnni/<id>/{system,vendor}/lib64/libz.so; no gate/build property in
+    /odm/etc/build.prop; the gb.rc block once, after the 'on early-init' /vendor overlay action, every action in it
+    gated on a ro.system/vendor build fingerprint, one bind per packed library; no /odm/vnni use and no libz.so mention
+    anywhere else in gb.rc (no ungated bind); GBINIT's gb.vnni=0 kill switch."""
+    d = {p: (m, x) for p, m, x in ents}
+    rc = d[f"{tree}/etc/init/gb.rc"][1]
+    got = {p[len(tree) + 1:]: v for p, v in d.items() if p.startswith(f"{tree}/vnni/") and v[1] is not None}
+    want = {p: (m, x) for p, x, m in VNNI_FILES}
+    assert got == want, f"{label}: /odm/vnni files {sorted(got)} != inject\\vnni {sorted(want)}"
+    allowed_libz = {f"{tree}/{p}" for p in want if p.endswith("/libz.so")
+                    and re.fullmatch(rf"vnni/{VNNI_ID_RE}/(system|vendor)/lib64/libz\.so", p)}
+    bad_libz = [p for p, (m, _) in d.items()
+                if (m & 0o170000) != 0o040000 and p.rsplit("/", 1)[-1].startswith("libz.so") and p not in allowed_libz]
+    assert not bad_libz, f"{label}: libz.so* entry outside {tree}/vnni/<id>/{{system,vendor}}/lib64/libz.so: {bad_libz}"
+    bp = (d.get(f"{tree}/etc/build.prop", (0, b""))[1] or b"").decode("utf-8", "replace").splitlines()
+    for ln in bp:
+        s = ln.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.split("=", 1)[0].strip()
+            assert k not in VNNI_BINDS.values() and not k.startswith(("ro.system.build.", "ro.vendor.build.")), \
+                f"{label}: /odm/etc/build.prop overrides gate/build property {k}"
+    rest = rc
+    if VNNI_RC_BLOCK:
+        assert rc.count(VNNI_RC_BLOCK) == 1, f"{label}: the vnni rc block must be in gb.rc once"
+        ov = rc.find(b"    mount overlay gbkm /vendor ")
+        ov_heads = [ln.strip() for ln in rc[:ov].splitlines()
+                    if ln.strip() and not ln.startswith((b" ", b"\t", b"#"))] if ov >= 0 else []
+        assert 0 <= ov < rc.index(VNNI_RC_BLOCK) and ov_heads and ov_heads[-1] == b"on early-init", \
+            f"{label}: the vnni binds must come after the 'on early-init' /vendor overlay action"
+        rest = rc.replace(VNNI_RC_BLOCK, b"", 1)
+        lines = VNNI_RC_BLOCK.split(b"\n")
+        heads = [ln for ln in lines if ln and not ln.startswith((b"#", b" "))]
+        binds = [ln for ln in lines if ln.startswith(b"    mount none /odm/vnni/") and ln.endswith(b" bind")]
+        libs = [p for p in want if not p.endswith("/manifest.json")]
+        assert all(re.fullmatch(rf"on early-init && property:ro\.(system|vendor)\.build\.fingerprint={VNNI_FP_RE}".encode(), h)
+                   and all(chr(b) in VNNI_PROP_SAFE for b in h.split(b"=", 1)[1])
+                   for h in heads) and len(heads) == len(binds) == len(libs), f"{label}: an ungated vnni action"
+    assert b"/odm/vnni" not in rest and b"libz.so" not in rest, f"{label}: /odm/vnni or libz.so outside the vnni block"
+    gi = d.get("gbinit", (0, b""))[1]
+    assert all(gi.count(_new) == 1 for _old, _new in VNNI_GBINIT_EDITS), f"{label}: GBINIT's gb.vnni=0 kill switch"
+
+def _check_otagate(ents, tree, label):
+    """(W5b) the OTA gate in one tree ("gbstage" or "gbnative"; OTA_CLASSES, ota-gating DESIGN.md): the validated
+    build file == the boot slot's init_boot fingerprint (0644); gb_otagate.sh (0755) and its rc file (0644; no other rc
+    file names the gate's services or its property); GBINIT's token scan before /proc is unmounted and its gate once,
+    after the /odm copy and the VNNI kill switch, before the bring-up, the module loading and exec /init, its unvalidated
+    branch removing exactly the "skip" roots; every /odm/vup, /odm/vnni, /odm/etc/selinux, /odm/etc/vintf file and every
+    rc bind source below /odm classified; the SELinux cil in its OTA-robust form."""
+    import fnmatch as _fnm
+    d = {p: (m, x) for p, m, x in ents}
+    rcs = {p: x for p, (m, x) in d.items() if p.startswith(f"{tree}/etc/init/") and x is not None}
+    assert d.get(f"{tree}/{OTA_VALIDATED}") == (0o100644, OTA_VALIDATED_BYTES), f"{label}: /odm/{OTA_VALIDATED}"
+    assert f"{tree}/{OTA_STATE}" not in d, f"{label}: /odm/{OTA_STATE} is written at boot, never packed"
+    assert d.get(f"{tree}/{OTA_SCRIPT}") == (0o100755, GB_OTAGATE_SH), f"{label}: /odm/{OTA_SCRIPT} (0755)"
+    assert d.get(f"{tree}/{OTA_RC_FILE}") == (0o100644, OTA_RC) and not any(
+        s in x for p, x in rcs.items() if p != f"{tree}/{OTA_RC_FILE}" for s in (b"gb_otagate", b"ota_gate")), \
+        f"{label}: the OTA gate rc file /odm/{OTA_RC_FILE} (0644, the only rc file naming the gate)"
+    gi = d.get("gbinit", (0, b""))[1]
+    gate = gi.find(b"if [ -f /odm/etc/gb/ota_validated ]; then\n")
+    marks = [gi.find(s) for s in (b"/busybox umount /proc\n", b"/busybox cp -a $SRC/. /odm/\n",
+                                  b"[ \"$VN\" = 0 ] && /busybox rm -rf /odm/vnni\n",
+                                  b"if [ \"$HW\" = native ] && [ \"$HWTOK\" = 1 ]",
+                                  b"if [ \"$HW\" = native ] && [ -f /odm/lib/modules/modules.load ]", b"exec /init\n")]
+    tok = gi.find(OTA_GBINIT_TOKENS)
+    assert gi.count(OTA_GBINIT_TOKENS) == 1 and 0 <= tok < marks[0], f"{label}: GBINIT's gb.otagate token scan"
+    assert gi.count(b"/odm/etc/gb/ota_validated") == 2 and gi.count(OTA_GBINIT_UNVALIDATED) == 1 and min(marks) >= 0 \
+        and marks[1] < marks[2] < gate < gi.find(OTA_GBINIT_UNVALIDATED) < marks[3] < marks[4] < marks[5], \
+        f"{label}: GBINIT's OTA gate (once, after the /odm copy and the VNNI kill switch, before the bring-up and modules)"
+    assert gi.rstrip(b"\n").endswith(b"\nexec /init"), f"{label}: GBINIT must end with exec /init"
+    removed = set(re.findall(rb"/busybox rm -rf /odm/(\S+)\n", OTA_GBINIT_UNVALIDATED))
+    skip = {(p[:-2] if p.endswith("/*") else p).encode() for p, c, _l in OTA_CLASSES if c == "skip"}
+    assert removed == skip, f"{label}: GBINIT's unvalidated branch removes {sorted(removed)}, OTA_CLASSES skip {sorted(skip)}"
+
+    def cls(rel):
+        for p, c, _l in OTA_CLASSES:
+            if _fnm.fnmatchcase(rel, p):
+                return c
+        return None
+    rels = [p[len(tree) + 1:] for p, (m, x) in d.items() if x is not None and p.startswith(
+        tuple(f"{tree}/{s}/" for s in ("vup", "vnni", "etc/selinux", "etc/vintf")))]
+    rels += [s.decode()[len("/odm/"):] for x in rcs.values()
+             for s in re.findall(rb"^\s*mount none (/odm/\S+) \S+ bind$", x, re.M)]
+    unclassified = sorted({r for r in rels if cls(r) is None})
+    assert not unclassified, (f"{label}: injections without an OTA class: {unclassified[:8]} -- add each to OTA_CLASSES "
+                              f"(skip/keep/always; ota-gating DESIGN.md 3)")
+    assert d.get(f"{tree}/etc/selinux/odm_sepolicy.cil") == (0o100644, ODMCIL) and ODMCIL == ota_safe_cil(ODMCIL_RAW) \
+        and not re.search(rb"^\(typepermissive ", ODMCIL, re.M), \
+        f"{label}: the SELinux cil must be the OTA-robust form (ota_safe_cil)"
+    _miss = ota_cil_missing(d[f"{tree}/etc/selinux/odm_sepolicy.cil"][1])
+    assert not _miss, (f"{label}: odm_sepolicy.cil does not make {_miss} permissive (SA-1: the global SELinux mode is "
+                       f"enforcing; OTA_REQUIRED_PERMISSIVE)")
+    assert all(_l.encode() in GB_OTAGATE_SH for _l in OTA_SKIP_LABELS + OTA_KEEP_LABELS), f"{label}: gb_otagate labels"
+
+
 def _check_vm(ents, label="VM tree"):
-    """The gbstage (VMware) tree carries no part of the dGPU stack (invariant 19, VM-1B-01)."""
+    """The gbstage (VMware) tree carries no part of the dGPU stack (invariant 19, VM-1B-01); since W4 it carries zram
+    for mmd, fs-verity in the fstab and the software Gatekeeper (dgpu\\w4\\VM_UPGRADE.md 2.2)."""
     _check_common(ents, label)
     for path, mode, data in ents:
         assert not any(s in path for s in _VM_FORBIDDEN), f"{label}: {path} (no dGPU stack in the VM tree)"
@@ -2129,12 +3019,32 @@ def _check_vm(ents, label="VM tree"):
     assert b"ro.gfx.driver." not in d["gbstage/etc/build.prop"], f"{label}: build.prop has ro.gfx.driver."
     for s in (b"gb_nouveau", b"gb_gfx_selftest", b"nvk_probe", b"gb_gpu_compute", b"gb_gfxdriver"):
         assert s not in d["gbstage/etc/init/gb.rc"], f"{label}: gb.rc mentions {s.decode()}"
-    # wave 3: the VM stays unchanged (items 4, 11, 12): no bring-up script, the shared fstab, no apgetty rule
+    # wave 3 items 11, 12 stay native-only: no bring-up script, no apgetty rule
     assert "gbbringup.sh" not in d, f"{label}: /gbbringup.sh is native only"
-    assert d["gbstage/etc/fstab.android-desktop"] == FSTAB, f"{label}: the VM fstab must be inject\\fstab.android-desktop"
     assert b"apgetty" not in d["gbstage/etc/init/gb.rc"], f"{label}: apgetty is disabled natively only"
-    for p in ("gbstage/vnni_kat", "gbstage/gb_vnni_kat.sh", "gbstage/lib/modules/zram.ko", "gbstage/lib/modules/zsmalloc.ko"):
+    # W4 2.2(b): the fstab of both trees (inject\fstab.android-desktop + fsverity on userdata)
+    assert d["gbstage/etc/fstab.android-desktop"] == FSTAB_VERITY, f"{label}: the VM fstab must be FSTAB_VERITY"
+    # W4 2.2(a): our staged zsmalloc + zram, loaded at early-init after vmwgfx; only mmd writes zram0/disksize
+    krel, rc = kernel_release(), d["gbstage/etc/init/gb.rc"]
+    for n in VM_ZRAM:
+        ko = d.get("gbstage/lib/modules/" + n)
+        assert ko is not None and ko == open(os.path.join(HERE, "inject", "modules", n), "rb").read(), \
+            f"{label}: {n} missing or not the staged inject\\modules copy"
+        assert _vermagic(ko).split()[0] == krel and ko.endswith(SIG_TRAILER), f"{label}: {n} vermagic/signature != {krel}"
+    zi = b"".join(b"    insmod /odm/lib/modules/" + n.encode() + b"\n" for n in VM_ZRAM)
+    assert rc.count(zi) == 1 and rc.count(b"insmod /odm/lib/modules/zram.ko") == 1, f"{label}: zram insmod lines"
+    assert b"disksize" not in rc and b"swapon" not in rc and b"mkswap" not in rc, \
+        f"{label}: only lapis's mmd sizes and enables zram (2.2(a))"
+    # (W4 rehearsal) the fallback for lapis's racing `modprobe zram`: the script, its service and the post-fs-data start
+    zs = {p: (m, x) for p, m, x in ents}.get("gbstage/gb_zram.sh")
+    assert zs == (0o100755, GB_ZRAM_SH) and rc.count(GB_ZRAM_RC) == 1 and rc.count(b"service gb_zram ") == 1, \
+        f"{label}: gb_zram (0755 script, service, post-fs-data start) missing or changed"
+    assert not any(w in GB_ZRAM_SH for w in (b"disksize", b"swapon", b"mkswap")), f"{label}: gb_zram must not set zram up"
+    for p in ("gbstage/vnni_kat", "gbstage/gb_vnni_kat.sh"):
         assert p not in d, f"{label}: {p} belongs to the throwaway KAT tree only"
+    _check_gatekeeper(ents, "gbstage", label)
+    _check_vnni(ents, "gbstage", label)                 # W5: the fingerprint-gated libz patch
+    _check_otagate(ents, "gbstage", label)              # W5b: the OTA gate
 
 def _check_native(ents, label="native tree"):
     _check_common(ents, label)
@@ -2184,11 +3094,14 @@ def _check_native(ents, label="native tree"):
     # wave 3: item 12 (bring-up script, gated GBINIT), item 4 (native fstab), item 11 (apgetty off)
     assert d.get("gbbringup.sh") == (0o100755, GB_BRINGUP_SH), f"{label}: /gbbringup.sh 0755 missing"
     assert d.get("gbinit") == (0o100755, GBINIT), f"{label}: gbinit"
-    assert d["gbnative/etc/fstab.android-desktop"][1] == FSTAB_NATIVE, f"{label}: native fstab (fsverity)"
+    assert d["gbnative/etc/fstab.android-desktop"][1] == FSTAB_VERITY, f"{label}: native fstab (fsverity)"
     rc = d["gbnative/etc/init/gb.rc"][1]
     for s in (b"    setprop desktop.apgetty.enable 0\n", b"on property:init.svc.apgetty=running\n    stop apgetty\n",
               b"on property:init.svc.apgetty=restarting\n    stop apgetty\n"):
         assert s in rc, f"{label}: gb.rc lacks {s!r}"
+    _check_gatekeeper(ents, "gbnative", label)          # W4: the software Gatekeeper (component gatekeeper)
+    _check_vnni(ents, "gbnative", label)                # W5: the fingerprint-gated libz patch
+    _check_otagate(ents, "gbnative", label)             # W5b: the OTA gate
 
 def _gfx_build_id(ents, payload):
     """/odm/etc/gb/gfx_build_id (INTERFACES 5.3, 25.1): one line from the bytes that go into this tree."""
@@ -2224,6 +3137,7 @@ def native_cpio():
             _add_entry(ents, "gbnative/etc/gb/gfx_build_id", _gfx_build_id(ents, p), 0o100644)
         ents = _dedupe(ents, "native tree")
         _check_native(ents)
+        _check_links(ents)                                   # (C-2) link-closure gate of the /vendor overlay
         _NATIVE.append(cpio_newc(ents))
         print(f"native cpio: {len(ents)} entries, {len(_NATIVE[0]):,} B", flush=True)
     return _NATIVE[0]
@@ -2281,11 +3195,12 @@ def vm_test_gfx_cpio():
 
 # ---- test-only VNNI KAT tree (WAVE3_PLAN 6.4, R-13, contract 2.7; lead decision D-e) ----
 KAT_DIR = os.path.join(HERE, "inject", "kat")       # KERNEL's drop: vnni_kat (static x86-64 ELF) + SHA256SUMS
+# (W4) zram is part of the shipped VM tree now (zsmalloc/zram at early-init; lapis's mmd sizes zram0 and enables the
+# swap after boot_completed, VM_UPGRADE.md 2.2(a)). The KAT therefore neither loads the modules nor writes disksize (that
+# would race mmd and abort it); its script waits for mmd's zram swap and reports it ("zram swap on"), so a KAT boot also
+# exercises the W4 zram path under k15.
 KAT_RC = (b"\n# ---- VNNI KAT (VM test only) ----\n"         # one literal: verify_image V28 reads it with ast
           b"on property:sys.boot_completed=1\n"
-          b"    insmod /odm/lib/modules/zsmalloc.ko\n"
-          b"    insmod /odm/lib/modules/zram.ko\n"
-          b"    write /sys/block/zram0/disksize 67108864\n"
           b"    start gb_vnni_kat\n"
           b"\n"
           b"service gb_vnni_kat /system/bin/sh /odm/gb_vnni_kat.sh\n"
@@ -2298,9 +3213,11 @@ GB_VNNI_KAT_SH = (b"#!/system/bin/sh\n"
                   b"# Test-only (WAVE3_PLAN 6.4, R-13): the throwaway VMware KAT image only, never a shipped tree.\n"
                   b"k() { echo \"$1\" > /dev/kmsg; }\n"
                   b"k 'gb_vnni_kat: start'\n"
-                  b"if /system/bin/toybox mkswap /dev/block/zram0 > /dev/null 2>&1 && /system/bin/toybox swapon /dev/block/zram0; then\n"
-                  b"  k 'gb_vnni_kat: zram swap on'\n"
-                  b"else k 'gb_vnni_kat: zram swap FAILED'; fi\n"
+                  # (W4) mmd's zram swap (the VM tree's own zram): wait at most 300 s for zram0 in /proc/swaps
+                  b"z=0\n"
+                  b"while [ $z -lt 300 ] && ! /system/bin/toybox grep -q zram0 /proc/swaps; do /system/bin/toybox sleep 1; z=$((z+1)); done\n"
+                  b"if /system/bin/toybox grep -q zram0 /proc/swaps; then k \"gb_vnni_kat: zram swap on (mmd, after $z s)\"\n"
+                  b"else k 'gb_vnni_kat: zram swap FAILED (no zram0 in /proc/swaps after 300 s: mmd set up none)'; fi\n"
                   b"/system/bin/toybox cat /proc/swaps | while IFS= read -r l; do k \"gb_vnni_kat: swaps $l\"; done\n"
                   # (wave 3 build, R-13 early run) the counters are system-wide (INTERFACES E-15): right after
                   # boot_completed lapis's own processes (system_server, dex2oat, surfaceflinger) emulate VEX VNNI in
@@ -2321,11 +3238,10 @@ GB_VNNI_KAT_SH = (b"#!/system/bin/sh\n"
                   b"/system/bin/toybox timeout 5 /system/bin/toybox cat /sys/kernel/gb_vnni/summary 2>&1 | "
                   b"while IFS= read -r l; do k \"gb_vnni_kat: summary $l\"; done\n"
                   b"k 'gb_vnni_kat: done'\n")
-KAT_FILES = {"gbstage/vnni_kat": 0o100755, "gbstage/gb_vnni_kat.sh": 0o100755,
-             "gbstage/lib/modules/zsmalloc.ko": 0o100644, "gbstage/lib/modules/zram.ko": 0o100644}
+KAT_FILES = {"gbstage/vnni_kat": 0o100755, "gbstage/gb_vnni_kat.sh": 0o100755}    # (W4: zram is in the VM tree)
 
 def _kat_inputs(kat_dir):
-    """(vnni_kat bytes, {module name: bytes}) after the contract 2.7 checks; RuntimeError names what is missing."""
+    """vnni_kat bytes after the contract 2.7 checks; RuntimeError names what is missing."""
     def need(c, msg):
         if not c:
             raise RuntimeError(f"VM test KAT tree: {msg}")
@@ -2349,31 +3265,20 @@ def _kat_inputs(kat_dir):
     phentsize, phnum = struct.unpack_from("<HH", exe, 54)
     need(not any(struct.unpack_from("<I", exe, phoff + i * phentsize)[0] == 3 for i in range(phnum)),
          "vnni_kat has a PT_INTERP (it must be static)")
-    krel = kernel_release()
-    mods = {}
-    for n in ("zsmalloc.ko", "zram.ko"):          # the native set's staged copies (stage_kernel.py NATIVE_EARLY)
-        p = os.path.join(NATIVE_MOD_DIR, n)
-        need(os.path.isfile(p), f"{p} missing")
-        d = open(p, "rb").read()
-        need(_vermagic(d).split()[0] == krel and d.endswith(SIG_TRAILER),
-             f"{n}: vermagic/signature do not match the kernel {krel} (stage it first)")
-        mods[n] = d
-    return exe, mods
+    return exe
 
 _VMKAT = []
 def vm_test_kat_cpio(kat_dir=None):
     """Test-only VM tree (WAVE3_PLAN 6.4): the gbstage cpio plus /odm/vnni_kat (inject\\kat, checked against its
-    SHA256SUMS), the k15-staged zsmalloc.ko + zram.ko from inject\\native\\modules (this throwaway image only: the
-    shipped VM tree stays without zram, item 5), /odm/gb_vnni_kat.sh and the KAT rc fragment appended to gb.rc.
-    For one throwaway VMware boot (build_usb.py --vm-test --vm-test-kat); never written to lapis.bin."""
+    SHA256SUMS), /odm/gb_vnni_kat.sh and the KAT rc fragment appended to gb.rc. (W4: the shipped VM tree has zram
+    itself now, so the KAT no longer adds zsmalloc/zram and waits for mmd's zram swap.) For one throwaway VMware boot
+    (build_usb.py --vm-test --vm-test-kat); never written to lapis.bin."""
     if _VMKAT and kat_dir is None:
         return _VMKAT[0]
-    exe, mods = _kat_inputs(kat_dir or KAT_DIR)
+    exe = _kat_inputs(kat_dir or KAT_DIR)
     ents = [(p, m, (x + KAT_RC) if p == "gbstage/etc/init/gb.rc" else x) for p, m, x in _VM_ENTRIES]
     _add_entry(ents, "gbstage/vnni_kat", exe, 0o100755)
     _add_entry(ents, "gbstage/gb_vnni_kat.sh", GB_VNNI_KAT_SH, 0o100755)
-    for n, d in mods.items():
-        _add_entry(ents, "gbstage/lib/modules/" + n, d, 0o100644)
     ents = _dedupe(ents, "VM test KAT tree")
     _check_common(ents, "VM test KAT tree")
     old, new = {p: (m, x) for p, m, x in _VM_ENTRIES}, {p: (m, x) for p, m, x in ents}
@@ -2387,6 +3292,40 @@ def vm_test_kat_cpio(kat_dir=None):
         _VMKAT.append(cpio)
     print(f"VM test KAT tree: {len(extra)} files added to the VM tree", flush=True)
     return cpio
+
+# ---- test-only trees of the W4 rehearsal (dgpu\w4\VM_UPGRADE.md 2.3, GATEKEEPER.md 9.2/9.5) ----
+# --vm-test-rehearsal (build_usb.py) boots EXACTLY INJECT_CPIO, the tree `GB_WRITE_LAPIS=1 build_esp.py` writes into
+# lapis.bin; its gb/inject.gz sha256 (vm_tree_record) is what the user-VM preview must match (verify_image
+# --expect-inject-sha256). --vm-test-nogk boots that tree minus exactly the Gatekeeper trio: the stand-in for a pre-W4
+# ESP in the fix-forward / rollback-after-clear tests, on the throwaway rehearsal disk only.
+GK_NOGK_DIRS = ("gbstage/etc/vintf", "gbstage/etc/vintf/manifest")    # exist only for the fragment
+
+def vm_tree_record(cpio=None):
+    """The identity of a VM tree: '<sha256>  gb/inject.gz' (the gzip is deterministic, mtime 0) + the cpio's sha256."""
+    cpio = INJECT_CPIO if cpio is None else cpio
+    return (f"{_hl.sha256(inject_gz(cpio)).hexdigest()}  gb/inject.gz\n"
+            f"{_hl.sha256(cpio).hexdigest()}  gb/inject.cpio (uncompressed)\n").encode()
+
+_VMNOGK = []
+def vm_test_nogk_cpio():
+    """Test-only VM tree: the shipped VM tree without the software Gatekeeper (no binary, no VINTF fragment, no rc
+    block; the Trusty masks stay), everything else byte-identical. Never written to lapis.bin; build_usb.py --vm-test
+    --vm-test-nogk only (output below D:\\gb-w4test\\)."""
+    if _VMNOGK:
+        return _VMNOGK[0]
+    drop = {"gbstage/" + GK_BIN_DEST, "gbstage/" + GK_VINTF_DEST} | set(GK_NOGK_DIRS)
+    ents = [(p, m, (x.replace(GK_RC_BLOCK, b"", 1) if p == "gbstage/etc/init/gb.rc" else x))
+            for p, m, x in _VM_ENTRIES if p not in drop]
+    _check_common(ents, "VM test no-Gatekeeper tree")
+    _check_gatekeeper(ents, "gbstage", "VM test no-Gatekeeper tree", present=False)
+    old, new = {p: (m, x) for p, m, x in _VM_ENTRIES}, {p: (m, x) for p, m, x in ents}
+    assert set(old) - set(new) == drop and not set(new) - set(old), sorted(set(old) ^ set(new))
+    for p in new:
+        want = (old[p][0], old[p][1].replace(GK_RC_BLOCK, b"", 1)) if p == "gbstage/etc/init/gb.rc" else old[p]
+        assert new[p] == want, p
+    _VMNOGK.append(cpio_newc(ents))
+    print(f"VM test no-Gatekeeper tree: {len(drop)} entries and the gatekeeper rc block left out", flush=True)
+    return _VMNOGK[0]
 
 BOOTCONFIG_EXTRA = (
  'androidboot.force_normal_boot = "1"\n'
@@ -2605,6 +3544,11 @@ def make_esp(files, size=ESP_BYTES, min_free=0):
           f"{fat.clusters:,} clusters" + (f" (min_free {min_free/2**20:.1f} MiB)" if min_free else ""), flush=True)
     return img
 
+def vm_min_free(files):
+    """(W4) Free space a VM ESP must keep: room for the other slot's initrd that gb_slotsync builds after an OTA, plus a
+    16 MiB margin (no boot-log floor in the VM). verify_image V1 checks the same for every VM kind."""
+    return max(len(v) for k, v in files.items() if k.startswith("initrd-")) + 16 * MiB
+
 if __name__ == "__main__":       # build_usb.py imports this module for the shared pieces and builds its own ESP
     FILES = slot_files(CMDLINE_VM, INJECT_CPIO, "Googlebook lapis x86")
     if os.environ.get("GB_NATIVE_TEST"):
@@ -2622,7 +3566,10 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
                                                   f"initrd  /initrd-ntest.img\noptions {ntest}\n").encode(),
                  "initrd-ntest.img": make_initrd(native_cpio(), SLOT)}
         print("NATIVE TEST entry is the default for this build", flush=True)
-    ESP = make_esp(FILES)
+        ESP = make_esp(FILES)
+    else:
+        ESP = make_esp(FILES, min_free=vm_min_free(FILES))     # (W4) an OTA's second initrd must still fit
+        print("VM tree:", vm_tree_record().decode().replace("\n", "; "), flush=True)
     print("CMDLINE:", CMDLINE_VM, flush=True)
     print(f"boot slot: {SLOT}; entries: {sorted(k for k in FILES if k.startswith('loader/entries'))}", flush=True)
     # write ESP into lapis.bin's EFI-SYSTEM partition (only that region); the guard is checked again right before it

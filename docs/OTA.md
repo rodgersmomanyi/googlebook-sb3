@@ -62,6 +62,55 @@ porting notes (github.com/linuxkid473/gbos-x86 @f8a5c1a, porting.md); the code i
 Then reboot as Android asks. The new slot boots with **our kernel** and the new slot's ramdisks, vendor modules and
 system; Android marks it successful (`gb_bootok` -> `bootctl mark-boot-successful`, helped by the `crossystem` stub).
 
+## The OTA gate (wave 5)
+
+Everything our ESP adds to `/odm` (drivers, HALs, configuration, the KeyMint and Gatekeeper grafts, the VNNI libz
+patch) was built and tested for one lapis build. After an update, `gb_slotsync` starts the new slot with the same
+`/gb/inject.gz`, so build N's additions also start build N+1. Since wave 5 the image records the build it was made for
+and checks it at every boot:
+
+* **At build time** `build_esp.py` writes the boot slot's `init_boot` fingerprint (`ro.bootimage.build.fingerprint`)
+  to `/odm/etc/gb/ota_validated`.
+* **At every boot** `gbinit` compares it with the fingerprint in the booting slot's own `init_boot` ramdisk, before
+  Android's init starts.
+  * Same build: nothing changes.
+  * Another build, or one it cannot read: `gbinit` removes `/odm/vnni` (the patched libz, the only build-specific
+    addition that is not needed to boot; [PERFORMANCE.md](PERFORMANCE.md)) and appends
+    `ro.vendor.gb.ota_gate=unvalidated` to `/odm/etc/build.prop`. Everything needed to boot stays as built:
+    skipping the KeyMint graft, the VINTF manifest, the fstab or the SELinux list would turn a possibly stale
+    addition into a certain boot failure.
+  * On such a build, at `boot_completed`, the notification **"System update not validated"** appears (tag
+    `gb_update`; natively through `gb_notify`, in the VM posted directly) and one kmsg line is written.
+* **The SELinux list is OTA-robust.** Every `(typepermissive T)` line of
+  [`inject/odm_sepolicy.cil`](../inject/odm_sepolicy.cil) is packed as `(optional gb_ota_T (typepermissive T))`.
+  Before, one type that a later build removes made init's boot-time policy compile fail, which means a reboot loop.
+  Now only that block is skipped and that domain is enforcing on that build. lapis .276's own `secilc` compiles both
+  forms to the byte-identical policy. (The global SELinux mode is enforcing; this list is what makes the domains
+  permissive, see [ARCHITECTURE.md](ARCHITECTURE.md).)
+* **Build-time checks.** `build_esp.py` refuses an image in which any file below `/odm/vup`, `/odm/vnni`,
+  `/odm/etc/selinux` or `/odm/etc/vintf`, or any rc bind source, has no class in `OTA_CLASSES` (skip, keep or
+  always), and one whose SELinux list lacks a domain the image needs (`OTA_REQUIRED_PERMISSIVE`: `init`,
+  `vendor_init`, `ueventd`, the Gatekeeper and KeyMint HALs, `gatekeeperd`, `keystore`, `system_server`, `zygote`,
+  `shell`).
+
+**When "System update not validated" appears:** the new build runs with this image's additions, which were not
+tested on it. Most things are expected to work. To validate it, rebuild the ESP on the host from a `lapis.bin` that
+has the new build in its boot slot: in the VM (VM off) `python -I vnni_prepare.py` (optional; patches the new build's
+libz), then `GB_WRITE_LAPIS=1 python -I build_esp.py`; for a dual-boot install, a new export and
+`install_dualboot.ps1 -UpdateEspOnly`. To go back instead, pick the previous slot's entry in the boot menu.
+
+**Boot-menu tokens** (press `e` on the entry and append to the line; one boot):
+
+* `gb.otagate=0` turns the gate off for that boot. The VNNI binds are still gated on the exact build fingerprint.
+* `gb.otagate=force` takes the "not validated" path on the validated build (to test it: `/odm/vnni` removed, the
+  property set, the notification shown).
+
+**Tested:** `gbinit`'s gate under the shipped busybox with the real slot a and slot b fingerprints, every token and
+every failure path (each one still reaches `exec /init`; 54 builder checks); the notification on a VM by rewriting the
+gate's state file; the validated path in every wave 5 boot (`/odm/etc/gb/ota_state` says `validated`). A real update
+to an unvalidated build has not happened yet. Design, classification of all 136 additions and tests:
+[native/ota-gating/DESIGN.md](../native/ota-gating/DESIGN.md).
+
 ## Host-side rebuilds follow the slot
 
 `build_esp.py` and `build_usb.py` never assume slot A: `extract_slot.boot_slot()` reads the same vbmeta GPT
@@ -85,6 +134,8 @@ complete and no firmware is touched.
 * **fs-verity**: Android itself enables ext4 verity on `/data` at the first boot, natively and in the VM (the VM's
   `/data` already has it). The native fstab also names `fsverity` (wave 3), which adds nothing on top
   ([INPUTS.md](INPUTS.md#userdata-fs-verity)).
+* After an update the image marks the new build "not validated" and skips the libz patch on it (see
+  [The OTA gate](#the-ota-gate-wave-5)).
 * Natively, native modules we ship that are copies of lapis vendor modules (the HDA codecs) must match the booted
   build; `gb_audio.sh` swaps in the vendor_dlkm copies when they do not.
 * The ESP needs room for two initrds: 192 MiB in the VM, 512 MiB on USB/internal images.

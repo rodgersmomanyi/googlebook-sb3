@@ -31,7 +31,7 @@ certutil -hashfile out\googlebook-sb3-usb.img SHA256   # must equal the first wo
   `pvmfw_a/b`, `misc`, `metadata`, `frp_persist`, `desktop_security_persist`, `desktop_security_storage`, `super`,
   `userdata`) and the vbmeta slot attributes (at least one slot marked successful);
 * the copied partitions are identical to `lapis.bin` (full compare; `super` sampled), the blank ones are zero;
-* the ESP (checks V1-V28):
+* the ESP (checks V1-V31 and V12b):
   * the FAT32 layout and its free space;
   * exactly the default entry and its `[NVIDIA test]` twin, whose `androidboot.boot_part_uuid` names this image's
     `super`, with the native options (`gb.hw=native`, `efi_pstore.pstore_disable=1`, `module_blacklist=`,
@@ -47,7 +47,11 @@ certutil -hashfile out\googlebook-sb3-usb.img SHA256   # must equal the first wo
   * the native fstab asks for `fsverity` on userdata, while the VM tree keeps the shared fstab unchanged;
   * no `gb\gb.cfg`, no `gb\overlay\` and no `gb.overlay=` in any entry (the bring-up config of section 8 is
     something you add yourself, for one boot);
-  * no VMware-only, test-only or backup file in the native tree.
+  * no VMware-only, test-only or backup file in the native tree;
+  * (wave 4) the software Gatekeeper's binary, VINTF fragment and init block (V29);
+  * (wave 5) the VNNI libz patch: `/odm/vnni` equal to `inject/vnni`, gated on the exact build fingerprint (V31,
+    [PERFORMANCE.md](PERFORMANCE.md#checking-it));
+* every x86-64 ELF executable and shared object in the initrd cpio has bionic-compatible `PT_LOAD` segments (`p_offset == p_vaddr mod max(p_align, 4 KiB)`, check `V12b`).
 
 Pass `--krel FILE` to also check the kernel release against a file. Use `--esp FILE` for an ESP image alone. It ends
 with `RESULT: OK` or the list of problems (exit code 1). Do not flash an image that fails it.
@@ -90,7 +94,8 @@ internal disk (section 5).
 |---|---|
 | Display / brightness | picture appears; brightness keys or Settings → Display |
 | Base keyboard and touchpad | type, click, two-finger scroll, quick flicks (a short fast swipe should move the pointer at once) |
-| Touchscreen and pen | tap, swipe, draw with the Surface Pen |
+| Touchscreen and pen | tap, swipe, draw with the Surface Pen; rest your palm while the pen hovers (touch is suppressed while the pen is in proximity) |
+| Power button and volume keys | short press of the power button sleeps and wakes the screen (also with the clipboard detached); Volume Up / Down move the volume slider |
 | Battery | the status bar shows one combined level for both batteries; plug/unplug the charger |
 | Detach | press the detach key on the keyboard: the base should release after a moment |
 | Wi-Fi / Bluetooth | connect to Wi-Fi, pair a device |
@@ -116,8 +121,11 @@ into a Windows PC and read `gblog\` from its FAT32 partition. Include those file
 Each snapshot starts with a one-screen `== summary` block for triage: the 8250 / Surface Aggregator lines, the
 Aggregator input devices, the ALSA cards and DRAS lines, firmware load failures, swap, PCI functions without a
 driver, the `#UD` emulator counter (`/sys/kernel/gb_vnni/summary`), the i915 "white veil" and HWUI-on-Vulkan greps,
-a held system update (`gb_slotsync HOLD:`), the apgetty and fs-verity state and the ESP bring-up log. Section 7 maps
-symptoms to those lines.
+a held system update (`gb_slotsync HOLD:`), the apgetty and fs-verity state and the ESP bring-up log. Images from
+wave 5 on add: the power and volume buttons, the posture (whether Android switched the built-in keyboard off), the
+sound driver mode, Wi-Fi, Bluetooth, the cameras, programs that cannot start (`linker:`), deferred driver probes and
+panel self-refresh errors. They also keep a copy of the boot's first kernel messages (without SELinux `avc:` lines),
+so the later snapshots still show them (`kernel log:` line). Section 7 maps symptoms to those lines.
 
 ### First-boot checklist
 
@@ -126,14 +134,21 @@ Windows and check its `== summary` block:
 
 | Check | Line in the summary | Good result |
 |---|---|---|
-| Keyboard base, touchpad, batteries, charger, detach (the Surface Aggregator link) | `serial 8250:`, `serial errors:`, `serial surface_serial_hub bound:` | `Serial: 8250/16550 driver, 4 ports`; `dw-apb-uart -22: 0`; a device name after `bound:`. Read `serial 8250:` in the earliest file (`t40`): later snapshots can say `no 8250 banner` once the early kernel messages have left the log buffer |
+| Keyboard base, touchpad, batteries, charger, detach (the Surface Aggregator link) | `serial 8250:`, `serial errors:`, `serial surface_serial_hub bound:` | `Serial: 8250/16550 driver, 4 ports`; `dw-apb-uart -22: 0`; `failed to setup IRQ: 0`; a device name after `bound:`. On images built before wave 5, read `serial 8250:` in the earliest file (`t40`): their later snapshots can say `no 8250 banner` once the early kernel messages have left the log buffer |
 | Base keyboard and touchpad as input devices | `inputs (Surface Aggregator HID, bus 0019):` | the keyboard and the touchpad are listed |
+| Power button and volume keys | `buttons:` (and `[vendor.gb.buttons]` in `== getprop`) | `MSHW0040 bound to soc_button_array`; `INT3455 pinctrl bound`; `gpio-keys inputs: 2`; `bound inputs=2` |
+| Posture (built-in keyboard/touchpad enabled) | `posture:` (and `gb_hw: diag: posture:` in `== dmesg`) | `mCommittedState=OPEN` (laptop) or `TABLET` (detached); `disabled by Android: none` |
 | Sound | `audio cards:`, `audio DRAS:` | the card id `sofhdadsp`; more than 0 DRAS lines naming `sofhdadsp` |
+| Sound driver mode (wave 5) | `audio dsp_driver=` | `3` (SOF); `gb_audio:` ends with `card sofhdadsp = card0` and `done:`. `1` only if you chose the legacy driver (section 7, "No sound") |
+| Deferred driver probes (wave 5) | `deferred probes (-517, ...)` | at most `surface_hotplug MSHW0153:00`: a driver that waited for another one and was retried. Not an error |
+| Wi-Fi (wave 5) | `wifi:` and the `iwlwifi` line under it | `wlan0`; `link: wpa_supplicant ok; hostapd ok`; `loaded firmware version ...`. `FAILED: CANNOT LINK EXECUTABLE ...` means Wi-Fi cannot connect on this image: report it |
+| Bluetooth (wave 5) | `bluetooth:` and the `Bluetooth: hci0:` lines under it | `hci0`; `hal=running`; `Firmware loaded in ...` or `Firmware already loaded` |
+| Programs that cannot start (wave 5) | `linker:` and `-- linker failures` | `CANNOT LINK lines: 0 logcat, 0 kernel`. `dlopen failed` lines can be normal for optional libraries; note the top ones in your report |
 | Firmware (Wi-Fi, Bluetooth, display, sound) | `-- firmware load failures (dmesg)`, `firmware i915 DMC:` | no `Direct firmware load for ... failed` line (note any names, for example Bluetooth `ibt-...`); a DMC line |
 | Data partition fs-verity | `fs-verity:` | `ext4 feature present`; no `FS_STAT_ENABLE_VERITY_FAILED` or `Failed to run tune2fs` |
 | Serial login console off | `apgetty:` | `desktop.apgetty.enable=0`, `init.svc.apgetty` not `running` |
 | AVX-VNNI emulator | `-- gb_vnni` | `emulated <n> ... irqon <n> ...` with both numbers equal |
-| Grey, washed-out picture | `i915 white veil:` | note the count; section 7 if the picture is washed out |
+| Grey, washed-out picture | `i915 white veil:` | images from wave 5 on: `drmhwc LOG_GAMMA_LUT lines: 0` and `hwc: use_log_gamma_lut=false persistent_hdr=false force_color_mode=-1` (the composer's sRGB output; the same values are in the `== getprop` section). Section 7 if the picture is washed out |
 | Apps drawing with the wrong GPU | `HWUI Vulkan queueCount abort lines:` | `0` |
 | System update held | `gb_slotsync HOLD:` | empty |
 | Bring-up configuration | `-- ESP bring-up` | `absent (gb.overlay=1 not set)`, unless you used section 8 on purpose |
@@ -179,18 +194,25 @@ boot option is added for one boot by pressing `e` on the entry in the systemd-bo
 | Symptom | Look for | Then |
 |---|---|---|
 | Black screen right after the systemd-boot menu (no `gblog\` file for that boot at all) | nothing is written: the kernel never ran | The firmware may hang on the kernel's `NX_COMPAT` flag: [NATIVE.md, Known risks](NATIVE.md#known-risks--open-points) (`build_internal.py --clear-nx-compat` clears it for an internal install). |
-| No base keyboard or touchpad, no battery level, charger or detach | `serial 8250:` must show `Serial: 8250/16550 driver, 4 ports`; `serial errors: dw-apb-uart -22: 0`; `serial surface_serial_hub bound:` names a device; the `== cmdline` section contains `8250.nr_uarts=4` | On the Surface Book 3 the base keyboard, touchpad, batteries, charger and detach all go through the Surface Aggregator, whose link is a UART. Our kernel is built with no 8250 ports at run time, so without `8250.nr_uarts=` that UART never registers (`-22`). Images built before wave 3 dropped the token natively: see [below](#images-built-before-wave-3-no-keyboard-base). |
-| No sound | `audio cards:` must list the card id `sofhdadsp`; `audio DRAS: logcat lines naming sofhdadsp:` above 0 | DRAS matches `<soundcard>` in `/vendor/etc/data/hal_configs/audio_default.xml` against the ALSA card **id** (`sofhdadsp`, not the name `sof-hda-dsp`). The `gblog\audio-*` report has the details ([native/audio](../native/audio/)). |
+| The boot logo stays and nothing happens; no `gblog\` file for that boot | nothing is written: the boot stopped before Android | Either the firmware hangs on `NX_COMPAT` (row above), or the kernel oopsed while `gbinit` loaded i915, IPTS (touch), the camera or the Surface modules. With `panic=0` the boot stops there, and natively there is no screen console. To find the module, turn one module off per boot with `GB_SKIPMOD=` ([section 8](#8-bring-up-configuration-gbgbcfg)), i915 last: without it there is no picture. |
+| No base keyboard or touchpad, no battery level, charger or detach | `serial 8250:` must show `Serial: 8250/16550 driver, 4 ports`; `serial errors: dw-apb-uart -22: 0`; `serial surface_serial_hub bound:` names a device; the `== cmdline` section contains `8250.nr_uarts=4` | On the Surface Book 3 the base keyboard, touchpad, batteries, charger and detach all go through the Surface Aggregator, whose link is a UART. Our kernel is built with no 8250 ports at run time, so without `8250.nr_uarts=` that UART never registers (`-22`). Images built before wave 3 dropped the token natively: see [below](#images-built-before-wave-3-no-keyboard-base). A `-517` line (`deferred probes` in the summary) is a driver that waited for another one and was retried: not an error. |
+| No keyboard or touchpad input in Android although `inputs (Surface Aggregator HID, bus 0019):` lists `Microsoft Surface 045E:09AE Keyboard`, or the device immediately goes to sleep ("no keyboard") | `posture:` in the summary (or `gb_hw: diag: posture:` in `== dmesg`): `mCommittedState=CLOSED` or `disabled by Android: Microsoft Surface 045E:09AE Keyboard` (`Enabled: false`) | lapis's `DesktopDeviceStateProvider` puts the device into `CLOSED` when the lid switch reads closed, which disables built-in input devices and forces sleep. For one boot without a shell, add `GB_PROP_1=vendor.gb.posture=open` to `gb\gb.cfg` and boot once with `gb.overlay=1` added to the boot entry ([section 8](#8-bring-up-configuration-gbgbcfg)). `gb_hw.sh posture` resolves the `OPEN` state id after `sys.boot_completed=1` and runs `cmd device_state state <id>`. To keep the override across boots, use `persist.vendor.gb.posture=open` (`reset` cancels it). While a posture override is active, closing the lid does not put the device in `CLOSED` (use the power button to sleep). |
+| Power button and volume keys do nothing; a detached clipboard cannot wake from sleep | `buttons:` in the summary, `[vendor.gb.buttons]` in `== getprop`, and `gb_hw: buttons:` in `== dmesg` | `MSHW0040:00` (`soc_button_array`) needs lapis's `pinctrl-icelake` (`INT3455:00`), which loads at coldboot after `gbinit`. Images from wave 5 on rebind `MSHW0040:00` in `gb_hw.sh buttons` `on boot` (and retry once in `gb_hw.sh diag`) so two `gpio-keys` input devices appear. If `buttons:` still reports `FAILED`, include the full `gblog\` folder in your report. |
+| No sound | `audio cards:` must list the card id `sofhdadsp`; `audio DRAS: logcat lines naming sofhdadsp:` above 0 | DRAS matches `<soundcard>` in `/vendor/etc/data/hal_configs/audio_default.xml` against the ALSA card **id** (`sofhdadsp`, not the name `sof-hda-dsp`). The `gblog\audio-*` report has the details ([native/audio](../native/audio/)). If `audio cards:` stays empty and the log shows SOF errors (`sof-audio-pci-intel-icl ... error`), try the older HDA driver for one boot: press `e` on the entry and change `snd_intel_dspcfg.dsp_driver=3` to `snd_intel_dspcfg.dsp_driver=1`. Speakers, the headphone jack and HDMI/DP audio then use the legacy driver; the internal microphones need SOF and do not work with it. The summary then shows `audio dsp_driver=1` and the card id `PCH`. This setting cannot go into `gb\gb.cfg`: the kernel reads it once at boot, from the command line only. Report which driver worked. |
 | Hang or reboot loop with the keyboard base attached, once Android is up | the dGPU report, `vendor.gb.nouveau.result` | Add ` gb.nouveau=0` (this boot only). Settings > System > Graphics > **Intel only** keeps the NVIDIA driver off ([NVIDIA.md](NVIDIA.md#safety-rails-and-recovery)). |
-| Grey, washed-out picture ("white veil"); Night Light changes nothing | `i915 white veil: drmhwc LOG_GAMMA_LUT lines:` above 0, and the current `gb_ignore_user_gamma=` | Kernel build #15 has an opt-in switch, `i915.gb_ignore_user_gamma` (default 0 = unchanged). It is set **only** through the ESP bring-up config ([NATIVE.md](NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg)): `GB_MODOPTS_i915=gb_ignore_user_gamma=3` in `gb\gb.cfg`, then boot once with ` gb.overlay=1`. `3` makes the gamma and degamma tables linear (Night Light stops working; the CTM-based colour-correction accessibility modes keep working); `7` also drops the CTM (gbOS86's fix). Whether the SB3 panel needs it at all is not known yet. |
+| Grey, washed-out, pale picture ("white veil") | the summary's `i915 white veil:` line: `drmhwc LOG_GAMMA_LUT lines:` above 0 means the composer took its log-gamma fallback (images before wave 5 always print 0 there: count `Missing optional LOG_GAMMA_LUT` in the `== logcat` section instead); its `hwc:` values (`use_log_gamma_lut`, `persistent_hdr`, `force_color_mode`, also in the `== getprop` section); `gb_ignore_user_gamma=` | Expected cause (from the composer binary, wave 5): lapis's vendor build.prop puts the stock composer in the BT.2020 colour mode of Google's own panel (`force_color_mode=13`). The composer then adds a BT.709→BT.2020 gamut matrix to i915's colour matrix (CTM) and tags the eDP output as BT.2020, so colours look pale on this sRGB panel. Images from wave 5 on use the composer's own defaults natively (`-1`, `false`, and `use_log_gamma_lut=false`), and Night Light keeps working. On older images, boot once with the three `GB_PROP_<n>` lines of [section 8](#8-bring-up-configuration-gbgbcfg). If the picture is still pale: `GB_MODOPTS_i915=gb_ignore_user_gamma=4` drops the CTM. Night Light and the colour-correction accessibility modes then stop working, because they use the same matrix. `3` changes nothing on this image: natively the composer already clears the gamma LUT on every frame and never sets a degamma LUT. Report what you see either way. |
+| Flicker, ghost images ("3D glasses"), short freezes of the picture | the summary's `i915 PSR/underrun lines:` above 0 (images from wave 5 on), or the `== dmesg` part of the log: `CPU pipe A FIFO underrun`, `Selective fetch area calculation failed`, PSR errors | These usually come from Panel Self Refresh (PSR2) or frame-buffer compression on the eDP panel. Add `GB_MODOPTS_i915=enable_psr=0 enable_fbc=0` to `gb\gb.cfg` and boot once with ` gb.overlay=1` ([section 8](#8-bring-up-configuration-gbgbcfg)). Typing `i915.enable_psr=0` in the boot editor does nothing (see below). gbOS86 needed exactly these two options on another Intel Surface panel. |
 | Quick flicks on the touchpad do not move the pointer | `inputs (Surface Aggregator HID, bus 0019):` lists the touchpad | The touchpad IDC sets `gestureProp.Change_Timeout = 0.02` (Android's default holds motion for 200 ms after touchdown). Report it if flicks still fail. |
 | The boot hangs or misbehaves after you changed `gb\gb.cfg` | `-- ESP bring-up (/odm/gbinit_bringup.log)` | Boot the normal entry (it never carries `gb.overlay=1`), or rename `gb\gb.cfg` from Windows. A format error refuses the whole file (nothing in it is applied); a single refused setting (unknown key, denied property, module not in `modules.load`, overlay path not allowed) is skipped with its own log line and the rest is applied. |
 | Notification "System update held: Kernel mismatch" | `gb_slotsync HOLD:` | The update's kernel interface (KMI) differs from our kernel's, so its vendor modules would not load: the default stays on the old slot ([OTA.md](OTA.md#kernel-check-before-the-switch)). |
-| Wi-Fi or Bluetooth missing | `-- firmware load failures (dmesg)` (`Direct firmware load for ... failed`) | Note the file name in your report; [INPUTS.md](INPUTS.md#firmware-native-only) lists what is staged and from where. |
+| Notification "System update not validated" (wave 5 images) | `gb_otagate: UNVALIDATED build: ...` in `== dmesg`; `[ro.vendor.gb.ota_gate]: [unvalidated]` in `== getprop` | Android was updated to a build this image was not made for. The image then skips its build-specific libz patch and keeps everything else; most things are expected to work, but nothing was tested on that build. Rebuild the boot partition for the new build on the host, or pick the previous slot's `(slot X)` entry in the boot menu. Boot options for one boot: ` gb.otagate=0` (gate off), ` gb.otagate=force` (test the "not validated" path on the validated build) ([OTA.md](OTA.md#the-ota-gate-wave-5)). |
+| Wi-Fi or Bluetooth missing | `-- firmware load failures (dmesg)` (`Direct firmware load for ... failed`); from wave 5 on also `wifi:` and `bluetooth:` | Note the file name in your report; [INPUTS.md](INPUTS.md#firmware-native-only) lists what is staged and from where. `wifi: ... link: wpa_supplicant FAILED: CANNOT LINK EXECUTABLE ...` means the Wi-Fi supplicant of this image cannot start, so Wi-Fi cannot scan or connect even though the card works (`wlan0` present, firmware loaded): report it with the `gblog\` folder. |
+| A feature never starts; a service keeps restarting (wave 5 images) | `linker:` and the `-- linker failures (most frequent first)` lines below it | `CANNOT LINK EXECUTABLE "<program>"` means Android cannot load that program: one of its libraries is missing or does not match. Report the line. `dlopen failed` lines from optional plugins can be normal; the summary leaves out lines from `/data` (app names). |
+| Camera app shows no cameras, or `vendor.camera-provider-2-7-legacy-wrapper` keeps restarting | `camera:` line in `== summary` (`HAL load failures:` must be `0`), `CANNOT LINK lines:` (`0`), and `intel-ipu6` firmware lines in dmesg | Images built before wave 5 had misaligned `PT_LOAD` headers in the staged camera ELFs (`dlopen failed: cannot find "n34_0_Box_C"`), fixed in wave 5 (`V12b`). On hardware, verify that `intel/ipu/ipu4p_fw.bin` was staged when building the image ([INPUTS.md](INPUTS.md#firmware-native-only)). If the IPU4P kernel driver itself hangs or errors during bring-up, add `GB_SKIPMOD=intel_ipu6_isys,intel_ipu6` to `gb\gb.cfg` and boot once with ` gb.overlay=1`. |
 | HWUI aborts (apps crash on start) | `HWUI Vulkan queueCount abort lines:` above 0 | HWUI landed on a Vulkan device with one queue per family. Report it with the `gblog\` folder; the supported workaround is Settings > System > Graphics > **Intel only** ([NVIDIA.md](NVIDIA.md#status-and-what-to-test-first)). |
 
-Typing `<module>.<parameter>=` on the kernel command line does nothing for our own modules (i915, the Surface
-modules, ...): `gbinit` loads them with `insmod`, which never reads the command line. The ESP bring-up config's
+Typing `<module>.<parameter>=` on the kernel command line (for example `i915.enable_psr=0`) does nothing for our own
+modules (i915, the Surface modules, ...): `gbinit` loads them with `insmod`, which never reads the command line. The ESP bring-up config's
 `GB_MODOPTS_<module>=` is the way to pass a module option for testing. The table's structure follows gbOS86's
 [logs](https://gbos86.com/docs/logs) and [install](https://gbos86.com/docs/install) pages.
 
@@ -228,14 +250,38 @@ If such a boot misbehaves, boot the normal entry again (it never reads the file)
 Windows. Never add `gb.overlay=1` to an entry file: gb_slotsync copies the default entry's options into the next
 slot's entry.
 
-Example, the "white veil" switch of section 7 (only if the picture looks washed out and Night Light changes
-nothing):
+Example 1, the "white veil" of section 7 on an image built before wave 5. These are the composer properties that
+wave-5 images set by themselves:
 
 ```
 # gb.cfg v1
-GB_MODOPTS_i915=gb_ignore_user_gamma=3
+GB_PROP_1=vendor.hwc.drm.force_color_mode=-1
+GB_PROP_2=vendor.hwc.drm.persistent_hdr=false
+GB_PROP_3=vendor.hwc.use_log_gamma_lut=false
 ```
 
-`3` makes the gamma and degamma tables linear: Night Light stops working, the CTM-based accessibility colour modes
-keep working. Whether the Surface Book 3's panel needs it at all is not known yet; report what you see either way.
+Night Light keeps working with these. If the picture is still pale, the kernel switch drops i915's colour matrix
+(Night Light and the colour-correction accessibility modes then stop working): `GB_MODOPTS_i915=gb_ignore_user_gamma=4`.
+To compare a wave-5 image with the old behaviour, set the lapis values for one boot instead: `13`, `true`, `true`.
+
+Example 2, flicker or ghost images (section 7):
+
+```
+# gb.cfg v1
+GB_MODOPTS_i915=enable_psr=0 enable_fbc=0
+```
+
+A key may appear only once, so put every i915 option on the one `GB_MODOPTS_i915=` line, for example
+`GB_MODOPTS_i915=enable_psr=0 enable_fbc=0 gb_ignore_user_gamma=4`. Report what you see either way.
+
+Example 3, posture recovery (section 7), if the built-in keyboard is listed in the summary's `inputs` line but
+disabled because Android selected `CLOSED`:
+
+```
+# gb.cfg v1
+GB_PROP_1=vendor.gb.posture=open
+```
+
+Allowed values are `open`, `tablet`, `docked`, `closed` and `reset` (`off` or `none` does nothing). While an override is
+active, closing the lid does not put the device into `CLOSED`; use the power button to sleep.
 

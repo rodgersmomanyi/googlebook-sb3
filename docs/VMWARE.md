@@ -102,7 +102,9 @@ follows it automatically (it reads the slot state from lapis.bin, see [OTA.md](O
 ## Limitations in the VM
 
 * No Bluetooth (features marked unavailable), no sensors, no camera, no touch.
-* Software KeyMint, no Gatekeeper/Weaver: no screen-lock credential, no hardware-backed keys or attestation.
+* Software KeyMint, no Weaver, and a **software** Gatekeeper (since wave 4): a lock-screen PIN works, but it is a
+  convenience lock with its key on the unencrypted /data. There are no hardware-backed keys and no attestation
+  ([GATEKEEPER.md](GATEKEEPER.md)). Your profile is user 10 (lapis runs in headless system user mode).
 * The display never sleeps (`gb_showhome` keeps it awake: a sleep/resume used to wedge SurfaceFlinger) and the
   kernel holds a wakelock; Android suspend is disabled.
 * Vulkan apps run on SwiftShader (CPU); GLES/Skia runs on the host GPU.

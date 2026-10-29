@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# gb_gatekeeper: software Gatekeeper HAL (android.hardware.gatekeeper.IGatekeeper/default) and its
+# ISharedSecret/gatekeeper participant. Design: C:\GB-build\native\dgpu\w4\GATEKEEPER.md.
+# Fragment for gb.rc (VM and native trees). The binary is /odm/vup/bin/hw/..., i.e.
+# /vendor/bin/hw/android.hardware.gatekeeper-service.gb through the /vendor overlay; the VINTF
+# fragment is /odm/etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml.
+#
+# * early_hal like AOSP's nonsecure Gatekeeper: registered before keystore2 negotiates the shared
+#   HMAC key and long before gatekeeperd (late_start) waits for IGatekeeper/default. The service
+#   does not touch /data until the first enroll/verify, which only system_server causes.
+# * "interface aidl": if anything waits for one of the two instances while the service is down,
+#   servicemanager asks init to start it (no boot hang on a stopped HAL).
+# * user/group hsm: neither system_server nor gatekeeperd (uid system) can read the key file by
+#   DAC; SELinux (permissive here) would also keep them out of gatekeeper_vendor_data_file.
+# * onrestart restart gatekeeperd: gatekeeperd keeps the HAL binder it got at start and has no
+#   death handling for it; restarting it makes it fetch the new one (LockSettingsService re-links
+#   to gatekeeperd by itself).
+service gb_gatekeeper /vendor/bin/hw/android.hardware.gatekeeper-service.gb
+    class early_hal
+    user hsm
+    group hsm
+    seclabel u:r:hal_gatekeeper_default:s0
+    interface aidl android.hardware.gatekeeper.IGatekeeper/default
+    interface aidl android.hardware.security.sharedsecret.ISharedSecret/gatekeeper
+    stdio_to_kmsg
+    onrestart restart gatekeeperd
+
+# The state directory, after init.rc's "mkdir /data/vendor 0771 root root encryption=Require"
+# (init.rc's post-fs-data actions are queued before the ones of /odm/etc/init/*.rc). mkdir
+# applies the vendor file_contexts label gatekeeper_vendor_data_file and never changes an
+# existing directory's contents.
+on post-fs-data
+    mkdir /data/vendor/gatekeeper 0700 hsm hsm

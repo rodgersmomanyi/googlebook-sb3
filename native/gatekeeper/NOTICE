@@ -1,0 +1,54 @@
+gb_gatekeeper (android.hardware.gatekeeper-service.gb)
+Software Gatekeeper HAL for Googlebook OS on VMware and on the Surface Book 3.
+
+Our own code (src/, tests/, tools/, build.sh, rc/, vintf/, component/): Apache-2.0, see the
+repository LICENSE.
+
+This directory and the binary built from it also contain:
+
+1. AOSP libgatekeeper, unmodified
+   third_party/aosp/system_gatekeeper/  (gatekeeper.cpp, gatekeeper_messages.cpp,
+   include/gatekeeper/*.h)
+   https://android.googlesource.com/platform/system/gatekeeper  branch android17-release,
+   commit 5b5e75b5bda9fccbc3132e9624cb25286babdaac
+   Copyright (C) 2015 The Android Open Source Project. Licensed under the Apache License,
+   Version 2.0.
+
+2. AOSP hw_auth_token.h, unmodified
+   third_party/aosp/libhardware/include/hardware/hw_auth_token.h
+   https://android.googlesource.com/platform/hardware/libhardware  (include_all/hardware/)
+   branch android17-release, commit 97ee3e33ec5ba48c0eca8341ed377ac4497a0678
+   Copyright (C) 2014 The Android Open Source Project. Licensed under the Apache License,
+   Version 2.0.
+
+3. AOSP libbinder_ndk platform headers, unmodified, used only by the compile-time ABI check
+   (src/abi_check.cpp); not part of the binary
+   third_party/aosp/libbinder_ndk_platform/android/  (binder_manager.h, binder_process.h,
+   binder_stability.h)
+   https://android.googlesource.com/platform/frameworks/native  (libs/binder/ndk/include_platform/)
+   branch android17-release, commit ae266dcb706d083868578cfedce381ef44488a07.
+   Copyright The Android Open Source Project. Licensed under the Apache License, Version 2.0.
+
+4. BoringSSL (libcrypto, linked statically; not stored here, fetched by build.sh)
+   https://android.googlesource.com/platform/external/boringssl  branch android17-release,
+   commit 0cd1f6a94b670e6b61af95a06e71e690ae8e3262
+   Licensed under the Apache License, Version 2.0 (its LICENSE; the Go-licensed test-suite code
+   it mentions is not part of libcrypto). The full text is copied next to the binary as
+   out/android/licenses/LICENSE.boringssl.
+
+5. Design references (behaviour reproduced, code not copied unless stated)
+   * AOSP nonsecure Gatekeeper, hardware/interfaces/gatekeeper/aidl/software (Apache-2.0):
+     the scrypt parameters of the password signature, the ISharedSecret participant and the
+     AIDL error mapping.
+   * AOSP system/keymaster km_openssl/soft_keymaster_enforcement.cpp and ckdf.cpp
+     (Apache-2.0): the shared HMAC key derivation (CKDF, zero agreement key, labels).
+
+6. gbOS86 software Gatekeeper
+   gatekeeper/soft_gk.c of gbOS86, https://github.com/linuxkid473/gbos-x86 , commit 03a6a46,
+   by Vihaan Nathan, "SPDX-License-Identifier: Apache-2.0".
+   The idea of a hand-written stable-AIDL server over the libbinder_ndk C API, its parcelable
+   framing (non-null marker + size patched afterwards) and the meta-transaction codes are
+   adapted from it in src/aidl_service.cpp and src/binder_api.h. Its fixed compile-time keys,
+   its self-signed auth tokens and its missing throttling were not taken over.
+
+The NDK's libc++ (Apache-2.0 WITH LLVM-exception) is linked statically.

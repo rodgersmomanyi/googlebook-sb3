@@ -5,6 +5,9 @@
 # 2. on boot: put the firmware limits back (persist.vendor.gb.rapl.mode=fw|lapis|custom, default fw) and let the
 #    composer (user system) write any backlight (lapis only chowns intel_backlight).
 # 3. boot_completed: re-apply the limits once more and log a hardware summary to kmsg (picked up by gb_bootlog).
+# 4. on boot, own service: bind the power button / volume rocker (MSHW0040) to soc_button_array once lapis's
+#    pinctrl-icelake drives the INT3455 GPIO controller (readiness A-H1; bounded, idempotent, never blocks boot).
+# 5. boot_completed with vendor.gb.posture / persist.vendor.gb.posture set: opt-in device-state override (A-M1).
 service gb_hw_rapl_snap /system/bin/sh /odm/gb_hw.sh rapl-snapshot
     user root
     group root
@@ -29,14 +32,37 @@ service gb_hw_diag /system/bin/sh /odm/gb_hw.sh diag
     oneshot
     disabled
 
+service gb_hw_buttons /system/bin/sh /odm/gb_hw.sh buttons
+    user root
+    group root
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+service gb_hw_posture /system/bin/sh /odm/gb_hw.sh posture
+    user root
+    group root system
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
 on early-init
     exec_start gb_hw_rapl_snap
 
 on boot
     start gb_hw_boot
+    start gb_hw_buttons
 
 on property:sys.boot_completed=1
     start gb_hw_diag
 
 on property:persist.vendor.gb.rapl.mode=*
     start gb_hw_boot
+
+on property:sys.boot_completed=1 && property:vendor.gb.posture=*
+    start gb_hw_posture
+
+on property:sys.boot_completed=1 && property:persist.vendor.gb.posture=*
+    start gb_hw_posture

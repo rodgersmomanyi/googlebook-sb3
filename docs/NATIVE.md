@@ -14,6 +14,9 @@ device. In short:
   reworked `#UD` VNNI emulator and the opt-in i915 gamma switch. The config, KMI and exports are the same as #13, so
   every module and lapis vendor module behaves as with #13 ([kernel/K15.md](../kernel/K15.md)). The VM keeps
   whatever kernel its ESP was last built with.
+* **Wave 5 additions (both trees):** the software Gatekeeper (lock-screen PIN, [GATEKEEPER.md](GATEKEEPER.md)), the
+  build-gated VNNI libz patch ([PERFORMANCE.md](PERFORMANCE.md)) and the OTA gate ([OTA.md](OTA.md#the-ota-gate-wave-5));
+  natively also the readiness fixes ([DEVICE-STATUS.md](DEVICE-STATUS.md), the Wave 5 group).
 * **Kernel modules** (our build; lapis's Google-signed GKI modules are refused by our kernel), loaded by `gbinit`
   from `modules.load` before Android starts, in dependency order (`stage_kernel.py`, `NATIVE_EARLY`):
   Wi-Fi/Bluetooth helpers (`libarc4`, `pps_core`, `ptp`, `rfkill`, `bluetooth`, `btbcm`, `hidp`, `rfcomm`), zram,
@@ -129,7 +132,11 @@ The same layout can also be installed from a bootable installer ISO that you bui
 * `efi_pstore.pstore_disable=1`: panics are not written into the UEFI variable store; `efivarfs` is not built.
 * `reboot=pci` (the Surface Book 3 hangs with other reboot methods, per linux-surface).
 * `iommu.passthrough=1` (IPTS DMA faults under the IOMMU; replaces linux-surface's IOMMU quirk).
-* `snd_intel_dspcfg.dsp_driver=3` (SOF; the kernel's built-in table has no Ice Lake entry).
+* `snd_intel_dspcfg.dsp_driver=3` (SOF; the kernel's built-in table has no Ice Lake entry). `=1` for one boot (boot
+  menu `e`) selects the legacy HDA driver instead: `gb_audio.sh` then loads `snd_hda_intel` for the Intel HDA function
+  only and points DRAS at the `PCH` card ([FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option),
+  "No sound"). It cannot come from `gb\gb.cfg`: the parameter belongs to the built-in `snd_intel_dspcfg`, is
+  read-only at run time and is read once, before gbinit reads the ESP.
 * `8250.nr_uarts=4` is kept natively (wave 3): the GKI is built with `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, so
   without it `serial8250_init()` gives up before the 8250 driver registers, and the LPSS UART that carries the
   Surface Aggregator (base keyboard, touchpad, batteries, charger, detach) fails with `-22`. No `console=ttyS*` or
@@ -179,11 +186,17 @@ gbinit applies to the `/odm` tree before Android starts (wave 3; design idea fro
   is applied. Keys:
   * `GB_MODOPTS_<module>=<name>=<value> [...]`: options appended to that module's line in `modules.load` (1-8
     tokens, `[a-z0-9_]+=[A-Za-z0-9_.,:-]+`, <= 200 characters; the module must be in `modules.load`). Example:
-    `GB_MODOPTS_i915=gb_ignore_user_gamma=3` (the white-veil switch, [FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)).
+    `GB_MODOPTS_i915=enable_psr=0 enable_fbc=0` (flicker or ghost images) or `GB_MODOPTS_i915=gb_ignore_user_gamma=4`
+    (the kernel white-veil fallback, [FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)).
   * `GB_SKIPMOD=<name>,<name>`: those `modules.load` lines are commented out for this boot.
   * `GB_PROP_<1..16>=<prop>=<value>`: one line appended to `/odm/etc/build.prop`. Only `ro.`, `persist.`,
     `vendor.` and `debug.` names; the graphics-switching, adb, boot, build, product, crypto, USB, zygote and
-    privapp properties are refused, and so are the properties the image itself guards.
+    privapp properties are refused, and so are the properties the image itself guards. Example:
+    `GB_PROP_1=vendor.gb.posture=open` (forces the `OPEN` device state after `boot_completed` if Android's posture
+    policy disabled the built-in keyboard in `CLOSED`; [FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)).
+  * Not possible through `gb.cfg`: parameters of drivers built into the kernel (`8250.nr_uarts`,
+    `snd_intel_dspcfg.dsp_driver`, ...). The kernel reads them from the command line before gbinit runs; add them
+    for one boot with `e` in the boot menu instead.
 * **Overlay.** `gb\overlay\<path>` replaces `/odm/<path>` only for input and audio configuration:
   `usr/idc/*.idc`, `usr/keylayout/*.kl`, `usr/keychars/*.kcm`, `vup/etc/audio/<dir>/*.xml` and
   `vup/etc/data/hal_configs/audio_default.xml`. Regular files only, at most 64 files, 256 KiB each, 4 MiB in total;

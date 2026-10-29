@@ -59,6 +59,8 @@ the same initrd boots from the VMware NVMe, a USB stick or the internal NVMe.
   [NATIVE.md](NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg)). No shipped entry has `gb.overlay=1`.
 * **native only**: insmods `/odm/lib/modules/modules.load` in order (log: `/odm/gbinit_modules.log`), before ueventd
   can autoload lapis's own copies of `video`, `wmi`, DRM helpers etc. that our i915 could not link against.
+* (wave 5) with the exact token `gb.vnni=0` on the command line, deletes `/odm/vnni` (the libz patch kill switch,
+  [PERFORMANCE.md](PERFORMANCE.md#kill-switch)).
 * `exec /init`.
 
 ## /odm and the /vendor overlay
@@ -70,7 +72,7 @@ the same initrd boots from the VMware NVMe, a USB stick or the internal NVMe.
 | `/odm/etc/init/gb.rc` | our init script (Android init language), parsed by init like any `/odm/etc/init/*.rc` |
 | `/odm/etc/build.prop` | loaded after `/vendor/build.prop`, so its `ro.*` values win |
 | `/odm/etc/fstab.android-desktop`, `/odm/etc/se_manifest.xml` | bind-mounted over the vendor fstab and the system_ext VINTF manifest |
-| `/odm/etc/selinux/odm_sepolicy.cil` | one `typepermissive` statement for every type in lapis's policy, so every domain is permissive even where `androidboot.selinux=permissive` is not honoured. `precompiled_sepolicy` next to it is a one-byte placeholder: with no matching `*.sha256` files, init compiles the policy from the CIL files, this one included |
+| `/odm/etc/selinux/odm_sepolicy.cil` | one `typepermissive` statement for every type in lapis's policy, so every domain is permissive even where `androidboot.selinux=permissive` is not honoured (it is not: lapis's user build keeps the global mode enforcing, `getenforce` prints `Enforcing`, and every logged denial is `permissive=1`). Since wave 5 each line is packed in its own `optional` block, so a type a later build removes cannot stop the policy compile ([OTA.md](OTA.md#the-ota-gate-wave-5)), and `build_esp.py` refuses a list without the domains the image needs (`OTA_REQUIRED_PERMISSIVE`). `precompiled_sepolicy` next to it is a one-byte placeholder: with no matching `*.sha256` files, init compiles the policy from the CIL files, this one included |
 | `/odm/vup/...` | **upper dir of an overlayfs mounted on /vendor** at early-init: `vup/bin/foo` adds or replaces `/vendor/bin/foo`, `vup/etc/x` -> `/vendor/etc/x` |
 | `/odm/lib/modules/` | our kernel modules + `modules.load` / `modules.load.late` |
 | `/odm/firmware/` | native firmware, searched first (`firmware_class.path=/odm/firmware,/vendor/firmware`) |
@@ -82,10 +84,22 @@ Services run as root with `seclabel u:r:shell:s0` (permissive), output to kmsg.
 
 * **Software KeyMint**: the AOSP pure-software KeyMint 4 service + its libraries from the Android 16 emulator image,
   with the matching Android 16 `libcrypto` (the cluster smashes its stack against lapis's BoringSSL), declared in our
-  `se_manifest.xml`; `keystore.module_hash.sent=true` because it lacks `setAdditionalAttestationInfo`.
-* **Trusty/GSC stubs**: strongbox KeyMint, Weaver and Gatekeeper are undeclared (empty VINTF fragments bound over
-  theirs), secretkeeper/gatekeeper binaries replaced by sleepers, `gscd` stopped, `timberslide`, `udsattestation`,
-  the charge-control HAL and `storage_metrics_service` replaced by idle sleepers (they crash-loop without an EC/GSC).
+  `se_manifest.xml`; `keystore.module_hash.sent=true` because it lacks `setAdditionalAttestationInfo`. The native tree
+  ships these libraries under private sonames (`lib<x>_gbkm16.so`, `inject/keymint/native/`), so lapis's own
+  `/vendor/lib64/libcrypto.so` (needed by `libssl.so`: `wpa_supplicant`, `hostapd`) stays in place; `build_esp.py`'s
+  link-closure gate (`link_closure.py`) refuses any native overlay that would leave a vendor program unable to link.
+  The VM tree still overlays the stock names (no Wi-Fi in the VM).
+* **Trusty/GSC stubs**: strongbox KeyMint, Weaver and the Trusty Gatekeeper are undeclared (empty VINTF fragments
+  bound over theirs), secretkeeper/gatekeeper binaries replaced by sleepers, `gscd` stopped, `timberslide`,
+  `udsattestation`, the charge-control HAL and `storage_metrics_service` replaced by idle sleepers (they crash-loop
+  without an EC/GSC).
+* **Software Gatekeeper** (wave 4): `gb_gatekeeper` (`/odm/vup/bin/hw/android.hardware.gatekeeper-service.gb`, user
+  `hsm`, `class early_hal`) declares `IGatekeeper/default` and `ISharedSecret/gatekeeper` through an ODM VINTF
+  fragment, so a lock-screen PIN can be set. Its state is in `/data/vendor/gatekeeper`. Not hardware-backed:
+  [GATEKEEPER.md](GATEKEEPER.md).
+* **libz patch** (wave 5, only when `inject/vnni/` was prepared): `/odm/vnni/<id>/` holds the 2-byte-patched system
+  and vendor `libz.so`. The last block of gb.rc binds each over the original at early-init, gated on the exact
+  `ro.system/vendor.build.fingerprint` it was made for, then remounts it read-only ([PERFORMANCE.md](PERFORMANCE.md)).
 * **crossystem stub**: reports a healthy, successfully booted vboot slot, so the boot_control HAL can mark the slot
   successful and vold does not reboot with "Checkpoint commit failed"; `bootctl mark-boot-successful` at post-fs-data.
 * **RescueParty off**, SetupWizard disabled, device provisioned, launcher made the HOME role holder (`gb_ui.sh`),

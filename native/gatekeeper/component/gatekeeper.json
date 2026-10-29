@@ -1,0 +1,20 @@
+{
+ "name": "gatekeeper",
+ "source": "${GB_BUILD}\\native\\gatekeeper",
+ "comment": "DRAFT for wave 4, not in inject\\native\\components. Software Gatekeeper HAL, design ${GB_BUILD}\\native\\dgpu\\w4\\GATEKEEPER.md. Uses only keys build_esp.py _load_manifest knows. The VM tree (gbstage) needs the same two files and the rc fragment: build_esp.py's components are native-only today. Requires the Trusty Gatekeeper VINTF fragment to stay bound to the empty manifest (gb.rc early-init) so IGatekeeper/default is declared once.",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\gatekeeper\\out\\android\\android.hardware.gatekeeper-service.gb",
+   "dest": "vup/bin/hw/android.hardware.gatekeeper-service.gb",
+   "mode": "0o100755"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\gatekeeper\\vintf\\android.hardware.gatekeeper-service.gb.xml",
+   "dest": "etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml",
+   "mode": "0644"
+  }
+ ],
+ "rc_files": [
+  "${GB_BUILD}\\native\\gatekeeper\\rc\\gb_gatekeeper.rc"
+ ]
+}

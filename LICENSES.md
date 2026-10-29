@@ -33,7 +33,14 @@ project keeps that project's license:
 | `native/hw-gap-audit/tree/etc/excluded-input-devices.xml` | Apache-2.0 | our overlay of the AOSP-format input exclusion list; keeps lapis's one entry ("Power Button") |
 | `inject/odm_sepolicy.cil` | Apache-2.0 | generated: one `typepermissive` statement per SELinux type name in lapis's policy |
 | `kernel/patches/0005-i915-optional-ignore-user-gamma.patch` (wave 3) | GPL-2.0 | ours, derived from Linux (i915 display code) |
-| Wave 3 tools and changes: `native/nouveau-kernel/tools/fw_coverage.py`, the DRAS (`audio_default.xml`, `audio_config.xml`) and touchpad IDC edits, the ESP bring-up parser (`build_esp.py` `/gbbringup.sh`), the gb_slotsync kernel check, the `-UpdateEspOnly` checks (`native/dualboot/`, `gbdisk dump`, `tools/esp_extract.py`, the test helpers) | Apache-2.0 | ours. Ideas from gbOS86 (gbos-x86 @f8a5c1a) are credited in each file; **no gbos-x86 code is included anywhere** (gbos-x86 has no top-level licence, so its unlicensed files are not usable here) |
+| Wave 3 tools and changes: `native/nouveau-kernel/tools/fw_coverage.py`, the DRAS (`audio_default.xml`, `audio_config.xml`) and touchpad IDC edits, the ESP bring-up parser (`build_esp.py` `/gbbringup.sh`), the gb_slotsync kernel check, the `-UpdateEspOnly` checks (`native/dualboot/`, `gbdisk dump`, `tools/esp_extract.py`, the test helpers) | Apache-2.0 | ours. Ideas from gbOS86 (gbos-x86 @f8a5c1a) are credited in each file; **no gbos-x86 code is included in them** (gbos-x86 has no top-level licence, so its unlicensed files are not usable here; the only gbos-x86 file with its own licence that we adapted is `soft_gk.c`, next row) |
+| `native/gatekeeper/` (wave 4: `src/`, `tests/`, `tools/`, `rc/`, `vintf/`, `component/`, `build.sh`) | Apache-2.0 (ours) | the software Gatekeeper. `src/aidl_service.cpp` and `src/binder_api.h` adapt the AIDL parcelable framing and meta-transaction codes of gbOS86's `gatekeeper/soft_gk.c` (SPDX Apache-2.0, gbos-x86 commit `03a6a46`), credited in [native/gatekeeper/NOTICE](native/gatekeeper/NOTICE) and in both files. The binary built from it (never in this repository) also links BoringSSL (Apache-2.0, fetched by `build.sh`) and the NDK's libc++ (Apache-2.0 WITH LLVM-exception) statically |
+| `native/gatekeeper/third_party/aosp/` | Apache-2.0 (AOSP) | unmodified copies with their licence headers: libgatekeeper (`platform/system/gatekeeper`), `hw_auth_token.h` (`platform/hardware/libhardware`) and three libbinder_ndk platform headers (`platform/frameworks/native`, used only by a compile-time ABI check); branches and commits in `NOTICE` |
+| `native/dgpu/w4/` (wave 4 design, VM upgrade plan, review, `tools/`) | Apache-2.0 (ours) | working documents; evidence is not published |
+| `native/vnni-perf/` (wave 5: `patcher/`, `tests/`, `tools/`, `component/`, `w5/tools/`, docs), `vnni_prepare.py` | Apache-2.0 (ours) | the libz patcher, its proofs and measurement tools. `patcher/manifest.json` holds only sha256 values, offsets, a few original bytes around each edit and the 2-byte edits of Google's `libz.so` (no part of the library beyond those bytes). Idea credit: gbOS86; no gbos-x86 code was copied |
+| `native/hwtest/` (collector, analyser, README) | Apache-2.0 (ours) | first-boot log collection and triage tools |
+| `native/ota-gating/` (wave 5: `DESIGN.md`, `tests/`, `tools/`) | Apache-2.0 (ours) | the OTA gate's design, host suite, builder harness and evidence tools. `tests/sepolicy/*.cil` are copies of `inject/odm_sepolicy.cil` (the generated list of lapis's SELinux type names) in its plain and OTA-robust forms, with and without one test type |
+| `link_closure.py`, `linkref_prepare.py`, `keymint_native_graft.sh`, `verify_keymint_graft.py` (wave 5) | Apache-2.0 (ours) | the native tree's link gate and the KeyMint graft with private sonames; their outputs (`inject/keymint/native/`: renamed AOSP binaries and the link data of your lapis image) are never committed |
 
 ## What is deliberately not here
 
@@ -42,9 +49,15 @@ project keeps that project's license:
   copies of them (patched minigbm: we ship the patcher instead).
 * Android emulator / AOSP binaries (the software KeyMint graft), SwiftShader/Mesa/NVK/iptsd/tinyalsa/llama.cpp build
   outputs, our kernel and module builds, the GbGpu and GbGfxDriver APKs, the dGPU payload, the installer ISO and its
-  payload, the built `gb_slotsync` binary and the test-only `vnni_kat` known-answer test binary.
-* Code from gbOS86 (gbos-x86): none. Its findings and ideas are credited in the README and in each file that uses
-  them; gbos-x86 has no top-level licence, so none of its files is copied here.
+  payload, the built `gb_slotsync` binary, the test-only `vnni_kat` known-answer test binary, and the built
+  `gb_gatekeeper` binary (`native/gatekeeper/out/`).
+* The patched `libz.so` copies of the VNNI patch (`inject/vnni/`, made by `vnni_prepare.py` from your own lapis image)
+  and anything carved or extracted from lapis for it (`native/vnni-perf/out/`, its evidence and disassembly).
+* The native KeyMint graft with private sonames and the lapis link data (`inject/keymint/native/`, made by
+  `keymint_native_graft.sh` and `linkref_prepare.py`).
+* Code from gbOS86 (gbos-x86): none, except the adapted parts of its Apache-2.0 `gatekeeper/soft_gk.c` in
+  `native/gatekeeper` (credited in its `NOTICE`). Its findings and ideas are credited in the README and in each file
+  that uses them; gbos-x86 has no top-level licence, so none of its other files is copied here.
 * Firmware (Intel graphics, Wi-Fi, Bluetooth, SOF audio, the proprietary IPU4P camera firmware, Realtek USB
   Ethernet, the NVIDIA TU117 firmware), ACPI table dumps and Windows driver INF files.
 * Keys and personal data: the ADB key used for scrcpy, the builder's SSH key, the signing keys of the sensors

@@ -1,10 +1,11 @@
 """Verify a built Googlebook disk image (build_usb.py output) or an ESP image file before it is used
 (WAVE2_PLAN_v2 B-03, section 3.2).
 
-  python -I verify_image.py [IMG] [--expect-tree auto|native|vm|vmtest-gfx|vmtest-kat] [--krel FILE] [--no-gfxdriver]
-                            [--compare-export ESP]
+  python -I verify_image.py [IMG] [--expect-tree auto|native|vm|vmtest-gfx|vmtest-kat|vmtest-nogk] [--krel FILE]
+                            [--no-gfxdriver] [--compare-export ESP] [--expect-inject-sha256 HEX]
   python -I verify_image.py --esp FILE [--boot usb|internal] [--super-guid G] [--expect-tree ...] [--krel FILE]
-                            [--no-gfxdriver] [--compare-export ESP] [--expect-bringup-test]
+                            [--no-gfxdriver] [--compare-export ESP] [--expect-bringup-test] [--esp-size BYTES]
+                            [--expect-inject-sha256 HEX]
   python -I verify_image.py --extract IMG ESP_PATH OUTDIR     (IMG: a disk image or an ESP image; OUTDIR new or empty)
 
 Image mode (IMG, default C:\\GB-x86\\out\\googlebook-sb3-usb.img):
@@ -14,7 +15,8 @@ Image mode (IMG, default C:\\GB-x86\\out\\googlebook-sb3-usb.img):
   VB blank partitions zero at start and end
   then the ESP checks on the EFI-SYSTEM partition (its super GUID taken from the GPT).
 ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-tree names it):
-  V1  FAT32 parses; size 536,870,912 B == the partition/file size; native: free >= max(initrd-*.img) + 144 MiB
+  V1  FAT32 parses; size 536,870,912 B (--esp-size: e.g. 201,326,592 for the user VM's lapis ESP) == the partition/file
+      size; native: free >= max(initrd-*.img) + 144 MiB; (W4) VM kinds: free >= max(initrd-*.img) + 16 MiB
   V2  loader.conf default gb-<slot> + editor yes; entries exactly gb-<slot>.conf (+ gb-<slot>-nvtest.conf native);
       nvtest = default + " [NVIDIA test]" title + " gb.nouveau=test" options; no gb.nouveau= in the default entry, no
       gb.gfxdriver= anywhere; every androidboot.boot_part_uuid= names the super GUID; --boot: a native default entry
@@ -32,19 +34,39 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
   V12 native: every component manifest's files/payload/symlinks/rc/build_prop are in the image; every kind (wave 3,
       wave 2b review L5): gbinit, gb_bootlog.sh, gbbringup.sh (build_esp.py, read with ast) and gb_slotsync
       (inject\\slotsync) are byte-identical to their sources
+  V12b (W5, C-1) every x86-64 executable / shared object in the cpio (every tree and kind) is mappable by bionic: each
+      PT_LOAD has a power-of-two p_align, p_offset == p_vaddr modulo max(p_align, 4 KiB) and lies inside the file
   V13 the vulkan.nouveau.so symlink and the empty payload mount points   V14 no libvulkan.so
   V15 the GbGpu / GbGfxDriver APKs   V16 the default entry's native options, incl. 8250.nr_uarts >= 1 and no
       console=ttyS / earlycon (WAVE3 item 1)   V17 --compare-export: same tree as ESP
   V18 gb/slot_<slot>.stamp and initrd-<slot>.img   V19 modules.load names this vmlinuz (md5)
   V20 /odm/etc/gb/gfx_build_id   V21 gb_nouveau.sh has GB_PANIC_TIMEOUT=30   V22 gfx_app_prefs.default, tu117.sha256
   V23 no gb_gfxdriver.sh   V24 VM kinds: gb.hw=vm, console=ttyS0,115200 and 8250.nr_uarts=4 (the VM is unchanged;
-      vmtest-gfx/vmtest-kat: the test title)
+      vmtest-gfx/vmtest-kat/vmtest-nogk: the test title)
   V25 ESP bring-up (WAVE3 item 12): no gb/gb.cfg, no gb/overlay/, no gb.overlay= in any entry (--expect-bringup-test:
       the R-12b test ESP instead carries them); gbinit has the three-token gate, the timed call and exec /init last, and
       no cmdline module-option forwarder (D-d); /gbbringup.sh in the native cpio only
-  V26 fstab (item 4): native userdata has fsverity; the VM tree's fstab == inject\\fstab.android-desktop
-  V27 apgetty off (item 11) in the native gb.rc only   V28 the VNNI KAT (vnni_kat, gb_vnni_kat.sh, zram/zsmalloc in a
-      gbstage tree) only in kind vmtest-kat, and there exactly the inject\\kat / staged inputs
+  V26 fstab (item 4; W4 for the VM): every tree's fstab == inject\\fstab.android-desktop + ',fsverity' on the one
+      userdata line
+  V27 apgetty off (item 11) in the native gb.rc only   V28 the VNNI KAT (vnni_kat, gb_vnni_kat.sh) only in kind
+      vmtest-kat, and there exactly the inject\\kat input; (W4) every VM kind: zsmalloc.ko + zram.ko == the staged
+      inject\\modules copies, insmodded at early-init right after vmwgfx, and no gb.rc line writes disksize, runs mkswap
+      or swapon (lapis's mmd sets zram up); (W4 rehearsal) the gb_zram post-fs-data fallback (== build_esp
+      GB_ZRAM_SH / GB_ZRAM_RC) for lapis's own `modprobe zram`, which can win the early-init race
+  V29 (W4) the software Gatekeeper (GATEKEEPER.md 7.5): the binary (0755, == the component source and its SHA256SUMS
+      line, only LLNDK NEEDED, interpreter linker64), the ODM VINTF fragment (0644, the reviewed bytes, the only one)
+      and the component rc block (once; the only IGatekeeper/default interface line) all present in every kind except
+      vmtest-nogk, where none of them is; always the Trusty Gatekeeper masked (fragment bind, stub binary, GBINIT
+      whiteout of its .rc) and the Weaver fragment bind; (W4 rehearsal) always the gb_kmsgdbg service (a root-only
+      0600 /dev/kmsg_debug) started first thing at early-init, without which stdio_to_kmsg output is lost on lapis
+  V30 --expect-inject-sha256 HEX: gb/inject.gz has that sha256 (the W4 rehearsal tree == the user-VM preview's)
+  V31 (W5) the VNNI libz patch (build_esp.py, vnni_prepare.py, vnni-perf\\INTEGRATION.md 6): the tree's /odm/vnni ==
+      inject\\vnni byte for byte (0644); per <id>/manifest.json every patched file exists, has the manifest's
+      patched_sha256, and its (orig, patched, bind, gate) pair is a deployable target of the reviewed
+      vnni-perf\\patcher\\manifest.json; its gate value is the folder's fingerprint; gb.rc holds exactly one action per
+      file, "on early-init && property:ro.<system|vendor>.build.fingerprint=<fp>" with the 4 reviewed lines, after the
+      /vendor overlay action, and no other section uses /odm/vnni or names libz.so (no ungated bind); gbinit has the
+      gb.vnni=0 kill switch; a gb.vnni= token only as gb.vnni=0 in a "(VM test, W5, VNNI off)" entry
 Read-only: images, lapis.bin and the host inputs are opened "rb"; only --extract writes (into OUTDIR).
 Exit 0 and last line "RESULT: OK"; exit 1 and "RESULT: <n> problem(s)" with one "PROBLEM: V<n> ..." line each;
 exit 2 = usage. Module API (build_iso.py imports this file by path): esp_of_disk, fat_files, fat_parse, cpio_entries,
@@ -97,6 +119,12 @@ HOST = {
     "slotsync": os.path.join(HERE, r"inject\slotsync\gb_slotsync"),
     "fstab": os.path.join(HERE, r"inject\fstab.android-desktop"),
     "kat": os.path.join(HERE, r"inject\kat"),
+    # W4 (V28, V29): the VM module set (zsmalloc/zram for mmd); the Gatekeeper sources come from the component manifest
+    # inject\native\components\gatekeeper.json (both trees), its binary's SHA256SUMS next to the binary
+    "vm_modules": os.path.join(HERE, r"inject\modules"),
+    # W5 (V31): the prepared VNNI libz patch folders (vnni_prepare.py) and the reviewed patcher manifest
+    "vnni": os.path.join(HERE, r"inject\vnni"),
+    "vnni_patcher": os.path.join(GB_BUILD, r"native\vnni-perf\patcher\manifest.json"),
 }
 SIG_TRAILER = b"~Module signature appended~\n"
 OPTIN = ("drm_exec", "drm_gpuvm", "gpu_sched", "drm_ttm_helper", "nouveau")          # names with "-" -> "_"
@@ -113,8 +141,38 @@ VMTEST_GFX = {"gbstage/app/GbGpu/GbGpu.apk": 0o100644, "gbstage/app/GbGfxDriver/
 VMTEST_RC_MARK = "\n# ---- component gpu_ui (VM test) ----\n"
 VMTEST_TITLE = "(VM test, gfx components)"
 VMTEST_KAT_TITLE = "(VM test, KAT)"
-KAT_FILES = {"gbstage/vnni_kat": 0o100755, "gbstage/gb_vnni_kat.sh": 0o100755,       # == build_esp.KAT_FILES
-             "gbstage/lib/modules/zsmalloc.ko": 0o100644, "gbstage/lib/modules/zram.ko": 0o100644}
+VMTEST_NOGK_TITLE = "(VM test, no Gatekeeper)"
+KAT_FILES = {"gbstage/vnni_kat": 0o100755, "gbstage/gb_vnni_kat.sh": 0o100755}     # == build_esp.KAT_FILES (W4)
+VM_KINDS = ("vm", "vmtest-gfx", "vmtest-kat", "vmtest-nogk")
+VM_ZRAM = ("zsmalloc.ko", "zram.ko")                                                # == build_esp.VM_ZRAM (load order)
+# W4 software Gatekeeper (== build_esp GK_*; GATEKEEPER.md 7)
+GK_BIN_DEST = "vup/bin/hw/android.hardware.gatekeeper-service.gb"
+GK_VINTF_DEST = "etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml"
+GK_VINTF_SHA256 = "48cd680b721996e57c4b93acce4d842d9f14e0cd3dbd9cda75e1fe3b3216b77b"
+GK_LLNDK = ("libbinder_ndk.so", "libc.so", "libdl.so", "liblog.so", "libm.so")
+GK_IFACE = "interface aidl android.hardware.gatekeeper.IGatekeeper/default"
+GK_TRUSTY_BIND = "mount none /odm/empty_vintf.xml /vendor/etc/vintf/manifest/android.hardware.gatekeeper-service.trusty.xml bind"
+GK_WEAVER_BIND = ("mount none /odm/empty_vintf.xml "
+                  "/vendor/etc/vintf/manifest/android.hardware.weaver-service.android-desktop.xml bind")
+GK_TRUSTY_WHITEOUT = "/busybox mknod /odm/vup/etc/init/android.hardware.gatekeeper-service.trusty.rc c 0 0"
+GK_TRUSTY_BIN = "vup/bin/hw/android.hardware.gatekeeper-service.trusty"
+# W4 rehearsal: stdio_to_kmsg needs /dev/kmsg_debug, which lapis's user-build init never creates (== build_esp
+# GB_KMSGDBG_SVC / GB_KMSGDBG_EARLY, stripped lines)
+KMSGDBG_SVC = ("service gb_kmsgdbg /system/bin/toybox mknod -m 0600 /dev/kmsg_debug c 1 11", "user root", "group root",
+               "seclabel u:r:shell:s0", "oneshot", "disabled")
+KMSGDBG_EARLY = ("exec_start gb_kmsgdbg", "restorecon /dev/kmsg_debug")
+# W5 VNNI libz patch (== build_esp VNNI_FORMAT / VNNI_BINDS / VNNI_ODM; the kill switch lines of GBINIT)
+VNNI_FORMAT = "gb-vnni-1"
+VNNI_ODM = "/odm/vnni"
+VNNI_BINDS = {"/system/lib64/libz.so": "ro.system.build.fingerprint", "/vendor/lib64/libz.so": "ro.vendor.build.fingerprint"}
+VNNI_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+VNNI_FP_RE = r"[^/]+/[^/]+/[^/:]+:[^/]+/([^/]+)/([^:/]+):[^/]+/[^/]+"
+VNNI_PROP_SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:+,@~"
+VNNI_KILL_INIT = "HW=; USB=0; HWTOK=0; OV=0; VN=1"
+VNNI_KILL_CASE = "gb.vnni=0) VN=0;;"
+VNNI_KILL = '[ "$VN" = 0 ] && /busybox rm -rf /odm/vnni'
+VNNI_OFF_TITLE = "(VM test, W5, VNNI off)"
+VNNI_GATE_RE = re.compile(rf"on early-init && property:(ro\.(?:system|vendor)\.build\.fingerprint)=({VNNI_FP_RE})")
 # GBINIT's ESP bring-up call (WAVE3 contract 2.3, exact lines)
 GBINIT_GATE = 'if [ "$HW" = native ] && [ "$HWTOK" = 1 ] && [ "$OV" = 1 ] && [ -f /gbbringup.sh ]; then'
 GBINIT_CALL = "  /busybox timeout 40 /busybox sh /gbbringup.sh >> /odm/gbinit_bringup.log 2>&1"
@@ -820,9 +878,12 @@ class Ctx:
     tests that build files directly); cpio / listing: parsed from files unless given."""
 
     def __init__(self, files, info=None, kind="auto", super_guid=None, boot=None, part_size=None, krel_file=None,
-                 no_gfxdriver=False, compare=None, cpio=None, listing=None, bringup_test=False):
+                 no_gfxdriver=False, compare=None, cpio=None, listing=None, bringup_test=False, esp_size=None,
+                 expect_inject=None):
         self.files, self.info, self.boot, self.part_size = files, info, boot, part_size
         self.bringup_test = bringup_test                 # the R-12b test ESP (build_usb.py --bringup-test)
+        self.esp_size = esp_size or ESP_SIZE             # (W4) --esp-size: the user VM's lapis ESP is 192 MiB
+        self.expect_inject = expect_inject.lower() if expect_inject else None    # (W4) V30
         self.super_guid = super_guid.lower() if super_guid else None
         self.krel_file, self.no_gfxdriver, self.compare = krel_file, no_gfxdriver, compare
         self.notes = []                                 # (check id, text): informational lines for the report
@@ -929,15 +990,16 @@ def v1(c):
         return [f"the ESP does not parse as FAT32: {c.info['error']}"]
     p = []
     size = c.info["bytes"]
-    if size != ESP_SIZE:
-        p.append(f"ESP size {size:,} B, expected {ESP_SIZE:,} B")
+    if size != c.esp_size:
+        p.append(f"ESP size {size:,} B, expected {c.esp_size:,} B")
     if c.part_size is not None and c.part_size != size:
         p.append(f"the FAT covers {size:,} B but the partition/file is {c.part_size:,} B")
-    if c.kind == "native":
-        ini = [len(v) for k, v in c.files.items() if re.fullmatch(r"initrd-[a-z]\.img", k)]
-        need = (max(ini) if ini else 0) + 144 * MiB
-        if c.info["free"] < need:
-            p.append(f"ESP free {c.info['free'] / MiB:.1f} MiB < max(initrd) + 144 MiB = {need / MiB:.1f} MiB")
+    ini = [len(v) for k, v in c.files.items() if re.fullmatch(r"initrd-[a-z]\.img", k)]
+    # native: gb_slotsync's second initrd + 16 MiB + gb_bootlog's 128 MiB floor; (W4) VM: the second initrd + 16 MiB
+    margin = 144 if c.kind == "native" else 16
+    need = (max(ini) if ini else 0) + margin * MiB
+    if c.info["free"] < need:
+        p.append(f"ESP free {c.info['free'] / MiB:.1f} MiB < max(initrd) + {margin} MiB = {need / MiB:.1f} MiB")
     return p
 
 
@@ -1292,7 +1354,7 @@ def v11(c):
     rc = c.rc("gbstage")
     if rc is None:
         return p + ["no gbstage/etc/init/gb.rc"]
-    if c.kind in ("vm", "vmtest-kat"):              # the KAT tree's own additions: V28
+    if c.kind in ("vm", "vmtest-kat", "vmtest-nogk"):   # the KAT tree's own additions: V28; the nogk tree's: V29
         if hits:
             p.append(f"dGPU stack in the VM tree: {hits[:4]}")
         for s in VM_RC_FORBIDDEN:
@@ -1406,6 +1468,49 @@ def v12(c):
     if len(p) > 12:
         p = p[:12] + [f"... {len(p) - 12} more"]
     return ["; ".join(p)] if p else []
+
+
+def ptload_problems(data):
+    """(W5, C-1) None for a file that is not an x86-64 ELF64 executable or shared object (not ELF, a relocatable .ko,
+    another machine); else [problem, ...] of its PT_LOAD headers as bionic maps them (page-wise): each needs a
+    power-of-two p_align, p_offset == p_vaddr modulo max(p_align, 4 KiB) and to lie inside the file
+    (== build_esp._ptload_problems, which returns [] for the None case)."""
+    if data[:4] != b"\x7fELF" or len(data) < 64 or data[4] != 2 or data[5] != 1 or \
+            struct.unpack_from("<HH", data, 16) not in ((2, 62), (3, 62)):
+        return None
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    if phentsize < 56 or phoff + phnum * phentsize > len(data):
+        return ["program headers outside the file"]
+    probs, loads = [], 0
+    for i in range(phnum):
+        f = struct.unpack_from("<IIQQQQQQ", data, phoff + i * phentsize)
+        p_type, p_off, p_vaddr, p_filesz, p_align = f[0], f[2], f[3], f[5], f[7]
+        if p_type == 1:
+            loads += 1
+            if p_align & (p_align - 1) or (p_off - p_vaddr) % max(p_align, 4096) or p_off + p_filesz > len(data):
+                probs.append(f"PT_LOAD {i}: offset {p_off:#x} vaddr {p_vaddr:#x} filesz {p_filesz:#x} "
+                             f"align {p_align:#x}")
+    return probs if loads else ["no PT_LOAD"]
+
+
+def v12b(c):
+    """(W5, C-1) every x86-64 executable / shared object in the cpio (every tree and kind) is mappable by bionic."""
+    bad, n = [], 0
+    for path, (md, d) in sorted(c.tree.items()):
+        if d is None or not is_reg(md):
+            continue
+        pr = ptload_problems(d)
+        if pr is None:
+            continue
+        n += 1
+        if pr:
+            bad.append(f"{path}: {pr[0]}" + (f" (+{len(pr) - 1} more)" if len(pr) > 1 else ""))
+    c.notes.append(("V12b", f"{n} x86-64 ELF executables / shared objects checked"))
+    if not bad:
+        return []
+    return [f"{len(bad)} ELF file(s) that bionic cannot map (PT_LOAD p_offset != p_vaddr mod p_align, C-1): "
+            + "; ".join(bad[:4]) + (f"; ... {len(bad) - 4} more" if len(bad) > 4 else "")]
 
 
 def v13(c):
@@ -1615,6 +1720,8 @@ def v24(c):
         p.append(f"the VM test gfx title lacks {VMTEST_TITLE!r}")
     if c.kind == "vmtest-kat" and VMTEST_KAT_TITLE not in (c.base["title"] or ""):
         p.append(f"the VM test KAT title lacks {VMTEST_KAT_TITLE!r}")
+    if c.kind == "vmtest-nogk" and VMTEST_NOGK_TITLE not in (c.base["title"] or ""):
+        p.append(f"the VM test no-Gatekeeper title lacks {VMTEST_NOGK_TITLE!r}")
     return p
 
 
@@ -1664,26 +1771,24 @@ def v25(c):
 
 
 def v26(c):
-    """WAVE3 item 4 ([W3R-06]): fs-verity on the native userdata only; the VM fstab is the shared input unchanged."""
+    """WAVE3 item 4 ([W3R-06]); W4 (VM_UPGRADE.md 2.2(b)): fs-verity on the userdata line of both trees' fstab."""
     try:
         host = rd_host(HOST["fstab"])
     except OSError as e:
         return [f"inject fstab unreadable ({e})"]
-    if c.kind != "native":
-        got = c.data("gbstage/etc/fstab.android-desktop")
-        return [] if got == host else ["the VM tree's fstab differs from inject\\fstab.android-desktop (the user's VM)"]
-    got = c.data("gbnative/etc/fstab.android-desktop")
+    tr, label = ("gbnative", "native") if c.kind == "native" else ("gbstage", "VM")
+    got = c.data(f"{tr}/etc/fstab.android-desktop")
     if got is None:
-        return ["no gbnative/etc/fstab.android-desktop"]
+        return [f"no {tr}/etc/fstab.android-desktop"]
     ud = fstab_userdata(got)
     if len(ud) != 1 or len(ud[0][1]) != 5 or ud[0][1][4].split(b",").count(b"fsverity") != 1:
-        return ["the native fstab needs exactly one userdata line with fsverity in its fs_mgr flags"]
+        return [f"the {label} fstab needs exactly one userdata line with fsverity in its fs_mgr flags"]
     hu = fstab_userdata(host)
     lines = host.split(b"\n")
     if len(hu) == 1:
         lines[hu[0][0]] = lines[hu[0][0]].rstrip() + b",fsverity"
     if len(hu) != 1 or b"\n".join(lines) != got:
-        return ["the native fstab is not inject\\fstab.android-desktop plus ',fsverity' on the userdata line"]
+        return [f"the {label} fstab is not inject\\fstab.android-desktop plus ',fsverity' on the userdata line"]
     return []
 
 
@@ -1701,16 +1806,42 @@ def v27(c):
 
 
 def v28(c):
-    """WAVE3 6.4 / contract 2.7: the VNNI KAT and its zram modules only in the throwaway vmtest-kat tree."""
+    """WAVE3 6.4 / contract 2.7: the VNNI KAT only in the throwaway vmtest-kat tree. W4 (VM_UPGRADE.md 2.2(a)): every
+    VM kind loads the staged zsmalloc + zram at early-init and leaves sizing/enabling zram to lapis's mmd."""
     p = []
     kat = sorted(x for x in c.tree if x.rsplit("/", 1)[-1] in ("vnni_kat", "gb_vnni_kat.sh"))
+    if c.kind != "native":
+        rc = c.data("gbstage/etc/init/gb.rc") or b""
+        for n in VM_ZRAM:
+            e = c.tree.get("gbstage/lib/modules/" + n)
+            try:
+                if e is None or e[0] != 0o100644 or e[1] != rd_host(os.path.join(HOST["vm_modules"], n)):
+                    p.append(f"gbstage/lib/modules/{n} missing, not 0644 or not the staged inject\\modules copy")
+            except OSError as ex:
+                p.append(f"inject\\modules\\{n} unreadable ({ex})")
+        early = [s for s in rc_sections(rc.decode("utf-8", "replace")) if s[0] == "on early-init"]
+        lines = early[0][1:] if len(early) == 1 else []
+        want = ["insmod /odm/lib/modules/vmwgfx.ko"] + [f"insmod /odm/lib/modules/{n}" for n in VM_ZRAM]
+        at = [i for i in range(len(lines)) if lines[i:i + len(want)] == want]
+        if len(early) != 1 or len(at) != 1 or rc.count(b"insmod /odm/lib/modules/zram.ko") != 1:
+            p.append("the VM gb.rc must insmod zsmalloc.ko then zram.ko once, right after vmwgfx.ko in on early-init")
+        bad = [w for w in (b"disksize", b"mkswap", b"swapon") if w in rc]
+        if bad:
+            p.append(f"the VM gb.rc sets up zram itself ({[w.decode() for w in bad]}): only lapis's mmd may (2.2(a))")
+        # (W4 rehearsal) gb_zram: the post-fs-data fallback for lapis's racing `modprobe zram` (build_esp GB_ZRAM_*)
+        try:
+            zs, zrc = be_const("GB_ZRAM_SH"), be_const("GB_ZRAM_RC")
+            e = c.tree.get("gbstage/gb_zram.sh")
+            if e is None or e[0] != 0o100755 or e[1] != zs or rc.count(zrc) != 1 or rc.count(b"service gb_zram ") != 1:
+                p.append("the VM tree lacks gb_zram (0755 /odm/gb_zram.sh == build_esp GB_ZRAM_SH, its service and the "
+                         "post-fs-data start, once): lapis's own modprobe of zram can win the early-init race")
+            if any(w in zs for w in (b"disksize", b"mkswap", b"swapon")):
+                p.append("gb_zram.sh sets up zram itself: only lapis's mmd may (2.2(a))")
+        except (OSError, KeyError, ValueError, SyntaxError) as ex:
+            p.append(f"build_esp.py GB_ZRAM constants unreadable ({ex.__class__.__name__})")
     if c.kind != "vmtest-kat":
         if kat:
             p.append(f"the KAT is in a {c.kind} tree: {kat}")
-        if c.kind != "native":
-            z = sorted(x for x in c.tree if x in ("gbstage/lib/modules/zram.ko", "gbstage/lib/modules/zsmalloc.ko"))
-            if z:
-                p.append(f"zram in the shipped VM tree {z} (item 5 is out of scope)")
         if "VNNI KAT" in (c.rc("gbstage") or "") + (c.rc() or ""):
             p.append("the KAT rc fragment is in a shipped gb.rc")
         return p
@@ -1729,12 +1860,6 @@ def v28(c):
             p.append("gbstage/vnni_kat does not match inject\\kat\\SHA256SUMS")
     except OSError as e:
         p.append(f"inject\\kat\\SHA256SUMS unreadable ({e})")
-    for n in ("zsmalloc.ko", "zram.ko"):
-        try:
-            if c.data("gbstage/lib/modules/" + n) != rd_host(os.path.join(HOST["modules"], n)):
-                p.append(f"gbstage/lib/modules/{n} is not the staged inject\\native\\modules copy")
-        except OSError as e:
-            p.append(f"inject\\native\\modules\\{n} unreadable ({e})")
     try:
         if c.data("gbstage/gb_vnni_kat.sh") != be_const("GB_VNNI_KAT_SH"):
             p.append("gbstage/gb_vnni_kat.sh differs from build_esp.py")
@@ -1747,13 +1872,264 @@ def v28(c):
     return p
 
 
+def elf_dynamic(data):
+    """(interpreter or None, [DT_NEEDED names]) of an ELF64 x86-64 LE file (program headers only); ValueError if not."""
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1 or struct.unpack_from("<H", data, 18)[0] != 62:
+        raise ValueError("not an x86-64 ELF64 LE file")
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    loads, dyn, interp = [], None, None
+    for i in range(phnum):
+        p_type, _, p_off, p_vaddr, _, p_filesz = struct.unpack_from("<IIQQQQ", data, phoff + i * phentsize)
+        if p_type == 1:
+            loads.append((p_vaddr, p_off, p_filesz))
+        elif p_type == 2:
+            dyn = (p_off, p_filesz)
+        elif p_type == 3:
+            interp = data[p_off:p_off + p_filesz].split(b"\0")[0].decode("ascii", "replace")
+    if dyn is None:
+        raise ValueError("no PT_DYNAMIC")
+    tags = [struct.unpack_from("<qQ", data, dyn[0] + 16 * k) for k in range(dyn[1] // 16)]
+    strtab = [v for t, v in tags if t == 5]
+    off = [o + strtab[0] - va for va, o, sz in loads if strtab and va <= strtab[0] < va + sz]
+    if len(strtab) != 1 or not off:
+        raise ValueError("no usable DT_STRTAB")
+    needed = []
+    for t, v in tags:
+        if t == 0:
+            break
+        if t == 1:
+            needed.append(data[off[0] + v:data.index(b"\0", off[0] + v)].decode("ascii", "replace"))
+    return interp, needed
+
+
+def gk_component():
+    """(binary bytes, its SHA256SUMS sha256 or None, VINTF fragment bytes, the gb.rc block) from the gatekeeper
+    component manifest (HOST components): the same sources build_esp.py packs into both trees."""
+    m = [m for _, m in manifests(False) if m.get("name") == "gatekeeper"]
+    if len(m) != 1:
+        raise KeyError("no single gatekeeper component manifest")
+    files = {e["dest"]: e["src"] for e in m[0].get("files", [])}
+    gbin = rd_host(files[GK_BIN_DEST])
+    sums = {}
+    for ln in rd_host(os.path.join(os.path.dirname(files[GK_BIN_DEST]), "SHA256SUMS")).decode("ascii").splitlines():
+        if ln.strip():
+            h, n = ln.split(None, 1)
+            sums[n.strip().lstrip("*")] = h.lower()
+    rc = rd_host(m[0]["rc_files"][0])
+    return gbin, sums.get(os.path.basename(files[GK_BIN_DEST])), rd_host(files[GK_VINTF_DEST]), \
+        b"\n# ---- component gatekeeper ----\n" + rc
+
+
+def v29(c):
+    """W4 (GATEKEEPER.md 7.5): the software Gatekeeper in every kind except vmtest-nogk (there: none of it); the Trusty
+    Gatekeeper and Weaver stay masked in every kind."""
+    tr = "gbnative" if c.kind == "native" else "gbstage"
+    rcb = c.data(f"{tr}/etc/init/gb.rc")
+    if rcb is None:
+        return [f"no {tr}/etc/init/gb.rc"]
+    rc = rcb.decode("utf-8", "replace")
+    lines = [ln.strip() for ln in rc.splitlines()]
+    b, v = c.tree.get(f"{tr}/{GK_BIN_DEST}"), c.tree.get(f"{tr}/{GK_VINTF_DEST}")
+    frags = sorted(x for x, (m, d) in c.tree.items() if x.startswith(f"{tr}/etc/vintf/") and d is not None)
+    p = []
+    if c.kind == "vmtest-nogk":
+        if b is not None or v is not None or frags or "gb_gatekeeper" in rc or GK_IFACE in lines:
+            p.append("the no-Gatekeeper test tree carries a Gatekeeper part (binary, fragment or rc)")
+    else:
+        try:
+            gbin, gsum, gvintf, block = gk_component()
+        except (OSError, KeyError, ValueError, IndexError) as e:
+            return [f"gatekeeper component sources unreadable ({e.__class__.__name__}: {e})"]
+        if b is None or b[0] != 0o100755 or b[1] != gbin:
+            p.append(f"{tr}/{GK_BIN_DEST} missing, not 0755 or not the component's binary")
+        if gsum != sha256(gbin):
+            p.append("the component's binary does not match its out\\android\\SHA256SUMS line")
+        if b is not None:
+            try:
+                interp, needed = elf_dynamic(b[1])
+                if interp != "/system/bin/linker64" or not needed or set(needed) - set(GK_LLNDK):
+                    p.append(f"the Gatekeeper binary: interpreter {interp}, NEEDED {needed} (LLNDK only: {GK_LLNDK})")
+            except (ValueError, struct.error, IndexError) as e:
+                p.append(f"the Gatekeeper binary is not a readable ELF ({e})")
+        if v is None or v[0] != 0o100644 or sha256(v[1]) != GK_VINTF_SHA256 or v[1] != gvintf:
+            p.append(f"{tr}/{GK_VINTF_DEST} missing, not 0644 or not the reviewed fragment ({GK_VINTF_SHA256[:8]})")
+        if frags != [f"{tr}/{GK_VINTF_DEST}"]:
+            p.append(f"ODM VINTF fragments {frags}: exactly the Gatekeeper's expected")
+        if rcb.count(block) != 1 or rc.count("service gb_gatekeeper ") != 1:
+            p.append("gb.rc must hold the gatekeeper component's rc block exactly once (pairing rule)")
+        if lines.count(GK_IFACE) != 1:
+            p.append(f"gb.rc has {lines.count(GK_IFACE)} '{GK_IFACE}' lines (exactly one declaration)")
+    if lines.count(GK_TRUSTY_BIND) != 1 or lines.count(GK_WEAVER_BIND) != 1:
+        p.append("gb.rc must bind the empty manifest over the Trusty Gatekeeper and the Weaver fragments (once each)")
+    t = c.tree.get(f"{tr}/{GK_TRUSTY_BIN}")
+    if t is None or t[0] != 0o100755 or not (t[1] or b"").startswith(b"#!/system/bin/sh\n"):
+        p.append(f"{tr}/{GK_TRUSTY_BIN} must stay the sleep stub")
+    if GK_TRUSTY_WHITEOUT not in (c.data("gbinit") or b"").decode("utf-8", "replace").splitlines():
+        p.append("gbinit lacks the whiteout of the Trusty Gatekeeper .rc")
+    ks = [i for i, ln in enumerate(lines) if ln == KMSGDBG_SVC[0]]
+    ei = lines.index("on early-init") if "on early-init" in lines else -1
+    if (len(ks) != 1 or tuple(lines[ks[0]:ks[0] + len(KMSGDBG_SVC)]) != KMSGDBG_SVC or ei < 0
+            or tuple(lines[ei + 1:ei + 3]) != KMSGDBG_EARLY or lines.count(KMSGDBG_EARLY[0]) != 1
+            or lines.count(KMSGDBG_EARLY[1]) != 1):
+        p.append("gb.rc must create the root-only /dev/kmsg_debug first thing at early-init (gb_kmsgdbg service, "
+                 "exec_start + restorecon): without it stdio_to_kmsg output (gb_gatekeeper) is lost on the user build")
+    return p
+
+
+def v30(c):
+    """W4: --expect-inject-sha256 (the rehearsal tree == the user-VM preview's tree)."""
+    if c.expect_inject is None:
+        return []
+    gz = c.files.get("gb/inject.gz")
+    if gz is None or sha256(gz) != c.expect_inject:
+        return [f"gb/inject.gz sha256 {sha256(gz) if gz is not None else 'missing'} != {c.expect_inject}"]
+    return []
+
+
+def vnni_host_tree(root=None):
+    """{"vnni/<id>/<path>": bytes} of the prepared VNNI folders on the host (HOST["vnni"]); {} without the folder."""
+    root = root or HOST["vnni"]
+    out = {}
+    if os.path.isdir(root):
+        for dp, _, fs in os.walk(root):
+            for n in fs:
+                p = os.path.join(dp, n)
+                out["vnni/" + os.path.relpath(p, root).replace("\\", "/")] = rd_host(p)
+    return out
+
+
+def vnni_actions(files):
+    """([(id, target, [the stripped lines of its gb.rc action])], problems) from the vnni/<id>/manifest.json files of
+    a tree ({"vnni/<id>/<path>": bytes}): every target's file exists, has its patched_sha256, its gate is the
+    folder's fingerprint and an init-safe token, its bind one of VNNI_BINDS; each folder holds exactly its files."""
+    acts, p = [], []
+    stray = sorted(k for k in files if k.count("/") < 2)
+    if stray:
+        p.append(f"/odm/vnni top-level files outside an <id> folder: {stray[:3]}")
+    ids = sorted({k.split("/")[1] for k in files if k.count("/") >= 2})
+    for i in ids:
+        raw = files.get(f"vnni/{i}/manifest.json")
+        try:
+            m = json.loads(raw.decode("utf-8")) if raw is not None else None
+        except (ValueError, UnicodeDecodeError):
+            m = None
+        if not isinstance(m, dict) or m.get("format") != VNNI_FORMAT or m.get("id") != i or not m.get("targets"):
+            p.append(f"vnni/{i}/manifest.json missing or not a {VNNI_FORMAT} manifest of id {i} with targets")
+            continue
+        want = {f"vnni/{i}/manifest.json"} | {f"vnni/{i}/{t.get('file')}" for t in m["targets"]}
+        have = {k for k in files if k.startswith(f"vnni/{i}/")}
+        if have != want:
+            p.append(f"vnni/{i}: files {sorted(have - want)[:3]} not in its manifest or {sorted(want - have)[:3]} missing")
+        for t in m["targets"]:
+            f, dst, gp, gv = t.get("file"), t.get("bind"), t.get("gate_prop"), t.get("gate_value")
+            data = files.get(f"vnni/{i}/{f}")
+            if data is None or sha256(data) != t.get("patched_sha256"):
+                p.append(f"vnni/{i}/{f}: missing or not its manifest's patched_sha256")
+            if VNNI_BINDS.get(dst) != gp or f != (dst or "").lstrip("/"):
+                p.append(f"vnni/{i}/{f}: bind {dst} / gate {gp} is not one of {sorted(VNNI_BINDS.items())}")
+                continue
+            if (not gv or gv == "*" or gv != (m.get("fingerprints") or {}).get(gp)
+                    or not all(ch in VNNI_PROP_SAFE for ch in gv)
+                    or not VNNI_GATE_RE.fullmatch(f"on early-init && property:{gp}={gv}")):
+                p.append(f"vnni/{i}/{f}: gate value {gv!r} is not the folder's {gp} (init-safe)")
+                continue
+            src = f"{VNNI_ODM}/{i}/{f}"
+            acts.append((i, t, [f"on early-init && property:{gp}={gv}", f"restorecon {src}",
+                                f"mount none {src} {dst} bind", f"restorecon {dst}", f"mount none none {dst} remount bind ro"]))
+    return acts, p
+
+
+def vnni_rc_text(files):
+    """The gb.rc actions build_esp.py appends for these vnni files (without its comment head), as text."""
+    acts, _ = vnni_actions(files)
+    return "\n".join(a[2][0] + "\n" + "".join(f"    {ln}\n" for ln in a[2][1:]) for a in acts)
+
+
+def v31(c):
+    """W5: the VNNI libz patch: the packed folders == inject\\vnni, sha-pinned to the reviewed patcher manifest,
+    every bind gated on the exact build fingerprint (remounted read-only in init's mount namespace only; the inode
+    stays writable through the rw /odm tmpfs), none ungated, after the 'on early-init' /vendor overlay; no libz.so*
+    outside /odm/vnni/<id>/; no gate override in /odm/etc/build.prop; the gb.vnni=0 kill switch."""
+    tr = "gbnative" if c.kind == "native" else "gbstage"
+    rcb = c.data(f"{tr}/etc/init/gb.rc")
+    if rcb is None:
+        return [f"no {tr}/etc/init/gb.rc"]
+    p = []
+    img = {x[len(tr) + 1:]: e for x, e in c.tree.items() if x.startswith(f"{tr}/vnni/")}
+    files = {k: d for k, (m, d) in img.items() if d is not None and is_reg(m)}
+    bad = sorted(k for k, (m, d) in img.items() if d is not None and (not is_reg(m) or m & 0o7777 != 0o644))
+    if bad:
+        p.append(f"/odm/vnni entries that are not 0644 regular files: {bad[:3]}")
+    try:
+        host = vnni_host_tree()
+    except OSError as e:
+        return p + [f"inject\\vnni unreadable ({e})"]
+    if set(files) != set(host) or any(files[k] != host[k] for k in files if k in host):
+        p.append(f"/odm/vnni differs from inject\\vnni (missing {sorted(set(host) - set(files))[:2]}, extra "
+                 f"{sorted(set(files) - set(host))[:2]}, changed {sorted(k for k in files if k in host and files[k] != host[k])[:2]})")
+    acts, probs = vnni_actions(files)
+    p += probs
+    allowed_libz = {f"{tr}/vnni/{i}/{t.get('file')}" for i, t, _ in acts
+                    if re.fullmatch(rf"vnni/{VNNI_ID_RE}/(?:system|vendor)/lib64/libz\.so", f"vnni/{i}/{t.get('file')}")}
+    bad_libz = sorted(x for x, (m, _) in c.tree.items()
+                      if not is_dir(m) and x.rsplit("/", 1)[-1].startswith("libz.so") and x not in allowed_libz)
+    if bad_libz:
+        p.append(f"libz.so* entry outside {tr}/vnni/<id>/{{system,vendor}}/lib64/libz.so: {bad_libz[:3]}")
+    bp = (c.data(f"{tr}/etc/build.prop") or b"").decode("utf-8", "replace").splitlines()
+    bad_bp = [ln.strip() for ln in bp if ln.strip() and not ln.strip().startswith("#") and "=" in ln
+              and (ln.split("=", 1)[0].strip() in VNNI_BINDS.values()
+                   or ln.split("=", 1)[0].strip().startswith(("ro.system.build.", "ro.vendor.build.")))]
+    if bad_bp:
+        p.append(f"{tr}/etc/build.prop overrides a VNNI gate/build property: {bad_bp[:2]}")
+    rc = rcb.decode("utf-8", "replace")
+    secs = rc_sections(rc)
+    vsec = [i for i, s in enumerate(secs) if any(VNNI_ODM in ln or "libz.so" in ln for ln in s)]
+    if files or vsec:
+        try:
+            pm = json.loads(rd_host(HOST["vnni_patcher"]).decode("utf-8"))
+            allowed = {(t["orig_sha256"], t["patched_sha256"], t["deploy"]["bind"], t["deploy"]["gate_prop"])
+                       for t in pm["targets"] if t.get("deploy")}
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return p + [f"the reviewed patcher manifest is unreadable ({e.__class__.__name__})"]
+        for i, t, _ in acts:
+            if (t.get("orig_sha256"), t.get("patched_sha256"), t.get("bind"), t.get("gate_prop")) not in allowed:
+                p.append(f"vnni/{i}/{t.get('file')}: not a deployable target of the reviewed patcher manifest")
+        want = [tuple(a[2]) for a in acts]
+        got = [tuple(secs[i]) for i in vsec]
+        for w in want:
+            if got.count(w) != 1:
+                p.append(f"gb.rc must hold the gated action '{w[0][:60]}...' for {w[2].split()[2]} exactly once "
+                         f"(the 4 reviewed lines)")
+        extra = [g[0] for g in got if g not in want]
+        if extra:
+            p.append(f"gb.rc sections using /odm/vnni or naming libz.so that are not a packed file's gated action "
+                     f"(an ungated or stray bind): {extra[:2]}")
+        ov = [i for i, s in enumerate(secs) if any(ln.startswith("mount overlay gbkm /vendor ") for ln in s)]
+        if vsec and (not ov or secs[ov[0]][0] != "on early-init" or min(vsec) < ov[0]):
+            p.append("the vnni actions must come after the 'on early-init' /vendor overlay action (a bind made before it is hidden)")
+        gl = (c.data("gbinit") or b"").decode("utf-8", "replace").splitlines()
+        cp = next((k for k, ln in enumerate(gl) if ln.startswith("/busybox cp -a $SRC/. /odm/")), -1)
+        if VNNI_KILL_INIT not in gl or not any(VNNI_KILL_CASE in ln and "/proc/cmdline" in ln for ln in gl) or \
+                cp < 0 or gl[cp + 1:cp + 2] != [VNNI_KILL]:
+            p.append("gbinit lacks the gb.vnni=0 kill switch (VN=1, the case token, the rm of /odm/vnni after the copy)")
+    for n, text in sorted(c.entries.items()):
+        e = parse_entry(text)
+        vt = [x for x in e["tokens"] if x.startswith("gb.vnni=")]
+        if vt and (vt != ["gb.vnni=0"] or c.kind == "native" or VNNI_OFF_TITLE not in (e["title"] or "")):
+            p.append(f"entry {n}: {vt} (gb.vnni=0 only in a test entry titled {VNNI_OFF_TITLE!r})")
+    return p
+
+
 ALL, NATIVE, VMS = "all", "native", "vm"
 CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("V5", v5, NATIVE),
           ("V6", v6, ALL), ("V7", v7, ALL), ("V8", v8, NATIVE), ("V8b", v8b, NATIVE), ("V9", v9, ALL),
-          ("V10", v10, ALL), ("V11", v11, ALL), ("V12", v12, ALL), ("V13", v13, NATIVE), ("V14", v14, ALL),
+          ("V10", v10, ALL), ("V11", v11, ALL), ("V12", v12, ALL), ("V12b", v12b, ALL), ("V13", v13, NATIVE),
+          ("V14", v14, ALL),
           ("V15", v15, NATIVE), ("V16", v16, NATIVE), ("V17", v17, ALL), ("V18", v18, ALL), ("V19", v19, NATIVE),
           ("V20", v20, NATIVE), ("V21", v21, NATIVE), ("V22", v22, NATIVE), ("V23", v23, ALL), ("V24", v24, VMS),
-          ("V25", v25, ALL), ("V26", v26, ALL), ("V27", v27, ALL), ("V28", v28, ALL)]
+          ("V25", v25, ALL), ("V26", v26, ALL), ("V27", v27, ALL), ("V28", v28, ALL), ("V29", v29, ALL),
+          ("V30", v30, ALL), ("V31", v31, ALL)]
 
 
 def run_checks(c, only=None):
@@ -1795,13 +2171,14 @@ def esp_report(rep, files, info, a, super_guid, part_size, label):
             rep.bad("V17", f"--compare-export {a.compare_export}: {e}")
     c = Ctx(files, info=info, kind=a.expect_tree, super_guid=super_guid, boot=a.boot, part_size=part_size,
             krel_file=a.krel, no_gfxdriver=a.no_gfxdriver, compare=compare,
-            bringup_test=getattr(a, "expect_bringup_test", False))
+            bringup_test=getattr(a, "expect_bringup_test", False), esp_size=getattr(a, "esp_size", None),
+            expect_inject=getattr(a, "expect_inject_sha256", None))
     print(f"{label}: tree {c.kind}, slot {c.slot}, krel {c.krel}, {len(c.cpio)} cpio entries, "
           f"{len(files)} ESP files" + (f", free {info['free'] / MiB:.1f} MiB" if info and 'free' in info else ""),
           flush=True)
     t0 = time.time()
     for vid, probs in run_checks(c).items():
-        if vid == "V17" and compare is None:
+        if (vid == "V17" and compare is None) or (vid == "V30" and c.expect_inject is None):
             continue
         if probs:
             for msg in probs:
@@ -1968,9 +2345,14 @@ def main(argv=None):
     ap.add_argument("--esp", help="verify an ESP image file instead of a disk image")
     ap.add_argument("--boot", choices=["usb", "internal"], help="--esp: the entry's gb.boot= value")
     ap.add_argument("--super-guid", help="--esp: the super GUID every boot_part_uuid must name")
-    ap.add_argument("--expect-tree", choices=["auto", "native", "vm", "vmtest-gfx", "vmtest-kat"], default="auto")
+    ap.add_argument("--expect-tree", choices=["auto", "native", "vm", "vmtest-gfx", "vmtest-kat", "vmtest-nogk"],
+                    default="auto")
     ap.add_argument("--expect-bringup-test", action="store_true",
                     help="--esp: the R-12b test ESP (build_usb.py --bringup-test): gb/gb.cfg and gb.overlay=1 expected")
+    ap.add_argument("--esp-size", type=int, metavar="BYTES",
+                    help=f"--esp: the expected FAT size (default {ESP_SIZE:,}; the user VM's lapis ESP: 201326592)")
+    ap.add_argument("--expect-inject-sha256", metavar="HEX",
+                    help="V30: gb/inject.gz must have this sha256 (build_usb.py --vm-test-rehearsal's .vmtree.sha256)")
     ap.add_argument("--krel", help="file whose first line is the expected kernel release")
     ap.add_argument("--no-gfxdriver", action="store_true", help="the image was built with GB_GFXDRIVER=0")
     ap.add_argument("--compare-export", metavar="ESP", help="an export EFI-SYSTEM.img that must hold the same tree")
@@ -1982,8 +2364,12 @@ def main(argv=None):
         return extract_mode(*a.extract)
     if a.esp and a.img:
         ap.error("give either IMG or --esp FILE")
-    if not a.esp and (a.boot or a.super_guid or a.expect_bringup_test):
-        ap.error("--boot, --super-guid and --expect-bringup-test are only used with --esp")
+    if not a.esp and (a.boot or a.super_guid or a.expect_bringup_test or a.esp_size):
+        ap.error("--boot, --super-guid, --expect-bringup-test and --esp-size are only used with --esp")
+    if a.expect_inject_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", a.expect_inject_sha256):
+        ap.error("--expect-inject-sha256 needs 64 hex digits")
+    if a.esp_size is not None and (a.esp_size <= 0 or a.esp_size % SECTOR):
+        ap.error("--esp-size must be a positive multiple of 512")
     if a.super_guid:
         try:
             uuid.UUID(a.super_guid)

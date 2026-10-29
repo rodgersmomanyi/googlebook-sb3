@@ -16,6 +16,8 @@ use it, read [docs/NVIDIA.md](../../docs/NVIDIA.md) first.
 | `1b/REVIEW.md` | The review of the first graphics-switching draft. |
 | `1b/WAVE2_PLAN_v2.md` | The executed integration plan for the image pipeline (USB image, dual-boot export, installer ISO). |
 | `w3/WAVE3_PLAN.md`, `w3/WAVE3_REVIEW.md` | Wave 3 (2026-10-26): the executed plan for the findings taken from gbOS86 (8250 `nr_uarts`, DRAS card id, the `#UD` emulator rework and kernel build #15, fs-verity, the boot-log summary, apgetty, the ESP bring-up config, the gb_slotsync kernel check, `-UpdateEspOnly`, firmware pinning, the HWUI and white-veil checks, docs) and its adversarial review (`[W3R-nn]` corrections). |
+| `w4/GATEKEEPER.md`, `w4/REVIEW.md` | Wave 4 (2026-10-26): the design of the software Gatekeeper (lock-screen PIN) with its sources, persistence and throttling analysis, integration as built (7.9), lock-out recovery (8), test plan and the device rehearsal results (9.6), and the adversarial review of that design and of the VM upgrade plan. User summary: [docs/GATEKEEPER.md](../../docs/GATEKEEPER.md); sources: [`native/gatekeeper`](../gatekeeper/). |
+| `w4/VM_UPGRADE.md`, `w4/tools/` | Wave 4: backing up a VMware VM, then upgrading its ESP (k15, zram, fs-verity, the Gatekeeper), with the rehearsal on a throwaway VM, the rollback paths, and the backup/preview tools (`gb_vmbackup.py`, `vm_esp_preview.py`, `esp_tree_diff.py`, `sb_probe.py`). |
 
 Components: [`nouveau-kernel`](../nouveau-kernel/) (policy scripts), [`power`](../power/) (gb_power),
 [`nvk-android`](../nvk-android/) (NVK build and `nvk_probe`), [`gfx-driver-pkg`](../gfx-driver-pkg/) (per-app driver

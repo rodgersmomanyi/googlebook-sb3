@@ -1,0 +1,9 @@
+pre_w4_src/  byte-identical copy of src/ as reviewed in C:\GB-build\native\dgpu\w4\REVIEW.md
+             (gb_gatekeeper 0.1.0, binary sha256 b62b205c90da7367d95e97a375dce51613f8b6bcedc5d3dcd5354ef9f153a46e),
+             taken from the builder copy ~/gk/proto/gatekeeper/src before the W4 fixes; its 13 sha256
+             equal the reviewed Windows copy's. Not built into anything: only
+             `REGRESS_OLD=tests/regress/pre_w4_src sh build.sh` (tests/regress_old.sh) compiles the
+             current tests against it to prove that the W4-GK-1/2/3 tests fail on the old code.
+             Proven to be the reviewed code (verification, 2026-10-26): rebuilt with the 0.1.0 recipe
+             (out/verify/vfy_old.sh) it gives exactly b62b205c...a46e (stripped) and
+             9d3b1efd6c82e79b9f985f3c3a80a22533d07f7fba5fa8173eb43dd9ac9421d2 (unstripped).

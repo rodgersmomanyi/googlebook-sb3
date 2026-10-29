@@ -1,0 +1,288 @@
+{
+  "build": "CL3B.260622.276.R4 / 16658739",
+  "note": "Build-time VEX AVX-VNNI avoidance for zlib adler32. Each target is pinned to orig_sha256 (and its result to patched_sha256); no match => no patch (k15 still emulates). Only targets with a deploy block are bound, and every bind is gated at boot on the partition's build fingerprint (gb_slotsync reuses the same initrd for an OTA'd slot). Idea credit: gbOS86 (clean-room reimplementation, no code copied).",
+  "targets": [
+    {
+      "name": "system/lib64/libz.so",
+      "orig_sha256": "371f70d6a9392327cb36838d0cbc7af7388d1689c25d91cd343af8e58433683b",
+      "scan_path": "fs/system_b/system/lib64/libz.so",
+      "path": "system/lib64/libz.so",
+      "out": "system/lib64/libz.so",
+      "exports_zlib": true,
+      "proof": "execution",
+      "strategy": "branch_flip",
+      "edits": [
+        {
+          "vaddr": "0xa7d5",
+          "file_off": "0xa7d5",
+          "orig": "0f8458ffffff",
+          "new": "90e958ffffff",
+          "desc": "adler32_z: je(scalar)->nop;jmp(scalar); len>=64 path skips adler32_simd_ (flag@0x20000, call->0x10fc0, simd@0x11067, scalar@0xa733)"
+        }
+      ],
+      "alt_edits": [
+        {
+          "vaddr": "0x1164f",
+          "file_off": "0x1164f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x20000 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "aa60fb2b951db26ae8def04d8efce24df746e7df4a9fa13d4cc9f02221141047",
+      "deploy": {
+        "bind": "/system/lib64/libz.so",
+        "odm_name": "system_libz.so",
+        "gate_prop": "ro.system.build.fingerprint",
+        "gate_prop_file": "system/build.prop",
+        "gate_value": "Android/desktop_system/desktop:17/CL3B.260622.276.R4/16658739:user/release-keys"
+      }
+    },
+    {
+      "name": "vendor/lib64/libz.so",
+      "orig_sha256": "e45aecb65cbb40f0c3070b05aa9d974076d401ed6f2aff3081af26a14e812590",
+      "scan_path": "fs/vendor_b/lib64/libz.so",
+      "path": "vendor/lib64/libz.so",
+      "out": "vendor/lib64/libz.so",
+      "exports_zlib": true,
+      "proof": "execution",
+      "strategy": "branch_flip",
+      "edits": [
+        {
+          "vaddr": "0xa7d5",
+          "file_off": "0xa7d5",
+          "orig": "0f8458ffffff",
+          "new": "90e958ffffff",
+          "desc": "adler32_z: je(scalar)->nop;jmp(scalar); len>=64 path skips adler32_simd_ (flag@0x20000, call->0x10fc0, simd@0x11067, scalar@0xa733)"
+        }
+      ],
+      "alt_edits": [
+        {
+          "vaddr": "0x1164f",
+          "file_off": "0x1164f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x20000 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "fc4987b213e150178de77cc3aeb54863c696fc6a9c894a5a2471cc0118065350",
+      "deploy": {
+        "bind": "/vendor/lib64/libz.so",
+        "odm_name": "vendor_libz.so",
+        "gate_prop": "ro.vendor.build.fingerprint",
+        "gate_prop_file": "vendor/build.prop",
+        "gate_value": "ASUS/lapis/lapis:17/CL3B.260622.276.R4/16658739:user/release-keys"
+      }
+    },
+    {
+      "name": "system/bin/init",
+      "orig_sha256": "9c6d33419ac64c7938c117fc84f99ddd9bd03fcd16438d6e1085fbf7a529326a",
+      "scan_path": "fs/system_b/system/bin/init",
+      "path": "system/bin/init",
+      "out": "system/bin/init",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0x21471f",
+          "file_off": "0x21471f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x2ca140 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "8d3a711f63140295f3d0eced9cccee462ab7eb2782516e43c497f148471306f3",
+      "deploy_note": "not deployable by bind: second-stage init is exec'd by first-stage init before any rc runs, and ueventd / the vendor_init subcontext are the same running binary (measured load: 16 traps in the native tree)"
+    },
+    {
+      "name": "system/bin/bootstrap/linker64",
+      "orig_sha256": "8d0ef11d34fbfbb101dd5557eb1817f97805809874bd7b3b7d68ab9b681fd9db",
+      "scan_path": "fs/system_b/system/bin/bootstrap/linker64",
+      "path": "system/bin/bootstrap/linker64",
+      "out": "system/bin/bootstrap/linker64",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0x1dac7f",
+          "file_off": "0x1dac7f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x208458 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "4af08303221817616f3d9d99c1c04707d39faa1493e5ad26f0e150d9dcb6287e",
+      "deploy_note": "not deployed: PT_INTERP of every bootstrap-namespace executable; a bad bind breaks every exec (load not captured)"
+    },
+    {
+      "name": "system/bin/bpftool",
+      "orig_sha256": "0ce148b1dc0e1c5d94c3d9b7d6e6cba36157abfdd30efeef6c9d1405fac2f002",
+      "scan_path": "fs/system_b/system/bin/bpftool",
+      "path": "system/bin/bpftool",
+      "out": "system/bin/bpftool",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0xb601f",
+          "file_off": "0xb601f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0xcc308 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "70517db190eac1d1f01389a981c9842991f9c9f762f2c055bf8b3e0f28a06b39",
+      "deploy_note": "not deployed by default: bindable in principle but no runtime load was captured; flag_zero is proven by disassembly only"
+    },
+    {
+      "name": "system/bin/snapuserd",
+      "orig_sha256": "2f9621c0a8f409d1eb8aaaae6192feff1a5aab9321be274f38227ec28a8be54d",
+      "scan_path": "fs/system_b/system/bin/snapuserd",
+      "path": "system/bin/snapuserd",
+      "out": "system/bin/snapuserd",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0x3161df",
+          "file_off": "0x1161df",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x366e90 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "92f2648d2c46a8c3ad0c809250bb4b8ecccaa7c335188dadc2090a2e3c65d27c",
+      "deploy_note": "not deployed by default: bindable in principle but no runtime load was captured; flag_zero is proven by disassembly only"
+    },
+    {
+      "name": "system/bin/update_engine",
+      "orig_sha256": "cc9962207240038b877d71d9fed4653ad640f74a3c560e8a9ff036ed9ce235e5",
+      "scan_path": "fs/system_b/system/bin/update_engine",
+      "path": "system/bin/update_engine",
+      "out": "system/bin/update_engine",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0x1a572f",
+          "file_off": "0x1a572f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x2bad50 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "085cf45a2ada9123d26eca228d41f70e26671cd862cb5f08ec1db611e0780974",
+      "deploy_note": "not deployed by default: bindable in principle but no runtime load was captured; flag_zero is proven by disassembly only"
+    },
+    {
+      "name": "system/lib64/libfdtrack.so",
+      "orig_sha256": "85c152dabedbb093ba762c1da9e16535a86be9241f62f8bc9c2d43e041411c1c",
+      "scan_path": "fs/system_b/system/lib64/libfdtrack.so",
+      "path": "system/lib64/libfdtrack.so",
+      "out": "system/lib64/libfdtrack.so",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0xb137f",
+          "file_off": "0xb137f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x112848 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "d7b2515b814f9b21c730519c714b6b12bec670c477f2571db66d33a94c921ae4",
+      "deploy_note": "not deployed by default: bindable in principle but no runtime load was captured; flag_zero is proven by disassembly only"
+    },
+    {
+      "name": "system/lib64/libsnapshot.so",
+      "orig_sha256": "244b2b1e2924f85cb484749f301babb45f21196ccb2a9d36d6d84f2f60d1ca26",
+      "scan_path": "fs/system_b/system/lib64/libsnapshot.so",
+      "path": "system/lib64/libsnapshot.so",
+      "out": "system/lib64/libsnapshot.so",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0xed25f",
+          "file_off": "0xed25f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x23a6a8 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "93bac0d53477df302b1233260a6ce094dc95b430f2c1fda30f5520455196abb7",
+      "deploy_note": "not deployed by default: bindable in principle but no runtime load was captured; flag_zero is proven by disassembly only"
+    },
+    {
+      "name": "vendor/lib64/libflashrom.so",
+      "orig_sha256": "31dde3e14e64e6a431aecbaa3543dd2fa12d5d564d4f95c406813ec663ca3fe5",
+      "scan_path": "fs/vendor_b/lib64/libflashrom.so",
+      "path": "vendor/lib64/libflashrom.so",
+      "out": "vendor/lib64/libflashrom.so",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0x88f8f",
+          "file_off": "0x88f8f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x108f38 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "5bddd3d66b7414df0bfea6258af61f739990a62b34baa63a3c149a9ed7c7a69c",
+      "deploy_note": "not deployed by default: bindable in principle but no runtime load was captured; flag_zero is proven by disassembly only"
+    },
+    {
+      "name": "apex/com.android.runtime/bin/linker64",
+      "orig_sha256": "72a818e0c73483b9b6946348d689a5009f8a1fc9067f533f75a4083cc6161856",
+      "scan_path": "apex/system_b__com.android.runtime/bin/linker64",
+      "path": "apex/com.android.runtime/bin/linker64",
+      "out": "apex/com.android.runtime/bin/linker64",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0x1da57f",
+          "file_off": "0x1da57f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x208458 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "51c924ff7b6cc99a3b329eea55542a48bb66c2428df383c46d6c5c35f95cab74",
+      "deploy_note": "not deployed: inside an APEX (private /apex per mount namespace) and PT_INTERP of every dynamic executable"
+    },
+    {
+      "name": "apex/com.google.android.appsearch/lib64/libicing_anywhere.so",
+      "orig_sha256": "7daac53fd83f048f3f6edee4c6abb5277875bf5ed4494565550c31c3052692e8",
+      "scan_path": "apex/system_b__com.google.android.appsearch/lib64/libicing_anywhere.so",
+      "path": "apex/com.google.android.appsearch/lib64/libicing_anywhere.so",
+      "out": "apex/com.google.android.appsearch/lib64/libicing_anywhere.so",
+      "exports_zlib": false,
+      "proof": "disasm",
+      "strategy": "flag_zero",
+      "edits": [
+        {
+          "vaddr": "0x2a515f",
+          "file_off": "0x2a515f",
+          "orig": "2500020000",
+          "new": "2500000000",
+          "desc": "_cpu_check_features: and $0x200,%eax -> and $0x0 (SSSE3 flag@0x2ca570 always 0; adler32_z then always scalar)"
+        }
+      ],
+      "patched_sha256": "13a4f128aca8f01aa683c6f6bdc43e41059c423dd5b756465392c5f1d2003beb",
+      "deploy_note": "not deployed by default: inside an APEX -- /apex is a private mount point per mount namespace, so an init bind at early-init is not seen by default-namespace processes, and a /data/apex update re-mounts over it (INTEGRATION.md section 4)"
+    }
+  ]
+}
