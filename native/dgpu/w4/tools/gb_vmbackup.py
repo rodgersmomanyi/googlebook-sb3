@@ -3,7 +3,9 @@
   python -I -B gb_vmbackup.py backup  DEST [--src DIR] [--vmx NAME] [--need-gb N] [--foreground] [--no-disk]
   python -I -B gb_vmbackup.py verify  DEST [--foreground]
   python -I -B gb_vmbackup.py compare DEST [--src DIR] [--foreground]
-  python -I -B gb_vmbackup.py restore DEST --yes [--esp-only] [--src DIR] [--vmx NAME]
+  python -I -B gb_vmbackup.py restore DEST --yes [--esp-only [--with-gpt [--accept-unreadable-live-gpt]]
+                                                  [--pin-migration]] [--src DIR] [--vmx NAME]
+  python -I -B gb_vmbackup.py restore DEST --esp-only [--with-gpt ...] [--pin-migration] --dry-run
 
 DIR defaults to C:\\GB-x86, NAME to lapis-boot.vmx. DEST is a new or empty folder (D:\\GB-vm-backup\\<date>).
 backup   refuses while VMware runs the VM (vmrun list, VMware lock folders); refuses unless DEST's drive has N GB
@@ -18,13 +20,26 @@ verify   re-hashes every file against SHA256SUMS ("<sha> *<name>" or "<sha>  <na
          run in background processing mode unless --foreground.
 compare  lists which GPT partitions of the live lapis.bin differ from DEST\\lapis.bin (read-only).
 restore  VM must be off. Verifies the backup first. --esp-only (needs DEST\\manifest.json + lapis-esp.img) writes only
-         the saved EFI-SYSTEM image back (checks the partition still has the saved offset/size). Full (needs
+         the saved EFI-SYSTEM image back (checks the partition still has the saved offset/size). (W6, SA-7) Before
+         that it compares the PIN path (verify_image.pin_path_problems from DIR\\verify_image.py: Gatekeeper binary,
+         fragment and rc service, KeyMint service + its vup/lib64 graft, Trusty/Weaver masks, fstab, the PIN SELinux
+         types) of the saved ESP with the ESP now in lapis.bin and refuses any difference (an ESP without the
+         Gatekeeper the PIN was enrolled with locks the user out: safety audit SA-8) unless --pin-migration.
+         (W6, SA-5) --with-gpt: also write gpt-primary.bin back at offset 0 and gpt-backup.bin over the last 16,896
+         bytes, before the ESP. Only if both saved regions match SHA256SUMS and manifest.json, parse (header and entry
+         CRCs, header LBAs of this disk size, backup == primary), and hold the manifest's EFI-SYSTEM, partitions and
+         slot attributes; the disk size equals the manifest's; and every live GPT copy that parses has the same
+         partition layout and vbmeta slot attributes as the backup (otherwise an OTA, a slot switch or a repartition
+         happened: use the full restore, VM_UPGRADE.md 3.3). If neither live copy parses: only with
+         --accept-unreadable-live-gpt. Both regions are read back and must equal SHA256SUMS, then the live GPT is
+         parsed again. Nothing is written when the live regions already equal the backup. --dry-run (--esp-only):
+         every check, nothing written, no --yes needed. Full (needs
          DEST\\SHA256SUMS + lapis.bin, so it also works on a plain copy): rewrites only the 4 MiB blocks of lapis.bin
          that differ from the backup (in place: no extra space on C:), re-hashes lapis.bin against SHA256SUMS, restores the small
          files (the current ones are kept in DEST\\..\\pre-restore-<time>\\ first) and makes them writable.
 Reads lapis.bin "rb" except restore. Standard library only; Windows only (sparse files, background mode).
 """
-import ctypes, hashlib, json, msvcrt, os, shutil, stat, struct, subprocess, sys, time, zlib
+import ctypes, hashlib, importlib.util, json, msvcrt, os, shutil, stat, struct, subprocess, sys, time, zlib
 from ctypes import wintypes
 
 VMRUN = r"C:\Program Files\VMware\VMware Workstation\vmrun.exe"
@@ -34,6 +49,7 @@ SMALL = ["lapis-boot.vmx", "lapis-boot.vmxf", "lapis-boot.nvram", "lapis-boot.vm
 REQUIRED = {"lapis-boot.vmx", "lapis-boot.nvram", "lapis.vmdk"}
 RESTORE_SMALL = ["lapis-boot.vmx", "lapis-boot.vmxf", "lapis-boot.nvram", "lapis.vmdk"]
 CH, BLK = 64 << 10, 4 << 20            # NTFS sparse granularity (16 x 4 KiB clusters); read block
+G1, G2 = 34 * 512, 33 * 512            # the saved GPT regions: MBR + header + 32 entry sectors; 32 entry sectors + header
 GB = 10 ** 9
 FLOOR, MARGIN = 3 * GB, 1 * GB
 K32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -296,7 +312,115 @@ def cmd_compare(dest, src):
     return diff
 
 
-def cmd_restore(dest, src, vmx, esp_only):
+def gpt_region(region, base_lba, lbas, primary):
+    """(W6, SA-5) A GPT copy parsed from bytes in memory: the primary (region = LBA 0..33) or the backup (region = the
+    last 33 LBAs, base_lba = lbas - 33) of a disk of lbas sectors. {"hdr": (first/last usable, disk GUID, entries,
+    entry size, entry CRC), "parts": {name: (first LBA, last LBA, attrs)}, "ents": raw entries}; ValueError names the
+    first problem (CRCs, header LBAs, the entry array outside the region)."""
+    off = 512 if primary else len(region) - 512
+    h = region[off:off + 512]
+    if h[:8] != b"EFI PART":
+        raise ValueError("no GPT header")
+    hsz, crc = struct.unpack_from("<II", h, 12)
+    if not 92 <= hsz <= 512:
+        raise ValueError(f"header size {hsz}")
+    hh = bytearray(h[:hsz]); hh[16:20] = bytes(4)
+    if zlib.crc32(hh) != crc:
+        raise ValueError("header CRC mismatch")
+    my, alt, first, last = struct.unpack_from("<QQQQ", h, 24)
+    ent_lba, n, esz, ecrc = struct.unpack_from("<QIII", h, 72)
+    want = (1, lbas - 1) if primary else (lbas - 1, 1)
+    if (my, alt) != want:
+        raise ValueError(f"header LBAs {my}/{alt}, expected {want[0]}/{want[1]} on this disk size")
+    if esz < 128 or not 0 < n * esz <= 32 * 512:
+        raise ValueError(f"entry geometry {n} x {esz}")
+    eo = (ent_lba - base_lba) * 512
+    if eo < (1024 if primary else 0) or eo + n * esz > len(region) - (0 if primary else 512):
+        raise ValueError(f"entry array at LBA {ent_lba} outside the saved region")
+    ents = region[eo:eo + n * esz]
+    if zlib.crc32(ents) != ecrc:
+        raise ValueError("entry array CRC mismatch")
+    parts = {}
+    for i in range(n):
+        e = ents[i * esz:(i + 1) * esz]
+        if e[:16] != bytes(16):
+            parts[e[56:128].decode("utf-16-le", "replace").split("\0")[0]] = struct.unpack_from("<QQQ", e, 32)
+    return {"hdr": (first, last, h[56:72], n, esz, ecrc), "parts": parts, "ents": ents}
+
+
+def gpt_plan(dest, man, sums, lapis, size, unreadable_ok):
+    """(W6, SA-5) Every check of restore --with-gpt. Returns (primary, backup) region bytes to write, or None when the
+    live regions already equal the backup; dies on any problem (nothing written yet)."""
+    saved = {}
+    for n, k, ln in (("gpt-primary.bin", "primary", G1), ("gpt-backup.bin", "backup", G2)):
+        b = open(os.path.join(dest, n), "rb").read()
+        s = hashlib.sha256(b).hexdigest()
+        if n not in sums or s != sums[n] or s != man.get("gpt_sha256", {}).get(k) or len(b) != ln:
+            die(f"{n} does not match SHA256SUMS / manifest.json gpt_sha256 ({len(b)} B, expected {ln} B)")
+        saved[k] = b
+    if man.get("lapis_bin", {}).get("bytes") != size or size % 512:
+        die(f"lapis.bin has {size:,} B, the backup was taken of a {man.get('lapis_bin', {}).get('bytes')} B disk: the "
+            f"saved GPT does not fit it")
+    lbas = size // 512
+    try:
+        s1, s2 = gpt_region(saved["primary"], 0, lbas, True), gpt_region(saved["backup"], lbas - 33, lbas, False)
+    except ValueError as e:
+        die(f"the saved GPT is not usable: {e}")
+    if s1["hdr"] != s2["hdr"] or s1["ents"] != s2["ents"]:
+        die("the saved primary and backup GPT copies do not mirror each other")
+    lay = {k: v[:2] for k, v in s1["parts"].items()}
+    if {k: [v[0] * 512, (v[1] - v[0] + 1) * 512] for k, v in lay.items()} != man.get("partitions") or \
+            [man["esp"]["offset"], man["esp"]["bytes"]] != man["partitions"].get("EFI-SYSTEM"):
+        die("the saved GPT's partitions differ from manifest.json's record")
+    want = {k: list(v) for k, v in man.get("slot_attrs", {}).items()}
+    if {k: list(v) for k, v in slot_attrs(s1["parts"]).items()} != want:
+        die("the saved GPT's slot attributes differ from manifest.json's record")
+    with open(lapis, "rb") as f:
+        l1 = f.read(G1); f.seek(size - G2); l2 = f.read(G2)
+    if (l1, l2) == (saved["primary"], saved["backup"]):
+        print("GPT: both live regions already equal the backup; nothing to write", flush=True)
+        return None
+    live = []
+    for nm, reg, base, prim in (("primary", l1, 0, True), ("backup", l2, lbas - 33, False)):
+        try:
+            live.append((nm, gpt_region(reg, base, lbas, prim)))
+        except ValueError as e:
+            print(f"GPT: the live {nm} copy does not parse ({e})", flush=True)
+    if not live and not unreadable_ok:
+        die("neither live GPT copy parses, so nothing shows that no OTA or repartition happened since the backup: use "
+            "the full restore (VM_UPGRADE.md 3.3), or check the VM's history and pass --accept-unreadable-live-gpt")
+    for nm, g in live:
+        if {k: v[:2] for k, v in g["parts"].items()} != lay:
+            die(f"the live {nm} GPT has another partition layout than the backup (repartitioned?): use the full "
+                f"restore (VM_UPGRADE.md 3.3), not a GPT write")
+        la = {k: list(v) for k, v in slot_attrs(g["parts"]).items()}
+        if la != want:
+            die(f"the live {nm} GPT's slot attributes {la} differ from the backup's {want}: an OTA or a slot switch "
+                f"happened since the backup; use the full restore (VM_UPGRADE.md 3.3), not a GPT write")
+    print("GPT: the saved regions pass every check; differing now: "
+          + ", ".join(n for n, a, b in (("primary", l1, saved["primary"]), ("backup", l2, saved["backup"])) if a != b),
+          flush=True)
+    return saved["primary"], saved["backup"]
+
+
+def pin_problems(src, live_esp, new_esp):
+    """(W6, SA-7) verify_image.pin_path_problems (DIR\\verify_image.py) of the ESP now in lapis.bin against the one
+    to be written; [] = the same PIN path."""
+    vp = os.path.join(src, "verify_image.py")
+    try:
+        spec = importlib.util.spec_from_file_location("gb_vmbackup_verify_image", vp)
+        vi = importlib.util.module_from_spec(spec); spec.loader.exec_module(vi)
+        check = vi.pin_path_problems
+    except (OSError, AttributeError, ImportError, SyntaxError) as e:
+        return [f"cannot load the PIN-path check from {vp} ({e.__class__.__name__}: {e})"]
+    try:
+        old = vi.fat_files(live_esp)
+    except (ValueError, struct.error) as e:
+        return [f"the ESP now in lapis.bin is not a readable FAT32 ({e}): its PIN path is unknown"]
+    return check(old, vi.fat_files(new_esp))
+
+
+def cmd_restore(dest, src, vmx, esp_only, with_gpt=False, pin_migration=False, dry_run=False, unreadable_ok=False):
     probs, _ = vm_guard(src, vmx)
     if probs:
         die("refused: " + "; ".join(probs))
@@ -306,10 +430,44 @@ def cmd_restore(dest, src, vmx, esp_only):
         img = os.path.join(dest, "lapis-esp.img")
         if sha_file(img) != sums["lapis-esp.img"]:
             die("lapis-esp.img does not match SHA256SUMS")
-        es, ee, _ = gpt(lapis)["EFI-SYSTEM"]
+        size = os.path.getsize(lapis)
+        plan = gpt_plan(dest, man, sums, lapis, size, unreadable_ok) if with_gpt else None
+        if with_gpt:            # the ESP goes where the restored GPT puts it (== manifest.json, checked by gpt_plan)
+            es, ee = man["esp"]["offset"], man["esp"]["offset"] + man["esp"]["bytes"]
+        else:
+            es, ee, _ = gpt(lapis)["EFI-SYSTEM"]
         if (es, ee - es) != (man["esp"]["offset"], man["esp"]["bytes"]):
             die(f"EFI-SYSTEM is now {es}+{ee - es}, the backup has {man['esp']['offset']}+{man['esp']['bytes']}")
         data = open(img, "rb").read()
+        with open(lapis, "rb") as f:
+            f.seek(es); live_esp = f.read(ee - es)
+        pin = pin_problems(src, live_esp, data)
+        for p in pin:
+            print(f"PIN path: {p}", flush=True)
+        if pin and not pin_migration:
+            die(f"refused: the saved ESP's PIN path differs from the ESP now in lapis.bin, or cannot be compared "
+                f"({len(pin)} line(s) above). With a lock-screen PIN set, an ESP with another Gatekeeper or KeyMint "
+                f"can lock the user out (SA-8): restore a backup with the same PIN path (the documented ESP rollback "
+                f"target has it). Pass --pin-migration only after reading the lines above, e.g. when this restore "
+                f"undoes a reviewed migration, when the live ESP is unreadable, or when no PIN is set")
+        print("PIN path: " + ("differences ALLOWED by --pin-migration" if pin else "the same as the ESP now in "
+                              "lapis.bin"), flush=True)
+        if dry_run:
+            print(f"dry run OK: would write {'the GPT regions, then ' if plan else ''}{ee - es:,} B of ESP at {es} "
+                  f"(sha256 {sums['lapis-esp.img']}); nothing written")
+            return
+        if plan:
+            with open(lapis, "r+b") as f:
+                f.seek(0); f.write(plan[0]); f.seek(size - G2); f.write(plan[1]); f.flush(); os.fsync(f.fileno())
+            with open(lapis, "rb") as f:
+                b1 = f.read(G1); f.seek(size - G2); b2 = f.read(G2)
+            if hashlib.sha256(b1).hexdigest() != sums["gpt-primary.bin"] or \
+                    hashlib.sha256(b2).hexdigest() != sums["gpt-backup.bin"] or os.path.getsize(lapis) != size:
+                die("GPT read-back does not match the backup (the ESP was not written)")
+            if gpt(lapis)["EFI-SYSTEM"][:2] != (es, ee):
+                die("the restored GPT does not put EFI-SYSTEM where the backup has it (the ESP was not written)")
+            print(f"restore --with-gpt OK: {G1:,} B at 0 and {G2:,} B at {size - G2:,} read back equal to SHA256SUMS",
+                  flush=True)
         with open(lapis, "r+b") as f:
             f.seek(es); f.write(data); f.flush(); os.fsync(f.fileno())
         with open(lapis, "rb") as f:
@@ -369,9 +527,16 @@ def main():
             background()
         cmd_compare(dest, src)
     else:
-        if "--yes" not in a:
-            die("restore overwrites the VM image: pass --yes")
-        cmd_restore(dest, src, vmx, "--esp-only" in a)
+        eo, dry = "--esp-only" in a, "--dry-run" in a
+        for f in ("--with-gpt", "--pin-migration", "--dry-run", "--accept-unreadable-live-gpt"):
+            if f in a and not eo:
+                die(f"{f} is used with --esp-only (a full restore rewrites the whole disk, GPT included)")
+        if "--accept-unreadable-live-gpt" in a and "--with-gpt" not in a:
+            die("--accept-unreadable-live-gpt is used with --with-gpt")
+        if "--yes" not in a and not dry:
+            die("restore overwrites the VM image: pass --yes (or --dry-run to only check)")
+        cmd_restore(dest, src, vmx, eo, "--with-gpt" in a, "--pin-migration" in a, dry,
+                    "--accept-unreadable-live-gpt" in a)
 
 
 if __name__ == "__main__":

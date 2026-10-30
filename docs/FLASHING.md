@@ -101,15 +101,15 @@ internal disk (section 5).
 | Wi-Fi / Bluetooth | connect to Wi-Fi, pair a device |
 | Sound | play a video; headphone jack; microphone in the Recorder app |
 | Cameras | Camera app: front and rear (needs the IPU4P firmware in your build, see [INPUTS.md](INPUTS.md#firmware-native-only); software image processing, so expect modest quality) |
-| Auto-rotate / light | detach the screen, rotate it; auto-brightness |
+| Auto-rotate / light | base attached: tilting does not rotate the screen; detach the screen and rotate it (Quick Settings **Auto-rotate** on); auto-brightness |
 | NVIDIA graphics | base attached, default mode Auto: the Quick Settings tile **Graphics** shows `Intel (testing NVIDIA)`, then `NVIDIA`; start a game; detach (tile → `Unavailable (base detached)`) and reattach. Details and recovery: [NVIDIA.md](NVIDIA.md) |
 
 The per-device checklist with the log lines to look for is the "Hardware validation checklist" in
 [DEVICE-STATUS.md](DEVICE-STATUS.md).
 
 **If a boot with the base attached hangs once Android is up**, hold Power for 10 s and boot again: the crash-loop
-guard switches graphics to Intel by itself. The manual override is to press `e` on the normal entry in the boot menu
-and add ` gb.nouveau=0` (this boot only), and Settings → System → Graphics → **Intel only** keeps it off.
+guard switches graphics to Intel by itself. The manual override is to press `e` on the normal entry in the boot menu,
+press End and add ` gb.nouveau=0` (this boot only), and Settings → System → Graphics → **Intel only** keeps it off.
 
 ## 4. Logs
 
@@ -189,12 +189,15 @@ the same install from a stick, tested in VMware only.
 ## 7. Troubleshooting: symptom, log line, boot option
 
 The lines named here are in the `== summary` block at the top of every `gblog\boot<N>-t<T>.txt` (section 4). A
-boot option is added for one boot by pressing `e` on the entry in the systemd-boot menu.
+boot option is added for one boot by pressing `e` on the entry in the systemd-boot menu. The editor opens with the
+cursor at the start of the line: press End, type a space and the option, then press Enter (Esc leaves the editor
+without booting). Typed at the start, the option runs into the line's first word, `rdinit=/gbinit`, and the boot
+skips `gbinit`, the image's own start-up step: if your text is at the start, press Esc and try again.
 
 | Symptom | Look for | Then |
 |---|---|---|
 | Black screen right after the systemd-boot menu (no `gblog\` file for that boot at all) | nothing is written: the kernel never ran | The firmware may hang on the kernel's `NX_COMPAT` flag: [NATIVE.md, Known risks](NATIVE.md#known-risks--open-points) (`build_internal.py --clear-nx-compat` clears it for an internal install). |
-| The boot logo stays and nothing happens; no `gblog\` file for that boot | nothing is written: the boot stopped before Android | Either the firmware hangs on `NX_COMPAT` (row above), or the kernel oopsed while `gbinit` loaded i915, IPTS (touch), the camera or the Surface modules. With `panic=0` the boot stops there, and natively there is no screen console. To find the module, turn one module off per boot with `GB_SKIPMOD=` ([section 8](#8-bring-up-configuration-gbgbcfg)), i915 last: without it there is no picture. |
+| The boot logo stays and nothing happens; no `gblog\` file for that boot | nothing is written: the boot stopped before Android | Either the firmware hangs on `NX_COMPAT` (row above), or the kernel oopsed while `gbinit` loaded i915, IPTS (touch), the camera or the Surface modules. With `panic=0` the boot stops there, and natively there is no screen console. The [debug boot](#debug-boot-kernel-messages-on-the-screen) draws the kernel's messages on the screen for one boot: the error usually names the module (`[name]` after a function in the call trace; no text at all points to `NX_COMPAT`). Then turn that module off for one boot with `GB_SKIPMOD=` ([section 8](#8-bring-up-configuration-gbgbcfg)), i915 last: without it there is no picture. |
 | No base keyboard or touchpad, no battery level, charger or detach | `serial 8250:` must show `Serial: 8250/16550 driver, 4 ports`; `serial errors: dw-apb-uart -22: 0`; `serial surface_serial_hub bound:` names a device; the `== cmdline` section contains `8250.nr_uarts=4` | On the Surface Book 3 the base keyboard, touchpad, batteries, charger and detach all go through the Surface Aggregator, whose link is a UART. Our kernel is built with no 8250 ports at run time, so without `8250.nr_uarts=` that UART never registers (`-22`). Images built before wave 3 dropped the token natively: see [below](#images-built-before-wave-3-no-keyboard-base). A `-517` line (`deferred probes` in the summary) is a driver that waited for another one and was retried: not an error. |
 | No keyboard or touchpad input in Android although `inputs (Surface Aggregator HID, bus 0019):` lists `Microsoft Surface 045E:09AE Keyboard`, or the device immediately goes to sleep ("no keyboard") | `posture:` in the summary (or `gb_hw: diag: posture:` in `== dmesg`): `mCommittedState=CLOSED` or `disabled by Android: Microsoft Surface 045E:09AE Keyboard` (`Enabled: false`) | lapis's `DesktopDeviceStateProvider` puts the device into `CLOSED` when the lid switch reads closed, which disables built-in input devices and forces sleep. For one boot without a shell, add `GB_PROP_1=vendor.gb.posture=open` to `gb\gb.cfg` and boot once with `gb.overlay=1` added to the boot entry ([section 8](#8-bring-up-configuration-gbgbcfg)). `gb_hw.sh posture` resolves the `OPEN` state id after `sys.boot_completed=1` and runs `cmd device_state state <id>`. To keep the override across boots, use `persist.vendor.gb.posture=open` (`reset` cancels it). While a posture override is active, closing the lid does not put the device in `CLOSED` (use the power button to sleep). |
 | Power button and volume keys do nothing; a detached clipboard cannot wake from sleep | `buttons:` in the summary, `[vendor.gb.buttons]` in `== getprop`, and `gb_hw: buttons:` in `== dmesg` | `MSHW0040:00` (`soc_button_array`) needs lapis's `pinctrl-icelake` (`INT3455:00`), which loads at coldboot after `gbinit`. Images from wave 5 on rebind `MSHW0040:00` in `gb_hw.sh buttons` `on boot` (and retry once in `gb_hw.sh diag`) so two `gpio-keys` input devices appear. If `buttons:` still reports `FAILED`, include the full `gblog\` folder in your report. |
@@ -205,7 +208,7 @@ boot option is added for one boot by pressing `e` on the entry in the systemd-bo
 | Quick flicks on the touchpad do not move the pointer | `inputs (Surface Aggregator HID, bus 0019):` lists the touchpad | The touchpad IDC sets `gestureProp.Change_Timeout = 0.02` (Android's default holds motion for 200 ms after touchdown). Report it if flicks still fail. |
 | The boot hangs or misbehaves after you changed `gb\gb.cfg` | `-- ESP bring-up (/odm/gbinit_bringup.log)` | Boot the normal entry (it never carries `gb.overlay=1`), or rename `gb\gb.cfg` from Windows. A format error refuses the whole file (nothing in it is applied); a single refused setting (unknown key, denied property, module not in `modules.load`, overlay path not allowed) is skipped with its own log line and the rest is applied. |
 | Notification "System update held: Kernel mismatch" | `gb_slotsync HOLD:` | The update's kernel interface (KMI) differs from our kernel's, so its vendor modules would not load: the default stays on the old slot ([OTA.md](OTA.md#kernel-check-before-the-switch)). |
-| Notification "System update not validated" (wave 5 images) | `gb_otagate: UNVALIDATED build: ...` in `== dmesg`; `[ro.vendor.gb.ota_gate]: [unvalidated]` in `== getprop` | Android was updated to a build this image was not made for. The image then skips its build-specific libz patch and keeps everything else; most things are expected to work, but nothing was tested on that build. Rebuild the boot partition for the new build on the host, or pick the previous slot's `(slot X)` entry in the boot menu. Boot options for one boot: ` gb.otagate=0` (gate off), ` gb.otagate=force` (test the "not validated" path on the validated build) ([OTA.md](OTA.md#the-ota-gate-wave-5)). |
+| Notification "System update not validated" (wave 5 images) | `gb_otagate: UNVALIDATED build: ...` in `== dmesg`; `[ro.vendor.gb.ota_gate]: [unvalidated]` in `== getprop`; from wave 6 also `ota gate: state=unvalidated ...` in the summary | Android was updated to a build this image was not made for. The image then skips its build-specific libz patch and keeps everything else; most things are expected to work, but nothing was tested on that build. Rebuild the boot partition for the new build on the host, or pick the previous slot's `(slot X)` entry in the boot menu. Boot options for one boot: ` gb.otagate=0` (gate off), ` gb.otagate=force` (test the "not validated" path on the validated build) ([OTA.md](OTA.md#the-ota-gate-wave-5)). |
 | Wi-Fi or Bluetooth missing | `-- firmware load failures (dmesg)` (`Direct firmware load for ... failed`); from wave 5 on also `wifi:` and `bluetooth:` | Note the file name in your report; [INPUTS.md](INPUTS.md#firmware-native-only) lists what is staged and from where. `wifi: ... link: wpa_supplicant FAILED: CANNOT LINK EXECUTABLE ...` means the Wi-Fi supplicant of this image cannot start, so Wi-Fi cannot scan or connect even though the card works (`wlan0` present, firmware loaded): report it with the `gblog\` folder. |
 | A feature never starts; a service keeps restarting (wave 5 images) | `linker:` and the `-- linker failures (most frequent first)` lines below it | `CANNOT LINK EXECUTABLE "<program>"` means Android cannot load that program: one of its libraries is missing or does not match. Report the line. `dlopen failed` lines from optional plugins can be normal; the summary leaves out lines from `/data` (app names). |
 | Camera app shows no cameras, or `vendor.camera-provider-2-7-legacy-wrapper` keeps restarting | `camera:` line in `== summary` (`HAL load failures:` must be `0`), `CANNOT LINK lines:` (`0`), and `intel-ipu6` firmware lines in dmesg | Images built before wave 5 had misaligned `PT_LOAD` headers in the staged camera ELFs (`dlopen failed: cannot find "n34_0_Box_C"`), fixed in wave 5 (`V12b`). On hardware, verify that `intel/ipu/ipu4p_fw.bin` was staged when building the image ([INPUTS.md](INPUTS.md#firmware-native-only)). If the IPU4P kernel driver itself hangs or errors during bring-up, add `GB_SKIPMOD=intel_ipu6_isys,intel_ipu6` to `gb\gb.cfg` and boot once with ` gb.overlay=1`. |
@@ -224,7 +227,7 @@ them. Check the `options` line of `loader\entries\gb-a.conf` / `gb-b.conf` on th
 no `8250.nr_uarts=`, the image is affected.
 
 * **For one boot:** press `e` on the entry in the boot menu (use a USB keyboard; the base keyboard is what is
-  missing), append ` 8250.nr_uarts=4` and press Enter. Unlike module options (above), this one works on the command
+  missing), press End, append ` 8250.nr_uarts=4` and press Enter. Unlike module options (above), this one works on the command
   line: the 8250 serial driver is built into the kernel, not loaded with `insmod`.
 * **For good:** rebuild the stick with the current `build_usb.py` and flash it again. An internal install made from
   an older export or ISO gets the current ESP with a new export built with `--reuse-guids` and
@@ -232,6 +235,61 @@ no `8250.nr_uarts=`, the image is affected.
   Googlebook's kernel/initrd later"; import an ISO install's state first), or is uninstalled and installed again
   from a current ISO. Editing the entry files by hand is not recommended: gb_slotsync writes the next slot's entry
   from the default entry, so a hand edit is easy to lose or to spread by mistake.
+
+### Debug boot: kernel messages on the screen
+
+Natively the kernel has no screen console, and `gblog\` is written only once Android is up. If a boot stops before
+that (the boot logo stays, no `gblog\` file), make the kernel's messages visible for one boot:
+
+1. In the boot menu, with the normal entry highlighted (the default, not `[NVIDIA test]`), press **e** before the
+   countdown ends.
+2. The editor opens with the cursor at the start of the line. Press **End**, then type, with the leading space:
+
+   ```
+    printk.ignore_loglevel=0 loglevel=5 earlycon=efifb keep_bootcon
+   ```
+
+3. Check that the line now ends with these words. If they are at the start, in front of `rdinit=/gbinit`, press
+   **Esc** and start again: typed there, they break that first word and the boot skips `gbinit`.
+4. Press **Enter**. The change is for this boot only (**Esc** leaves the editor without booting).
+
+What the four words do:
+
+* `earlycon=efifb` draws the kernel's messages on the firmware's frame buffer (the UEFI picture), in a small 8x16
+  font. It is not a serial console: the native entries never use the UART, which belongs to the Surface Aggregator.
+* `keep_bootcon` keeps it drawing after the kernel registers its own (invisible) console a second or two in, so it
+  covers `gbinit`'s module loading and the rest of the boot.
+* `loglevel=5` draws errors and warnings only. `printk.ignore_loglevel=0` switches off the entry's `ignore_loglevel`,
+  which would draw every message. It takes effect about half a second in, so the first lines (about 110 in VMware)
+  are drawn in full right after the menu: if no text appears at all, the kernel never started (most likely the
+  `NX_COMPAT` hang above).
+* An oops or a panic is always drawn in full, and with `panic=0` the boot stops there and the text stays. Drawing
+  can be slow on the laptop, so wait until the text has not changed for a minute. Then take a sharp photo of the
+  whole screen, above all the lines from `BUG:` or `Oops:` (or `Kernel panic - not syncing:`) down to
+  `---[ end Kernel panic`, with the `Comm:` line (the program that was running, `busybox` while `gbinit` loads
+  modules) and, if shown, `Modules linked in:`.
+
+Tested in VMware with the wave 5 image (typed in this editor): the text appears right after the menu, Android still
+starts, and a panic forced while `gbinit` loaded modules stayed on the screen with its call trace (and, as on the
+laptop, left no `gblog\` file). Not yet run on the Surface Book 3:
+
+* Once Android runs, its own error and warning lines keep scrolling (about 550 lines in the first 2.5 minutes in
+  VMware). Each new line moves the whole picture up, which is slow on the laptop, so this boot is slower.
+* i915 is expected to keep the firmware's picture until Android draws its first frame (inferred). After that the
+  kernel still writes into the firmware's old picture memory, which the graphics driver can reuse: stray text, a
+  garbled picture or a graphics hang are possible. If the boot gets as far as the Android picture, the debug boot has
+  nothing to show: restart and boot normally.
+
+To find the module, put `GB_SKIPMOD=<module>` into `gb\gb.cfg` ([section 8](#8-bring-up-configuration-gbgbcfg)) and
+type ` gb.overlay=1` after the four words in the same edit. Try one module at a time, i915 last: without it there is
+no picture after the boot logo. One exception in the debug boot: if the text stops, or the screen goes dark, right
+after an `i915` line, skip i915 first. Without i915 nothing takes the firmware's picture over, so the text stays
+visible while the other modules load (as in VMware, where i915 finds no device).
+
+The same result without the first ~110 lines, if you would rather edit inside the line: delete `ignore_loglevel`,
+change `loglevel=8` to `loglevel=5`, and type only ` earlycon=efifb keep_bootcon` at the end. Keep it a boot-menu
+edit: do not write these words into the entry files on the stick (every boot would be slower, and gb_slotsync copies
+the default entry to the other slot after an update).
 
 ## 8. Bring-up configuration (`gb\gb.cfg`)
 

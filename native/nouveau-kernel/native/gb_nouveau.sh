@@ -20,7 +20,10 @@
 # Safety rails (NVIDIA_PLAN.md section 8):
 # * nouveau is never in a load list; it is insmodded (or, with the module already loaded, bound: the bind path) here,
 #   only after sys.boot_completed, only when renderD128 and card0 are Intel/i915, the dGPU (first 10de function of
-#   class 0x03) has a BAR, and no vfat mount of the ESP exists.
+#   class 0x03) has a BAR, and no vfat mount of the ESP exists. (Wave 6, B-4) The dGPU must be a TU117 (13.5-inch
+#   model): any other well-formed NVIDIA device id ends in refused:model before any write and stays driverless
+#   (D3cold); an unreadable or malformed id is not gated (fail open: the behaviour before the gate), and the boot-menu
+#   token gb.nouveau.model=any turns the gate off for one boot.
 # * Kill switches (boot editor, no shell needed): gb.nouveau=0, any unknown gb.nouveau= value,
 #   module_blacklist=...nouveau... .
 # * Crash-loop guard: /data/vendor/gb/nouveau.loading ("mode=.. t=.. boot=<boot_id> argv=..") is written + synced
@@ -125,6 +128,8 @@ MARKW=insmod                 # kernel log mark word: insmod (insmod path) or bin
 REC=load                     # record prefix: report/load-<N>.txt, or report/bind-<N>.txt for the bind path
 GFXM=
 BOOTID=
+MODEL=                       # (B-4) the dGPU's device id (+ chip) for the model-gate log line
+MODEL_WARNED=0               # (B-4) 1 once the fail-open line was logged in this run
 MARKED=0                     # R-1: 1 once write_marker wrote the crash-loop marker (MARKLINE = its exact line)
 MARKLINE=
 BINDING=0                    # R-1: 1 while a bind write may still be inside the kernel (never remove the marker then)
@@ -255,6 +260,7 @@ parse_cmdline() {
   CL_NV=
   CL_NV_SET=0
   CL_FW=
+  CL_MODEL=
   CL_BL=
   CL_PART=EFI-SYSTEM
   _cl=
@@ -263,6 +269,7 @@ parse_cmdline() {
     case $_a in
       gb.nouveau=*) CL_NV=${_a#gb.nouveau=}; CL_NV_SET=1 ;;
       gb.nouveau.fw=*) CL_FW=${_a#gb.nouveau.fw=} ;;
+      gb.nouveau.model=*) CL_MODEL=${_a#gb.nouveau.model=} ;;
       module_blacklist=*) CL_BL="$CL_BL,${_a#module_blacklist=}" ;;
       gb.logpart=*)
         _p=${_a#gb.logpart=}
@@ -279,6 +286,10 @@ parse_cmdline() {
     esac
   fi
   case "$CL_BL," in *,nouveau,*) KILL=1 ;; esac     # any module_blacklist= listing nouveau (fail safe)
+  case $CL_MODEL in                      # (B-4) only "any" turns the model gate off (this boot); the gate stays on
+    '' | any) ;;                         # for every other value
+    *) log "ignored gb.nouveau.model value '$(san "$CL_MODEL")' (only 'any' turns the model gate off)"; CL_MODEL= ;;
+  esac
   [ $KILL = 1 ] && CL_MODE=
   return 0
 }
@@ -310,6 +321,40 @@ bar_ok() {                               # first resource line has a non-zero st
   case $_st in 0x*[1-9a-fA-F]*) return 0 ;; esac
   return 1
 }
+
+# (wave 6, B-4) The image stages nvidia/tu117/* firmware only (firmware_staged_sha256.txt, build_esp.py
+# _payload_inputs), so the 13.5-inch Surface Book 3's GTX 1650 Max-Q (TU117) is the only nouveau target. nouveau names
+# the chip from its BOOT0 register and requests nvidia/<chip>/... (nvkm_firmware_get), so any other chip cannot load
+# here. TU117's PCI device ids are NVIDIA's block 0x1f80-0x1fff (pci.ids 2024.03.31: 33 TU117 ids 0x1f81-0x1ff9 and
+# nothing else in the block); the 15-inch model has a TU116 (GTX 1660 Ti, 0x2180-0x21ff) or a TU106 (Quadro RTX 3000,
+# 0x1f00-0x1f7f). Without the gate nouveau probes a TU116/TU106, fails for missing firmware and ends every boot in
+# "unhealthy:bind" plus the "NVIDIA GPU problem" notification; with it the dGPU is never probed: it stays driverless,
+# gb_power keeps it in D3cold and shows "not supported" in GbGpu, result=refused:model, one log line.
+# Only a well-formed id ("0x" + 4 hex digits, as the kernel prints it) can refuse: an unreadable or malformed id is
+# logged once and not gated, so on the 13.5-inch target the gate is a read that either passes or changes nothing.
+# gb.nouveau.model=any (boot menu "e", this boot only) turns the gate off: nouveau is tried as before the gate.
+model_ok() {                             # 1 = $DGPU is positively not a TU117 (MODEL = the id + chip for the log)
+  if [ "$CL_MODEL" = any ]; then
+    [ "$MODEL_WARNED" = 1 ] || log "model gate: off for this boot (gb.nouveau.model=any): $DGPU is tried whatever its device id"
+    MODEL_WARNED=1
+    return 0
+  fi
+  rd "$PCI/$DGPU/device"
+  case $V in
+    0x1[fF][89a-fA-F][0-9a-fA-F]) return 0 ;;                       # TU117
+    0x21[89a-fA-F][0-9a-fA-F]) MODEL="$V TU116" ;;
+    0x1[fF][0-7][0-9a-fA-F]) MODEL="$V TU106" ;;
+    0x[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) MODEL=$V ;;
+    *)
+      [ "$MODEL_WARNED" = 1 ] || log "model gate: $DGPU device id '$(san "$V" 16)' is unreadable or malformed: not gated (loading as before the gate)"
+      MODEL_WARNED=1
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+model_why() { printf '%s' "guard: $DGPU is NVIDIA $MODEL, not the 13.5-inch Surface Book 3's TU117: this image has no firmware for it; nouveau is not loaded, the dGPU stays powered off (Intel graphics only)"; }
 
 i915_ok() {
   for _n in renderD128 card0; do
@@ -1207,6 +1252,7 @@ do_bind() {                              # INTERFACES 7.2a: nouveau loaded, the 
     exit 0
   fi
   [ -z "$DRV" ] || { log "guard: $DGPU is bound to '$(san "$DRV")'"; refuse refused:nodgpu; }
+  model_ok || { log "$(model_why)"; refuse refused:model; }          # (B-4)
   bar_ok || { log "guard: $DGPU has no BAR assigned"; refuse refused:bar; }
   detach_wait                            # step 3
   open_window bind
@@ -1226,6 +1272,7 @@ do_bind() {                              # INTERFACES 7.2a: nouveau loaded, the 
   find_dgpu || late_refuse refused:nodgpu "the NVIDIA function disappeared during the bind window"
   drv_of "$PCI/$DGPU"
   [ -z "$DRV" ] || late_refuse refused:nodgpu "$DGPU got bound to '$(san "$DRV")' during the bind window"
+  model_ok || late_refuse refused:model "$(model_why)"               # (B-4)
   bar_ok || late_refuse refused:bar "$DGPU lost its BAR during the bind window"
   up_ms                                  # step 6
   TOKEN=$$-$UPMS
@@ -1361,6 +1408,8 @@ do_auto() {
     fi
     refuse refused:nodgpu
   fi
+  # (B-4) before probation and every other guard: a dGPU this image has no firmware for is never a load attempt
+  if find_dgpu && ! model_ok; then log "$(model_why)"; refuse refused:model; fi
   if [ "$MODE" = auto ] && [ "$CLEAN" -lt 3 ]; then
     PROBATION=1
     PROB_TXT="$((CLEAN + 1))/3"
@@ -1411,6 +1460,7 @@ do_auto() {
   # right before the probe: no detach under way, the dGPU still there with its BAR (it may have been pulled)
   [ -e "$FLAGS/detaching" ] && late_refuse refused:detach "a detach started during the load window: not loading"
   find_dgpu || late_refuse refused:nodgpu "the NVIDIA function disappeared during the load window"
+  model_ok || late_refuse refused:model "$(model_why)"               # (B-4)
   bar_ok || late_refuse refused:bar "$DGPU lost its BAR during the load window"
   up_ms
   TOKEN=$$-$UPMS

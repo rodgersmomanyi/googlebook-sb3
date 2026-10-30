@@ -72,9 +72,24 @@ Ordering and timing:
   it keeps the stock copy for its short life (emulated, no correctness impact).
   `/system/bin/init` itself carries a static zlib copy that no bind can replace.
 * Each bind is relabelled and then remounted read-only in init's mount
-  namespace (`mount none none <dst> remount bind ro`); copies propagated at
-  bind time to other namespaces stay rw, and the inode remains writable via
-  the rw `/odm` tmpfs (same trust level as other `/odm` injections).
+  namespace (`mount none none <dst> remount bind ro`). That per-mount flag does
+  not reach copies propagated to other namespaces. (W6) The source files
+  therefore sit on their own tmpfs: gbinit moves `/odm/vnni` onto a tmpfs named
+  `gbvnni`, mode 0755, with no other options, so the binds keep the `/odm`
+  mount flags. This happens after the kill switch and the OTA gate. The vnni
+  block's last action, `on init` / `mount tmpfs gbvnni /odm/vnni remount ro`,
+  runs after every early-init relabel and bind. It is a superblock remount
+  (MS_REMOUNT without MS_BIND), so every mount of that filesystem refuses
+  writes: the binds in every mount namespace, the propagated copy
+  `/odm/vlower/lib64/libz.so` and the source path. A `context=` mount at gbinit
+  time is not possible: SELinux refuses mount context options before the policy
+  is loaded (EINVAL, `security/selinux/hooks.c` `selinux_add_opt` /
+  `selinux_set_mnt_opts` of the k15 tree), and context mounts cannot be
+  relabelled. The libraries keep their stock labels through `restorecon` before
+  the remount. Any failure in the gbinit step removes `/odm/vnni`, so there is
+  no bind and the stock libz stays under emulation; gbinit then writes
+  `/odm/gbinit_vnni.log`. (Wave 6 VM-1: with `/odm/vnni` absent, lapis's init
+  logs no ENOENT line for the tail, only the two `remount bind ro` failures.)
 
 ---
 
@@ -204,9 +219,11 @@ APEX signature and payload verity at activation.
 * Verified boot (orange): binds change no block of a dm-verity partition and no
   APEX file, so AVB/dm-verity/apexd verification is unaffected. The bound inode
   lives on the unverified `/odm` tmpfs (from the ESP initrd) — same trust level as
-  everything else `/odm` already injects. The rc remounts the bind read-only in
-  init's mount namespace only; the inode stays writable through the rw `/odm`
-  tmpfs (same trust as every other `/odm` injection).
+  everything else `/odm` already injects. (W6) The bound files live on gbinit's
+  own `gbvnni` tmpfs, which init remounts read-only as a whole at `on init`,
+  after the relabel: no mount of it (in any namespace, `/odm/vlower` included)
+  accepts a write. Root can still remount it read-write; that is the same trust
+  level as every other `/odm` injection on an unlocked device.
 * Smoke test after wiring (VM tree):
   * `dmesg | grep -iE "vnni|libz|unexported property trigger|gb.rc"` shows no init
     parse error for the gated actions (gb.rc under `/odm` is parsed in the
@@ -270,7 +287,17 @@ on early-init && property:ro.system.build.fingerprint=Android/desktop_system/des
     mount none none /system/lib64/libz.so remount bind ro
 (the same for /vendor/lib64/libz.so, gated on ro.vendor.build.fingerprint=ASUS/lapis/lapis:17/...:user/release-keys)
 ```
+
+(W6) then, as the block's last action:
+
+```
+on init
+    mount tmpfs gbvnni /odm/vnni remount ro
+```
 Each action is byte-identical to `vnni_patch.rc_block()` with source `/odm/vnni/<id>/<file>` (tests\w5 PACK).
+(W6) followed by `VNNI_RC_TAIL` (above); gbinit moves `/odm/vnni` onto its own tmpfs (`VNNI_GBINIT_RO`).
+`_vnni_inputs` refuses a folder for another slot or another build than the boot slot's init_boot fingerprint (SA-2)
+and a gate value that is not the reviewed `deploy.gate_value` (SA-3).
 No service. Those fingerprint values are what init reported on this build (`dgpu\1b\evidence\w2fix\vm1\gblog\`).
 `_check_vnni` (both trees) refuses a missing/extra file, an ungated action, `/odm/vnni` or `libz.so` outside the
 block, the block before the overlay or twice, and a GBINIT without the kill switch.
@@ -316,6 +343,6 @@ recorded in KNOWN_STALE); trees 18 PASS; w2a 8/8 groups (140 ok); ISO static + b
   `w5\evidence\esp_compare.txt`).
 
 Not verified until a boot (the Measure step): that vendor_init accepts the two property triggers in `/odm` rc
-(`unexported property trigger` would mean no bind: the safe failure), the binds per mount namespace (`ro` in init's
-mount namespace only; the inode stays writable through the rw `/odm` tmpfs), the
+(`unexported property trigger` would mean no bind: the safe failure), the binds per mount namespace (W6: the `gbvnni`
+superblock `ro` in every namespace, mountinfo super options `ro`, `/odm/vlower/lib64/libz.so` included), the
 emulation counter drop, and no SELinux/`restorecon` errors.

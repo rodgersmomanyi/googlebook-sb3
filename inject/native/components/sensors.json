@@ -17,12 +17,17 @@
    "mode": "0644"
   },
   {
+   "src": "${GB_BUILD}\\native\\sensors\\overlay-settings\\GbSb3SettingsOverlay.apk",
+   "dest": "vup/overlay/GbSb3SettingsOverlay.apk",
+   "mode": "0644"
+  },
+  {
    "src": "${GB_BUILD}\\native\\sensors\\bin\\gb_hal_probe",
    "dest": "gb_hal_probe",
    "mode": "0755"
   }
  ],
  "rc_files": [],
- "rc_text": "service gb_sensors_wait /system/bin/sh /odm/gb_sensors.sh wait\n    user root\n    group root\n    seclabel u:r:shell:s0\n    oneshot\n    disabled\n\nservice gb_sensors_diag /system/bin/sh /odm/gb_sensors.sh diag\n    user root\n    group root system shell\n    seclabel u:r:shell:s0\n    oneshot\n    disabled\n\non early-boot\n    exec_start gb_sensors_wait\n\non property:sys.boot_completed=1\n    start gb_sensors_diag\n",
+ "rc_text": "service gb_sensors_wait /system/bin/sh /odm/gb_sensors.sh wait\n    user root\n    group root\n    seclabel u:r:shell:s0\n    oneshot\n    disabled\n\nservice gb_sensors_diag /system/bin/sh /odm/gb_sensors.sh diag\n    user root\n    group root system shell\n    seclabel u:r:shell:s0\n    oneshot\n    disabled\n\non early-boot\n    exec_start gb_sensors_wait\n\non property:sys.boot_completed=1\n    start gb_sensors_diag\n\nservice gb_sensors_rotation /system/bin/sh /odm/gb_sensors.sh rotation\n    user root\n    group root system shell\n    seclabel u:r:shell:s0\n    oneshot\n    disabled\n\non property:sys.boot_completed=1 && property:vendor.gb.dtx.mode=*\n    start gb_sensors_rotation\n",
  "build_prop": []
 }

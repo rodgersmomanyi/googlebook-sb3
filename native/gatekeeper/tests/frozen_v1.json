@@ -1,0 +1,30 @@
+{
+ "format": "gb-gatekeeper-frozen/1",
+ "about": "Frozen on-disk vectors of gb_gatekeeper (SAFETY_AUDIT SA-6): every later build must verify these handles with these key files, or an enrolled lock-screen PIN stops verifying after the update.",
+ "scheme": {
+  "key_file": "gk_key.v1 (and gk_key.v1.bak): 'GBGKKEY1' | K_dev[32] | SHA-256('GBGKKEY1' | K_dev)",
+  "handle": "AOSP password_handle_t v2, 58 B packed: version u8 = 2 | user_id u64 LE | flags u64 LE = 1 (HANDLE_FLAG_THROTTLE_SECURE) | salt u64 LE | signature[32] | hardware_backed u8 = 0",
+  "signature": "HMAC-SHA256(K_dev, scrypt(P = handle[0:17] | password, S = salt as 8 B LE, N = 16384, r = 8, p = 1, dkLen = 32))"
+ },
+ "enrolled_by": "gb_gatekeeper 0.2.0 (binary sha256 505b404d0606bf80bcb41ff8a66a80c962934e3791d3b8db13645608da143d51), unit tests of its 2026-10-26 build",
+ "vectors": [
+  {
+   "name": "v1-host-0.2.0",
+   "source": "gatekeeper\\out\\host\\vectors.json",
+   "key_file": "4742474b4b45593105e7574af475fe1ee105ec08f9be9a875fd1fc6161e9ba54dcba5d266fa2ba5fa85a36a2dbf17595df569c1f52b00f845701e2c23f87ffe2b40bcf0fc5abd659",
+   "password": "31323334",
+   "handle": "02cfcf14b485efc4870100000000000000dd018a042c68fc6bd52f4a0c1b9db337af60aafa8909cda77e2bd47157db37c5960d8453d75da91c00",
+   "secure_user_id": "87c4ef85b414cfcf",
+   "uid": 100000
+  },
+  {
+   "name": "v1-android-lapis-bionic-0.2.0",
+   "source": "gatekeeper\\out\\android\\test\\vectors.json",
+   "key_file": "4742474b4b45593101c8d065430ef2f03ba0315176765020f1da4745095e344836aa18582f9f31b099d3fe14fd4420ce1b448f8879f4c2efd5739ad6dda38684d896017e08306f8c",
+   "password": "31323334",
+   "handle": "027e6472808114bc2501000000000000001fa5c0c7e4aad079bdd206d574e7b529722dd944f381a6ec08bf38aa778557f33c2628ba130772bc00",
+   "secure_user_id": "25bc14818072647e",
+   "uid": 100000
+  }
+ ]
+}

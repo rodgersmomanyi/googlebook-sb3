@@ -18,6 +18,7 @@ import gb.sb3.gpu.core.StateMapper.TileState;
 import gb.sb3.gpu.core.Status;
 import gb.sb3.gpu.core.Texts;
 import gb.sb3.gpu.core.Transport;
+import gb.sb3.gpu.core.UserPolicy;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -87,6 +88,17 @@ final class UnitTests {
         json();
         replies();
         validation();
+        userPolicy();
+    }
+
+    // ------------------------------------------------------------------ wave 6: which user acts on the state
+
+    static void userPolicy() {
+        T.group("W6-NOTIFY UserPolicy (headless system user mode, INTERFACES 12.1 wave 6)");
+        T.eq(false, UserPolicy.actsOnState(true, true), "headless mode, system user 0: ignores state broadcasts");
+        T.eq(true, UserPolicy.actsOnState(true, false), "headless mode, full user (10): acts");
+        T.eq(true, UserPolicy.actsOnState(false, true), "not headless, user 0 is the person: acts");
+        T.eq(true, UserPolicy.actsOnState(false, false), "not headless, secondary user: acts");
     }
 
     // ------------------------------------------------------------------ UI-1B-01 graphicsTile (INTERFACES 27.1)
@@ -140,8 +152,10 @@ final class UnitTests {
                 "NVIDIA unavailable - test not run", "15", "I"},
             {"standby", "selftest", "intel", "attached", "Intel (NVIDIA test failed)",
                 "NVIDIA unavailable - test failed", "16", "I"},
-            {"off", "nodriver", "intel", "attached", "Intel", "NVIDIA unavailable - not ready", "17", "I"},
-            {"standby", "detaching", "intel", "attached", "Intel", "NVIDIA unavailable - not ready", "17", "I"},
+            {"off", "model", "intel", "attached", "Intel (NVIDIA not supported)", "NVIDIA unavailable - not supported",
+                "17", "I"},
+            {"off", "nodriver", "intel", "attached", "Intel", "NVIDIA unavailable - not ready", "18", "I"},
+            {"standby", "detaching", "intel", "attached", "Intel", "NVIDIA unavailable - not ready", "18", "I"},
         };
         for (String[] r : both) {
             for (String mode : new String[] {"auto", "nvidia"}) {
@@ -166,18 +180,19 @@ final class UnitTests {
         tile(Fx.st("gfx_mode", "Intel"), A, "NVIDIA", 12, "unknown gfx_mode 'Intel' counts as auto");
         tile(Fx.st("gfx_mode", "turbo"), A, "NVIDIA", 12, "unknown gfx_mode 'turbo' counts as auto");
         tile(Fx.st("gfx_mode", ""), A, "NVIDIA", 12, "empty gfx_mode counts as auto");
-        tile(Fx.st("gfx_active", "intel", "gfx_reason", "weird"), I, "Intel", 17, "unknown gfx_reason -> row 17");
-        tile(Fx.st("gfx_active", "intel", "gfx_reason", ""), I, "Intel", 17, "empty gfx_reason -> row 17");
-        tile(Fx.st("gfx_active", "NVIDIA", "gfx_reason", "ok"), I, "Intel", 17, "gfx_active 'NVIDIA' is not nvidia");
+        tile(Fx.st("gfx_active", "intel", "gfx_reason", "weird"), I, "Intel", 18, "unknown gfx_reason -> row 18");
+        tile(Fx.st("gfx_active", "intel", "gfx_reason", ""), I, "Intel", 18, "empty gfx_reason -> row 18");
+        tile(Fx.st("gfx_active", "intel", "gfx_reason", "Model"), I, "Intel", 18, "gfx_reason 'Model' is not model");
+        tile(Fx.st("gfx_active", "NVIDIA", "gfx_reason", "ok"), I, "Intel", 18, "gfx_active 'NVIDIA' is not nvidia");
         tile(Fx.st("state", "busy:0"), A, "NVIDIA", 12, "state busy:0 is not busy");
         tile(Fx.st("state", "busy:1000"), A, "NVIDIA", 12, "state busy:1000 is not busy");
         tile(Fx.st("state", "busy:01"), A, "NVIDIA", 12, "state busy:01 is not busy");
-        tile(Fx.st("state", "sleeping", "gfx_active", "intel", "gfx_reason", "nodriver"), I, "Intel", 17,
+        tile(Fx.st("state", "sleeping", "gfx_active", "intel", "gfx_reason", "nodriver"), I, "Intel", 18,
                 "unknown state");
         tile(Fx.st("base", "Attached", "gfx_active", "intel", "gfx_reason", "detached"), I,
                 "Unavailable (base detached)", 10, "base 'Attached' is not attached");
         tile(Fx.st("pending", "weird"), A, "NVIDIA", 12, "unknown pending is not detach");
-        tile(Fx.st("dtx", "weird", "gfx_active", "intel", "gfx_reason", "detaching"), I, "Intel", 17,
+        tile(Fx.st("dtx", "weird", "gfx_active", "intel", "gfx_reason", "detaching"), I, "Intel", 18,
                 "unknown dtx is not n/a");
         tile(Fx.st("gfx_cap", 2), U, "Unavailable", 1, "gfx_cap 2 is not 1");
         tile(st("standby", 1), U, "Unavailable", 1, "a v1.1 status without the v1.2 fields (gfx_cap missing)");
@@ -220,7 +235,8 @@ final class UnitTests {
             {"gfx_reason", "test", "gfx_active", "intel"}, {"base", "detached", "gfx_active", "intel"},
             {"state", "busy:4"}, {}, {"gfx_reason", "loading", "gfx_active", "intel"},
             {"gfx_reason", "untested", "gfx_active", "intel"}, {"gfx_reason", "testerror", "gfx_active", "intel"},
-            {"gfx_reason", "selftest", "gfx_active", "intel"}, {"gfx_reason", "nodriver", "gfx_active", "intel"}};
+            {"gfx_reason", "selftest", "gfx_active", "intel"}, {"gfx_reason", "model", "gfx_active", "intel"},
+            {"gfx_reason", "nodriver", "gfx_active", "intel"}};
         for (Object[] c : cases) {
             for (String mode : new String[] {"auto", "nvidia"}) {
                 boolean intelRow = c.length > 0 && "gfx_mode".equals(c[0]);
@@ -235,7 +251,7 @@ final class UnitTests {
                         "row " + m.row + " (" + mode + "): tap = set-mode, tile not UNAVAILABLE");
             }
         }
-        T.eq(15, rows.size(), "rows 3-17 all reached by the tap cases " + rows);
+        T.eq(16, rows.size(), "rows 3-18 all reached by the tap cases " + rows);
         // the command a tap sends: set-mode <nextMode(gfx_mode)>
         T.eq("intel", StateMapper.nextMode(Fx.st().gfxMode), "tap in auto sends set-mode intel");
         T.eq("nvidia", StateMapper.nextMode(Fx.st("gfx_mode", "intel").gfxMode), "tap in intel sends set-mode nvidia");
@@ -273,6 +289,7 @@ final class UnitTests {
             {"fault", "Intel (NVIDIA GPU fault)"}, {"mode", "Intel (Intel only mode)"},
             {"detached", "Intel (keyboard base detached)"}, {"detaching", "Intel (preparing to detach)"},
             {"loading", "Intel (starting NVIDIA)"}, {"nodriver", "Intel (NVIDIA driver not running)"},
+            {"model", "Intel (this NVIDIA GPU is not supported)"},
             {"untested", "Intel (testing NVIDIA)"}, {"testerror", "Intel (NVIDIA test could not run)"},
             {"selftest", "Intel (NVIDIA self-test failed)"}, {"bogus", "Intel"}, {"", "Intel"}, {"ok", "Intel"}};
         for (String[] r : reasons) {
@@ -345,6 +362,14 @@ final class UnitTests {
         T.eq("NVIDIA GPU: active", GraphicsPage.build(Fx.st("power_state", "D0"), null, DF).gpuLine, "GPU active");
         T.eq("NVIDIA GPU: no driver", GraphicsPage.build(Fx.st("driver", "", "state", "off"), null, DF).gpuLine,
                 "GPU no driver");
+        T.eq("NVIDIA GPU: not supported (no driver)", GraphicsPage.build(Fx.st("driver", "", "state", "off",
+                "gfx_active", "intel", "gfx_reason", "model"), null, DF).gpuLine, "GPU not supported (B-4 model)");
+        T.eq("NVIDIA GPU: no driver", GraphicsPage.build(Fx.st("driver", "", "state", "off", "gfx_active", "intel",
+                "gfx_reason", "nodriver"), null, DF).gpuLine, "GPU no driver for reason nodriver");
+        T.eq("NVIDIA GPU: not connected", GraphicsPage.build(Fx.st("bdf", "", "gfx_active", "intel", "gfx_reason",
+                "model"), null, DF).gpuLine, "GPU not connected wins over model");
+        T.eq("Auto: Intel (NVIDIA not supported)", StateMapper.summary(Fx.st("driver", "", "state", "off",
+                "gfx_active", "intel", "gfx_reason", "model")), "summary for a model refusal (B-4)");
         T.eq("NVIDIA GPU: not connected", GraphicsPage.build(Fx.st("bdf", "", "state", "unavailable"), null, DF)
                 .gpuLine, "GPU not connected");
         Status used = Fx.st("state", "busy:2", "power_state", "D0", "refcnt", 2, "holders", Fx.holders(
@@ -790,7 +815,8 @@ final class UnitTests {
             Texts.INTEL_RECOVERED, Texts.NV_RECOVERED, Texts.INTEL_TEST_BOOT, Texts.UNAVAILABLE_DETACHED,
             Texts.NV_DETACHED, Texts.nvidiaBusy(999), Texts.nvidiaManualBusy(999), Texts.NVIDIA, Texts.NVIDIA_MANUAL,
             Texts.INTEL_STARTING, Texts.NV_STARTING, Texts.INTEL_TESTING, Texts.NV_TESTING, Texts.INTEL_TEST_NOT_RUN,
-            Texts.NV_TEST_NOT_RUN, Texts.INTEL_TEST_FAILED, Texts.NV_TEST_FAILED, Texts.INTEL, Texts.NV_NOT_READY}) {
+            Texts.NV_TEST_NOT_RUN, Texts.INTEL_TEST_FAILED, Texts.NV_TEST_FAILED, Texts.INTEL, Texts.NV_NOT_READY,
+            Texts.INTEL_NOT_SUPPORTED, Texts.NV_NOT_SUPPORTED}) {
             T.check(s.length() <= 40 && s.matches("[ -~]+"), "subtitle short printable ASCII: " + s);
         }
         // errors of the new commands

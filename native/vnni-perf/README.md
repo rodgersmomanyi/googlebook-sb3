@@ -294,10 +294,11 @@ LRU, and `grep libz /proc/<pid>/maps` shows the bound file for zygote/system_ser
   partition or any APEX file, so AVB/dm-verity/apexd checks are unaffected. It
   does move the trust anchor of `libz.so` from the verified `/system` to the
   unverified ESP initrd / `/odm` tmpfs — the same trust level as everything else
-  this pipeline already injects through `/odm` on an unlocked (orange) device. The
-  generated rc remounts the bind read-only in init's mount namespace only (bind
-  copies propagated to other namespaces may stay rw); the source inode stays
-  writable by root through `/odm/vnni/` (the `/odm` tmpfs is read-write). SELinux:
+  this pipeline already injects through `/odm` on an unlocked (orange) device. (W6)
+  The patched copies sit on gbinit's own `gbvnni` tmpfs, and init remounts that
+  filesystem read-only after the relabel. No bind, no propagated copy and no
+  source path accepts a write. Root can still remount it read-write, which is
+  the same trust level as every other `/odm` injection. SELinux:
   the global mode is enforcing (lapis's user build ignores
   `androidboot.selinux=permissive`), and every type of this build is permissive
   through `inject/odm_sepolicy.cil`; `build_esp.py` refuses a cil that drops
@@ -397,6 +398,7 @@ directory changed:
   with the measured lower bound and an acceptance measurement.
 * **MEDIUM — hardening:** bound tmpfs inode was writable → read-only remount
   (init's mount namespace only; see INTEGRATION.md and w5/INTEGRATE_REVIEW.md F1).
+  (W6: superseded by the read-only `gbvnni` tmpfs, w6prep vnni-hardening.)
 * **LOW:** `gb_vnni.sh` used init's mount syntax with toybox (always failed);
   patcher crashed on a symlinked target; output hash not pinned; `run_equiv.sh`
   left a root-owned `chroot.*` skeleton; INTEGRATION's early-init/ordering

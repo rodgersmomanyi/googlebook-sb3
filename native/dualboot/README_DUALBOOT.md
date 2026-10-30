@@ -19,7 +19,7 @@ image files (see [Test harness](#test-harness)).
 
 | file | what it is |
 |---|---|
-| `build_internal.py` | Exports the partition set for the internal install (`<out>\*.img` + `manifest.json`). Reads the workspace's `lapis.bin` (`GB_HOME`, default: the repository root) and does not write it. Imports `build_esp.py`/`build_usb.py` without changing them. |
+| `build_internal.py` | Exports the partition set for the internal install (`<out>\*.img` + `manifest.json`). Reads the workspace's `lapis.bin` (`GB_HOME`, default: the repository root) and does not write it. It refuses while the VM that uses `lapis.bin` runs (`--allow-running-vm` overrides it; `--dry-run` and the `--test-*` exports only warn). Imports `build_esp.py`/`build_usb.py` without changing them. |
 | `install_dualboot.ps1` | The installer: checks, backups, D: shrink, partitions, raw writes, boot entry. It also has two maintenance modes: `-UpdateEspOnly` and `-RepairBootEntry`. |
 | `uninstall_dualboot.ps1` | Removes the boot entry and the Googlebook partitions, then extends D: back to its original size. |
 | `Import-GooglebookIsoInstall.ps1` | Imports the state of an install made by the installer ISO (`\gbinstall\` on its ESP) into `C:\GB-backup`, so the scripts below work for it. See [Installed from the ISO](#installed-from-the-iso). |

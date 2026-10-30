@@ -6,6 +6,25 @@
 
 # gpu-ui: the GbGpu app (Graphics tile, Graphics page, notifications)
 
+**Wave 6 (notify, headless system user mode, 2026-10-30):** lapis runs in headless system user mode: user 0 is the
+headless "System User" (login screen), the person uses a full user (10). Measured on lapis 276.R4: a plain `pm grant`
+granted POST_NOTIFICATIONS to user 0 only, `cmd statusbar add-tile` at boot went to user 0's tiles, gb_notify's
+`am broadcast --user 0` reached only user 0's GbGpu (whose `ui-caps notify` then suppressed gb_power's N08 while its
+detach notification was invisible), and lapis's SystemUI drops `requestListeningState` for the tile ("Couldn't find
+tile ...(10)"). Changes: `gb_gpu_ui_setup.sh` grants every full user and adds the tile once per user while a full user
+is in the foreground (markers `tile_added.<u>`); new non-exported `.UserReceiver` (BOOT_COMPLETED, permission
+RECEIVE_BOOT_COMPLETED) refreshes at each user's unlock; `.StateReceiver`/`.UserReceiver` do nothing in the headless
+system user (`core/UserPolicy`); the tile is no longer an ACTIVE_TILE (bound whenever the QS panel is shown). gb_notify
+now broadcasts to every running full user (nouveau-kernel). INTERFACES 12.1a, 13.2. APK `7888b882...` (versionCode
+29889106, same signer `68617480...`); proof: `C:\GB-build\native\w6prep\notify\RESULT.md`.
+
+**Wave 6 (readiness B-4, 2026-10-30):** gb_power reports `gfx_reason` = `model` when gb_nouveau refused a dGPU this
+system has no driver for (`vendor.gb.nouveau.result=refused:model`: a 15-inch Surface Book 3's TU116/TU106). The app
+shows it: tile row 17 `Intel (NVIDIA not supported)` / `NVIDIA unavailable - not supported` (the old row 17
+"otherwise" is now row 18), status line `Apps you open now use: Intel (this NVIDIA GPU is not supported)`, GPU line
+`NVIDIA GPU: not supported (no driver)` (INTERFACES 27.1, 27.2, 27.6). The mock derives it too. APK `b5108d54...`
+(versionCode 29888620); the wave-5 APK `d653940a...` is kept as `out\prev-w6\GbGpu.apk`.
+
 **v1.2 r2 (review fix pass, INTERFACES section 29, 2026-10-25):** HoldersActivity's detach mode ignores
 `not-holder` refusals and falls back to `detach-request` on `ESTALE` (R-16); the mock follows gb_power's new
 `compute-start` `EAGAIN` rule (R-6). APK `d653940a...` (versionCode 29882330); every test re-run PASS
@@ -27,7 +46,7 @@ D1-D8 (INTERFACES 22.1) are implemented by gb_power and the other components; th
 
 * **Quick Settings tile "Graphics"** (`.GpuTileService`, same component name as v1.1, so a tile the user already added
   stays). It shows what apps you open now get: `NVIDIA`, `NVIDIA (busy 2)`, `Intel`, `Unavailable (base detached)`,
-  `Off (Intel mode)`, `Fault`, ... (the 17 rows of INTERFACES 27.1, with separate texts in the manual `NVIDIA` mode,
+  `Off (Intel mode)`, `Fault`, ... (the 18 rows of INTERFACES 27.1, with separate texts in the manual `NVIDIA` mode,
   e.g. `NVIDIA unavailable - base detached`). A **tap cycles the mode Auto -> Intel -> NVIDIA -> Auto** (`set-mode`,
   never a dialog; toasts `Takes effect after restart`, `Takes effect when the keyboard base is attached`, `Switching
   to Intel when apps on NVIDIA close`). A **long-press opens the Graphics page**. Taps need an unlocked device.
@@ -104,7 +123,7 @@ D1-D8 (INTERFACES 22.1) are implemented by gb_power and the other components; th
 | `AndroidManifest.xml`, `res/` | Manifest (v1.2 permissions, components, injection meta-data); strings, themes, two vector icons, data-extraction rules. |
 | `src/gb/sb3/gpu/core/*.java` | Protocol client and the host-tested models. |
 | `src/gb/sb3/gpu/*.java` | Android layer: tiles, Graphics page, summary provider, receivers (state, Cancel), dialog, notifications, LocalSocket transport, catalog query (`Gb`). |
-| `gb_gpu_ui.rc`, `gb_gpu_ui_setup.sh` | Unchanged (INTERFACES 15.4; `pm grant`, one-time `add-tile`). |
+| `gb_gpu_ui.rc`, `gb_gpu_ui_setup.sh` | rc unchanged (INTERFACES 15.4). (Wave 6) setup per user: `pm grant --user <u>` for every full user, `add-tile` once per user while that full user is in the foreground (`tile_added.<u>`). |
 | `gpu_ui.json` | Wave 2 component manifest: APK, setup script, rc, and (v1.2) the empty `gfx_app_prefs.default` seed -> `/odm/etc/gb/gfx_app_prefs.default` 0644. |
 | `gfx_app_prefs.default` | The per-app choices seed, empty (INTERFACES 24.2: "ships empty"). |
 | `build_apk.sh`, `build_on_builder.sh`, `run_tests.sh` | Build (unchanged toolchain) and the test runner. |

@@ -23,6 +23,32 @@ def _lapis_write_refused():
         return f"VMware has the VM open ({', '.join(lck)}); lapis.bin is never written while it runs"
     return None
 
+def _pin_path_refused(new_esp, lapis=None):
+    """(W6 prep, SA-7) Why new_esp must not replace the ESP now in lapis.bin (None = allowed): the PIN path of the tree
+    it boots (verify_image.pin_path: the Gatekeeper binary, fragment and rc service, the KeyMint service and its
+    vup/lib64 graft, the Trusty/Weaver masks, the fstab, the PIN SELinux types) must equal the current one, or a
+    lock-screen PIN enrolled on the user's VM may stop verifying (safety audit SA-7). Every difference is printed;
+    GB_PIN_MIGRATION=1 allows a reviewed migration."""
+    import importlib.util as _u
+    try:
+        spec = _u.spec_from_file_location("verify_image", os.path.join(HERE, "verify_image.py"))
+        vi = _u.module_from_spec(spec); spec.loader.exec_module(vi)
+        with open(lapis or LAPIS, "rb") as f:
+            f.seek(ESP_OFFSET); old = f.read(ESP_BYTES)
+        probs = vi.pin_path_problems(vi.fat_files(old), vi.fat_files(new_esp))
+    except (OSError, ValueError, AttributeError, ImportError, SyntaxError, struct.error) as e:
+        probs = [f"the PIN path cannot be compared ({e.__class__.__name__}: {e})"]
+    for p in probs:
+        print(f"PIN path: {p}", flush=True)
+    if not probs:
+        print("PIN path: the same as the ESP now in lapis.bin", flush=True)
+        return None
+    if os.environ.get("GB_PIN_MIGRATION") == "1":
+        print("PIN path: the differences above are ALLOWED by GB_PIN_MIGRATION=1", flush=True)
+        return None
+    return (f"the new ESP changes the PIN path of the user's VM ({len(probs)} difference(s) above): an enrolled "
+            f"lock-screen PIN may stop verifying. Set GB_PIN_MIGRATION=1 only for a reviewed migration")
+
 if __name__ == "__main__" and _lapis_write_refused():      # refuse before reading anything
     sys.exit(f"build_esp.py: refused: {_lapis_write_refused()}")
 
@@ -318,6 +344,21 @@ GBINIT = (b"#!/busybox sh\n"
           b"  fi\n"
           b"  { echo \"state=$OS\"; echo \"validated=$FV\"; echo \"booted=${FB:-unknown}\"; echo \"token=${OG:-none}\"; }"
           b" > /odm/etc/gb/ota_state\n"
+          b"fi\n"
+          # (W6, F1 + M-vlower; VNNI_GBINIT_RO below) what is left of /odm/vnni after the kill switch and the OTA gate
+          # moves to its own tmpfs "gbvnni" (the same files). gb.rc relabels and binds each library at early-init and
+          # then remounts this superblock read-only: every mount of it (the binds in every mount namespace and their
+          # propagated copy /odm/vlower/lib64/libz.so) refuses writes. Any failure here: no /odm/vnni (no bind).
+          b"if [ -d /odm/vnni ]; then\n"
+          b"  /busybox rm -rf /odm/.gbvnni; /busybox mv /odm/vnni /odm/.gbvnni\n"
+          b"  if /busybox mkdir -m 0755 /odm/vnni && /busybox mount -t tmpfs -o mode=0755 gbvnni /odm/vnni"
+          b" && /busybox cp -a /odm/.gbvnni/. /odm/vnni/; then\n"
+          b"    /busybox rm -rf /odm/.gbvnni\n"
+          b"  else\n"
+          b"    /busybox umount /odm/vnni 2>/dev/null\n"
+          b"    /busybox rm -rf /odm/vnni /odm/.gbvnni\n"
+          b"    echo \"vnni: no own tmpfs, /odm/vnni removed (no bind)\" > /odm/gbinit_vnni.log\n"
+          b"  fi\n"
           b"fi\n"
           b"/busybox mkdir -p /odm/etc\n"
           b"echo \"$HW\" > /odm/etc/gb_hw\n"
@@ -1533,6 +1574,10 @@ assert GBINIT.count(OTA_GBINIT_TOKENS) == 1 and GBINIT.count(OTA_GBINIT_UNVALIDA
 # gb_notify ships and its queue exists (native), queues the message like every other producer; gb_otagate_post (user
 # shell, the identity gb_notify posts with; INTERFACES D6: posting as uid 0 is unverified) posts it directly everywhere
 # else (the VM tree has no gb_notify). Notifications with the same tag replace each other, so a double post is one.
+# (Wave 6, notify) lapis is in headless system user mode: a shell post without a user lands in user 0 (the login
+# screen's headless "System User") and SystemUI hides it from the person's user 10 (forced OTA-gate boot: sysui
+# NotCurrentUserFilter). Both paths now post ONE record for UserHandle.ALL (`cmd notification post -u all`, as
+# gb_notify does), which SystemUI shows to whichever user is in the foreground, before and after the sign-in.
 OTA_TITLE = b"System update not validated"
 OTA_TEXT = (b"Build $B is not the build this boot setup was made for ($V). Paused until the next ESP update: "
             + ", ".join(OTA_SKIP_LABELS).encode() + b".")
@@ -1544,7 +1589,9 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"# /odm/etc/gb/ota_state). Service gb_otagate (root): one kmsg line, and the \"System update not validated\"\n"
                  b"# notification (tag gb_update, INTERFACES 12.1) queued for gb_notify where gb_notify and its queue exist\n"
                  b"# (native). Service gb_otagate_post (argument post, user shell): posts it directly everywhere else (VM).\n"
+                 b"# (wave 6, notify) Posted for UserHandle.ALL (-u all): headless system user mode hides user 0's posts.\n"
                  b"# It changes nothing else. Test hooks (never set by init): GB_ROOT (path prefix), GB_TEST_PATH.\n"
+                 b"# (wave 6, OTA-F3) gb_otagate then logs the stock sha256 of each bind target nothing of ours covers.\n"
                  b"LC_ALL=C; export LC_ALL\n"
                  b"PATH=${GB_TEST_PATH:+$GB_TEST_PATH:}/system/bin:/vendor/bin; export PATH\n"
                  b"R=${GB_ROOT:-}\n"
@@ -1565,7 +1612,7 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"qok() { [ -f \"$R/odm/vup/bin/gb_notify.sh\" ] && [ -d \"$Q\" ] && [ ! -L \"$Q\" ]; }\n"
                  b"if [ \"${1:-}\" = post ]; then\n"
                  b"  qok && exit 0\n"
-                 b"  timeout 20 cmd notification post -t \"$TITLE\" gb_update \"$TEXT\" > /dev/null 2>&1 || "
+                 b"  timeout 20 cmd notification post -u all -S bigtext -t \"$TITLE\" gb_update \"$TEXT\" > /dev/null 2>&1 || "
                  b"log1 \"cmd notification post failed\"\n"
                  b"  exit 0\n"
                  b"fi\n"
@@ -1574,6 +1621,9 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  + ", ".join(OTA_KEEP_LABELS).encode() + b"; update the ESP to re-validate\"\n"
                  b"if qok; then\n"
                  b"  ms=\"$(date +%s)000\"; f=$Q/$ms-$$-1.msg\n"
+                 # (wave 6, notify) 0644 as 12.1 asks: gb_notify reads it as the shell user, and init starts this
+                 # root service with umask 077 (the notify proof VM: a 0600 file gb_notify could not open)
+                 b"  umask 022\n"
                  b"  set -C\n"
                  b"  if printf 'kind=notify\\ntag=gb_update\\ntitle=%s\\ntext=%s\\n' \"$TITLE\" \"$TEXT\" > \"$f.tmp\" 2>/dev/null &&\n"
                  b"     mv \"$f.tmp\" \"$f\" 2>/dev/null; then\n"
@@ -1585,6 +1635,31 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"else\n"
                  b"  log1 \"no gb_notify queue: gb_otagate_post posts the notification\"\n"
                  b"fi\n"
+                 # (wave 6, OTA-F3, reviewed) diagnostic only, after the notification: for each bind of our /odm rc
+                 # files, the sha256 of its stock target when nothing of ours covers that path at runtime (a gated bind
+                 # that did not fire, e.g. the VNNI libz on this build), to compare with the validated build's
+                 # (ota-gating evidence stock_scan_slot_b.tsv, or the report of a gb.otagate=force boot of the
+                 # validated build); else "hidden-by-our-bind" (mounted) or "hidden-by-overlay" (a /vendor path our
+                 # overlay upper layer holds). No file of the /vendor overlay is hashed: the overlay mount also
+                 # propagated onto its lower dir /odm/vlower (MEASURE_W5 M-vlower: the vendor libz bind shows up at
+                 # /odm/vlower/lib64/libz.so), so no runtime path shows their stock version; they are only counted.
+                 # Reads only; at most 64 bind lines.
+                 b"stk() { s=$(sha256sum \"$1\" 2>/dev/null | cut -c1-64); printf '%s' \"${s:-unreadable}\"; }\n"
+                 b"n=$(cd \"$R/odm/vup\" 2>/dev/null && find . -type f 2>/dev/null | wc -l | tr -cd 0-9)\n"
+                 b"m=0\n"
+                 b"# one word per bind line (its spaces become @), so the for loop splits lines\n"
+                 b"# shellcheck disable=SC2013\n"
+                 b"for x in $(grep -r -h -E '^[[:space:]]*mount none /odm/[^ ]+ /[^ ]+ bind$' \"$R/odm/etc/init\" 2>/dev/null"
+                 b" | sed 's/^[[:space:]]*//; s/ /@/g' | sort -u); do\n"
+                 b"  o=${x#mount@none@}; o=${o%%@*}; d=${x#mount@none@*@}; d=${d%@bind}\n"
+                 b"  m=$((m + 1)); [ $m -gt 64 ] && continue\n"
+                 b"  if grep -q -F \" $d \" \"$R/proc/self/mountinfo\" 2>/dev/null; then s=hidden-by-our-bind\n"
+                 b"  elif [ \"${d#/vendor/}\" != \"$d\" ] && [ -e \"$R/odm/vup/${d#/vendor/}\" ]; then s=hidden-by-overlay\n"
+                 b"  else s=$(stk \"$R$d\"); fi\n"
+                 b"  log1 \"stock $d $s ours $(stk \"$R$o\")\"\n"
+                 b"done\n"
+                 b"log1 \"stock report: $m bind target(s) (at most 64 logged); ${n:-0} /vendor overlay file(s) not hashed (no "
+                 b"runtime path shows their stock version); diagnostic only, compare with the validated build's report\"\n"
                  b"exit 0\n")
 # /odm/etc/init/gb_otagate.rc (both trees; init parses every file of /odm/etc/init). ro.vendor.* is an actionable
 # property for /odm rc files; the property comes from /odm/etc/build.prop only when gbinit appended it.
@@ -1633,6 +1708,10 @@ GK_BIN_DEST = "vup/bin/hw/android.hardware.gatekeeper-service.gb"
 GK_VINTF_DEST = "etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml"
 GK_VINTF_SHA256 = "48cd680b721996e57c4b93acce4d842d9f14e0cd3dbd9cda75e1fe3b3216b77b"   # the reviewed fragment (GK-6)
 GK_MIN_VERSION = (0, 2, 0)                                # W4-GK-1 (must before a real PIN), W4-GK-2, W4-GK-3
+# (W6 prep, SA-6) every accepted build after 0.2.0 must have passed the frozen on-disk vectors (gatekeeper\tests\
+# test_frozen_v1.cpp: the gk_key.v1 files + handles 0.2.0 enrolled for the PIN "1234" still verify): ACCEPTANCE.txt
+# "host: GK_FROZEN_V1: PASS". 0.2.0 itself predates the test; it passed it on its own sources (w6prep\safety-misc SA-6).
+GK_FROZEN_PREDATES = ("505b404d0606bf80bcb41ff8a66a80c962934e3791d3b8db13645608da143d51",)
 GK_LLNDK = ("libbinder_ndk.so", "libc.so", "libdl.so", "liblog.so", "libm.so")
 GK_IFACE = b"interface aidl android.hardware.gatekeeper.IGatekeeper/default"
 GK_TRUSTY_BIND = (b"    mount none /odm/empty_vintf.xml "
@@ -1700,6 +1779,8 @@ def _gatekeeper_inputs(manifest=GK_MANIFEST):
         f"gatekeeper ACCEPTANCE.txt: version {ver.group(0) if ver else '?'} < {'.'.join(map(str, GK_MIN_VERSION))}"
     assert f"sha256: {_hl.sha256(gbin).hexdigest()}  {os.path.basename(bsrc)}" in acc.splitlines(), \
         "gatekeeper ACCEPTANCE.txt does not name this binary's sha256"
+    assert _hl.sha256(gbin).hexdigest() in GK_FROZEN_PREDATES or re.search(r"^host: GK_FROZEN_V1: PASS", acc, re.M), \
+        "gatekeeper ACCEPTANCE.txt lacks 'host: GK_FROZEN_V1: PASS' (SA-6: enrolled PINs must keep verifying)"
     interp, needed = _elf_dynamic(gbin)
     assert interp == "/system/bin/linker64" and needed and set(needed) <= set(GK_LLNDK), \
         f"gatekeeper binary: interpreter {interp}, NEEDED {needed} (LLNDK only: {GK_LLNDK})"
@@ -1726,8 +1807,10 @@ print(f"software Gatekeeper: ON in both trees (binary sha256 {_hl.sha256(GK_BIN)
 # the verified partition's own build.prop before early-init): gb_slotsync reuses this initrd for an A/B OTA's new slot,
 # whose fingerprint differs, so a stale patched libz is never bound over another build (INTEGRATION.md 3). No service.
 # Kill switch: gb.vnni=0 on the kernel command line makes GBINIT delete /odm/vnni (the binds then fail harmlessly).
-# Checks: _vnni_inputs (each file == its manifest's patched_sha256, each (orig, patched, bind, gate) pair a deployable
-# target of the reviewed patcher manifest, gates unique, nothing else in a folder), _check_vnni, verify_image V31.
+# Checks: _vnni_inputs (each file == its manifest's patched_sha256, each (orig, patched, bind, gate, reviewed gate value)
+# a deployable target of the reviewed patcher manifest, gates unique, nothing else in a folder; W6: the folder's slot
+# and build == this ESP's boot slot and its init_boot build), _check_vnni, verify_image V31. (W6) Read-only: GBINIT
+# moves /odm/vnni onto its own tmpfs and the block's last action remounts that superblock read-only (VNNI_GBINIT_RO).
 # Patched Google binaries are never published (collect.py excludes inject\vnni). Idea credit: gbOS86; code ours.
 VNNI_DIR = os.path.join(HERE, "inject", "vnni")
 VNNI_PATCHER_MANIFEST = os.path.join(os.environ.get("GB_BUILD") or (HERE if os.path.isdir(os.path.join(HERE, "native")) else r"C:\GB-build"), "native", "vnni-perf", "patcher", "manifest.json")
@@ -1749,11 +1832,54 @@ VNNI_GBINIT_EDITS = ((b"HW=; USB=0; HWTOK=0; OV=0\n", b"HW=; USB=0; HWTOK=0; OV=
                      (b"/busybox cp -a $SRC/. /odm/\n",
                       b"/busybox cp -a $SRC/. /odm/\n[ \"$VN\" = 0 ] && /busybox rm -rf /odm/vnni\n"))
 assert all(GBINIT.count(_new) == 1 for _old, _new in VNNI_GBINIT_EDITS), "GBINIT: the gb.vnni=0 kill switch"
+# (W6, INTEGRATE_REVIEW F1 + MEASURE_W5 M-vlower) GBINIT's own tmpfs for /odm/vnni (a literal copy, checked by
+# _check_vnni and V31). A per-mount `remount bind ro` reaches only the mount it names, so the copies that propagated at
+# bind time (another mount namespace, /odm/vlower/lib64/libz.so) stayed rw, and the source sat on the rw /odm tmpfs.
+# A superblock remount (MS_REMOUNT without MS_BIND) makes the filesystem itself read-only: every mount of it refuses
+# writes (__mnt_is_readonly: MNT_READONLY or sb_rdonly), wherever it was propagated. The libraries must be relabelled
+# first (restorecon needs a writable mount), so gb.rc does the remount (VNNI_RC_TAIL) after its binds; a context= mount
+# here is not possible: SELinux refuses mount context options before the policy is loaded (EINVAL), and context mounts
+# cannot be relabelled at all. Same files, same flags as the /odm tmpfs (no nosuid/nodev/noexec change for the binds).
+VNNI_GBINIT_RO = (b"if [ -d /odm/vnni ]; then\n"
+                  b"  /busybox rm -rf /odm/.gbvnni; /busybox mv /odm/vnni /odm/.gbvnni\n"
+                  b"  if /busybox mkdir -m 0755 /odm/vnni && /busybox mount -t tmpfs -o mode=0755 gbvnni /odm/vnni"
+                  b" && /busybox cp -a /odm/.gbvnni/. /odm/vnni/; then\n"
+                  b"    /busybox rm -rf /odm/.gbvnni\n"
+                  b"  else\n"
+                  b"    /busybox umount /odm/vnni 2>/dev/null\n"
+                  b"    /busybox rm -rf /odm/vnni /odm/.gbvnni\n"
+                  b"    echo \"vnni: no own tmpfs, /odm/vnni removed (no bind)\" > /odm/gbinit_vnni.log\n"
+                  b"  fi\n"
+                  b"fi\n")
+VNNI_GBINIT_RO_AFTER = (VNNI_GBINIT_EDITS[2][1], OTA_GBINIT_UNVALIDATED)          # the kill switch, the OTA gate
+VNNI_GBINIT_RO_BEFORE = (b"if [ \"$HW\" = native ] && [ \"$HWTOK\" = 1 ]", b"exec /init\n")   # the bring-up, init
+
+
+def _vnni_gbinit_ro_ok(gi):
+    """(W6) GBINIT text gi holds VNNI_GBINIT_RO once, after the kill switch and the OTA gate, before the bring-up (when
+    present: its own checks report it missing) and exec /init."""
+    pos = [gi.find(s) for s in VNNI_GBINIT_RO_AFTER] + [gi.find(VNNI_GBINIT_RO)] + \
+          [gi.find(s) for s in VNNI_GBINIT_RO_BEFORE]
+    if pos[3] < 0:
+        pos.pop(3)
+    return gi.count(VNNI_GBINIT_RO) == 1 and min(pos) >= 0 and pos == sorted(pos)
+
+
+assert _vnni_gbinit_ro_ok(GBINIT), "GBINIT: the gbvnni read-only tmpfs block (after the kill switch and the OTA gate)"
+# (W6) the last action of the vnni block, on the init trigger (init runs it after every early-init action, so after every
+# gated relabel + bind; the VM gb.rc keeps one `on early-init` section, V28): the gbvnni superblock goes read-only. Not
+# gated (it binds nothing; without /odm/vnni, or if it is not a mount root, init logs the failure and goes on: it can
+# never touch /odm itself, do_remount needs the mount root).
+VNNI_RC_TAIL = (b"\n# (W6) every library above is relabelled and bound (early-init): the gbvnni tmpfs (gbinit) now goes read-only\n"
+                b"# for all its mounts, the binds in every mount namespace and their propagated copies included.\n"
+                b"on init\n"
+                b"    mount tmpfs gbvnni /odm/vnni remount ro\n")
 
 def _vnni_action(ident, t):
     """The init action of one target: the reviewed vnni_patch.rc_block form (restorecon the source, bind it over the
-    stock library, relabel, remount the bind read-only in init's mount namespace only; the inode stays writable through
-    the rw /odm tmpfs), source /odm/vnni/<id>/<file>, gated on the exact fingerprint."""
+    stock library, relabel, remount the bind read-only in init's mount namespace only), source /odm/vnni/<id>/<file>,
+    gated on the exact fingerprint. (W6) The source is on gbinit's own gbvnni tmpfs, which VNNI_RC_TAIL then makes
+    read-only as a whole (every mount of it, in every namespace)."""
     src, dst = f"{VNNI_ODM}/{ident}/{t['file']}", t["bind"]
     return (f"on early-init && property:{t['gate_prop']}={t['gate_value']}\n"
             f"    restorecon {src}\n"
@@ -1761,16 +1887,24 @@ def _vnni_action(ident, t):
             f"    restorecon {dst}\n"
             f"    mount none none {dst} remount bind ro\n").encode()
 
-def _vnni_inputs(vdir=VNNI_DIR, patcher_manifest=VNNI_PATCHER_MANIFEST):
+def _vnni_inputs(vdir=VNNI_DIR, patcher_manifest=VNNI_PATCHER_MANIFEST, slot=None, boot_fp=None):
     """([(path below /odm, bytes, mode)], the gb.rc block, [ids]) of every inject\\vnni\\<id>\\ folder (vnni_prepare.py's
-    output); ([], b"", []) without one. Any folder that does not check out stops the build (fail closed)."""
+    output); ([], b"", []) without one. Any folder that does not check out stops the build (fail closed). (W6, safety
+    audit SA-2) so does a folder prepared for another slot than the one this ESP boots (slot, default SLOT) or for
+    another build than that slot's (build id and incremental of its gates vs the init_boot fingerprint boot_fp, default
+    OTA_FP): its binds could never fire there (it was a WARNING). (W6, SA-3) each target's gate value must also be the
+    reviewed deploy.gate_value of the patcher manifest."""
     names = sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []
     if not names:
         return [], b"", []
+    slot = slot or SLOT
+    boot_fp = boot_fp or OTA_FP.decode("ascii")
+    bm = re.fullmatch(VNNI_FP_RE, boot_fp)
+    assert bm, f"VNNI: the boot slot's init_boot fingerprint {boot_fp!r} is not brand/product/device:release/id/incr:type/tags"
     with open(patcher_manifest, encoding="utf-8") as fh:
         pm = _json.load(fh)
-    allowed = {(t["orig_sha256"], t["patched_sha256"], t["deploy"]["bind"], t["deploy"]["gate_prop"], t["path"])
-               for t in pm["targets"] if t.get("deploy")}
+    allowed = {(t["orig_sha256"], t["patched_sha256"], t["deploy"]["bind"], t["deploy"]["gate_prop"],
+                t["deploy"].get("gate_value"), t["path"]) for t in pm["targets"] if t.get("deploy")}
     files, actions, gates = [], [], set()
     for n in names:
         d = os.path.join(vdir, n)
@@ -1780,9 +1914,9 @@ def _vnni_inputs(vdir=VNNI_DIR, patcher_manifest=VNNI_PATCHER_MANIFEST):
         m = _json.loads(mraw.decode("utf-8"))
         assert m.get("format") == VNNI_FORMAT and m.get("id") == n and m.get("targets"), \
             f"inject\\vnni\\{n}\\manifest.json: format {VNNI_FORMAT}, id {n}, at least one target"
-        if m.get("slot") and m.get("slot") != SLOT:
-            print(f"WARNING: inject\\vnni\\{n} was prepared for slot _{m.get('slot')}, current SLOT is _{SLOT} "
-                  f"(run vnni_prepare.py --check-slot)", flush=True)
+        assert m.get("slot") == slot, \
+            (f"inject\\vnni\\{n} was prepared for slot _{m.get('slot')}, this ESP boots slot _{slot} (SA-2): run "
+             f"vnni_prepare.py for this slot, or move the folder to archive\\vnni-prev to build without the patch")
         have = {os.path.relpath(os.path.join(dp, f), d).replace("\\", "/") for dp, _, fs in os.walk(d) for f in fs}
         want = {"manifest.json"} | {t["file"] for t in m["targets"]}
         assert have == want, f"inject\\vnni\\{n}: files {sorted(have)} != manifest {sorted(want)}"
@@ -1790,24 +1924,33 @@ def _vnni_inputs(vdir=VNNI_DIR, patcher_manifest=VNNI_PATCHER_MANIFEST):
             data = open(os.path.join(d, *t["file"].split("/")), "rb").read()
             assert _hl.sha256(data).hexdigest() == t["patched_sha256"] and len(data) == t["size"] and data[:4] == b"\x7fELF", \
                 f"inject\\vnni\\{n}\\{t['file']}: not the patched_sha256 of its manifest"
-            assert (t["orig_sha256"], t["patched_sha256"], t["bind"], t["gate_prop"], t["file"]) in allowed, \
-                f"inject\\vnni\\{n}\\{t['file']}: not a deployable target of {patcher_manifest} (orig/patched/bind/gate)"
+            assert (t["orig_sha256"], t["patched_sha256"], t["bind"], t["gate_prop"], t.get("gate_value"),
+                    t["file"]) in allowed, \
+                (f"inject\\vnni\\{n}\\{t['file']}: not a deployable target of {patcher_manifest} (orig/patched/bind/gate "
+                 f"and (SA-3) the reviewed deploy.gate_value)")
             assert VNNI_BINDS.get(t["bind"]) == t["gate_prop"] and t["file"] == t["bind"].lstrip("/"), t["bind"]
             v = t["gate_value"]
             assert (v and v != "*" and v == m["fingerprints"].get(t["gate_prop"])
                     and all(c in VNNI_PROP_SAFE for c in v) and re.fullmatch(VNNI_FP_RE, v)), \
                 f"inject\\vnni\\{n}: gate value {v!r} (the partition's fingerprint, init-safe characters only)"
+            fm = re.fullmatch(VNNI_FP_RE, v)
+            assert fm.groups() == bm.groups(), \
+                (f"inject\\vnni\\{n} was prepared for build {'/'.join(fm.groups())}, slot _{slot} runs build "
+                 f"{'/'.join(bm.groups())} (SA-2): run vnni_prepare.py for this build, or move the folder to "
+                 f"archive\\vnni-prev to build without the patch")
             assert (t["gate_prop"], v) not in gates, f"inject\\vnni\\{n}: a second folder for {t['gate_prop']}={v}"
             gates.add((t["gate_prop"], v))
             files.append((f"vnni/{n}/{t['file']}", data, 0o100644))
             actions.append(_vnni_action(n, t))
         files.append((f"vnni/{n}/manifest.json", mraw, 0o100644))
-    return files, VNNI_RC_HEAD + b"\n".join(actions), names
+    return files, VNNI_RC_HEAD + b"\n".join(actions) + VNNI_RC_TAIL, names
 
 VNNI_FILES, VNNI_RC_BLOCK, VNNI_IDS = _vnni_inputs()
 GB_RC += VNNI_RC_BLOCK                  # after the gatekeeper block: the VM gb.rc's last block (native: after _COMP_RC)
 _nb = VNNI_RC_BLOCK.count(b"\non early-init && property:")
-print("VNNI libz patch: " + (f"ON in both trees ({', '.join(VNNI_IDS)}; {_nb} fingerprint-gated binds)" if VNNI_IDS
+print("VNNI libz patch: " + (f"ON in both trees ({', '.join(VNNI_IDS)}; {_nb} fingerprint-gated binds; slot _{SLOT}, "
+                              f"build {'/'.join(re.fullmatch(VNNI_FP_RE, OTA_FP.decode('ascii')).groups())}; read-only "
+                              f"gbvnni tmpfs)" if VNNI_IDS
                              else "off (no inject\\vnni\\<id> folder: run vnni_prepare.py)"), flush=True)
 
 # ---------------- Native mode (gb.hw=native): Surface Book 3 on bare metal ----------------
@@ -1876,6 +2019,8 @@ GB_MODULES_SH = (b"#!/system/bin/sh\n"
 # copy the first snapshot keeps in /dev (no avc lines) plus the current dump, counts the real threadtime drmhwc line, and
 # adds the -517, buttons, posture, dsp_driver, PSR, Wi-Fi, Bluetooth, camera and linker lines; the wave 3 lines keep
 # their order and prefixes (hwtest\analyze_gblog.py keys on them).
+# (Wave 6, OTA gate follow-up F2) One more summary line after the gb_slotsync line: "ota gate: ..." from gbinit's
+# /odm/etc/gb/ota_state (w6prep\ota-followups; hwtest\analyze_gblog.py item ota_gate).
 GB_BOOTLOG_SH = rb"""#!/system/bin/sh
 # gb_bootlog (native): kernel + Android logs to <boot partition>\gblog\boot<N>-t<T>.txt at T = 40, 90, 180, 420, 900 s.
 # Each snapshot is collected in /dev first; the ESP is locked (INTERFACES 5.4 r3) and mounted rw,flush only for the
@@ -1982,6 +2127,15 @@ probe() {
   elif printf '%s\n' "$v" | grep -q "^$3"; then echo ok
   else echo "FAILED (exit $e): $(printf '%s\n' "$v" | head -n 1 | cut -c1-200)"; fi
 }
+# (wave 6, OTA gate F2) gbinit's verdict for this boot from /odm/etc/gb/ota_state (ota-gating DESIGN.md 2.2), then
+# what followed from it: the gate property in /odm/etc/build.prop, /odm/vnni (the one "skip" root) and the notifier
+# service. ostate: the last value of one key, printable characters only, at most 120 (as gb_otagate.sh reads it)
+ostate() { sed -n "s/^$1=//p" "$r/odm/etc/gb/ota_state" 2>/dev/null | tail -n 1 | tr -cd ' -~' | cut -c1-120; }
+otagate() {
+  [ -f "$r/odm/etc/gb/ota_state" ] || { echo 'no state file (an image without the OTA gate)'; return 0; }
+  if [ -d "$r/odm/vnni" ]; then ov=present; else ov=absent; fi
+  echo "state=$(ostate state) token=$(ostate token) prop=$(getprop ro.vendor.gb.ota_gate) vnni=$ov notifier=$(getprop init.svc.gb_otagate) booted=$(ostate booted) validated=$(ostate validated)"
+}
 # (wave 3, item 8) one-screen triage, tied to the DEVICE-STATUS checklist. Read-only and bounded: dmesg and logcat -d
 # (dump and exit, never a streaming logcat: [W3R-14]) once each into /dev, then fixed greps. It prints no serial
 # numbers, SSIDs or account names (input device names only for the Surface Aggregator bus 0019 and, in the posture
@@ -2071,6 +2225,9 @@ summary() {
   echo "HWUI Vulkan queueCount abort lines: $(grep -c -F 'queueFamilyProperties.queueCount < kRequestedQueueCount' "$T.lc")"
   # item 13: gb_slotsync HOLD (WAVE3 2.6)
   echo "gb_slotsync HOLD: $(grep -F 'gb_slotsync: HOLD slot ' "$K" | tail -n 2 | tr '\n' ' ')"
+  # (wave 6, OTA-F2) the OTA gate: validated = the build this image was made for; unvalidated = another build (after a
+  # Google OTA) or gb.otagate=force, the VNNI libz patch skipped; off = gb.otagate=0. Build fingerprints only
+  echo "ota gate: $(otagate)"
   # item 11: apgetty off natively; item 4: fs-verity on /data
   echo "apgetty: desktop.apgetty.enable=$(getprop desktop.apgetty.enable) init.svc.apgetty=$(getprop init.svc.apgetty)"
   echo "fs-verity: ext4 feature $([ -e "$r/sys/fs/ext4/features/verity" ] && echo present || echo absent); $(grep -E 'Enabling ext4 verity|FS_STAT_ENABLE_VERITY_FAILED|Failed to run tune2fs' "$K" | tail -n 2 | tr '\n' ' ')"
@@ -2270,9 +2427,13 @@ GB_RC_NATIVE = (
          # apgetty.rc (read from lapis.bin, both slots): orange boot state -> early-init `setprop
          # desktop.apgetty.enable 1`; started by `on property:desktop.apgetty.enable=1` AND by `on init &&
          # property:desktop.apgetty.enable=1`, which init runs before this file's `on init` (system_ext rc files are
-         # parsed first). So: 0 here stops the property start, and the init.svc triggers below stop the init-time
-         # start. There is no console UART natively (the SAM UART belongs to serdev), so it would only crash-loop.
+         # parsed first). So: 0 here stops the property start, and `stop apgetty` right here stops the init-time
+         # start ~0.1 s after it (W6 prep: lapis's init enables property triggers only after `on boot`, builtin
+         # enable_property_trigger, so the init.svc triggers below never fired before `on boot` stopped it: VM-1 boot
+         # log 10-29, apgetty ran 21.2-41.1 s). There is no console UART natively (the SAM UART belongs to serdev), so
+         # it would only crash-loop.
          b"    setprop desktop.apgetty.enable 0\n"
+         b"    stop apgetty\n"
          b"\n"
          b"on property:init.svc.apgetty=running\n"
          b"    stop apgetty\n"
@@ -2547,6 +2708,13 @@ def _xv(o):
 def _rel_ok(p):
     return bool(p) and not p.startswith("/") and "\\" not in p and ".." not in p.split("/")
 
+def _bp_import(line):
+    """(W6 prep, SA-9) True for a build.prop line that init's property loader would treat as `import <file>` (AOSP
+    property_service LoadProperties; INFERRED for lapis): the F4 checks only see key=value lines, so a file imported
+    from /odm/etc/build.prop could set a VNNI gate or build property. Refused in component build_prop and both trees."""
+    s = (line.decode("utf-8", "replace") if isinstance(line, bytes) else line).strip()
+    return s == "import" or s.startswith(("import ", "import\t"))
+
 def _load_manifest(m, mf):
     """Check one component manifest m (from file mf) and read its inputs:
     (files [(dest, bytes, mode)], payload [(dest, bytes)], symlinks [(dest, target, mode)], rc bytes, build.prop bytes)."""
@@ -2571,6 +2739,7 @@ def _load_manifest(m, mf):
         assert not l.startswith(_BAD_PROP), f"{mf}: {l} is not allowed (invariant 1, W2G-03)"
         assert l.split("=", 1)[0].strip() not in VNNI_BINDS.values() and not l.startswith(("ro.system.build.", "ro.vendor.build.")), \
             f"{mf}: {l} overrides a VNNI gate/build property"
+        assert not _bp_import(l), f"{mf}: {l!r}: no import lines in build_prop (SA-9)"
         prop += l.encode() + b"\n"
     return files, payload, links, rc, prop
 
@@ -2618,8 +2787,9 @@ assert ODM_BUILD_PROP_NATIVE.count(b"ro.gfx.driver.0=") == (1 if "gfxdriver" in 
     "ro.gfx.driver.0 must be set exactly once, and only with the gfxdriver component"
 for _l in ODM_BUILD_PROP_NATIVE.decode().splitlines():
     assert not _l.startswith(_BAD_PROP), f"native build.prop: {_l} is not allowed (invariant 1, W2G-03)"
-# (wave 5, B-2) the native composer colour switches: each exactly once, after the component lines too (a later line
-# with the same name would win at boot)
+# (wave 5, B-2) the native composer colour switches: each exactly once, checked after the component lines are added
+# (a later line with the same name would win at boot). They sit in ODM_BUILD_PROP_NATIVE, i.e. before the component
+# lines (camera, gfxdriver); the order does not matter while each key occurs once (W6 prep, image audit IA-2).
 for _l in ("vendor.hwc.drm.force_color_mode=-1", "vendor.hwc.drm.persistent_hdr=false", "vendor.hwc.use_log_gamma_lut=false"):
     assert [x for x in ODM_BUILD_PROP_NATIVE.decode().splitlines() if x.split("=")[0] == _l.split("=")[0]] == [_l], \
         f"native build.prop: exactly one {_l} (B-2 white veil)"
@@ -2918,7 +3088,9 @@ def _check_vnni(ents, tree, label):
     for byte); no libz.so* entry outside <tree>/vnni/<id>/{system,vendor}/lib64/libz.so; no gate/build property in
     /odm/etc/build.prop; the gb.rc block once, after the 'on early-init' /vendor overlay action, every action in it
     gated on a ro.system/vendor build fingerprint, one bind per packed library; no /odm/vnni use and no libz.so mention
-    anywhere else in gb.rc (no ungated bind); GBINIT's gb.vnni=0 kill switch."""
+    anywhere else in gb.rc (no ungated bind); GBINIT's gb.vnni=0 kill switch. (W6, F3-dir) no entry of any type (a
+    directory included, or a path below one) named libz.so* outside those two regular files; (W6, F1) the block ends
+    with VNNI_RC_TAIL (the gbvnni read-only remount, the one action without a gate) and GBINIT has VNNI_GBINIT_RO."""
     d = {p: (m, x) for p, m, x in ents}
     rc = d[f"{tree}/etc/init/gb.rc"][1]
     got = {p[len(tree) + 1:]: v for p, v in d.items() if p.startswith(f"{tree}/vnni/") and v[1] is not None}
@@ -2926,12 +3098,13 @@ def _check_vnni(ents, tree, label):
     assert got == want, f"{label}: /odm/vnni files {sorted(got)} != inject\\vnni {sorted(want)}"
     allowed_libz = {f"{tree}/{p}" for p in want if p.endswith("/libz.so")
                     and re.fullmatch(rf"vnni/{VNNI_ID_RE}/(system|vendor)/lib64/libz\.so", p)}
-    bad_libz = [p for p, (m, _) in d.items()
-                if (m & 0o170000) != 0o040000 and p.rsplit("/", 1)[-1].startswith("libz.so") and p not in allowed_libz]
+    bad_libz = [p for p, (m, _) in d.items() if any(c.startswith("libz.so") for c in p.split("/"))
+                and not (p in allowed_libz and (m & 0o170000) == 0o100000)]
     assert not bad_libz, f"{label}: libz.so* entry outside {tree}/vnni/<id>/{{system,vendor}}/lib64/libz.so: {bad_libz}"
     bp = (d.get(f"{tree}/etc/build.prop", (0, b""))[1] or b"").decode("utf-8", "replace").splitlines()
     for ln in bp:
         s = ln.strip()
+        assert not _bp_import(s), f"{label}: /odm/etc/build.prop has an import line {s!r} (SA-9)"
         if s and not s.startswith("#") and "=" in s:
             k = s.split("=", 1)[0].strip()
             assert k not in VNNI_BINDS.values() and not k.startswith(("ro.system.build.", "ro.vendor.build.")), \
@@ -2945,7 +3118,9 @@ def _check_vnni(ents, tree, label):
         assert 0 <= ov < rc.index(VNNI_RC_BLOCK) and ov_heads and ov_heads[-1] == b"on early-init", \
             f"{label}: the vnni binds must come after the 'on early-init' /vendor overlay action"
         rest = rc.replace(VNNI_RC_BLOCK, b"", 1)
-        lines = VNNI_RC_BLOCK.split(b"\n")
+        assert VNNI_RC_BLOCK.endswith(VNNI_RC_TAIL) and VNNI_RC_BLOCK.count(b"\non init\n") == 1, \
+            f"{label}: the vnni block must end with the gbvnni read-only remount (VNNI_RC_TAIL), its only ungated action"
+        lines = VNNI_RC_BLOCK[:-len(VNNI_RC_TAIL)].split(b"\n")
         heads = [ln for ln in lines if ln and not ln.startswith((b"#", b" "))]
         binds = [ln for ln in lines if ln.startswith(b"    mount none /odm/vnni/") and ln.endswith(b" bind")]
         libs = [p for p in want if not p.endswith("/manifest.json")]
@@ -2955,6 +3130,8 @@ def _check_vnni(ents, tree, label):
     assert b"/odm/vnni" not in rest and b"libz.so" not in rest, f"{label}: /odm/vnni or libz.so outside the vnni block"
     gi = d.get("gbinit", (0, b""))[1]
     assert all(gi.count(_new) == 1 for _old, _new in VNNI_GBINIT_EDITS), f"{label}: GBINIT's gb.vnni=0 kill switch"
+    assert _vnni_gbinit_ro_ok(gi), \
+        f"{label}: GBINIT's gbvnni read-only tmpfs block (once, after the kill switch and the OTA gate, before the bring-up)"
 
 def _check_otagate(ents, tree, label):
     """(W5b) the OTA gate in one tree ("gbstage" or "gbnative"; OTA_CLASSES, ota-gating DESIGN.md): the validated
@@ -3096,7 +3273,8 @@ def _check_native(ents, label="native tree"):
     assert d.get("gbinit") == (0o100755, GBINIT), f"{label}: gbinit"
     assert d["gbnative/etc/fstab.android-desktop"][1] == FSTAB_VERITY, f"{label}: native fstab (fsverity)"
     rc = d["gbnative/etc/init/gb.rc"][1]
-    for s in (b"    setprop desktop.apgetty.enable 0\n", b"on property:init.svc.apgetty=running\n    stop apgetty\n",
+    for s in (b"    setprop desktop.apgetty.enable 0\n    stop apgetty\n",
+              b"on property:init.svc.apgetty=running\n    stop apgetty\n",
               b"on property:init.svc.apgetty=restarting\n    stop apgetty\n"):
         assert s in rc, f"{label}: gb.rc lacks {s!r}"
     _check_gatekeeper(ents, "gbnative", label)          # W4: the software Gatekeeper (component gatekeeper)
@@ -3575,6 +3753,8 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
     # write ESP into lapis.bin's EFI-SYSTEM partition (only that region); the guard is checked again right before it
     if _lapis_write_refused():
         sys.exit(f"build_esp.py: refused: {_lapis_write_refused()}")
+    if _pin_path_refused(ESP):                          # (W6 prep, SA-7) after the VM-off guard, before the write
+        sys.exit(f"build_esp.py: refused: {_pin_path_refused(ESP)}")
     with open(LAPIS, "r+b") as f:
         f.seek(ESP_OFFSET)
         f.write(ESP)

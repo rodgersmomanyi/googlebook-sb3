@@ -80,6 +80,7 @@ final class SpecTests {
             case 14: return Fx.st("gfx_mode", mode, "gfx_active", "intel", "gfx_reason", "untested");
             case 15: return Fx.st("gfx_mode", mode, "gfx_active", "intel", "gfx_reason", "testerror");
             case 16: return Fx.st("gfx_mode", mode, "gfx_active", "intel", "gfx_reason", "selftest");
+            case 17: return Fx.st("gfx_mode", mode, "gfx_active", "intel", "gfx_reason", "model");
             default: return Fx.st("gfx_mode", mode, "gfx_active", "intel", "gfx_reason", "nodriver");
         }
     }
@@ -115,7 +116,7 @@ final class SpecTests {
                         "27.1 row " + row + " nvidia: spec " + r[2] + "/" + nv + ", app " + mn);
             }
         }
-        T.eq(17, seen, "27.1 table has 17 rows");
+        T.eq(18, seen, "27.1 table has 18 rows");
         T.check(s271.contains("Label `" + Texts.TILE_LABEL + "`"), "27.1 tile label " + Texts.TILE_LABEL);
         Matcher tm = Pattern.compile("`(next-boot|next-attach|pending)` -> `([^`]+)`").matcher(flat(s271));
         int toasts = 0;
@@ -134,7 +135,7 @@ final class SpecTests {
         for (String[] r : table(section(spec, "### 27.6 "))) {
             if (r.length == 2) reasons.put(r[0].startsWith("`") ? tick(r[0]) : r[0], tick(r[1]));
         }
-        T.eq(17, reasons.size(), "27.6 has 16 reasons + other");
+        T.eq(18, reasons.size(), "27.6 has 17 reasons + other");
         for (Map.Entry<String, String> e : reasons.entrySet()) {
             String key = "other".equals(e.getKey()) ? "no-such-reason" : e.getKey();
             T.eq(e.getValue(), Texts.reasonText(key), "27.6 " + e.getKey());
@@ -169,7 +170,7 @@ final class SpecTests {
         String s272 = flat(section(spec, "### 27.2 "));
         String[] exact = {Texts.RADIO_AUTO, Texts.RADIO_AUTO_SUB, Texts.RADIO_INTEL, Texts.RADIO_INTEL_SUB,
             Texts.RADIO_NVIDIA, Texts.RADIO_NVIDIA_SUB, Texts.STATUS_PREFIX + Texts.NVIDIA, Texts.GPU_ASLEEP,
-            Texts.GPU_ACTIVE, Texts.GPU_NO_DRIVER, Texts.GPU_NOT_CONNECTED, Texts.SELFTEST_NOT_RUN,
+            Texts.GPU_ACTIVE, Texts.GPU_NO_DRIVER, Texts.GPU_NOT_SUPPORTED, Texts.GPU_NOT_CONNECTED, Texts.SELFTEST_NOT_RUN,
             Texts.SELFTEST_RUNNING, Texts.SELFTEST_RERUN, Texts.ALL_APPS_OFF, Texts.ALL_APPS_ON, Texts.APPS_HINT,
             Texts.USE_NVIDIA, Texts.ALWAYS_INTEL, Texts.GAME_BADGE, Texts.HOLDER_RESTART, Texts.HOLDER_NOW,
             Texts.HELP_TEXT, Texts.CLOSE_APPS, Texts.MODE_AUTO, Texts.MODE_INTEL, Texts.MODE_NVIDIA, Texts.UNAVAILABLE,

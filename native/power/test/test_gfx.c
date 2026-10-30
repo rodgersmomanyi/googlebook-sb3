@@ -2172,6 +2172,112 @@ static void test_w3_esp_lock(void) {
   put(q, "4300 gb_nouveau 95\n");
   CHECK(!nouveau_window_open(), "W3-4 our own .stale directory is not a steal in progress");
 }
+/* ================================================================== GP-B4 (wave 6, readiness B-4 / B-4b): refused:model */
+/* gb_nouveau refuses a dGPU that is not a TU117 (a 15-inch Surface Book 3: TU116/TU106, no firmware in the image) with
+ * vendor.gb.nouveau.result = refused:model. gb_power then (a) reports gfx_reason "model" exactly where 23.2 row 12 gave
+ * "nodriver" and the dGPU is present (the property selects a reason only), (b) never re-issues gb_nouveau from
+ * reconcile_on for it (B-4b), (c) still starts it once for a new appearance of a dGPU (another base), and (d) shows the
+ * reason in the status object GbGpu reads. */
+static void test_b4_model(void) {
+  gfx_tree("tree_b4_matrix");
+  int dtx_fd = g_dtx.fd, n = 0, bad = 0, model = 0;
+  g_submit_hook = count_submit;
+  quiet(1);
+  struct mxc c;
+  for (c.re = 0; c.re < RE_N; c.re++) {
+    mx_record(c.re);
+    for (c.mo = 0; c.mo < MO_N; c.mo++)
+      for (c.ba = 0; c.ba < BA_N; c.ba++)
+        for (c.dg = 0; c.dg < DG_N; c.dg++)
+          for (c.sp = 0; c.sp < SP_N; c.sp++) {
+            mx_apply(&c, dtx_fd);                 /* the GP-1B-01 combination, then result refused:model where it was clean */
+            if (c.sp != SP_CRASHLOOP && c.dg != DG_LOADING) prop_set("vendor.gb.nouveau.result", "refused:model");
+            inventory();
+            g_refcnt = nouveau_refcnt();
+            holders_clear();
+            gfx_inputs();
+            g_gfx.active = 0;
+            g_sess.have = 1;
+            g_sess.job = g_sess.stale = 0;
+            g_gfx.n16 = 0;
+            gfx_eval();
+            const char *want = oracle(&c), *wa = strcmp(want, "ok") ? "intel" : "nvidia";
+            if (!strcmp(want, "nodriver") && c.dg != DG_ABSENT) want = "model";   /* 23.2 row 12 (B-4) */
+            n++;
+            model += !strcmp(want, "model");
+            if (strcmp(prop("vendor.gb.gfx_reason"), want) || strcmp(prop("vendor.gb.gfx_active"), wa)) {
+              if (bad++ < 12) {
+                quiet(0);
+                printf("FAIL b4 matrix mo=%d ba=%d dg=%d re=%d sp=%d: got %s/%s want %s/%s\n", c.mo, c.ba, c.dg, c.re, c.sp,
+                       prop("vendor.gb.gfx_active"), prop("vendor.gb.gfx_reason"), wa, want);
+                quiet(1);
+              }
+            }
+          }
+  }
+  quiet(0);
+  g_submit_hook = NULL;
+  g_dtx.fd = dtx_fd;
+  CHECK(n == 5 * 3 * 6 * 7 * 12 && !bad && model > 0, "GP-B4 matrix with result refused:model: %d combinations, %d give \"model\", %d mismatches",
+        n, model, bad);
+  /* single cases on the 26.3 tree: another refusal stays nodriver, Intel only mode wins, an absent dGPU is not "model" */
+  gfx_tree("tree_b4_single");
+  rm(FN0 "/driver");
+  drm_gone();
+  prop_set("vendor.gb.nouveau.result", "refused:esp");
+  T += 2000;
+  status_tick(T);
+  CHECK(!strcmp(prop("vendor.gb.gfx_reason"), "nodriver"), "another refusal (refused:esp): reason nodriver, got '%s'", prop("vendor.gb.gfx_reason"));
+  prop_set("vendor.gb.nouveau.result", "refused:marker");   /* a neighbour of refused:model (same "refused:m" prefix) */
+  T += 2000;
+  status_tick(T);
+  CHECK(!strcmp(prop("vendor.gb.gfx_reason"), "nodriver"), "refused:marker: reason nodriver, got '%s'", prop("vendor.gb.gfx_reason"));
+  prop_set("vendor.gb.nouveau.result", "refused:model");
+  T += 2000;
+  status_tick(T);
+  CHECK(!strcmp(prop("vendor.gb.gfx_reason"), "model") && !strcmp(prop("vendor.gb.gfx_active"), "intel"),
+        "refused:model, dGPU present and driverless, auto: intel/model, got %s/%s", prop("vendor.gb.gfx_active"), prop("vendor.gb.gfx_reason"));
+  prop_set("persist.vendor.gb.gfx_mode", "intel");
+  T += 2000;
+  status_tick(T);
+  CHECK(!strcmp(prop("vendor.gb.gfx_reason"), "mode"), "Intel only mode wins over model (row 8), got '%s'", prop("vendor.gb.gfx_reason"));
+  prop_set("persist.vendor.gb.gfx_mode", "nvidia");
+  rm("/sys/bus/pci/devices/0000:02:00.0");
+  rm("/sys/bus/pci/devices/0000:02:00.1");
+  T += 2000;
+  status_tick(T);
+  CHECK(!strcmp(prop("vendor.gb.gfx_reason"), "nodriver"), "no dGPU present (stale refused:model): nodriver, got '%s'", prop("vendor.gb.gfx_reason"));
+  /* (d) the status object (9.5) carries the reason and the result GbGpu shows */
+  fns_back();
+  T += 2000;
+  status_tick(T);
+  int cl = cl_pair(0, 100);
+  const char *r = req(cl, "status\n");
+  CHECK(strstr(r, "\"gfx_reason\":\"model\"") && strstr(r, "\"gfx_active\":\"intel\"") && strstr(r, "\"result\":\"refused:model\""),
+        "status: gfx_reason model, gfx_active intel, result refused:model: %.300s", r);
+  drop(cl);
+  /* (b) B-4b: reconcile_on never re-issues gb_nouveau for refused:model (40 s of ticks, both modes that want a driver) */
+  for (int m = 0; m < 2; m++) {
+    ron_tree(m ? "tree_b4_ron_auto" : "tree_b4_ron_nv");
+    if (m) prop_set("persist.vendor.gb.gfx_mode", "auto");
+    prop_set("vendor.gb.nouveau.result", "refused:model");
+    ron_ticks(20);
+    CHECK(!strstr(g_ctl_log, "ctl.start=gb_nouveau ") && g_nv.starts == 0, "B-4b %s mode: no reconcile_on start for refused:model in 40 s '%s'",
+          m ? "auto" : "nvidia", g_ctl_log);
+    CHECK(!strcmp(prop("vendor.gb.gfx_reason"), "model"), "B-4b %s mode: reason model, got '%s'", m ? "auto" : "nvidia", prop("vendor.gb.gfx_reason"));
+  }
+  ron_tree("tree_b4_ron_ctl");                    /* control: the same tree with a retryable refusal does start it */
+  prop_set("vendor.gb.nouveau.result", "refused:esp");
+  ron_ticks(20);
+  CHECK(count_in(g_ctl_log, "ctl.start=gb_nouveau ") >= 1, "control: refused:esp is retried by reconcile_on '%s'", g_ctl_log);
+  /* (c) a new appearance of a dGPU (another base) still starts gb_nouveau once, then nothing more */
+  hot_tree("tree_b4_hot");
+  prop_set("vendor.gb.nouveau.result", "refused:model");
+  appear();
+  CHECK(count_in(g_ctl_log, "ctl.start=gb_nouveau ") == 1 && g_nv.starts == 1, "hot attach with a stale refused:model: one start '%s'", g_ctl_log);
+  for (int k = 0; k < 20; k++) { T += 2000; status_tick(T); }
+  CHECK(count_in(g_ctl_log, "ctl.start=gb_nouveau ") == 1 && g_nv.starts == 1, "then no reconcile_on retry in 40 s '%s'", g_ctl_log);
+}
 #define GROUP(id, fn) do { int c0_ = checks, f0_ = fails; fn(); \
     printf("%s %s: %d checks, %d failures\n", id, #fn, checks - c0_, fails - f0_); } while (0)
 static void test_gfx_all(void) {
@@ -2211,4 +2317,7 @@ static void test_fix_all(void) {                  /* review fix pass (INTERFACES
 static void test_w2b_all(void) {                  /* Wave 2b (INTERFACES 30) */
   GROUP("GP-W2B-1", test_w2b_esp_lock);
   GROUP("GP-W3-1", test_w3_esp_lock);
+}
+static void test_w6_all(void) {                   /* Wave 6 (readiness B-4, B-4b) */
+  GROUP("GP-B4", test_b4_model);
 }

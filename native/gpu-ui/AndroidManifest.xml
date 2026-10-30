@@ -3,7 +3,10 @@
   GbGpu (package gb.sb3.gpu): non-privileged system app in /odm/app/GbGpu (INTERFACES 13.2, v1.2 section 27).
   versionCode / versionName are set by build_apk.sh through aapt2 link (minutes since the epoch).
   Permissions (nothing privileged; checked by test/check_apk.py against the framework manifest in android.jar):
-    POST_NOTIFICATIONS   (dangerous, runtime; granted by gb_gpu_ui_setup.sh): the in-use and detach notifications.
+    POST_NOTIFICATIONS   (dangerous, runtime; granted by gb_gpu_ui_setup.sh for every full user, wave 6): the in-use
+                         and detach notifications.
+    RECEIVE_BOOT_COMPLETED (normal, wave 6): BOOT_COMPLETED reaches each user at its unlock (on lapis: the person's
+                         sign-in); UserReceiver then refreshes like StateReceiver (gb_notify only reaches running users).
     QUERY_ALL_PACKAGES   (normal, granted at install; INTERFACES 13.2 v1.2, D3). Justification: (1) the app catalog
                          of INTERFACES 24.3 must list every launchable app of the user, with ApplicationInfo.flags and
                          category, so that gb_power can opt games and "Use NVIDIA" apps into the NVIDIA driver; (2) the
@@ -22,6 +25,7 @@
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="false"
@@ -32,7 +36,9 @@
         android:theme="@style/Theme.GbGpu"
         android:usesCleartextTraffic="false">
 
-        <!-- QS tile "Graphics": Intel / NVIDIA / NVIDIA (busy N) / Unavailable (base detached) / ... (INTERFACES 27.1) -->
+        <!-- QS tile "Graphics": Intel / NVIDIA / NVIDIA (busy N) / Unavailable (base detached) / ... (INTERFACES 27.1).
+             (wave 6) Not an ACTIVE_TILE any more: lapis's SystemUI drops requestListeningState for it, so SystemUI now
+             binds it whenever the Quick Settings panel is shown (13.2). -->
         <service
             android:name=".GpuTileService"
             android:exported="true"
@@ -44,9 +50,6 @@
             </intent-filter>
             <meta-data
                 android:name="android.service.quicksettings.TOGGLEABLE_TILE"
-                android:value="true" />
-            <meta-data
-                android:name="android.service.quicksettings.ACTIVE_TILE"
                 android:value="true" />
         </service>
 
@@ -124,5 +127,15 @@
         <receiver
             android:name=".ActionReceiver"
             android:exported="false" />
+
+        <!-- (wave 6) per-user refresh at the user's unlock (sign-in); BOOT_COMPLETED is a protected broadcast that the
+             system delivers to non-exported receivers, so nothing else reaches it -->
+        <receiver
+            android:name=".UserReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

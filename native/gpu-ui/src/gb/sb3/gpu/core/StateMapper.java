@@ -23,7 +23,7 @@ public final class StateMapper {
     /** What a tap on the tile does. */
     public enum Tap {
         NONE,
-        /** 27.1 rows 3-17: {@code set-mode <nextMode(gfx_mode)>}, never a dialog. */
+        /** 27.1 rows 3-18: {@code set-mode <nextMode(gfx_mode)>}, never a dialog. */
         SET_MODE,
         /** Legacy 8.3 (v1.1 tests only). */
         ENABLE,
@@ -38,7 +38,7 @@ public final class StateMapper {
         public final Tap tap;
         /** N of busy:N, else 0. */
         public final int busy;
-        /** The 27.1 row that matched (1-17; 0 for the other tiles). */
+        /** The 27.1 row that matched (1-18; 0 for the other tiles). */
         public final int row;
 
         public TileModel(TileState state, String subtitle, Tap tap, int busy) {
@@ -150,7 +150,10 @@ public final class StateMapper {
         if ("selftest".equals(r)) {
             return t(TileState.INACTIVE, nv ? Texts.NV_TEST_FAILED : Texts.INTEL_TEST_FAILED, 0, 16);
         }
-        return t(TileState.INACTIVE, nv ? Texts.NV_NOT_READY : Texts.INTEL, 0, 17);
+        if ("model".equals(r)) {                 // (wave 6, B-4) a dGPU this system has no driver for
+            return t(TileState.INACTIVE, nv ? Texts.NV_NOT_SUPPORTED : Texts.INTEL_NOT_SUPPORTED, 0, 17);
+        }
+        return t(TileState.INACTIVE, nv ? Texts.NV_NOT_READY : Texts.INTEL, 0, 18);
     }
 
     /**

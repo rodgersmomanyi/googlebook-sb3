@@ -60,17 +60,36 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
       whiteout of its .rc) and the Weaver fragment bind; (W4 rehearsal) always the gb_kmsgdbg service (a root-only
       0600 /dev/kmsg_debug) started first thing at early-init, without which stdio_to_kmsg output is lost on lapis
   V30 --expect-inject-sha256 HEX: gb/inject.gz has that sha256 (the W4 rehearsal tree == the user-VM preview's)
+  V32 (W6, OTA-F1, safety audit SA-4) the OTA gate (build_esp OTA_*, ota-gating DESIGN.md 2), every kind: the tree's
+      /odm/etc/gb/ota_validated (0644, the one line ro.bootimage.build.fingerprint=<fp>, init/sh-safe) names exactly
+      the build GBINIT finds at rdinit in the default entry's initrd (the last system/etc/ramdisk/build.prop of its
+      segments by GBINIT's rule: last assignment, CRs dropped), else every boot of the image is "unvalidated"; no
+      packed ota_state; gb_otagate.sh (0755) and etc/init/gb_otagate.rc (0644) == build_esp's GB_OTAGATE_SH / OTA_RC
+      (read with ast; only the build-time label lists are free text), no other rc file names the gate and build.prop
+      does not set ro.vendor.gb.ota_gate; gbinit has the gb.otagate= token scan before /proc is unmounted and the gate
+      once, after the /odm copy and the VNNI kill switch, before the bring-up, the module loading and exec /init; the
+      SELinux cil == the OTA-robust form of inject\\odm_sepolicy.cil, with every OTA_REQUIRED_PERMISSIVE domain; a
+      gb.otagate= token only as gb.otagate=force in a VM test entry titled "(VM test, OTA gate forced)" (never =0)
   V31 (W5) the VNNI libz patch (build_esp.py, vnni_prepare.py, vnni-perf\\INTEGRATION.md 6): the tree's /odm/vnni ==
       inject\\vnni byte for byte (0644); per <id>/manifest.json every patched file exists, has the manifest's
       patched_sha256, and its (orig, patched, bind, gate) pair is a deployable target of the reviewed
       vnni-perf\\patcher\\manifest.json; its gate value is the folder's fingerprint; gb.rc holds exactly one action per
       file, "on early-init && property:ro.<system|vendor>.build.fingerprint=<fp>" with the 4 reviewed lines, after the
       /vendor overlay action, and no other section uses /odm/vnni or names libz.so (no ungated bind); gbinit has the
-      gb.vnni=0 kill switch; a gb.vnni= token only as gb.vnni=0 in a "(VM test, W5, VNNI off)" entry
+      gb.vnni=0 kill switch; a gb.vnni= token only as gb.vnni=0 in a "(VM test, W5, VNNI off)" entry. (W6) gbinit
+      moves /odm/vnni onto its own tmpfs (VNNI_RO_GBINIT, after the kill switch and the OTA gate) and the last vnni
+      section remounts that superblock read-only (VNNI_RO_TAIL); no entry of any type named libz.so* (a directory too)
+      outside the packed files; each gate value is the reviewed deploy.gate_value (SA-3); a note (not a problem) names
+      the gates' build against etc/gb/ota_validated (SA-2: "INERT" when they differ; build_esp refuses that)
 Read-only: images, lapis.bin and the host inputs are opened "rb"; only --extract writes (into OUTDIR).
 Exit 0 and last line "RESULT: OK"; exit 1 and "RESULT: <n> problem(s)" with one "PROBLEM: V<n> ..." line each;
 exit 2 = usage. Module API (build_iso.py imports this file by path): esp_of_disk, fat_files, fat_parse, cpio_entries,
 gunzip_padded, native_tree, erofs_listing, kernel_release, compare_export.
+VP (W6 prep, SA-7) --expect-pin-path ESP (an ESP image or a disk image; before a user-VM write: the ESP now in
+    lapis.bin): the PIN path of the verified ESP's booted tree (pin_path: the Gatekeeper binary, fragment and rc
+    service, the KeyMint service and its vup/lib64 NEEDED closure, the Trusty/Weaver masks and gbinit whiteouts, the
+    fstab, the PIN SELinux types) equals that ESP's; --pin-migration prints the differences as notes instead.
+    Module API: pin_path, pin_path_problems (build_esp.py's lapis.bin write and gb_vmbackup.py restore use them).
 """
 import argparse
 import ast
@@ -125,6 +144,8 @@ HOST = {
     # W5 (V31): the prepared VNNI libz patch folders (vnni_prepare.py) and the reviewed patcher manifest
     "vnni": os.path.join(HERE, r"inject\vnni"),
     "vnni_patcher": os.path.join(GB_BUILD, r"native\vnni-perf\patcher\manifest.json"),
+    # W6 (V32): the SELinux cil build_esp packs in its OTA-robust form
+    "odm_cil": os.path.join(HERE, r"inject\odm_sepolicy.cil"),
 }
 SIG_TRAILER = b"~Module signature appended~\n"
 OPTIN = ("drm_exec", "drm_gpuvm", "gpu_sched", "drm_ttm_helper", "nouveau")          # names with "-" -> "_"
@@ -173,10 +194,38 @@ VNNI_KILL_CASE = "gb.vnni=0) VN=0;;"
 VNNI_KILL = '[ "$VN" = 0 ] && /busybox rm -rf /odm/vnni'
 VNNI_OFF_TITLE = "(VM test, W5, VNNI off)"
 VNNI_GATE_RE = re.compile(rf"on early-init && property:(ro\.(?:system|vendor)\.build\.fingerprint)=({VNNI_FP_RE})")
+# (W6, F1 + M-vlower) == build_esp VNNI_GBINIT_RO (gbinit: /odm/vnni on its own tmpfs "gbvnni") and VNNI_RC_TAIL (the
+# vnni block's last action: that superblock read-only, for every mount of it); VNNI_RO_TAIL = its stripped section
+VNNI_RO_GBINIT = ('if [ -d /odm/vnni ]; then\n'
+                  '  /busybox rm -rf /odm/.gbvnni; /busybox mv /odm/vnni /odm/.gbvnni\n'
+                  '  if /busybox mkdir -m 0755 /odm/vnni && /busybox mount -t tmpfs -o mode=0755 gbvnni /odm/vnni'
+                  ' && /busybox cp -a /odm/.gbvnni/. /odm/vnni/; then\n'
+                  '    /busybox rm -rf /odm/.gbvnni\n'
+                  '  else\n'
+                  '    /busybox umount /odm/vnni 2>/dev/null\n'
+                  '    /busybox rm -rf /odm/vnni /odm/.gbvnni\n'
+                  '    echo "vnni: no own tmpfs, /odm/vnni removed (no bind)" > /odm/gbinit_vnni.log\n'
+                  '  fi\n'
+                  'fi\n')
+VNNI_RC_TAIL = ("\n# (W6) every library above is relabelled and bound (early-init): the gbvnni tmpfs (gbinit) now goes read-only\n"
+                "# for all its mounts, the binds in every mount namespace and their propagated copies included.\n"
+                "on init\n"
+                "    mount tmpfs gbvnni /odm/vnni remount ro\n")
+VNNI_RO_TAIL = ("on init", "mount tmpfs gbvnni /odm/vnni remount ro")
+VNNI_OTA_UNVALIDATED = 'echo "ro.vendor.gb.ota_gate=unvalidated" >> /odm/etc/build.prop'   # GBINIT's OTA gate (W5b)
 # GBINIT's ESP bring-up call (WAVE3 contract 2.3, exact lines)
 GBINIT_GATE = 'if [ "$HW" = native ] && [ "$HWTOK" = 1 ] && [ "$OV" = 1 ] && [ -f /gbbringup.sh ]; then'
 GBINIT_CALL = "  /busybox timeout 40 /busybox sh /gbbringup.sh >> /odm/gbinit_bringup.log 2>&1"
 GBINIT_UMOUNT = "  for m in /gbbu/esp /gbbu/sys /gbbu/proc; do /busybox umount -l $m 2>/dev/null; done"
+# W6 (V32) the OTA gate (== build_esp OTA_RAMDISK_PROP, OTA_VALIDATED, OTA_STATE, OTA_SCRIPT, OTA_RC_FILE; GBINIT's gate
+# head and module-loading lines); OTA_PROP, OTA_RC, GB_OTAGATE_SH, OTA_GBINIT_* come from build_esp.py itself (be_parts)
+OTA_RAMDISK_PROP = "system/etc/ramdisk/build.prop"
+OTA_VALIDATED, OTA_STATE = "etc/gb/ota_validated", "etc/gb/ota_state"
+OTA_SCRIPT, OTA_RC_FILE = "gb_otagate.sh", "etc/init/gb_otagate.rc"
+OTA_GATE_HEAD = "if [ -f /odm/etc/gb/ota_validated ]; then"
+OTA_GBINIT_MODULES = 'if [ "$HW" = native ] && [ -f /odm/lib/modules/modules.load ]; then'
+OTA_FORCE_TITLE = "(VM test, OTA gate forced)"                                  # == build_usb TITLE_VM_OTAGATE
+LZ4_MAGIC = b"\x02\x21\x4c\x18"
 GFXDRIVER_MEMBERS = {"AndroidManifest.xml", "resources.arsc", "assets/sphal_libraries.txt", "lib/x86_64/libgb_nvk.so",
                      "lib/x86_64/vulkan.intel.so"}
 MODULES_DGPU = b"drm_exec.ko\ndrm_gpuvm.ko\ngpu-sched.ko\ndrm_ttm_helper.ko\nnouveau.ko\n"
@@ -863,6 +912,58 @@ def be_const(name):
     return _BE[path][name]
 
 
+_BEX = {}
+
+
+def be_parts(name):
+    """(W6, V32) build_esp.py's top-level bytes constant `name` as [bytes or None]: byte literals, names of other
+    top-level constants, `+` and "<str literal or name>.encode()" are resolved; anything else (a value computed at build
+    time, e.g. a join over a table) is a None slot. Read with ast, never imported. KeyError if `name` is not assigned."""
+    path = HOST["build_esp"]
+    if path not in _BEX:
+        _BEX[path] = {n.targets[0].id: n.value for n in ast.parse(rd_host(path).decode("utf-8")).body
+                      if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}
+    tab = _BEX[path]
+
+    def walk(node, depth):
+        if depth > 40:
+            raise ValueError(f"{name}: nested too deeply")
+        if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+            return [node.value]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return walk(node.left, depth + 1) + walk(node.right, depth + 1)
+        if isinstance(node, ast.Name) and node.id in tab:
+            return walk(tab[node.id], depth + 1)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "encode"
+                and not node.args and not node.keywords):
+            s = node.func.value
+            s = tab.get(s.id, s) if isinstance(s, ast.Name) else s
+            if isinstance(s, ast.Constant) and isinstance(s.value, str):
+                return [s.value.encode()]
+        return [None]
+    out = []
+    for x in walk(tab[name], 0):
+        if x is not None and out and out[-1] is not None:
+            out[-1] += x
+        elif x is not None or not out or out[-1] is not None:
+            out.append(x)
+    return out
+
+
+def be_bytes(name):
+    """(W6, V32) build_esp.py's top-level bytes constant `name` when it resolves completely (be_parts), else ValueError."""
+    parts = be_parts(name)
+    if None in parts:
+        raise ValueError(f"{name} is not a plain concatenation of literals")
+    return b"".join(parts)
+
+
+def parts_match(parts, data):
+    """(W6, V32) data == the be_parts skeleton, each None slot filled with at most 400 printable characters (no newline)."""
+    rx = b"".join(re.escape(x) if x is not None else rb"[ -~]{0,400}" for x in parts)
+    return re.fullmatch(rx, data) is not None
+
+
 def fstab_userdata(fstab):
     """[(index, fields)] of the fs_mgr lines for /dev/block/by-name/userdata on /data."""
     out = []
@@ -945,6 +1046,141 @@ def entry_variant(text, title_sfx, opt_sfx):
             body += opt_sfx
         out.append(body + eol)
     return "".join(out)
+
+
+# ------------------------------------------------------------------------------------------------------- PIN path
+# (W6 prep, SA-7 of vnni-perf\w5\SAFETY_AUDIT.md) The PIN path of a tree: what an enrolled lock-screen PIN depends on.
+# A user-VM ESP write (GB_WRITE_LAPIS=1 build_esp.py) or an ESP rollback (gb_vmbackup.py restore --esp-only) that
+# changes any of it can leave every enrolled credential unverifiable (dgpu\w4\GATEKEEPER.md 4 and 8.4: a pre-W4 ESP
+# without gb_gatekeeper, another key scheme, another KeyMint graft), so both compare the ESP on the disk with the one
+# they write (pin_path_problems) and refuse a difference unless a migration was reviewed (GB_PIN_MIGRATION=1 /
+# --pin-migration). verify_image --expect-pin-path ESP reports the same comparison as check VP.
+PIN_FILES = (GK_BIN_DEST, "vup/bin/hw/android.hardware.security.keymint-service", GK_TRUSTY_BIN,
+             "vup/bin/hw/android.hardware.security.secretkeeper.trusty", "empty_vintf.xml",
+             "etc/fstab.android-desktop", "etc/selinux/precompiled_sepolicy")
+PIN_DIRS = ("etc/vintf/", "vup/etc/vintf/")  # every ODM and /vendor-overlay VINTF fragment (a 2nd IGatekeeper hangs boot)
+PIN_ELF = (GK_BIN_DEST, "vup/bin/hw/android.hardware.security.keymint-service")   # their vup/lib64 NEEDED closure
+PIN_RE = re.compile(r"gatekeeper|keymint|keymaster|keystore|weaver|secretkeeper|trusty|gbkm|empty_vintf", re.I)
+PIN_GBINIT_RE = re.compile(r"/odm/(?:vup|etc/vintf|etc/selinux|etc/fstab|empty_vintf)|gatekeeper|keymint|keystore|"
+                           r"trusty", re.I)
+PIN_TYPES = ("init", "vendor_init", "hal_gatekeeper_default", "gatekeeperd", "keystore", "hal_keymint_default",
+             "system_server", "vold")
+
+
+def pin_tree(files):
+    """The tree the ESP's default entry boots: gbinit takes /gbnative only with gb.hw=native (else /gbstage)."""
+    lc = files.get("loader/loader.conf", b"").decode("utf-8", "replace")
+    m = re.search(r"^default gb-([a-z])\s*$", lc, re.M)
+    e = parse_entry(files[f"loader/entries/gb-{m.group(1)}.conf"].decode("utf-8", "replace")) if m and \
+        f"loader/entries/gb-{m.group(1)}.conf" in files else None
+    hw = [t[6:] for t in (e["tokens"] if e else []) if t.startswith("gb.hw=")]
+    return "gbnative" if hw and hw[-1] == "native" else "gbstage"
+
+
+def pin_path(files):
+    """{key: value} of the PIN path of the ESP files' booted tree (paths relative to /odm): the files PIN_FILES and
+    PIN_DIRS (mode, sha256; None if absent), the vup/lib64 libraries in the NEEDED closure of the Gatekeeper and
+    KeyMint binaries, every rc service section that names a PIN_RE word (all its lines), the PIN_RE lines of the rc
+    action sections and every rc mount over a library that closure needs, the PIN_GBINIT_RE lines of gbinit, and which
+    PIN_TYPES odm_sepolicy.cil makes permissive. Comments and blank lines do not count. KeyError/ValueError if the ESP
+    has no readable gb/inject.gz."""
+    tr = pin_tree(files)
+    t = {}
+    for p, md, d in cpio_entries(gunzip_padded(files["gb/inject.gz"])):
+        t.setdefault(p, (md, d))
+    rel = {p[len(tr) + 1:]: v for p, v in t.items() if p.startswith(tr + "/")}
+    out = {"tree": tr if any(rel) else None}
+    for p in PIN_FILES + tuple(sorted(p for p, (m, d) in rel.items() if d is not None and p.startswith(PIN_DIRS))):
+        e = rel.get(p)
+        out["file " + p] = None if e is None or e[1] is None else (f"{e[0]:o}", sha256(e[1]))
+    libs = {p[len("vup/lib64/"):]: v for p, v in rel.items() if p.count("/") == 2 and p.startswith("vup/lib64/")
+            and v[1] is not None}
+    names, todo = set(), [rel[p][1] for p in PIN_ELF if p in rel and rel[p][1] is not None]
+    while todo:
+        try:
+            need = elf_dynamic(todo.pop())[1]
+        except (ValueError, struct.error, IndexError):
+            continue
+        for n in need:
+            if n not in names:
+                names.add(n)
+                if n in libs:
+                    out["lib vup/lib64/" + n] = (f"{libs[n][0]:o}", sha256(libs[n][1]))
+                    todo.append(libs[n][1])
+    for p in sorted(p for p, (m, d) in rel.items() if d is not None and p.startswith("etc/init/") and p.endswith(".rc")):
+        keep = []
+        for s in rc_sections(rel[p][1].decode("utf-8", "replace")):
+            if s[0].split()[0] == "service" or PIN_RE.search(s[0]):
+                if any(PIN_RE.search(x) for x in s):
+                    keep += [f"{s[0]} :: {x}" for x in s[1:]] or [s[0]]
+                continue
+            for x in s[1:] if s[0].split()[0] == "on" else s:
+                w = x.split()
+                if PIN_RE.search(x) or (w[0] == "mount" and len(w) >= 4 and w[3].rsplit("/", 1)[-1] in names):
+                    keep.append(f"{s[0]} :: {x}")
+        if keep:                                # an rc file without a PIN line is not part of the path
+            out["rc " + p] = tuple(keep)
+    gi = (t.get("gbinit") or (0, b""))[1] or b""
+    out["gbinit"] = tuple(ln.strip() for ln in gi.decode("utf-8", "replace").splitlines()
+                          if ln.strip() and not ln.strip().startswith("#") and PIN_GBINIT_RE.search(ln))
+    cil = (rel.get("etc/selinux/odm_sepolicy.cil") or (0, b""))[1] or b""
+    perm = set(re.findall(r"\(typepermissive\s+([A-Za-z0-9_.]+)\s*\)", cil.decode("utf-8", "replace")))
+    out["sepolicy permissive"] = tuple(x for x in PIN_TYPES if x in perm)
+    return out
+
+
+def _pin_show(v):
+    if v is None:
+        return "absent"
+    if isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, str) for x in v) and len(v[1]) == 64:
+        return f"{v[0]} {v[1][:12]}"
+    return repr(v)[:80]
+
+
+def pin_path_problems(old_files, new_files):
+    """[difference, ...] between the PIN path of the ESP now in place (old_files) and of the one to be written
+    (new_files), each as "<key>: <old> -> <new>"; [] = an enrolled PIN keeps verifying as far as the tree decides."""
+    got = []
+    for label, f in (("the current", old_files), ("the new", new_files)):
+        try:
+            got.append(pin_path(f))
+        except (KeyError, ValueError, zlib.error, struct.error) as e:
+            return [f"{label} ESP has no readable tree ({e.__class__.__name__}: {e}): its PIN path is unknown"]
+    o, n = got
+    probs = []
+    for k in sorted(set(o) | set(n), key=lambda x: (x != "tree", x)):
+        a, b = o.get(k), n.get(k)
+        if a == b:
+            continue
+        if isinstance(a, tuple) and isinstance(b, tuple) and k.startswith(("rc ", "gbinit", "sepolicy")):
+            gone, new = [x for x in a if x not in b], [x for x in b if x not in a]
+            probs.append(f"{k}: removed {gone[:2]}{' ...' if len(gone) > 2 else ''}, added {new[:2]}"
+                         f"{' ...' if len(new) > 2 else ''}" + ("" if gone or new else " (order changed)"))
+        else:
+            probs.append(f"{k}: {_pin_show(a)} -> {_pin_show(b)}")
+    return probs
+
+
+def pin_report(rep, files, a):
+    """(W6 prep, SA-7) Check VP: --expect-pin-path ESP (an ESP image, or a disk image: its EFI-SYSTEM) must have the
+    same PIN path as the verified ESP; with --pin-migration the differences are printed as notes instead."""
+    if not getattr(a, "expect_pin_path", None):
+        return
+    try:
+        with open(a.expect_pin_path, "rb") as fh:
+            disk = fh.read(1024)[512:520] == b"EFI PART"
+        old = fat_files(esp_of_disk(a.expect_pin_path) if disk else rd_host(a.expect_pin_path))
+    except (OSError, ValueError, struct.error) as e:
+        rep.bad("VP", f"--expect-pin-path {a.expect_pin_path}: {e}")
+        return
+    probs = pin_path_problems(old, files)
+    if not probs:
+        print(f"  VP ok: the PIN path equals that of {a.expect_pin_path}", flush=True)
+    for msg in probs:
+        if a.pin_migration:
+            print(f"  VP note (--pin-migration): {msg}", flush=True)
+        else:
+            rep.bad("VP", msg)
 
 
 def compare_export(a, b):
@@ -2041,16 +2277,21 @@ def vnni_actions(files):
 
 
 def vnni_rc_text(files):
-    """The gb.rc actions build_esp.py appends for these vnni files (without its comment head), as text."""
+    """The gb.rc actions build_esp.py appends for these vnni files (without its comment head), as text; (W6) followed
+    by the gbvnni read-only remount (VNNI_RC_TAIL) when there is at least one action."""
     acts, _ = vnni_actions(files)
-    return "\n".join(a[2][0] + "\n" + "".join(f"    {ln}\n" for ln in a[2][1:]) for a in acts)
+    return "\n".join(a[2][0] + "\n" + "".join(f"    {ln}\n" for ln in a[2][1:]) for a in acts) + \
+        (VNNI_RC_TAIL if acts else "")
 
 
 def v31(c):
     """W5: the VNNI libz patch: the packed folders == inject\\vnni, sha-pinned to the reviewed patcher manifest,
-    every bind gated on the exact build fingerprint (remounted read-only in init's mount namespace only; the inode
-    stays writable through the rw /odm tmpfs), none ungated, after the 'on early-init' /vendor overlay; no libz.so*
-    outside /odm/vnni/<id>/; no gate override in /odm/etc/build.prop; the gb.vnni=0 kill switch."""
+    every bind gated on the exact build fingerprint (each bind remounted read-only in init's mount namespace), none
+    ungated, after the 'on early-init' /vendor overlay; no libz.so* outside /odm/vnni/<id>/; no gate override in
+    /odm/etc/build.prop; the gb.vnni=0 kill switch. (W6) gbinit's own gbvnni tmpfs for /odm/vnni (VNNI_RO_GBINIT) and,
+    as the last vnni section, its superblock remount read-only (VNNI_RO_TAIL: every mount of it, in every namespace,
+    refuses writes); no libz.so* path component of any entry type (F3-dir); the reviewed deploy.gate_value (SA-3); a
+    note (never a problem) comparing the gates' build with etc/gb/ota_validated (SA-2: INERT when they differ)."""
     tr = "gbnative" if c.kind == "native" else "gbstage"
     rcb = c.data(f"{tr}/etc/init/gb.rc")
     if rcb is None:
@@ -2072,8 +2313,8 @@ def v31(c):
     p += probs
     allowed_libz = {f"{tr}/vnni/{i}/{t.get('file')}" for i, t, _ in acts
                     if re.fullmatch(rf"vnni/{VNNI_ID_RE}/(?:system|vendor)/lib64/libz\.so", f"vnni/{i}/{t.get('file')}")}
-    bad_libz = sorted(x for x, (m, _) in c.tree.items()
-                      if not is_dir(m) and x.rsplit("/", 1)[-1].startswith("libz.so") and x not in allowed_libz)
+    bad_libz = sorted(x for x, (m, _) in c.tree.items() if any(s.startswith("libz.so") for s in x.split("/"))
+                      and not (x in allowed_libz and is_reg(m)))
     if bad_libz:
         p.append(f"libz.so* entry outside {tr}/vnni/<id>/{{system,vendor}}/lib64/libz.so: {bad_libz[:3]}")
     bp = (c.data(f"{tr}/etc/build.prop") or b"").decode("utf-8", "replace").splitlines()
@@ -2082,22 +2323,46 @@ def v31(c):
                    or ln.split("=", 1)[0].strip().startswith(("ro.system.build.", "ro.vendor.build.")))]
     if bad_bp:
         p.append(f"{tr}/etc/build.prop overrides a VNNI gate/build property: {bad_bp[:2]}")
+    imp = [ln.strip() for ln in bp if ln.strip() == "import" or ln.strip().startswith(("import ", "import\t"))]
+    if imp:     # (W6 prep, SA-9) init would also load the named file: a gate/build override the line check cannot see
+        p.append(f"{tr}/etc/build.prop has import lines: {imp[:2]}")
     rc = rcb.decode("utf-8", "replace")
     secs = rc_sections(rc)
     vsec = [i for i, s in enumerate(secs) if any(VNNI_ODM in ln or "libz.so" in ln for ln in s)]
     if files or vsec:
         try:
             pm = json.loads(rd_host(HOST["vnni_patcher"]).decode("utf-8"))
-            allowed = {(t["orig_sha256"], t["patched_sha256"], t["deploy"]["bind"], t["deploy"]["gate_prop"])
-                       for t in pm["targets"] if t.get("deploy")}
+            allowed = {(t["orig_sha256"], t["patched_sha256"], t["deploy"]["bind"], t["deploy"]["gate_prop"],
+                        t["deploy"].get("gate_value")) for t in pm["targets"] if t.get("deploy")}
         except (OSError, ValueError, KeyError, TypeError) as e:
             return p + [f"the reviewed patcher manifest is unreadable ({e.__class__.__name__})"]
         for i, t, _ in acts:
-            if (t.get("orig_sha256"), t.get("patched_sha256"), t.get("bind"), t.get("gate_prop")) not in allowed:
-                p.append(f"vnni/{i}/{t.get('file')}: not a deployable target of the reviewed patcher manifest")
+            if (t.get("orig_sha256"), t.get("patched_sha256"), t.get("bind"), t.get("gate_prop"),
+                    t.get("gate_value")) not in allowed:
+                p.append(f"vnni/{i}/{t.get('file')}: not a deployable target of the reviewed patcher manifest "
+                         f"(orig/patched/bind/gate, SA-3: and its reviewed deploy.gate_value)")
+        # (W6, SA-2) a NOTE, never a problem: each gate's build (build id, incremental) against the build this tree is
+        # validated for (etc/gb/ota_validated; V32 checks that file). build_esp's _vnni_inputs refuses a folder for
+        # another build, so a difference means a hand-made tree or a test fixture of a synthetic build: there the
+        # fingerprint-gated binds cannot fire (inert, harmless)
+        fv = [ln.split("=", 1)[1].strip() for ln in (c.data(f"{tr}/etc/gb/ota_validated") or b"").decode(
+            "utf-8", "replace").splitlines() if ln.startswith("ro.bootimage.build.fingerprint=")]
+        bm = re.fullmatch(VNNI_FP_RE, fv[-1]) if fv else None
+        if bm and acts:
+            gb = {f"vnni/{i}/{t.get('file')}": re.fullmatch(VNNI_FP_RE, t.get("gate_value") or "") for i, t, _ in acts}
+            off = sorted(k for k, fm in gb.items() if not fm or fm.groups() != bm.groups())
+            c.notes.append(("V31", f"INERT (SA-2): {off[:2]} gated on another build than the validated "
+                                   f"{'/'.join(bm.groups())} (etc/gb/ota_validated): those binds cannot fire" if off else
+                                   f"(SA-2) every vnni gate is of the validated build {'/'.join(bm.groups())} "
+                                   f"(etc/gb/ota_validated)"))
         want = [tuple(a[2]) for a in acts]
         got = [tuple(secs[i]) for i in vsec]
-        for w in want:
+        if acts and (got.count(VNNI_RO_TAIL) != 1 or got[-1] != VNNI_RO_TAIL):
+            p.append("gb.rc must end its vnni sections with exactly one 'on init' / "
+                     "'mount tmpfs gbvnni /odm/vnni remount ro' (the gbvnni superblock read-only after every bind, W6)")
+        if acts:
+            want.append(VNNI_RO_TAIL)
+        for w in want[:len(acts)]:
             if got.count(w) != 1:
                 p.append(f"gb.rc must hold the gated action '{w[0][:60]}...' for {w[2].split()[2]} exactly once "
                          f"(the 4 reviewed lines)")
@@ -2113,11 +2378,219 @@ def v31(c):
         if VNNI_KILL_INIT not in gl or not any(VNNI_KILL_CASE in ln and "/proc/cmdline" in ln for ln in gl) or \
                 cp < 0 or gl[cp + 1:cp + 2] != [VNNI_KILL]:
             p.append("gbinit lacks the gb.vnni=0 kill switch (VN=1, the case token, the rm of /odm/vnni after the copy)")
+        gt = "\n".join(gl) + "\n"
+        pos = [gt.find(VNNI_KILL + "\n"), gt.find(VNNI_OTA_UNVALIDATED), gt.find(VNNI_RO_GBINIT), gt.find(GBINIT_GATE),
+               gt.rfind("exec /init")]
+        # the kill switch, the OTA gate (W5b) and the bring-up gate order the block only when present (a missing one is
+        # reported by its own rule: the kill switch above, V25); the block and exec /init must be there
+        pos = [x for k, x in enumerate(pos) if x >= 0 or k in (2, 4)]
+        if gt.count(VNNI_RO_GBINIT) != 1 or min(pos) < 0 or pos != sorted(pos):
+            p.append("gbinit lacks the gbvnni read-only tmpfs block for /odm/vnni (once, after the kill switch and the "
+                     "OTA gate, before the bring-up and exec /init; W6)")
     for n, text in sorted(c.entries.items()):
         e = parse_entry(text)
         vt = [x for x in e["tokens"] if x.startswith("gb.vnni=")]
         if vt and (vt != ["gb.vnni=0"] or c.kind == "native" or VNNI_OFF_TITLE not in (e["title"] or "")):
             p.append(f"entry {n}: {vt} (gb.vnni=0 only in a test entry titled {VNNI_OFF_TITLE!r})")
+    return p
+
+
+def initrd_segments(ini, start=0):
+    """(W6, V32) [(kind, begin, end)] of an initrd's segments from offset `start` up to its bootconfig trailer (if
+    any): "lz4" legacy streams (lapis's vendor and init_boot ramdisks), "gzip" members, plain "newc" cpio archives;
+    zero padding between them is skipped, as the kernel's initramfs unpacker does. ValueError for anything else."""
+    end = len(ini)
+    if ini.endswith(b"#BOOTCONFIG\n"):
+        size = struct.unpack_from("<I", ini, end - 20)[0]
+        end -= 20 + size
+        if end < start:
+            raise ValueError("the bootconfig trailer is larger than the initrd")
+    segs, o = [], start
+    while o < end:
+        if ini[o] == 0:
+            o += 1
+        elif ini[o:o + 4] == LZ4_MAGIC:
+            b, o = o, o + 4
+            while o + 4 <= end and ini[o:o + 4] != LZ4_MAGIC:
+                n = struct.unpack_from("<I", ini, o)[0]
+                if n == 0 or o + 4 + n > end:
+                    break
+                o += 4 + n
+            segs.append(("lz4", b, o))
+        elif ini[o:o + 2] == b"\x1f\x8b":
+            d = zlib.decompressobj(31)
+            d.decompress(ini[o:end])
+            if not d.eof:
+                raise ValueError(f"initrd: truncated gzip member at offset {o}")
+            segs.append(("gzip", o, end - len(d.unused_data)))
+            o = end - len(d.unused_data)
+        elif ini[o:o + 6] in (b"070701", b"070702"):
+            n = newc_files(ini[o:end], one=True)[1]
+            segs.append(("newc", o, o + n))
+            o += n
+        else:
+            raise ValueError(f"initrd: no ramdisk segment at offset {o} ({ini[o:o + 8].hex()})")
+    return segs
+
+
+def newc_files(buf, one=False):
+    """(W6, V32) ([(path, mode, data)], end offset) of the newc cpio archive(s) in buf (one=True: only the first; else
+    every archive, zero padding between them skipped, as the kernel unpacks them; later entries win at boot)."""
+    out, off = [], 0
+    while True:
+        while not one and off < len(buf) and buf[off] == 0:
+            off += 1
+        if off >= len(buf):
+            return out, off
+        while True:
+            if off + 110 > len(buf) or buf[off:off + 6] not in (b"070701", b"070702"):
+                raise ValueError(f"bad cpio header at offset {off}")
+            f = [int(buf[off + 6 + 8 * k:off + 14 + 8 * k], 16) for k in range(13)]
+            mode, fsize, nsize = f[1], f[6], f[11]
+            if nsize < 1 or off + 110 + nsize > len(buf):
+                raise ValueError(f"bad cpio name size at offset {off}")
+            name = buf[off + 110:off + 110 + nsize - 1].decode("utf-8", "replace")
+            doff = (off + 110 + nsize + 3) & ~3
+            if doff + fsize > len(buf):
+                raise ValueError(f"cpio entry {name} runs past the end")
+            off = (doff + fsize + 3) & ~3
+            if name == "TRAILER!!!":
+                break
+            out.append((name, mode, None if is_dir(mode) else bytes(buf[doff:doff + fsize])))
+        if one:
+            return out, min(off, len(buf))
+
+
+def initrd_build_prop(ini, start=0):
+    """(W6, V32) (bytes or None, segment index) of the file GBINIT reads as /system/etc/ramdisk/build.prop: the last
+    entry of that path in the initrd's segments (each later segment overwrites an earlier one); None if there is none
+    or the last one is not a regular file. Segments are decoded from the last one backwards, so a normal initrd only
+    decodes its init_boot (generic) ramdisk."""
+    segs = initrd_segments(ini, start)
+    for i in range(len(segs) - 1, -1, -1):
+        kind, b, e = segs[i]
+        raw = ini[b:e]
+        buf = lz4_legacy(raw) if kind == "lz4" else zlib.decompress(raw, 31) if kind == "gzip" else raw
+        hit = [(m, d) for p, m, d in newc_files(buf)[0] if re.sub(r"^(?:\.?/)+", "", p) == OTA_RAMDISK_PROP]
+        if hit:
+            return (hit[-1][1] if is_reg(hit[-1][0]) else None), i
+    return None, None
+
+
+def gbinit_fingerprint(prop_file, prop):
+    """(W6, V32) GBINIT's value of `prop` in a build.prop: sed -n 's/^<prop>=//p' | tr -d '\\r' | tail -n 1."""
+    vals = [ln[len(prop) + 1:].replace(b"\r", b"") for ln in prop_file.split(b"\n") if ln.startswith(prop + b"=")]
+    return vals[-1] if vals else None
+
+
+def ota_cil(raw):
+    """(W6, V32) == build_esp.ota_safe_cil: every (typepermissive T) line as (optional gb_ota_T (typepermissive T));
+    ValueError for any other line or a repeated type."""
+    out, seen = [], set()
+    for ln in raw.split(b"\n"):
+        ln = ln.rstrip(b"\r")
+        if not ln.strip():
+            continue
+        m = re.fullmatch(rb"\(typepermissive ([A-Za-z0-9_-]+)\)", ln)
+        if not m or m.group(1) in seen:
+            raise ValueError(f"odm_sepolicy.cil: unexpected or repeated line {ln[:60]!r}")
+        seen.add(m.group(1))
+        out.append(b"(optional gb_ota_" + m.group(1) + b" (typepermissive " + m.group(1) + b"))\n")
+    if not out:
+        raise ValueError("odm_sepolicy.cil: no typepermissive line")
+    return b"".join(out)
+
+
+def v32(c):
+    """W6 (OTA-F1, safety audit SA-4): the OTA gate in the tree of this kind (see the module docstring)."""
+    tr = "gbnative" if c.kind == "native" else "gbstage"
+    p = []
+    for n, text in sorted(c.entries.items()):
+        e = parse_entry(text)
+        ot = [x for x in e["tokens"] if x.startswith("gb.otagate=")]
+        if ot and (ot != ["gb.otagate=force"] or c.kind == "native" or OTA_FORCE_TITLE not in (e["title"] or "")):
+            p.append(f"entry {n}: {ot} (gb.otagate=force only in a VM test entry titled {OTA_FORCE_TITLE!r}; "
+                     f"never gb.otagate=0)")
+    try:
+        prop, rc_want = be_bytes("OTA_PROP"), be_bytes("OTA_RC")
+        tok, unv = be_bytes("OTA_GBINIT_TOKENS"), be_bytes("OTA_GBINIT_UNVALIDATED")
+        sh_parts, req = be_parts("GB_OTAGATE_SH"), be_const("OTA_REQUIRED_PERMISSIVE")
+    except (OSError, KeyError, ValueError, SyntaxError) as e:
+        return p + [f"build_esp.py's OTA gate constants are unreadable ({e.__class__.__name__}: {e})"]
+    # the validated build == the build GBINIT reads from this ESP's default initrd
+    fv, ve = None, c.tree.get(f"{tr}/{OTA_VALIDATED}")
+    if ve is None or ve[1] is None:
+        p.append(f"no {tr}/{OTA_VALIDATED} (an image built before the OTA gate)")
+    elif ve[0] != 0o100644:
+        p.append(f"{tr}/{OTA_VALIDATED} is not a 0644 regular file")
+    else:
+        m = re.fullmatch(re.escape(prop) + rb"=([^\n]+)\n", ve[1])
+        if not m or not all(chr(b) in VNNI_PROP_SAFE for b in m.group(1)):
+            p.append(f"{tr}/{OTA_VALIDATED} is not the one line {prop.decode()}=<fingerprint> (init/sh-safe characters)")
+        else:
+            fv = m.group(1)
+    if f"{tr}/{OTA_STATE}" in c.tree:
+        p.append(f"{tr}/{OTA_STATE} is packed (GBINIT writes it at boot)")
+    gz, ini = c.files.get("gb/inject.gz"), c.files.get(f"initrd-{c.slot}.img")
+    if gz is not None and ini is not None and ini[:len(gz)] == gz:          # else V3/V18 report it
+        try:
+            bp, _seg = initrd_build_prop(ini, len(gz))
+            fb = gbinit_fingerprint(bp, prop) if bp is not None else None
+        except (ValueError, struct.error, zlib.error, IndexError) as e:
+            fb = None
+            p.append(f"initrd-{c.slot}.img: its ramdisk segments do not parse ({e})")
+        else:
+            if not fb:
+                p.append(f"initrd-{c.slot}.img: no {OTA_RAMDISK_PROP} with a {prop.decode()} line (GBINIT finds no "
+                         f"build: every boot of this ESP would be unvalidated)")
+        if fb and fv is not None:
+            if fb != fv:
+                p.append(f"{tr}/{OTA_VALIDATED} names {fv.decode()!r}, but initrd-{c.slot}.img boots "
+                         f"{fb.decode('utf-8', 'replace')!r}: every boot of this ESP would be unvalidated (VNNI patch "
+                         f"removed, a notification at each boot)")
+            else:
+                c.notes.append(("V32", f"validated build {fv.decode()} == the init_boot ramdisk of initrd-{c.slot}.img"))
+    # gb_otagate.sh, its rc file (the only one naming the gate), no packed gate property
+    se = c.tree.get(f"{tr}/{OTA_SCRIPT}")
+    if se is None or se[0] != 0o100755 or not parts_match(sh_parts, se[1] or b""):
+        p.append(f"{tr}/{OTA_SCRIPT} missing, not 0755 or not build_esp's GB_OTAGATE_SH")
+    if c.tree.get(f"{tr}/{OTA_RC_FILE}") != (0o100644, rc_want):
+        p.append(f"{tr}/{OTA_RC_FILE} missing, not 0644 or not build_esp's OTA_RC")
+    other = sorted(x for x, (m, d) in c.tree.items() if x.startswith(tr + "/") and x.endswith(".rc") and is_reg(m)
+                   and x != f"{tr}/{OTA_RC_FILE}" and d is not None and (b"gb_otagate" in d or b"ota_gate" in d))
+    if other:
+        p.append(f"rc files other than {OTA_RC_FILE} name the gate: {other[:3]}")
+    if re.search(rb"^[ \t]*ro\.vendor\.gb\.ota_gate[ \t]*=", c.data(f"{tr}/etc/build.prop") or b"", re.M):
+        p.append(f"{tr}/etc/build.prop sets ro.vendor.gb.ota_gate (every boot would post the notification)")
+    # GBINIT: the token scan while /proc is mounted; the gate once, in its place
+    gi = c.data("gbinit") or b""
+    marks = [gi.find(s) for s in (b"\n/busybox umount /proc\n", b"\n/busybox cp -a $SRC/. /odm/\n",
+                                  ("\n" + VNNI_KILL + "\n").encode(), ("\n" + OTA_GATE_HEAD + "\n").encode(), unv,
+                                  ("\n" + GBINIT_GATE + "\n").encode(), ("\n" + OTA_GBINIT_MODULES + "\n").encode(),
+                                  b"\nexec /init\n")]
+    if gi.count(tok) != 1 or not 0 <= gi.find(tok) < marks[0]:
+        p.append("gbinit lacks the gb.otagate= token scan (once, before /proc is unmounted)")
+    # the kill switch, the bring-up call and the module loading are order anchors only where present (V31, V25 and V12
+    # report their absence); the /odm copy, the gate and exec /init are required
+    seq = [x for i, x in enumerate(marks[1:], 1) if x >= 0 or i not in (2, 5, 6)]
+    if (gi.count(("\n" + OTA_GATE_HEAD + "\n").encode()) != 1 or gi.count(unv) != 1 or min(seq) < 0
+            or seq != sorted(seq) or len(set(seq)) != len(seq)):
+        p.append("gbinit lacks the OTA gate (once, after the /odm copy and the VNNI kill switch, before the bring-up, "
+                 "the module loading and exec /init)")
+    # the SELinux cil in its OTA-robust form, the required domains permissive
+    ce = c.tree.get(f"{tr}/etc/selinux/odm_sepolicy.cil")
+    try:
+        cil_want = ota_cil(rd_host(HOST["odm_cil"]))
+    except (OSError, ValueError) as e:
+        p.append(f"inject\\odm_sepolicy.cil unreadable or not a typepermissive list ({e})")
+    else:
+        if ce != (0o100644, cil_want):
+            p.append(f"{tr}/etc/selinux/odm_sepolicy.cil is not the OTA-robust form of inject\\odm_sepolicy.cil (0644)")
+    have = set(re.findall(rb"^\(optional gb_ota_([A-Za-z0-9_-]+) \(typepermissive \1\)\)$", (ce or (0, b""))[1] or b"",
+                          re.M))
+    miss = [t for t in req if t.encode() not in have]
+    if miss:
+        p.append(f"the cil does not make {miss} permissive (OTA_REQUIRED_PERMISSIVE; the global mode is enforcing)")
     return p
 
 
@@ -2129,7 +2602,7 @@ CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("
           ("V15", v15, NATIVE), ("V16", v16, NATIVE), ("V17", v17, ALL), ("V18", v18, ALL), ("V19", v19, NATIVE),
           ("V20", v20, NATIVE), ("V21", v21, NATIVE), ("V22", v22, NATIVE), ("V23", v23, ALL), ("V24", v24, VMS),
           ("V25", v25, ALL), ("V26", v26, ALL), ("V27", v27, ALL), ("V28", v28, ALL), ("V29", v29, ALL),
-          ("V30", v30, ALL), ("V31", v31, ALL)]
+          ("V30", v30, ALL), ("V31", v31, ALL), ("V32", v32, ALL)]
 
 
 def run_checks(c, only=None):
@@ -2299,6 +2772,7 @@ def image_mode(a, rep):
     del espb
     print(f"  ESP: super GUID {sup}", flush=True)
     esp_report(rep, files, info, a, sup, part_size, "ESP")
+    pin_report(rep, files, a)
 
 
 def esp_mode(a, rep):
@@ -2309,6 +2783,7 @@ def esp_mode(a, rep):
     except (ValueError, struct.error) as e:
         files, info = {}, {"error": str(e)}
     esp_report(rep, files, info, a, a.super_guid, len(espb), "ESP")
+    pin_report(rep, files, a)
 
 
 def extract_mode(img, esp_path, outdir):
@@ -2356,6 +2831,10 @@ def main(argv=None):
     ap.add_argument("--krel", help="file whose first line is the expected kernel release")
     ap.add_argument("--no-gfxdriver", action="store_true", help="the image was built with GB_GFXDRIVER=0")
     ap.add_argument("--compare-export", metavar="ESP", help="an export EFI-SYSTEM.img that must hold the same tree")
+    ap.add_argument("--expect-pin-path", metavar="ESP",
+                    help="VP (SA-7): the PIN path must equal this ESP's (ESP or disk image; the ESP now on the disk)")
+    ap.add_argument("--pin-migration", action="store_true",
+                    help="with --expect-pin-path: report PIN-path differences as notes (a reviewed migration)")
     ap.add_argument("--extract", nargs=3, metavar=("IMG", "ESP_PATH", "OUTDIR"))
     a = ap.parse_args(argv)
     if a.extract:
@@ -2375,6 +2854,8 @@ def main(argv=None):
             uuid.UUID(a.super_guid)
         except ValueError:
             ap.error(f"--super-guid {a.super_guid!r} is not a GUID")
+    if a.pin_migration and not a.expect_pin_path:
+        ap.error("--pin-migration is only used with --expect-pin-path")
     rep = Report()
     t0 = time.time()
     try:

@@ -10,11 +10,13 @@ Native images also carry the NVIDIA test entry gb-<slot>-nvtest and the dGPU pay
 
 Usage: python -I build_usb.py [--out FILE] [--userdata-gib N] [--esp-mib 512] [--export DIR] [--sparse]
                               [--vm-test [--vm-test-gfx | --vm-test-kat | --vm-test-rehearsal | --vm-test-nogk |
-                                          --vm-test-w5 [--vnni-off]]]
+                                          --vm-test-w5 [--vnni-off] | --vm-test-otagate]]
                               [--esp-only FILE [--super-guid G] [--bringup-test DIR]]
   The image is written to <out>.part (sha256 computed while writing), checked with verify_image.py, and only then
   renamed to <out>, with <out>.sha256 = "<hex>  <name>". A failed check keeps the .part file and writes no sidecar.
   --sparse      NTFS sparse file: all-zero 1 MiB blocks are not allocated (same content and sha256)
+  --allow-running-vm  (W6 prep, IA-1) build the image although the user's VM (lapis-boot.vmx) runs: lapis.bin is then
+                read while the guest writes it (refused by default); verify_image's VC compare still has to pass
   --esp-only F  build only the ESP (the same code path as the image), write it to F, check it with
                 verify_image.py --esp, exit (checkpoints; --super-guid fixes the GUID for determinism checks)
   --vm-test-gfx test-only: the VM tree plus GbGpu and the gfx driver package (build_esp.vm_test_gfx_cpio); the output
@@ -35,6 +37,12 @@ Usage: python -I build_usb.py [--out FILE] [--userdata-gib N] [--esp-mib 512] [-
                 the output must be below D:\\gb-w5test\\
   --vnni-off    with --vm-test-w5 only: the same tree with gb.vnni=0 on the entry (gbinit deletes /odm/vnni: no bind,
                 stock libz under emulation) and the title "(VM test, W5, VNNI off)": the measurement baseline
+  --vm-test-otagate  test-only (W6, OTA gate follow-up SA-10 / OTA-force, ota-gating DESIGN.md 4.3): EXACTLY the VM
+                tree GB_WRITE_LAPIS=1 build_esp.py writes into lapis.bin (build_esp.INJECT_CPIO, validated for the boot
+                slot) with gb.otagate=force on the entry and the title "(VM test, OTA gate forced)": GBINIT takes the
+                unvalidated path on the validated build (no /odm/vnni, ro.vendor.gb.ota_gate=unvalidated, the "System
+                update not validated" notification); also writes <output>.vmtree.sha256 (the user-VM tree record); the
+                output must be below D:\\gb-w6test\\
   --bringup-test DIR  test-only (WAVE3_PLAN R-12b), with --esp-only: the native ESP plus DIR\\gb.cfg -> gb/gb.cfg,
                 DIR\\overlay\\** -> gb/overlay/** and gb.overlay=1 in the entries (never a shipped ESP); the output
                 must be below D:\\gb-w3test\\
@@ -57,6 +65,7 @@ VMTEST_GFX_ROOT = "D:\\gb-w2test"                 # --vm-test-gfx images only be
 W3TEST_ROOT = "D:\\gb-w3test"                     # --vm-test-kat / --bringup-test outputs only below this (wave 3)
 W4TEST_ROOT = "D:\\gb-w4test"                     # --vm-test-rehearsal / --vm-test-nogk outputs only below this (W4)
 W5TEST_ROOT = "D:\\gb-w5test"                     # --vm-test-w5 outputs only below this (W5, VNNI measurement)
+W6TEST_ROOT = "D:\\gb-w6test"                     # --vm-test-otagate outputs only below this (W6, OTA gate forced)
 TITLE_NATIVE = "Googlebook OS - Surface Book 3 (USB)"
 TITLE_VM = "Googlebook OS - USB image layout (VM test)"
 TITLE_VM_GFX = "Googlebook OS - USB image layout (VM test, gfx components)"
@@ -65,6 +74,7 @@ TITLE_VM_REHEARSAL = "Googlebook OS - USB image layout (VM test, W4 rehearsal)"
 TITLE_VM_NOGK = "Googlebook OS - USB image layout (VM test, no Gatekeeper)"
 TITLE_VM_W5 = "Googlebook OS - USB image layout (VM test, W5)"
 TITLE_VM_W5_OFF = "Googlebook OS - USB image layout (VM test, W5, VNNI off)"     # verify_image VNNI_OFF_TITLE
+TITLE_VM_OTAGATE = "Googlebook OS - USB image layout (VM test, OTA gate forced)"  # verify_image OTA_FORCE_TITLE
 BRINGUP_MAX = 8 * MiB                             # --bringup-test: the test inputs' total size
 
 # Surface Book 3 PCI paths (Windows DEVPKEY_Device_LocationPaths): PCH xHCI PCI(1400), Thunderbolt xHCI PCI(0D00),
@@ -141,6 +151,29 @@ def _below(path, root):
     return p != r and p.startswith(r.rstrip("\\/") + os.sep)
 
 
+VMRUN = r"C:\Program Files\VMware\VMware Workstation\vmrun.exe"
+
+
+def user_vm_busy(here=HERE, vmrun=VMRUN):
+    """(W6 prep, IA-1 of vnni-perf\\w5\\IMAGE_AUDIT.md) Why the user's VM may be using lapis.bin now ([] = it is off):
+    `vmrun list` names here\\lapis-boot.vmx, VMware holds a lapis*.lck lock (build_esp's write guard), or vmrun cannot
+    tell. A full image copies boot/super partitions from lapis.bin and must not read them while the guest writes."""
+    why = []
+    try:
+        out = subprocess.run([vmrun, "-T", "ws", "list"], capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        why.append(f"vmrun list failed ({e.__class__.__name__}): cannot show that the VM is off")
+    else:
+        if os.path.join(here, "lapis-boot.vmx").lower() in out.lower():
+            why.append(f"VMware lists {os.path.join(here, 'lapis-boot.vmx')} as running")
+    try:
+        why += [f"VMware lock {n} present" for n in sorted(os.listdir(here))
+                if n.lower().startswith("lapis") and n.lower().endswith(".lck")]
+    except OSError as e:
+        why.append(f"cannot list {here} for VMware locks ({e})")
+    return why
+
+
 def parse_args(argv=None):
     """Command line (plan 3.3). Usage errors exit 2 (argparse)."""
     ap = argparse.ArgumentParser(prog="build_usb.py")
@@ -149,6 +182,8 @@ def parse_args(argv=None):
     ap.add_argument("--esp-mib", type=int, default=512, help="room for both slots' initrds (gb_slotsync) + growth")
     ap.add_argument("--export", help="also write each partition as DIR\\<name>.img for the dual-boot installer")
     ap.add_argument("--sparse", action="store_true", help="write the image as an NTFS sparse file")
+    ap.add_argument("--allow-running-vm", action="store_true",
+                    help="(IA-1) read lapis.bin even while the user's VM runs (refused by default)")
     ap.add_argument("--vm-test", action="store_true",
                     help="same disk layout, but the VM overlay tree and the VMware NVMe boot device: boot-test the "
                          "image structure (GPT, slots, first-boot formatting) in VMware before flashing")
@@ -168,6 +203,8 @@ def parse_args(argv=None):
     ap.add_argument("--super-guid", metavar="G", help="with --esp-only: use this super partition GUID")
     ap.add_argument("--bringup-test", metavar="DIR",
                     help="with --esp-only (native): add DIR\\gb.cfg + DIR\\overlay and gb.overlay=1 (R-12b test ESP)")
+    ap.add_argument("--vm-test-otagate", action="store_true",
+                    help="with --vm-test: exactly the user-VM tree, gb.otagate=force on the entry (W6 forced OTA gate)")
     a = ap.parse_args(argv)
     if a.vm_test_gfx and not a.vm_test:
         ap.error("--vm-test-gfx needs --vm-test")
@@ -213,6 +250,11 @@ def parse_args(argv=None):
             ap.error(f"{flag} output must be below {W4TEST_ROOT}\\ (and no --export): {written}")
     if a.vm_test_w5 and (not _below(written, W5TEST_ROOT) or a.export):
         ap.error(f"--vm-test-w5 output must be below {W5TEST_ROOT}\\ (and no --export): {written}")
+    if a.vm_test_otagate:               # (W6) one more test variant: the user-VM tree with gb.otagate=force
+        if not a.vm_test or any((a.vm_test_gfx, a.vm_test_kat, a.vm_test_rehearsal, a.vm_test_nogk, a.vm_test_w5)):
+            ap.error("--vm-test-otagate needs --vm-test and is a separate test image")
+        if not _below(written, W6TEST_ROOT) or a.export:
+            ap.error(f"--vm-test-otagate output must be below {W6TEST_ROOT}\\ (and no --export): {written}")
     for p in filter(None, (a.out, a.esp_only, a.export)):
         if os.path.normcase(os.path.realpath(p)) == os.path.normcase(os.path.realpath(be.LAPIS)):
             ap.error("refusing to write lapis.bin")
@@ -298,6 +340,12 @@ def run_verify(args):
 
 def main(argv=None):
     a = parse_args(argv)
+    busy = [] if a.esp_only else user_vm_busy()     # (W6 prep, IA-1) --esp-only copies no partition
+    if busy and not a.allow_running_vm:
+        sys.exit("build_usb.py: refused: the user's VM may be using lapis.bin (" + "; ".join(busy) + "). Shut it down "
+                 "first (or pass --allow-running-vm on purpose)")
+    for w in busy:
+        print(f"WARNING (--allow-running-vm): {w}; lapis.bin is read while the guest may write it", flush=True)
     src = lapis_partitions(be.LAPIS)
     # The copied system must be the one the source boots (an OTA leaves the other slot stale), and no update may be
     # half-applied: super is copied but /metadata (snapshot state) starts blank. Checked before anything is built.
@@ -332,6 +380,9 @@ def main(argv=None):
                 usb_cmdline += " gb.vnni=0"
         else:
             tree, title, kind = be.INJECT_CPIO, TITLE_VM, "vm"
+        if a.vm_test_otagate:           # (W6) exactly the user-VM tree; GBINIT's unvalidated path forced on the entry
+            tree, title, kind = be.INJECT_CPIO, TITLE_VM_OTAGATE, "vm"
+            usb_cmdline += " gb.otagate=force"
         files = be.slot_files(usb_cmdline, tree, title, timeout=4)
         min_free = be.vm_min_free(files)        # (W4) as for the user's VM ESP: an OTA's second initrd must fit
     else:
@@ -350,6 +401,10 @@ def main(argv=None):
         assert record.split()[0].decode() == hashlib.sha256(files["gb/inject.gz"]).hexdigest(), "gb/inject.gz"
         if a.vm_test_rehearsal or a.vm_test_w5:
             assert tree is be.INJECT_CPIO and record == be.vm_tree_record(), "the rehearsal tree is not INJECT_CPIO"
+        print("VM tree: " + record.decode().replace("\n", "; "), flush=True)
+    if a.vm_test_otagate:               # (W6) the user-VM tree record: the forced boot runs exactly that tree
+        record = be.vm_tree_record(tree)
+        assert tree is be.INJECT_CPIO and record.split()[0].decode() == hashlib.sha256(files["gb/inject.gz"]).hexdigest()
         print("VM tree: " + record.decode().replace("\n", "; "), flush=True)
     tree_args = ["--expect-inject-sha256", record.split()[0].decode()] if record else []
 

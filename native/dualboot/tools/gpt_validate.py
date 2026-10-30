@@ -202,11 +202,77 @@ def unit_ranges(size):
         yield u, s, e
 
 
+def allocated_ranges(path):
+    """Sorted [(offset, end)] of the allocated ranges of an NTFS sparse file (FSCTL_QUERY_ALLOCATED_RANGES), or None
+    (not Windows, or the query failed: then every byte is read). A range outside these is a hole and reads as zeros.
+    (W6) Reading a hole of a sparse file through the Windows cache holds that much of the volume's free space until
+    the file is closed or deleted (a 32 GiB test disk could take the volume to 0 bytes free), so the readers below
+    never read a hole: they use the zeros it is known to contain. The results are unchanged."""
+    if os.name != "nt":
+        return None
+    try:
+        import msvcrt
+        from ctypes import wintypes
+        size = os.path.getsize(path)
+
+        class RANGE(ctypes.Structure):
+            _fields_ = [("off", ctypes.c_longlong), ("len", ctypes.c_longlong)]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        out, start = [], 0
+        with open(path, "rb") as f:
+            h = wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno()))
+            while start < size:
+                q = RANGE(start, size - start)
+                buf = (RANGE * 512)()
+                ret = wintypes.DWORD()
+                ok = k32.DeviceIoControl(h, 0x000940CF, ctypes.byref(q), ctypes.sizeof(q), ctypes.byref(buf),
+                                         ctypes.sizeof(buf), ctypes.byref(ret), None)
+                if not ok and ctypes.get_last_error() != 234:          # 234 = ERROR_MORE_DATA
+                    return None
+                n = ret.value // ctypes.sizeof(RANGE)
+                out += [(buf[i].off, buf[i].off + buf[i].len) for i in range(n)]
+                if ok or n == 0:
+                    break
+                start = out[-1][1]
+        return sorted((o, min(e, size)) for o, e in out if o < size)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+_RANGES = {}
+
+
+def _ranges_of(f):
+    """allocated_ranges() of an open image file, queried once per path (the image does not change while we read)."""
+    p = os.path.abspath(f.name)
+    if p not in _RANGES:
+        _RANGES[p] = allocated_ranges(p)
+    return _RANGES[p]
+
+
+def _is_hole(ranges, s, e):
+    """True if [s, e) touches no allocated range (it reads as zeros); False when unknown."""
+    if ranges is None:
+        return False
+    for o, oe in ranges:                      # ranges are sorted and few (a sparse test disk has some thousands)
+        if o >= e:
+            return True
+        if oe > s:
+            return False
+    return True
+
+
 def digests(path):
     size = os.path.getsize(path)
     out = []
     with open(path, "rb") as f:
+        rg = _ranges_of(f)
+        ri = 0
         for u, s, e in unit_ranges(size):
+            while rg is not None and ri < len(rg) and rg[ri][1] <= s:
+                ri += 1                                       # skip ranges that end before this unit
+            if e - s == MiB and rg is not None and (ri == len(rg) or rg[ri][0] >= e):
+                out.append(ZD); continue                      # a hole: zeros, not read
             f.seek(s); b = f.read(e - s)
             out.append(ZD if (e - s == MiB and b == ZERO_MIB) else hashlib.blake2b(b, digest_size=8).hexdigest())
     return out
@@ -235,19 +301,27 @@ class Report:
 
 
 def sha256_range(f, off, n):
-    h = hashlib.sha256(); f.seek(off)
+    h = hashlib.sha256(); rg = _ranges_of(f)
+    if off + n > os.fstat(f.fileno()).st_size: raise IOError("short read")
     while n:
-        b = f.read(min(n, 16 * MiB)); h.update(b); n -= len(b)
-        if not b: raise IOError("short read")
+        k = min(n, 16 * MiB)
+        if _is_hole(rg, off, off + k):
+            h.update(bytes(k))                                # a hole: zeros, not read
+        else:
+            f.seek(off); b = f.read(k); h.update(b)
+            if len(b) != k: raise IOError("short read")
+        off += k; n -= k
     return h.hexdigest()
 
 
 def zero_range(f, off, n):
-    f.seek(off)
+    rg = _ranges_of(f)
     while n:
-        b = f.read(min(n, 16 * MiB))
-        if b.count(0) != len(b): return False
-        n -= len(b)
+        k = min(n, 16 * MiB)
+        if not _is_hole(rg, off, off + k):                    # a hole is zero without reading it
+            f.seek(off); b = f.read(k)
+            if b.count(0) != len(b) or len(b) != k: return False
+        off += k; n -= k
     return True
 
 

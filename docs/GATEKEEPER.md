@@ -143,8 +143,22 @@ rehearsal on a throwaway VM, the checks after the first boot and the rollback pa
 only to an ESP that has gb_gatekeeper, or clear the PIN first. The procedure is in
 [native/dgpu/w4/VM_UPGRADE.md](../native/dgpu/w4/VM_UPGRADE.md), with its tools in `native/dgpu/w4/tools/`.
 
+Both write paths now check this themselves (wave 6): `build_esp.py` (`GB_WRITE_LAPIS=1`) and
+`gb_vmbackup.py restore --esp-only` compare the "PIN path" of the ESP they would write with the ESP now on the
+disk (the Gatekeeper binary and rc service, every VINTF fragment the image adds, the KeyMint service and its
+libraries, the Trusty and Weaver masks, the fstab and the SELinux types the PIN path runs in) and refuse any
+difference. A reviewed change needs `GB_PIN_MIGRATION=1` (build) or `--pin-migration` (rollback);
+`verify_image.py --expect-pin-path <ESP>` shows the same comparison. `gb_vmbackup.py restore --esp-only --dry-run`
+runs every check without writing.
+
 ## Limits and open points
 
+* A later gb_gatekeeper must still verify the PINs enrolled with this one. `tests/frozen_v1.json` holds two key
+  files and handles that version 0.2.0 enrolled; `tests/test_frozen_v1.cpp` verifies them through the service code
+  in every build (host and Android) and `ACCEPTANCE.txt` must say `GK_FROZEN_V1: PASS`, or `build_esp.py` refuses
+  the binary (wave 6; the 0.2.0 binary itself predates the test and is accepted by its pinned sha256). Eight
+  deliberate scheme changes (scrypt N or r, key-file magic or name, HMAC hash, key length, salt, key checksum)
+  all fail that test.
 * The native tree is untested on hardware. An OTA with a PIN set has not been tested yet: the design keeps the
   handles and K_dev on /data and depends only on LLNDK, so it is expected to work.
 * If file-based encryption is ever enabled (it needs a /data wipe), the design still holds. A lock-out would then

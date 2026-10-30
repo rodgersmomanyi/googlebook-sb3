@@ -145,6 +145,15 @@ Each artifact is listed with its sha256 in the producer's integration file.
 * **dGPU function**: the first entry of `ls /sys/bus/pci/devices` (sorted) whose `vendor` is `0x10de` and whose
   `class` starts with `0x03` (VGA `0x0300xx` or 3D `0x0302xx`). On the SB3 this is `0000:02:00.0` (INFERRED from the
   existing scripts; recorded on HW in Phase 2).
+* **Model gate (wave 6, B-4)**: the image stages `nvidia/tu117/*` firmware only (nouveau requests
+  `nvidia/<chip>/...` for the chip named by its BOOT0 register), so the dGPU's `device` must be in NVIDIA's TU117 block
+  `0x1f80`-`0x1fff` (any hex case; 13.5-inch SB3 GTX 1650 Max-Q; pci.ids: every TU117 id and nothing else). Any other
+  well-formed id (`0x` + 4 hex digits; 15-inch SB3: TU116 `0x2180`-`0x21ff` GTX 1660 Ti, TU106 `0x1f00`-`0x1f7f` Quadro
+  RTX 3000): `result=refused:model`, one log line, set `booted`, exit 1, before any marker, lock, payload, insmod or
+  bind; the function stays driverless (gb_power keeps it in D3cold and reports `gfx_reason` = `model`, 23.2). An
+  unreadable or malformed id is **not gated** (one warning line per run; the script goes on exactly as without the
+  gate), so the gate can only refuse a chip this image cannot drive; `gb.nouveau.model=any` (3) turns it off for one
+  boot. gb_nouveau.sh `model_ok()`.
 * **Other NVIDIA functions** (e.g. HDA `0000:02:00.1`, class `0x0403xx`): vendor `0x10de`, class not `0x03*`. They
   MUST stay driverless in every mode.
 * **Root port**: the parent directory of `realpath /sys/bus/pci/devices/<dgpu>` (basename is a BDF). gb_power caches it
@@ -217,6 +226,8 @@ Parsing rules for every consumer: split `/proc/cmdline` on whitespace; for a rep
 | `gb.nouveau.fw=` | `535` | Adds `NvGspFw=0` to the nouveau `config=` (forces the 535.113.01 GSP fwif; verified GKI `include/nvkm/core/firmware.h:53-58`, `nvkm/subdev/gsp/tu116.c:47-48`). | gb_nouveau.sh |
 | | `570` | Accepted no-op (570.144 is the default). | gb_nouveau.sh |
 | | other | Ignored, logged. | gb_nouveau.sh |
+| `gb.nouveau.model=` | `any` | (wave 6, B-4) Turns the TU117 model gate (2.2) off for this boot: the dGPU is tried whatever its device id, exactly as before the gate (one log line). For a first boot where the gate would be wrong; never in an entry file. | gb_nouveau.sh |
+| | other | Ignored, logged; the gate stays on. | gb_nouveau.sh |
 | `gb.gfxdriver=` | any | **(v1.2) Retired.** No component reads the token any more (`gb_gfxdriver.sh` is not shipped, the gfxtest entry is gone). The v1.1 text of this row follows for reference only. | none |
 | | `1` (v1.1 only) | P8 experiment: at post-fs-data `gb_gfxdriver.sh` sets `ro.gfx.driver.0` and `vendor.gb.gfxdriver=on` and creates the root-only flag `/dev/gb_dgpu/gfxdriver`, but only if the driver APK exists. Nothing else reads the raw token. The P8 gate everywhere else is **`vendor.gb.gfxdriver=on` AND the flag file** (the property alone is untrusted, section 4): nouveau render node 0666 (gb_nouveau.sh and gb_power alike), status field `gfxdriver`. The shim keys on the property (it cannot read `/dev/gb_dgpu`; a spoofed property only lets that app try NVK, the node mode still refuses it). The `foreign` flag at load is set on the property OR the file (safe direction). Any other value = off. | gb_gfxdriver.sh (only reader of the token) |
 | `module_blacklist=` | comma list | If **any** occurrence lists `nouveau`: same as `gb.nouveau=0` (and the kernel refuses the module anyway). Not last-wins, unlike the other keys (fail safe). | gb_nouveau.sh, gb_power (status) |
@@ -269,7 +280,7 @@ property: it is the file `/dev/gb_dgpu/wedged` (plus gb_power's in-memory copy),
 | `persist.vendor.gb.gfx_mode` | 26 | `auto`, `intel`, `nvidia`; unset or any other value = `auto` (D1) | gb_power (`set-mode`, `enable` = auto, `disable` = intel, rebind failure and unclean NVIDIA sessions = intel), gb_nouveau.sh (`intel` on crash-loop, unhealthy load, killed insmod), user (adb) | gb_nouveau.sh (`gfx_mode()`), init rc (15.1), gb_power | (v1.2) The user's graphics mode (22.2). |
 | `persist.vendor.gb.gfx_apps` | 26 | `games`, `all`; unset or other = `games` (D3) | gb_power (`set-app-policy`), user (adb) | gb_power | (v1.2) Which apps render on NVIDIA in auto/nvidia: games + the apps marked "Use NVIDIA", or every launchable non-system app (24.3). |
 | `vendor.gb.gfx_active` | 20 | `intel`, `nvidia`; unset = `intel` | gb_power (only) | shim (per `vkCreateInstance`), report, bootlog | (v1.2) What newly created app Vulkan instances get (23.2). An app that sets it gains nothing: the render node stays 0660 unless gb_power itself derived `nvidia` (23.5). |
-| `vendor.gb.gfx_reason` | 20 | `ok`, `nopkg`, `nodtx`, `kill`, `test`, `crashloop`, `wedged`, `fault`, `mode`, `detached`, `detaching`, `loading`, `nodriver`, `untested`, `testerror`, `selftest` | gb_power (only) | report, bootlog (GbGpu reads it from the status object) | (v1.2) Why `gfx_active` is `intel` (`ok` when `nvidia`), 23.2. |
+| `vendor.gb.gfx_reason` | 20 | `ok`, `nopkg`, `nodtx`, `kill`, `test`, `crashloop`, `wedged`, `fault`, `mode`, `detached`, `detaching`, `loading`, `nodriver`, (wave 6) `model`, `untested`, `testerror`, `selftest` | gb_power (only) | report, bootlog (GbGpu reads it from the status object) | (v1.2) Why `gfx_active` is `intel` (`ok` when `nvidia`), 23.2. |
 | `vendor.gb.gfx_test` | 18 | `none`, `pending`, `running`, `pass`, `fail`, `error` | gb_power (only) | report, bootlog | (v1.2) Self-test progress for the current identity (25.4). |
 | `persist.vendor.gb.gfx_ok` | 24 | `1`, `0`, empty | gb_power (only) | report, user | (v1.2) **Mirror** of the validated self-test record (25.4). Never an input: gb_power ignores it (D4, review D1B-3). |
 | `vendor.gb.power.api` | 19 | `1` | gb_power | UI, tests | Control socket is listening, protocol version 1. |
@@ -647,13 +658,14 @@ and after a failed or skipped kernel rebind. It is a load window exactly like an
 
 1. `init.svc.gb_nouveau_off` reads `running`: wait up to 30 s for it to stop; still running: `result=refused:off`, set
    `booted`, exit 1 (gb_power re-issues the start later, 23.7). (The property only makes the script wait.)
-2. Guards `i915`, `nodgpu`, `bar` (each `refused:<guard>`, set `booted`, exit 1).
+2. Guards `i915`, `nodgpu`, `model` (2.2, wave 6), `bar` (each `refused:<guard>`, set `booted`, exit 1).
 3. Detach wait 15 s (`refused:detach`, the v1.1 name and wait, review B3); ESP lock 120 s (`refused:esp`, owner
    `gb_nouveau`); `loading=1`; `result=loading`; `used`.
 4. No ESP vfat mount (else `refused:esp`). Marker `mode=bind t=<s> boot=<id> argv=-` + `sync`;
    `kernel.panic=30`.
-5. Late checks right before the write: `detaching` (`refused:detach`), the dGPU still present, driverless, with its
-   BAR (`refused:nodgpu` / `refused:bar`); each removes the marker.
+5. Late checks right before the write: `detaching` (`refused:detach`), the dGPU still present, driverless, not a
+   non-TU117 model (wave 6, 2.2), with its BAR (`refused:nodgpu` / `refused:model` / `refused:bar`); each removes the
+   marker.
 6. Kernel log mark; write the BDF to `/sys/bus/pci/drivers/nouveau/bind` in a background subshell; poll every 0.5 s,
    at most 40 times (20 s), for `<dgpu>/driver` -> `nouveau`.
    * The write is still running after 20 s: the probe hangs in the kernel. Create `wedged`, `keep` and `noload`,
@@ -851,7 +863,10 @@ Load record `report/load-<N>.txt` (`key=value` lines): `mode`, `argv`, `krel`, `
 `unhealthy:dmesg`, `off-ignored`, `off-busy:<n>`, `off-wedged`, `off-unbound`, `off-done`. (v1.1 added
 `refused:noload`, `refused:boot`, `refused:detach`; `refused:marker` was NP-D5.) (v1.2 adds `refused:keep` and
 `refused:off` (7.2-v12 step 8, 7.2a step 1), `bind-failed` (7.2a step 6) and `off-skipped` (7.3); `mode` gains
-`auto`.)
+`auto`.) (Wave 6, B-4: `refused:model`, a dGPU whose well-formed `device` is not a TU117, 2.2; checked after
+7.2-v12 step 8 and before probation, again with the step-13 late checks, and in 7.2a steps 2 and 5. gb_power's
+`reconcile_on()` (23.7a) never retries it; the rc's `booted` trigger (explicit `auto`/`nvidia` mode) and a hot attach
+(23.7, once per appearance) may start `auto` again, and each such run refuses the same way with one log line.)
 
 ### 7.9 Hot attach
 
@@ -1197,6 +1212,9 @@ When the state enum or `n` changes (coalesced, at most one per 2 s, only after `
 itself. (v1.2) Also when any of `gfx_mode`, `gfx_policy`, `gfx_active`, `gfx_reason`, `gfx_test`, `pending`,
 `detach_ref`, `apps_sync`, `persist` changes (same coalescing; this also answers ux-app Q5), and once after
 `sys.boot_completed=1` while `apps_sync` is 0 (24.3).
+(Wave 6, notify) gb_notify delivers it to every running full user (12.1a); a full user that starts later (the
+person's sign-in on lapis) refreshes itself at its `BOOT_COMPLETED` (GbGpu `.UserReceiver`, 13.2), so gb_power's
+coalescing and the message are unchanged.
 
 ### 10.8 Options
 
@@ -1310,8 +1328,10 @@ runs as **user shell** (the identity `adb shell cmd notification post` uses) and
   after the attempt. Validate: `tag` in {`gb_dgpu`, `gb_dtx`, `gb_dgpu_test`}; `pkg` regex as in 9.3; titles/texts
   printable ASCII. Delivery:
   * notify: `cmd notification post -t "<title>" "<tag>" "<text>"` (same tag replaces the previous one);
+    **(wave 6) replaced by** `cmd notification post -u all -S bigtext -t "<title>" "<tag>" "<text>"` (12.1a);
   * broadcast: `am broadcast --user 0 --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED -p gb.sb3.gpu`
-    (v1.1: also reaches a force-stopped GbGpu; the intent stays explicit);
+    (v1.1: also reaches a force-stopped GbGpu; the intent stays explicit); **(wave 6) replaced by** one such
+    broadcast with `--user <u>` for every running full user `<u>` (12.1a);
   * force-stop: `am force-stop --user <user> <pkg>`;
   * (v1.2) settings: `value=` -> `timeout 20 cmd settings put global updatable_driver_all_apps <0|3>`; `src=` -> read
     `/data/vendor/gb/<src>` only if it is a regular file (not a symlink), owned by uid 0, <= 64 KiB, with <= 512 lines
@@ -1329,6 +1349,35 @@ runs as **user shell** (the identity `adb shell cmd notification post` uses) and
   the nouveau component, e.g. the VM) it logs to kmsg only. The kmsg line is the contract of WAVE3_PLAN 2.6:
   `gb_slotsync: HOLD slot <x>: <reason>; default stays gb-<cur>`.
   Failures are logged to kmsg (`gb_notify: `) and dropped.
+
+#### 12.1a (Wave 6, notify) Delivery in headless system user mode
+
+lapis runs in headless system user mode (`ro.fw.mu.headless_system_user=true`, `cmd user
+is-headless-system-user-mode` = true): user 0 is the headless "System User" (it shows the login screen) and the
+person uses a **full** user (10 on the user's VM; `pm list users`: `UserInfo{0:System User:811} running`,
+`UserInfo{10:User:412}`). Measured on the wave-6 forced OTA-gate boot and the wave-6 notify proof (w6prep area "notify", its
+RESULT.md): a shell notification without a user is posted for user 0 (`0|com.android.shell|2020|<tag>|2000`) and SystemUI hides it from user 10
+(`filter=NotCurrentUserFilter`); `am broadcast --user 0` reaches only user 0's GbGpu; `pm grant` without `--user`
+grants user 0 only; `cmd statusbar add-tile` adds to the current user's tiles. lapis's `cmd notification post` has
+`-u|--user <user_id>` (`all` = UserHandle.ALL = -1). Delivery from wave 6 on (the queue format, the validation and
+the whitelists of 12.1 are unchanged):
+
+* `kind=notify`: `timeout 20 cmd notification post -u all -S bigtext -t "<title>" "<tag>" "<text>"`: ONE record for
+  UserHandle.ALL (`-1|com.android.shell|2020|<tag>|2000`). SystemUI's other-user filter passes UserHandle.ALL, so the
+  person sees it whichever full user is in the foreground: posted at the login screen it is there after the sign-in,
+  and it stays visible across user switches. The same tag replaces it (never twice); nothing is posted for user 0.
+  `bigtext` lets the shade expand the up to 200 characters. Same rule for gb_otagate_post (build_esp
+  `GB_OTAGATE_SH`, VM tree and native without the queue).
+* `kind=broadcast`: `pm list users` (timeout 20); for each line `UserInfo{<id>:<name>:<hex flags>} running` whose
+  flags have FULL (0x400) -- never the headless system user (811), never a profile -- one
+  `timeout 20 am broadcast --user <id> --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED -p gb.sb3.gpu`
+  (id <= 4 digits, flags <= 7 hex digits, the flags are the field after the last `:`, so a user name cannot fake
+  them; at most 8 users). No running full user (the login screen before the sign-in): nothing is sent (logged); the
+  user's GbGpu refreshes at its `BOOT_COMPLETED`. `pm list users` failing: one broadcast to `--user current` (logged).
+* `kind=force-stop` (`--user` = the holder's uid / 100000) and `kind=settings` (Settings.Global is device wide) were
+  already per user / per device and stay as they are.
+* GbGpu: an instance in the headless system user ignores `STATE_CHANGED` and `BOOT_COMPLETED` (it would declare
+  `ui-caps notify` and post the detach notification where nobody sees it, and push user 0's catalog); 13.2.
 
 ### 12.2 Catalog (exact strings; `<...>` substituted, truncated to fit 200 characters)
 
@@ -1378,6 +1427,7 @@ meaning; review B2):
 (<= 40 characters). All `gb_gfx` posts replace each other (one tag), so attach/detach cycles never stack.
 
 Shell-posted notifications appear under the Shell app's notification channel (platform behaviour); that is accepted.
+(Wave 6) They are posted for UserHandle.ALL (12.1a), so they show in the person's user, not only in user 0.
 
 ### 12.3 GbGpu's own notifications
 
@@ -1389,6 +1439,8 @@ Shell-posted notifications appear under the Shell app's notification channel (pl
 | (v1.2) `gb_gpu_detach` (new) | Detach | HIGH | id 3, posted when `detach_ref` grows beyond the value the app saw last (kept in its SharedPreferences): title `Can't detach yet`, text `<labels> are using the NVIDIA GPU. Close them to detach the screen.`, actions **Close apps and detach** (HoldersActivity mode `detach`) and **Cancel** (non-exported `.ActionReceiver`, cancels id 3 only). Cancelled when `base` is not `attached` or `state` is no longer `busy:N`. D6. |
 
 Triggered by the state broadcast (10.7): the receiver queries `status` and updates. The app never duplicates N01-N14.
+(Wave 6) Each app instance posts these in its own user: the broadcast goes to every running full user and a user that
+signs in later refreshes at its `BOOT_COMPLETED` (12.1a); the instance in the headless system user posts nothing.
 (v1.2) Except: when the app has declared `ui-caps notify` (26.1), its `gb_gpu_detach` notification replaces N08.
 
 ---
@@ -1421,6 +1473,10 @@ Triggered by the state broadcast (10.7): the receiver queries `status` and updat
 * Components (class names relative to `gb.sb3.gpu`):
   * `.GpuTileService`: QS tile, label `NVIDIA GPU`, meta-data `android.service.quicksettings.TOGGLEABLE_TILE=true`
     and `android.service.quicksettings.ACTIVE_TILE=true`; uses `watch` while listening; state per 8.3.
+    **(Wave 6, notify) no `ACTIVE_TILE` any more**: lapis 276.R4's SystemUI drops `TileService.requestListeningState`
+    for it (`TileServices: Couldn't find tile for ComponentInfo{gb.sb3.gpu/gb.sb3.gpu.GpuTileService}(10)`), so the
+    tile showed fresh state only while SystemUI happened to keep it bound. A normal tile is bound whenever the Quick
+    Settings panel is shown (then `watch`, capped at 5 min per listening period); the request is still sent.
   * `.DetachTileService` (optional): label `Detach screen`; tap -> `detach-request`; UNAVAILABLE when `base` is not
     `attached` or `dtx` is `n/a`.
   * `.SettingsActivity`: exported, intent filter `com.android.settings.action.IA_SETTINGS`, meta-data
@@ -1438,6 +1494,15 @@ Triggered by the state broadcast (10.7): the receiver queries `status` and updat
   android.permission.POST_NOTIFICATIONS` (ignore failure); if `/data/vendor/gb/ui/tile_added` is absent (v1.1 path; the
   directory is shell's own, created by `gb_gpu_ui.rc`): `cmd statusbar add-tile gb.sb3.gpu/.GpuTileService` and create
   the marker (one time only; a user removal is respected).
+  **(Wave 6, notify) per user** (12.1a): `pm grant --user <u> ...` for every full user every boot; then wait (at most
+  180 checks of `am get-current-user`, 10 s apart) for a full user in the foreground (the sign-in), grant again for it
+  and, if `/data/vendor/gb/ui/tile_added.<u>` is absent, `cmd statusbar add-tile` (it goes to the current user's tiles)
+  and create that marker (0644; only after add-tile succeeded; a user removal is respected per user). The v1.1 marker
+  `tile_added` recorded an add to user 0's tiles: ignored and kept.
+* (Wave 6, notify) `.UserReceiver` (`android:exported="false"`, action `android.intent.action.BOOT_COMPLETED` only,
+  permission `RECEIVE_BOOT_COMPLETED`, normal): at each user's unlock it runs the same refresh as `.StateReceiver`
+  (`status`, notifications 12.3, tile, `ui-caps`, catalog when `apps_sync` = 0). `.StateReceiver` and `.UserReceiver`
+  do nothing in the headless system user (`UserManager.isHeadlessSystemUserMode()` and `isSystemUser()`).
 
 **(v1.2) GbGpu changes** (details in section 27; the component names stay, so the QS tile a user added stays added):
 * Permissions: `POST_NOTIFICATIONS` (as v1.1) plus `android.permission.QUERY_ALL_PACKAGES` (normal protection level,
@@ -2254,7 +2319,7 @@ in `setup()` at process start (`a17 GraphicsEnvironment.java:52-54, 140`), and t
 | 9 | not `attached` | intel | `detached` |
 | 10 | `state` = `detaching`, or not `ec_ready`, or `pending` = `detach` | intel | `detaching` |
 | 11 | `loading` | intel | `loading` |
-| 12 | not `bound` | intel | `nodriver` |
+| 12 | not `bound` | intel | `nodriver`; (wave 6, B-4) `model` when the dGPU is present and `vendor.gb.nouveau.result` = `refused:model` |
 | 13 | `gfx_ok` = -1 | intel | `untested` (the self-test is or will be scheduled, 25.2) |
 | 14 | `gfx_ok` = -2 | intel | `testerror` |
 | 15 | `gfx_ok` = 0 | intel | `selftest` |
@@ -2354,7 +2419,8 @@ In every status tick after the hot attach: `setprop ctl.start gb_nouveau` when a
 (`mode` != `intel`, or a `once`/`test` boot); the dGPU present, driverless, with a BAR; `attached`; not `kill`, not
 `recovered`, not wedged, no fault; no rebind watch, no decision, no pending detach, EC ready;
 `vendor.gb.nouveau.booted` = 1; `vendor.gb.nouveau.result` is not one that a retry cannot change (`insmod-failed:*`,
-`refused:i915`, `refused:hw`, `refused:module`; a spoofed value can only suppress a start); neither `gb_nouveau` nor
+`refused:i915`, `refused:hw`, `refused:module`, (wave 6, B-4b) `refused:model`; a spoofed value can only suppress a
+start); neither `gb_nouveau` nor
 `gb_nouveau_off` read `running`, and 10 s have passed since the last tick that saw one of them running, since
 gb_power's own last start of `gb_nouveau` and since gb_power's first tick; and fewer than 3 `gb_nouveau` starts this
 boot (shared with 23.7). The script's own guards (7.2-v12, 7.2a) run again. This re-issues the start after an
@@ -2836,9 +2902,10 @@ Label `Graphics`. First matching row wins (status fields, 9.5):
 | 14 | `gfx_reason` = `untested` | INACTIVE | `Intel (testing NVIDIA)` | `NVIDIA unavailable - testing` |
 | 15 | `gfx_reason` = `testerror` | INACTIVE | `Intel (NVIDIA test not run)` | `NVIDIA unavailable - test not run` |
 | 16 | `gfx_reason` = `selftest` | INACTIVE | `Intel (NVIDIA test failed)` | `NVIDIA unavailable - test failed` |
-| 17 | otherwise | INACTIVE | `Intel` | `NVIDIA unavailable - not ready` |
+| 17 | `gfx_reason` = `model` (wave 6, B-4) | INACTIVE | `Intel (NVIDIA not supported)` | `NVIDIA unavailable - not supported` |
+| 18 | otherwise | INACTIVE | `Intel` | `NVIDIA unavailable - not ready` |
 
-* **Tap** (rows 3-17; rows 1-2 are UNAVAILABLE, which SystemUI does not deliver): `set-mode <next>` with the cycle
+* **Tap** (rows 3-18; rows 1-2 are UNAVAILABLE, which SystemUI does not deliver): `set-mode <next>` with the cycle
   Auto -> Intel -> NVIDIA -> Auto, starting from `gfx_mode` (unset/unknown = auto). Never a dialog. Toasts (exact):
   `next-boot` -> `Takes effect after restart`; `next-attach` -> `Takes effect when the keyboard base is attached`;
   `pending` -> `Switching to Intel when apps on NVIDIA close`; `now` -> none. Locked device: `unlockAndRun` (as v1.1).
@@ -2853,7 +2920,8 @@ Top to bottom, exact labels:
    whenever the keyboard base is attached`). Selecting sends `set-mode`; effects as the tile's toasts; `pending` shows
    the line `<labels> still use the NVIDIA GPU.` and a `Close apps` button (HoldersActivity mode `intel`).
 2. **Status:** `Apps you open now use: NVIDIA` or `Apps you open now use: Intel (<reason text>)` (27.6).
-3. **NVIDIA GPU:** `asleep (D3cold)` / `active` / `no driver` / `not connected`, plus `, used by <N> app(s): <labels>`.
+3. **NVIDIA GPU:** `asleep (D3cold)` / `active` / `no driver` / `not connected`, plus `, used by <N> app(s): <labels>`;
+   (wave 6, B-4) `not supported (no driver)` instead of `no driver` when `gfx_reason` = `model`.
 4. **Self-test:** `Passed on <date>` / `Failed on <date>: <reason>` / `Not run yet` / `Running...` / `Could not run:
    <reason>`; button `Run self-test again`, enabled when `gfx_cap` 1, `gfx_mode` not `intel`, `state` `standby` or
    `busy:N`, `gfx_test` not `running`, no `pending`, not wedged or fault.
@@ -2925,6 +2993,7 @@ every refusal as before.
 | `detaching` | `Intel (preparing to detach)` |
 | `loading` | `Intel (starting NVIDIA)` |
 | `nodriver` | `Intel (NVIDIA driver not running)` |
+| `model` | `Intel (this NVIDIA GPU is not supported)` |
 | `untested` | `Intel (testing NVIDIA)` |
 | `testerror` | `Intel (NVIDIA test could not run)` |
 | `selftest` | `Intel (NVIDIA self-test failed)` |
@@ -3080,3 +3149,18 @@ LOW findings L1-L5. Normative text is edited in place and marked "(r4)" / "(Wave
 
 Not changed: every other rule of 5.4 (the holder table, the 600 s rules, the ESP-mount check before insmod), the
 queue format of 12.1, and N01-N21.
+
+## 32. Wave 6 errata (v1.2 r5, 2026-10-30)
+
+Source: readiness audit B-4 (`C:\GB-build\native\readiness\B-display-dgpu.md`), the wave-5 display fix prep (its
+fail-closed gate was deferred by the wave-5 integrator because it put a new refusal in front of probation on the 13.5"
+target) and its LOW finding on gb_power's retries (B-4b). Normative text is edited in place and marked "(wave 6)".
+
+| # | Change (sections) | Source | Components |
+|---|---|---|---|
+| E-17 | TU117 model gate: a well-formed dGPU `device` outside `0x1f80`-`0x1fff` gives `refused:model` before probation and any write; an unreadable or malformed id is not gated (one warning line, the pre-gate behaviour); boot-menu override `gb.nouveau.model=any` (3); late checks in the insmod and bind windows (2.2, 3, 7.2a, 7.8) | readiness B-4; wave-5 deferral | nouveau-policy |
+| E-18 | `reconcile_on()` never retries `refused:model` (23.7a); a new appearance of a dGPU still gets its one hot-attach start (23.7) | display review LOW (B-4b) | gb-power |
+| E-19 | `gfx_reason` = `model` in 23.2 row 12 when the dGPU is present and the result is `refused:model` (4, 23.2); GbGpu tile row 17 `Intel (NVIDIA not supported)` / `NVIDIA unavailable - not supported` (the old row 17 is row 18), status text (27.6) and GPU line `not supported (no driver)` (27.1, 27.2) | readiness B-4 (a clear message instead of "NVIDIA GPU problem") | gb-power, gpu-ui |
+
+Not changed: every other refusal and its retry rule, the rc (15.1-v12), the notification catalog (no notification is
+posted for `refused:model`), the status object's fields (9.5; only a new `gfx_reason` value).

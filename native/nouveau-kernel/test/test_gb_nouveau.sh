@@ -1196,9 +1196,11 @@ if want NP-20; then
   run gb_notify.sh
   check "exit 0" eq "$RC" 0
   check "exactly 2 notification posts" eq "$(nlines "$T/log/cmd.log")" 2
-  check "first post exact (queue order)" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-t|NVIDIA GPU is in use|gb_dgpu|Close nvk_probe to switch the NVIDIA GPU off.|"
-  check "second post exact" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-t|Ready to detach|gb_dtx|You can remove the screen now.|"
-  check "broadcast delivered (also to a stopped GbGpu)" has "$T/log/am.log" "broadcast|--user|0|--include-stopped-packages|-a|gb.sb3.gpu.action.STATE_CHANGED|-p|gb.sb3.gpu|"
+  check "first post exact (queue order)" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|NVIDIA GPU is in use|gb_dgpu|Close nvk_probe to switch the NVIDIA GPU off.|"
+  check "second post exact" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|Ready to detach|gb_dtx|You can remove the screen now.|"
+  check "broadcast delivered to the running full user 10 (also to a stopped GbGpu)" has "$T/log/am.log" "broadcast|--user|10|--include-stopped-packages|-a|gb.sb3.gpu.action.STATE_CHANGED|-p|gb.sb3.gpu|"
+  check "no broadcast to the headless system user 0 (wave 6)" hasnt "$T/log/am.log" "broadcast|--user|0|"
+  check "the user list was read once (one broadcast message)" eq "$(grep -c '^list|users|$' "$T/log/pm.log")" 1
   check "valid force-stop delivered" has "$T/log/am.log" "force-stop|--user|10|com.example.game|"
   check "bad package dropped" hasnt "$T/log/am.log" "rm -rf"
   check "am called twice" eq "$(nlines "$T/log/am.log")" 2
@@ -1950,14 +1952,76 @@ if want NP-1B-17; then
   check "opt-out written" eq "$(cat "$K")" "settings|put|global|$OO|com.example.intel1,com.example.intel2|"
 fi
 
+# (wave 6, notify) headless system user mode: notices for UserHandle.ALL, state broadcasts per running full user
+if want NP-W6-NOTIFY; then
+  new_case NP-W6-NOTIFY
+  Q=$R/data/vendor/gb/notify
+  bq() { printf 'kind=broadcast\n' > "$Q/1792900000$1-50-$1.msg"; }
+  # 1: three running full users (10, 11, 12), a profile (13), the headless user 0, a stopped full user (14); a name
+  #    holding ':' and '}' (the flags are the field after the last ':')
+  printf '%s\n' '	UserInfo{0:System User:811} running' '	UserInfo{10:Pe:rs}on:412} running' \
+    '	UserInfo{11:Second:412} running' '	UserInfo{12:Guest:414} running' '	UserInfo{13:Work:1030} running' \
+    '	UserInfo{14:Stopped:412}' '	UserInfo{15:x:412} running:10} running' '	UserInfo{1x:Bad:412} running' \
+    > "$T/ctl/users"
+  bq 101
+  run gb_notify.sh
+  check "exit 0" eq "$RC" 0
+  check "broadcast to 10, 11, 12 in list order, nothing else" eq "$(tr '\n' ' ' < "$T/log/am.log")" \
+    "broadcast|--user|10|--include-stopped-packages|-a|gb.sb3.gpu.action.STATE_CHANGED|-p|gb.sb3.gpu| broadcast|--user|11|--include-stopped-packages|-a|gb.sb3.gpu.action.STATE_CHANGED|-p|gb.sb3.gpu| broadcast|--user|12|--include-stopped-packages|-a|gb.sb3.gpu.action.STATE_CHANGED|-p|gb.sb3.gpu| "
+  # 2: only the headless user runs (the login screen before the sign-in): nothing sent, logged, GbGpu refreshes later
+  printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412}\n' > "$T/ctl/users"
+  : > "$T/log/am.log"
+  bq 102
+  run gb_notify.sh
+  check "login screen only: no broadcast" eq "$(nlines "$T/log/am.log")" 0
+  check "login screen only: logged" has "$R/dev/kmsg" "no running full user: state broadcast 1792900000102-50-102.msg skipped"
+  # 3: pm list users fails: one broadcast to --user current, logged
+  : > "$T/ctl/pm_fail"
+  : > "$T/log/am.log"
+  bq 103
+  run gb_notify.sh
+  rm -f "$T/ctl/pm_fail"
+  check "no user list: one broadcast to --user current" eq "$(cat "$T/log/am.log")" "broadcast|--user|current|--include-stopped-packages|-a|gb.sb3.gpu.action.STATE_CHANGED|-p|gb.sb3.gpu|"
+  check "no user list: logged" has "$R/dev/kmsg" "pm list users failed: state broadcast 1792900000103-50-103.msg sent to --user current"
+  # 4: am broadcast fails: logged per user, the message is still deleted, the next message is delivered
+  rm -f "$T/ctl/users"
+  : > "$T/ctl/am_fail"
+  : > "$T/log/am.log"
+  bq 104
+  printf 'kind=notify\ntag=gb_dgpu\ntitle=t\ntext=x\n' > "$Q/1792900000105-50-105.msg"
+  run gb_notify.sh
+  rm -f "$T/ctl/am_fail"
+  check "broadcast failure logged (user 10)" has "$R/dev/kmsg" "am broadcast failed for 1792900000104-50-104.msg (user 10)"
+  check "after a failed broadcast the notice is still posted" has "$T/log/cmd.log" "notification|post|-u|all|-S|bigtext|-t|t|gb_dgpu|x|"
+  check "queue empty" eq "$(nmsg)" 0
+  # 5: every notice is posted for UserHandle.ALL, exactly once, never without -u all
+  : > "$T/log/cmd.log"
+  printf 'kind=notify\ntag=gb_update\ntitle=System update held\ntext=-u 0 starts like an option\n' > "$Q/1792900000106-50-106.msg"
+  run gb_notify.sh
+  check "one post, for all users, text kept as one argument" eq "$(cat "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|System update held|gb_update|-u 0 starts like an option|"
+  check "never a post without -u all" eq "$(grep -c '^notification|post|' "$T/log/cmd.log")" "$(grep -c '^notification|post|-u|all|' "$T/log/cmd.log")"
+  # 6: a message gb_notify cannot read (a root producer without umask 022: the notify proof found gb_otagate's 0600)
+  printf 'kind=notify
+tag=gb_dgpu
+title=t
+text=x
+' > "$Q/1792900000107-50-107.msg"
+  chmod 0000 "$Q/1792900000107-50-107.msg"
+  : > "$T/log/cmd.log"
+  run gb_notify.sh
+  check "unreadable message: dropped and logged" has "$R/dev/kmsg" "dropped 1792900000107-50-107.msg: not readable by gb_notify (12.1: mode 0644)"
+  check "unreadable message: nothing posted" eq "$(nlines "$T/log/cmd.log")" 0
+  check "unreadable message: deleted all the same" eq "$(nmsg)" 0
+fi
+
 if want NP-1B-18; then
   new_case NP-1B-18
   Q=$R/data/vendor/gb/notify
   printf 'kind=notify\ntag=gb_gfx\ntitle=Performance base connected\ntext=NVIDIA graphics on for apps you open now. Restart apps that are already open to switch them.\n' > "$Q/1792900000001-30-1.msg"
   printf 'kind=notify\ntag=gb_gfx\ntitle=Tablet mode - Intel graphics\ntext=Apps use Intel graphics while the keyboard base is detached. Reattach it to use NVIDIA graphics again.\n' > "$Q/1792900000002-30-2.msg"
   run gb_notify.sh
-  check "N16 posted under gb_gfx" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-t|Performance base connected|gb_gfx|NVIDIA graphics on for apps you open now. Restart apps that are already open to switch them.|"
-  check "N17 posted under gb_gfx" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-t|Tablet mode - Intel graphics|gb_gfx|Apps use Intel graphics while the keyboard base is detached. Reattach it to use NVIDIA graphics again.|"
+  check "N16 posted under gb_gfx" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|Performance base connected|gb_gfx|NVIDIA graphics on for apps you open now. Restart apps that are already open to switch them.|"
+  check "N17 posted under gb_gfx" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|Tablet mode - Intel graphics|gb_gfx|Apps use Intel graphics while the keyboard base is detached. Reattach it to use NVIDIA graphics again.|"
 fi
 
 if want NP-W3-01; then                            # wave 3 (lead decision D-a): tag gb_update, gb_slotsync's N22/N23
@@ -1980,8 +2044,8 @@ text=x
 ' > "$Q/1792900000003-40-3.msg"
   run gb_notify.sh
   check "exit 0" eq "$RC" 0
-  check "N22 posted under gb_update" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-t|System update held|gb_update|Kernel mismatch: the update (slot B) needs kernel 6.18-android17-6, this system runs 6.18-android17-5. Startup stays on slot A; (slot B) is in the boot menu.|"
-  check "N23 posted under gb_update" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-t|System update held|gb_update|Kernel check failed: the kernel version of the update (slot B) could not be checked. Startup stays on slot A; (slot B) is in the boot menu.|"
+  check "N22 posted under gb_update" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|System update held|gb_update|Kernel mismatch: the update (slot B) needs kernel 6.18-android17-6, this system runs 6.18-android17-5. Startup stays on slot A; (slot B) is in the boot menu.|"
+  check "N23 posted under gb_update" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|System update held|gb_update|Kernel check failed: the kernel version of the update (slot B) could not be checked. Startup stays on slot A; (slot B) is in the boot menu.|"
   check "exactly 2 posts (gb_updates is not a tag)" eq "$(nlines "$T/log/cmd.log")" 2
   check "the near-miss tag is dropped and logged" has "$R/dev/kmsg" "1792900000003-40-3.msg: bad tag"
   check "no .msg left" eq "$(nmsg)" 0
@@ -2448,6 +2512,179 @@ if want NP-W3-03; then                            # wave 3: ESP lock r4 (INTERFA
   mkdir -p "$R/dev/gb_esp.lock.stale.4252" "$R/proc/4252"
   st
   check "selftest: one lock mkdir after the back-offs, passed" eq "$(nlines "$T/log/lockmkdir.log")/$(recv verdict)" 1/pass
+fi
+
+# ================================================================= NP-B4 (wave 6, readiness B-4): TU117 device-id gate
+# The image has nvidia/tu117 firmware only. A 15-inch Surface Book 3 (TU116 GTX 1660 Ti 0x2191, TU106 Quadro RTX 3000
+# 0x1f36) must end in refused:model before any write: no marker, lock, payload, insmod or bind, no notification, the
+# graphics mode untouched, one clear log line. Every TU117 id (0x1f80-0x1fff, any hex case) still loads, and (wave 6)
+# an unreadable or malformed id is not gated: it loads exactly as before the gate, with one warning line.
+set_dev() { printf '%s\n' "$1" > "$(readlink -f "$R/sys/bus/pci/devices/0000:02:00.0")/device"; }
+no_write() {                             # nothing of the load window happened
+  _nw=
+  [ -e "$T/log/insmod.log" ] && _nw="$_nw insmod"
+  [ -s "$T/log/mount.log" ] && _nw="$_nw mount"
+  [ -s "$T/log/lockmkdir.log" ] && _nw="$_nw lock"
+  [ -s "$T/log/sync.log" ] && _nw="$_nw sync(marker)"
+  grep -q '^vendor.gb.nouveau.loading=' "$T/log/setprop.log" 2>/dev/null && _nw="$_nw loading"
+  grep -q '^vendor.gb.nouveau.used=' "$T/log/setprop.log" 2>/dev/null && _nw="$_nw used"
+  [ -z "$_nw" ] || { printf '     load-window activity:%s\n' "$_nw"; return 1; }
+}
+
+if want NP-B4; then
+  for _x in 0x2191:TU116:auto 0x21d1:TU116:nvidia 0x1f36:TU106:auto 0x1f76:TU106:auto 0x1e90:-:auto; do
+    _id=${_x%%:*}
+    _c=${_x#*:}
+    _gm=${_c#*:}
+    _c=${_c%%:*}
+    new_case "NP-B4-$_id"
+    set_dev "$_id"
+    [ "$_gm" = nvidia ] && setp persist.vendor.gb.gfx_mode nvidia
+    np auto
+    check "$_c $_id: refused:model, exit 1" eq "$(prop vendor.gb.nouveau.result)/$RC" refused:model/1
+    check "no load-window activity" no_write
+    check "no nouveau insmod, no bind write" eq "$(nins)/$(nlines "$T/log/bind.log")" 0/0
+    check "no marker" absent "$R/data/vendor/gb/nouveau.loading"
+    check "no notification queued" eq "$(nmsg)" 0
+    check "graphics mode untouched" eq "$(prop persist.vendor.gb.gfx_mode)" "$([ "$_gm" = nvidia ] && echo nvidia)"
+    check "no noload/keep flag (nothing failed)" eq "$(find "$R/dev/gb_dgpu" -mindepth 1 | wc -l | tr -d ' ')" 0
+    check "booted=1 (the runtime triggers are armed, like refused:nodgpu)" eq "$(prop vendor.gb.nouveau.booted)" 1
+    check "panic settings untouched" eq "$(cat "$R/proc/sys/kernel/panic")/$(cat "$R/proc/sys/kernel/panic_on_oops")" 0/1
+    check "no dmesg stream requested" eq "$(prop vendor.gb.dgpu.dmesg)" ""
+    check "no probation line (refused before it)" hasnt "$R/dev/kmsg" "probation"
+    [ "$_c" = - ] && _c=
+    check "one clear log line" eq "$(grep -c "guard: 0000:02:00.0 is NVIDIA $_id${_c:+ $_c}, not the 13.5-inch Surface Book 3's TU117: this image has no firmware for it; nouveau is not loaded, the dGPU stays powered off (Intel graphics only)" "$R/dev/kmsg")" 1
+    check "result logged" has "$R/dev/kmsg" "gb_nouveau: result=refused:model"
+  done
+
+  new_case NP-B4-test-mode                        # gb.nouveau=test (the [NVIDIA test] entry) on a 15-inch
+  set_dev 0x2191
+  cmdline gb.nouveau=test
+  np auto
+  check "test boot: refused:model, nothing written, panic_on_oops kept" \
+    eq "$(prop vendor.gb.nouveau.result)/$(nins)/$(cat "$R/proc/sys/kernel/panic_on_oops")" refused:model/0/1
+  check "test boot: no load-window activity" no_write
+
+  new_case NP-B4-unreadable                       # no device attribute: not gated (fail open, wave 6)
+  rm -f "$(readlink -f "$R/sys/bus/pci/devices/0000:02:00.0")/device"
+  cmdline gb.nouveau=once
+  np auto
+  check "device id unreadable: loads as before the gate (clean, one nouveau insmod)" \
+    eq "$(prop vendor.gb.nouveau.result)/$(nins)" clean/1
+  check "one fail-open line for the early and the late check together" \
+    eq "$(grep -c "model gate: 0000:02:00.0 device id '' is unreadable or malformed: not gated" "$R/dev/kmsg")" 1
+  check "no refusal line" hasnt "$R/dev/kmsg" "not the 13.5-inch"
+  check "no refused:model at any point" eq "$(results | grep -c refused:model)" 0
+  new_case NP-B4-unreadable-auto                  # the same in plain Auto (probation runs as before)
+  rm -f "$(readlink -f "$R/sys/bus/pci/devices/0000:02:00.0")/device"
+  np auto
+  check "Auto, unreadable id: probation 1/3 and a clean load as before" \
+    eq "$(prop vendor.gb.nouveau.result)/$(nins)/$(grep -c 'probation 1/3' "$R/dev/kmsg")" clean/1/1
+  for _id in "" garbage 0x219 0x21910 0X2191 2191 " 0x2191" "0x2191 " 0x2g91; do   # never printed by the kernel
+    new_case "NP-B4-malformed-$(printf '%s' "$_id" | tr -c '0-9A-Za-z' '_')"
+    set_dev "$_id"
+    cmdline gb.nouveau=once
+    np auto
+    check "malformed id '$_id': not gated, loads (clean, one insmod)" eq "$(prop vendor.gb.nouveau.result)/$(nins)" clean/1
+    check "malformed id '$_id': one fail-open line" eq "$(grep -c 'is unreadable or malformed: not gated' "$R/dev/kmsg")" 1
+  done
+  new_case NP-B4-unreadable-bind                  # bind path (nouveau loaded), unreadable id: binds as before
+  rm -f "$(readlink -f "$R/sys/bus/pci/devices/0000:02:00.0")/device"
+  mod_only
+  np auto
+  check "bind path, unreadable id: bound as before (loading healthy clean), one bind write" \
+    eq "$(results)/$(nlines "$T/log/bind.log")" "loading healthy clean /1"
+  check "bind path, unreadable id: one fail-open line, no refusal" \
+    eq "$(grep -c 'is unreadable or malformed: not gated' "$R/dev/kmsg")/$(grep -c 'not the 13.5-inch' "$R/dev/kmsg")" 1/0
+
+  new_case NP-B4-override                         # gb.nouveau.model=any (boot menu, this boot only): gate off
+  set_dev 0x2191
+  cmdline gb.nouveau=once gb.nouveau.model=any
+  np auto
+  check "override: a 15-inch id is tried as before the gate (clean in the fake tree, one nouveau insmod)" \
+    eq "$(prop vendor.gb.nouveau.result)/$(nins)" clean/1
+  check "override: one 'gate off' line, no refusal line" \
+    eq "$(grep -c 'model gate: off for this boot (gb.nouveau.model=any)' "$R/dev/kmsg")/$(grep -c 'not the 13.5-inch' "$R/dev/kmsg")" 1/0
+  new_case NP-B4-override-bind                    # the same on the bind path
+  set_dev 0x1f36
+  mod_only
+  cmdline gb.nouveau.model=any
+  np auto
+  check "override, bind path: bound as before (loading healthy clean), one bind write" \
+    eq "$(results)/$(nlines "$T/log/bind.log")" "loading healthy clean /1"
+  new_case NP-B4-override-bad                     # any other value: the gate stays on, the value is logged
+  set_dev 0x2191
+  cmdline gb.nouveau=once gb.nouveau.model=yes
+  np auto
+  check "gb.nouveau.model=yes: still refused:model, no insmod" eq "$(prop vendor.gb.nouveau.result)/$(nins)" refused:model/0
+  check "gb.nouveau.model=yes: logged as ignored" has "$R/dev/kmsg" "ignored gb.nouveau.model value 'yes'"
+  new_case NP-B4-override-last                    # the last occurrence wins, like every other key
+  set_dev 0x2191
+  cmdline gb.nouveau=once gb.nouveau.model=any gb.nouveau.model=0
+  np auto
+  check "gb.nouveau.model=any then =0: the gate is on (refused:model)" eq "$(prop vendor.gb.nouveau.result)" refused:model
+  new_case NP-B4-override-kill                    # the kill switch still wins
+  set_dev 0x2191
+  cmdline gb.nouveau=0 gb.nouveau.model=any
+  np auto
+  check "gb.nouveau=0 with gb.nouveau.model=any: disabled, no insmod" eq "$(prop vendor.gb.nouveau.result)/$(nins)" disabled/0
+
+  new_case NP-B4-retry                            # re-runs (rc booted trigger, hot attach): the same refusal each time
+  set_dev 0x2191
+  np auto
+  np auto
+  np auto
+  check "every run refused:model, the same line each time" \
+    eq "$(results)/$(grep -c 'is NVIDIA 0x2191 TU116, not the 13.5-inch' "$R/dev/kmsg")" "refused:model refused:model refused:model /3"
+  check "booted set once, no notification, no flag" \
+    eq "$(grep -c '^vendor.gb.nouveau.booted=' "$T/log/setprop.log")/$(nmsg)/$(find "$R/dev/gb_dgpu" -mindepth 1 | wc -l | tr -d ' ')" 1/0/0
+
+  new_case NP-B4-hda-only                         # the TU116's audio function alone: still refused:nodgpu
+  rm -f "$R/sys/bus/pci/devices/0000:02:00.0"
+  np auto
+  check "no display-class function: refused:nodgpu as before" eq "$(prop vendor.gb.nouveau.result)" refused:nodgpu
+
+  new_case NP-B4-bind                             # nouveau already loaded (bind path, 7.2a) on a 15-inch
+  set_dev 0x2191
+  mod_only
+  np auto
+  check "bind path: refused:model, exit 1" eq "$(prop vendor.gb.nouveau.result)/$RC" refused:model/1
+  check "bind path: no bind write" nobindw
+  check "bind path: no marker, no lock, loading never set" no_write
+  check "bind path: logged" has "$R/dev/kmsg" "guard: 0000:02:00.0 is NVIDIA 0x2191 TU116, not the 13.5-inch"
+
+  for _id in 0x1f91 0x1f99 0x1F9D 0x1fdd 0x1f80 0x1fff 0x1FB8; do   # TU117: unchanged behaviour (any hex case)
+    new_case "NP-B4-tu117-$_id"
+    set_dev "$_id"
+    cmdline gb.nouveau=once
+    np auto
+    check "TU117 $_id loads (clean, one nouveau insmod)" eq "$(prop vendor.gb.nouveau.result)/$(nins)" clean/1
+    check "TU117 $_id: no model line" hasnt "$R/dev/kmsg" "not the 13.5-inch"
+  done
+  for _id in 0x1f7f 0x2000 0x1e00 0x2180 0x10fa; do                # just outside the block, and the HDA id
+    new_case "NP-B4-edge-$_id"
+    set_dev "$_id"
+    cmdline gb.nouveau=once
+    np auto
+    check "$_id is not a TU117: refused:model, no insmod" eq "$(prop vendor.gb.nouveau.result)/$(nins)" refused:model/0
+  done
+
+  new_case NP-B4-late-insmod                      # the id changes inside the load window (after the marker)
+  printf '0x2191\n' > "$T/ctl/model_on_marker"
+  cmdline gb.nouveau=once
+  np auto
+  check "late: refused:model, nouveau.ko never" eq "$(prop vendor.gb.nouveau.result)/$(nins)" refused:model/0
+  check "late: marker removed (nothing probed), lock released, loading=0" \
+    eq "$(test -e "$R/data/vendor/gb/nouveau.loading" && echo M)$(test -e "$R/dev/gb_esp.lock" && echo L)$(prop vendor.gb.nouveau.loading)" 0
+  check "late: logged" has "$R/dev/kmsg" "guard: 0000:02:00.0 is NVIDIA 0x2191 TU116, not the 13.5-inch"
+
+  new_case NP-B4-late-bind                        # the same inside the bind window
+  mod_only
+  printf '0x1f36\n' > "$T/ctl/model_on_marker"
+  np auto
+  check "late bind: refused:model, no bind write" eq "$(prop vendor.gb.nouveau.result)/$(nobindw && echo none)" refused:model/none
+  check "late bind: marker removed, lock released" \
+    eq "$(test -e "$R/data/vendor/gb/nouveau.loading" && echo M)$(test -e "$R/dev/gb_esp.lock" && echo L)" ""
 fi
 
 if want NP-24; then

@@ -367,6 +367,11 @@ if [ -e "$GBT/ctl/detach_on_bind_marker" ] && grep -q '^mode=bind ' "$GB_ROOT/da
   rm -f "$GBT/ctl/detach_on_bind_marker"
   : > "$GB_ROOT/dev/gb_dgpu/detaching"
 fi
+# (wave 5, B-4) ctl/model_on_marker: the dGPU's device id becomes the file's content once a marker was synced (one shot)
+if [ -e "$GBT/ctl/model_on_marker" ] && [ -s "$GB_ROOT/data/vendor/gb/nouveau.loading" ]; then
+  cat "$GBT/ctl/model_on_marker" > "$GB_ROOT/sys/bus/pci/devices/0000:02:00.0/device"
+  rm -f "$GBT/ctl/model_on_marker"
+fi
 exit 0
 EOF
 
@@ -415,6 +420,27 @@ w am <<'EOF'
 #!/bin/sh
 for a in "$@"; do printf '%s|' "$a"; done >> "$GBT/log/am.log"
 echo >> "$GBT/log/am.log"
+[ -e "$GBT/ctl/am_fail" ] && exit 1
+exit 0
+EOF
+
+# (wave 6, notify) pm list users: ctl/users (default: lapis's headless system user 0 + the person's full user 10, both
+# running, as measured on lapis 276.R4); ctl/pm_fail makes it fail. Every call is logged to pm.log.
+w pm <<'EOF'
+#!/bin/sh
+for a in "$@"; do printf '%s|' "$a"; done >> "$GBT/log/pm.log"
+echo >> "$GBT/log/pm.log"
+if [ "$1 $2" = "list users" ]; then
+  [ -e "$GBT/ctl/pm_fail" ] && exit 1
+  echo "Users:"
+  if [ -f "$GBT/ctl/users" ]; then
+    cat "$GBT/ctl/users"
+  else
+    printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412} running\n'
+  fi
+  exit 0
+fi
+exit 1
 EOF
 
 w log <<'EOF'

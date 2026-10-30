@@ -38,6 +38,9 @@ public final class Texts {
     public static final String INTEL_TEST_FAILED = "Intel (NVIDIA test failed)";
     public static final String NV_TEST_FAILED = "NVIDIA unavailable - test failed";
     public static final String NV_NOT_READY = "NVIDIA unavailable - not ready";
+    // (wave 6, B-4) row 17: gfx_reason model (a dGPU this system has no driver for, e.g. a 15-inch Surface Book 3)
+    public static final String INTEL_NOT_SUPPORTED = "Intel (NVIDIA not supported)";
+    public static final String NV_NOT_SUPPORTED = "NVIDIA unavailable - not supported";
 
     public static String offIntelBusy(int n) {
         return "Off (Intel mode, " + n + " on NVIDIA)";
@@ -73,6 +76,8 @@ public final class Texts {
     public static final String GPU_ASLEEP = "asleep (D3cold)";
     public static final String GPU_ACTIVE = "active";
     public static final String GPU_NO_DRIVER = "no driver";
+    /** (wave 6, B-4) the GPU line for {@code gfx_reason} {@code model}. */
+    public static final String GPU_NOT_SUPPORTED = "not supported (no driver)";
     public static final String GPU_NOT_CONNECTED = "not connected";
     public static final String SELFTEST_PREFIX = "Self-test: ";
     public static final String SELFTEST_NOT_RUN = "Not run yet";
@@ -136,6 +141,7 @@ public final class Texts {
             case "detaching": return "Intel (preparing to detach)";
             case "loading": return "Intel (starting NVIDIA)";
             case "nodriver": return "Intel (NVIDIA driver not running)";
+            case "model": return "Intel (this NVIDIA GPU is not supported)";
             case "untested": return "Intel (testing NVIDIA)";
             case "testerror": return "Intel (NVIDIA test could not run)";
             case "selftest": return "Intel (NVIDIA self-test failed)";

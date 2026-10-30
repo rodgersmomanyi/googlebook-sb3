@@ -75,20 +75,24 @@ on the exact lapis build the copy was made from.
       mount none /odm/vnni/<id>/system/lib64/libz.so /system/lib64/libz.so bind
       restorecon /system/lib64/libz.so
       mount none none /system/lib64/libz.so remount bind ro
+  on init
+      mount tmpfs gbvnni /odm/vnni remount ro
   ```
 
   The vendor action is the same, gated on `ro.vendor.build.fingerprint`. The gate matters because after an A/B
   system update `gb_slotsync` boots the new slot with the **same** initrd. A different build never matches the
   fingerprint, so it keeps its own libz. The bind does not modify any verified partition or APEX, so dm-verity and
-  apexd are unaffected. The bound file is remounted read-only in `init`'s mount namespace only; the inode stays
-  writable through the rw `/odm` tmpfs (same trust level as every other `/odm` injection).
+  apexd are unaffected. From wave 6 the patched copies sit on their own small
+  tmpfs. After the relabel, init remounts that whole filesystem read-only, so neither the bind nor any copy of it in
+  another mount namespace accepts a write. If that tmpfs cannot be set up, the patch is simply left out for that
+  boot.
 * **Second layer: the OTA gate.** Independently of those triggers, `gbinit` removes `/odm/vnni` before Android starts
   whenever the boot slot is not the build the image was made for ([OTA.md](OTA.md#the-ota-gate-wave-5)). After a
   Google update the patch is therefore skipped twice, and the stock libz of the new build runs under emulation.
 
 ## Kill switch
 
-* **For one boot:** press **`e`** at the systemd-boot menu (`editor yes`, `timeout 3`) and append **`gb.vnni=0`** to the
+* **For one boot:** press **`e`** at the systemd-boot menu (`editor yes`, `timeout 3`), press End and append a space and **`gb.vnni=0`** to the
   kernel command line. (A shipped boot entry never carries it; `verify_image.py` V31 flags it on any entry except the
   VNNI-off test entry.) A one-off boot-menu edit does not persist across reboots or slot switches.
 * **To make it permanent:** edit `loader/entries/gb-<x>.conf` on the ESP and append `gb.vnni=0` to the `options` line

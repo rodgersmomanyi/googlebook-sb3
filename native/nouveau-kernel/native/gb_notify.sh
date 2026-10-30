@@ -2,6 +2,18 @@
 # gb_notify.sh -- delivers the dGPU notification queue (INTERFACES.md v1.2 section 12.1, D6). Service gb_notify,
 # user shell (the identity "adb shell cmd notification post" uses), started by init on any vendor.gb.notify change.
 #
+# (Wave 6, notify) Headless system user mode: lapis sets ro.fw.mu.headless_system_user=true, so user 0 is the headless
+# "System User" (the login screen) and the person uses a FULL user (10, ...). A shell notification without a user lands
+# in user 0 and SystemUI hides it from every other user (NotCurrentUserFilter, wave-6 forced OTA-gate boot), and an
+# "am broadcast --user 0" reaches only user 0's GbGpu. Delivery therefore is:
+#   notify    -> cmd notification post -u all -S bigtext: ONE record for UserHandle.ALL (-1), shown by SystemUI to
+#                whichever user is in the foreground -- at the login screen, after the sign-in and after any user
+#                switch -- so nothing is lost before the person signs in and nothing is posted twice (the same tag
+#                replaces the record; nothing is posted for user 0 any more).
+#   broadcast -> one explicit broadcast per RUNNING FULL user (pm list users: flag FULL 0x400 and "running"), never the
+#                headless system user; a user that starts later (the sign-in) refreshes itself: GbGpu's UserReceiver
+#                runs the same refresh at that user's BOOT_COMPLETED. If pm list users fails: --user current.
+#
 # Producers (gb_nouveau.sh, gb_dgpu_report.sh, gb_power, and (wave 3) gb_slotsync) never run cmd/am themselves: they write
 # /data/vendor/gb/notify/<epoch_ms 13 digits>-<pid>-<n>.msg (as .tmp, then renamed) and set vendor.gb.notify.
 # Message: key=value lines; kind=notify (tag, title, text) | kind=broadcast | kind=force-stop (pkg, user) |
@@ -52,6 +64,49 @@ valid_pkg() {                            # ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]
   [ ${#1} -le 127 ] || return 1          # without a fork per call (settings lists have up to 512 lines)
   case $1 in [A-Za-z]*.*) ;; *) return 1 ;; esac
   case $1 in *[!A-Za-z0-9_.]* | *..* | *.) return 1 ;; esac
+  return 0
+}
+
+full_users() {                           # -> USERS: ids of the running FULL users (pm list users); 1 = no list
+  USERS=
+  _ul=$(timeout 20 pm list users 2> /dev/null) || return 1
+  _nu=0
+  _ifs=$IFS
+  IFS='
+'
+  for _l in $_ul; do                     # "<tab>UserInfo{<id>:<name>:<hex flags>} running" (the name may hold ':')
+    case $_l in *'UserInfo{'*'} running') ;; *) continue ;; esac
+    _l=${_l%'} running'}
+    _f=${_l##*:}
+    _i=${_l#*'UserInfo{'}
+    _i=${_i%%:*}
+    case $_i in '' | *[!0-9]*) continue ;; esac
+    case $_f in '' | *[!0-9a-fA-F]*) continue ;; esac
+    if [ ${#_i} -gt 4 ] || [ ${#_f} -gt 7 ]; then continue; fi
+    [ $((0x$_f & 0x400)) -ne 0 ] || continue   # FLAG_FULL: never the headless system user (811), never a profile
+    USERS="$USERS $_i"
+    _nu=$((_nu + 1))
+    [ $_nu -lt 8 ] || break
+  done
+  IFS=$_ifs
+  return 0
+}
+
+broadcast_state() {                      # $1 = message file name (for the log)
+  if ! full_users; then
+    logn "pm list users failed: state broadcast $1 sent to --user current"
+    timeout 20 am broadcast --user current --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED \
+      -p gb.sb3.gpu > /dev/null 2>&1 || logn "am broadcast failed for $1 (user current)"
+    return 0
+  fi
+  if [ -z "$USERS" ]; then
+    logn "no running full user: state broadcast $1 skipped (GbGpu refreshes at the user's BOOT_COMPLETED)"
+    return 0
+  fi
+  for _u in $USERS; do
+    timeout 20 am broadcast --user "$_u" --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED \
+      -p gb.sb3.gpu > /dev/null 2>&1 || logn "am broadcast failed for $1 (user $_u)"
+  done
   return 0
 }
 
@@ -127,6 +182,10 @@ do_settings() {                          # $1 = message file name (for the log);
 }
 
 handle() {                               # $1 = message file
+  if [ ! -r "$1" ]; then                # (wave 6) e.g. a producer that forgot umask 022 (12.1 asks for 0644)
+    logn "dropped ${1##*/}: not readable by gb_notify (12.1: mode 0644)"
+    return 0
+  fi
   _sz=$(($(wc -c < "$1" 2>/dev/null) + 0))
   if [ "$_sz" -gt 4096 ]; then logn "dropped ${1##*/}: too large"; return 0; fi
   kind=
@@ -160,13 +219,10 @@ handle() {                               # $1 = message file
       case $tag in gb_dgpu | gb_dtx | gb_dgpu_test | gb_gfx | gb_update) ;; *) logn "dropped ${1##*/}: bad tag"; return 0 ;; esac
       printable "$title" 40 || { logn "dropped ${1##*/}: bad title"; return 0; }
       printable "$text" 200 || { logn "dropped ${1##*/}: bad text"; return 0; }
-      timeout 20 cmd notification post -t "$title" "$tag" "$text" > /dev/null 2>&1 ||
+      timeout 20 cmd notification post -u all -S bigtext -t "$title" "$tag" "$text" > /dev/null 2>&1 ||
         logn "cmd notification post failed for ${1##*/}"
       ;;
-    broadcast)
-      timeout 20 am broadcast --user 0 --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED \
-        -p gb.sb3.gpu > /dev/null 2>&1 || logn "am broadcast failed for ${1##*/}"
-      ;;
+    broadcast) broadcast_state "${1##*/}" ;;
     force-stop)
       valid_pkg "$pkg" || { logn "dropped ${1##*/}: bad package name"; return 0; }
       case $user in '' | *[!0-9]*) logn "dropped ${1##*/}: bad user"; return 0 ;; esac

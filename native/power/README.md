@@ -31,6 +31,16 @@ during a steal of gb_nouveau's lock is refused with N15. Tests: group GP-W3-1 (1
 under ASan/UBSan; socket 146/146; rc lint clean). Binary `bin\gb_power` `0ac03a00...` (source `e5a0055a...`); the r3
 binary is kept as `bin\gb_power.pre-w3` and the r3 source in `C:\GB-x86\archive\pre-w3\AUX\GB-build\native\power\`.
 
+**v1.2 r5 (wave 6, readiness B-4 / B-4b, 2026-10-30):** `reconcile_on()` no longer re-issues `gb_nouveau` after
+`vendor.gb.nouveau.result=refused:model` (gb_nouveau's TU117 device-id gate refused a 15-inch Surface Book 3's
+TU116/TU106: the model does not change on a retry; a new appearance of a dGPU still gets its one hot-attach start), and
+row 12 of the 23.2 derivation reports `gfx_reason` = `model` instead of `nodriver` for that refusal while the dGPU is
+present (the property only selects a reason), so GbGpu can say "not supported". Tests: group GP-B4 (the GP-1B-01
+matrix again with `refused:model`, single cases, the status object, reconcile_on in both modes with a control, hot
+attach; 20 (1039 in all) checks, 0 failures, also under ASan/UBSan; socket 146/146; rc lint clean), 8/8 mutants killed
+(`w6prep\nvidia-b4\tests\power_b4_mutation.py`). Binary `bin\gb_power` `170f0eb2...` (source `d54a038e...`; the unpatched source
+rebuilds `0ac03a00...` byte for byte); the r4 binary is kept as `bin\gb_power.pre-w6`.
+
 `gb_power` is the Surface Book 3 power daemon for Googlebook OS native images (`gb.hw=native`). It is a static
 bionic binary started by init at `early-init` and runs as root in `u:r:shell:s0`. It implements plan Phase 3
 (gb_power hot-plug hardening, deliverables 1-8), the server side of the Phase 7 control socket, plan P1 item 7
@@ -56,7 +66,7 @@ notes: `C:\GB-build\native\dgpu\integration\gb-power.md` (section 7 is v1.2).
 | C. Hot attach (v1.2, 23.7) | A driverless dGPU with a BAR newly appears (PCI add uevent of class 03xxxx, or newly in the inventory) while the mode wants a driver: `ctl.start gb_nouveau` (insmod, or its bind path when the module is loaded); once per appearance, 3 per boot; deferred (not counted) while `gb_nouveau` runs; `set-mode auto/nvidia` records a deferred start when it finds `gb_nouveau` running. |
 | C. `reconcile_off` (v1.2, 23.6) | Intel mode, nouveau bound, refcnt 0 on two ticks, no `keep`, not a once/test boot, no decision/rebind guard/wedge, `gb_nouveau_off` and `gb_nouveau` not running, 10 s since the last start: `ctl.start gb_nouveau_off` (whose refcnt gate decides). Replaces v1.1's `off_rebind_check()`. |
 | C. Rebind guard (v1.2, 23.8) | The kernel re-probes a re-added dGPU itself while nouveau.ko is loaded. Armed on the DTX attach event, a 10de VGA PCI add uevent, or as the first op of gb_power's rescan: ESP lock (owner `<pid> gb_power <uptime_s>`, atomic stale steal; a live holder is logged), crash marker `nouveau.loading` = `mode=rebind t=<s> boot=<id> argv=-` through the worker (fsync file + directory), detach refused (N15) during the watch. Healthy (bound + `suspended` + `D3cold` within 30 s): lock released, NVIDIA allowed, marker removed at +120 s (`clean_seen`). Failure: marker removed, `keep` + `noload`, fault `rebind`, `gfx_mode=intel`, N02 (`rebind`). No dGPU in 60 s or the base gone: ended quietly. |
-| G. Graphics derivation (v1.2, 23.2) | `vendor.gb.gfx_active` (`intel`/`nvidia`) and `vendor.gb.gfx_reason` from the 16-row table (`nopkg`, `nodtx`, `kill`, `test`, `crashloop`, `wedged`, `fault`, `mode`, `detached`, `detaching`, `loading`, `nodriver`, `untested`, `testerror`, `selftest`, `ok`). gb_power never reads its outputs back. |
+| G. Graphics derivation (v1.2, 23.2) | `vendor.gb.gfx_active` (`intel`/`nvidia`) and `vendor.gb.gfx_reason` from the 16-row table (`nopkg`, `nodtx`, `kill`, `test`, `crashloop`, `wedged`, `fault`, `mode`, `detached`, `detaching`, `loading`, `nodriver` (wave 6: `model` when gb_nouveau refused the present dGPU's model), `untested`, `testerror`, `selftest`, `ok`). gb_power never reads its outputs back. |
 | G. Transitions (v1.2, 23.3) | intel -> nvidia: `foreign` (property + file), app-graphics session marker `gfx_session` through the worker (fsync), render node 0666, `gfx_active=nvidia`, N16 after an attach event or a self-test pass, broadcast. nvidia -> intel: `gfx_active=intel` first, node 0660, marker removed, `gfx_unclean=0`. |
 | G. Session marker (v1.2, 23.10) | A `gfx_session` of an earlier boot at start = that boot ended with apps on NVIDIA: `gfx_unclean` += 1; two in a row: `gfx_mode=intel`, N19, reason `crashloop`. Removed at once at `sys.powerctl`. |
 | G. App driver selection (v1.2, 24) | Per-app choices `gfx_app_prefs` (`set-app-intel` / `set-app-nvidia`, <= 128, seeded once from `/odm/etc/gb/gfx_app_prefs.default`), the app catalog GbGpu pushes (`apps-begin` / `apps-add` / `apps-commit`, <= 512, stamped with the packages.list it was checked against), the computed `gfx_optin` (policy `games`: games + Use NVIDIA; `all`: every catalog app + Use NVIDIA; minus Always Intel; installed only; <= 512, class a cut first) and `gfx_optout`. |

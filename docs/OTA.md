@@ -80,7 +80,15 @@ and checks it at every boot:
     skipping the KeyMint graft, the VINTF manifest, the fstab or the SELinux list would turn a possibly stale
     addition into a certain boot failure.
   * On such a build, at `boot_completed`, the notification **"System update not validated"** appears (tag
-    `gb_update`; natively through `gb_notify`, in the VM posted directly) and one kmsg line is written.
+    `gb_update`; natively through `gb_notify`, in the VM posted directly) and one kmsg line is written. From wave 6
+    the notice is posted once for all users (`cmd notification post -u all`): lapis runs in headless system user
+    mode, and a notice posted for user 0 (the login screen) is never shown to the person in user 10, which is what
+    wave 5 images did. From wave 6
+    the kernel log also gets, after the notification, one line per bind mount of the image
+    (`gb_otagate: stock <path> <sha256> ours <sha256>`): the Google file's sha256 where nothing of ours covers it on
+    that boot (for example the stock `libz.so` when the libz patch was skipped), otherwise `hidden-by-our-bind` or
+    `hidden-by-overlay`. Files of the `/vendor` overlay are only counted: no path shows their Google version while
+    Android runs. Read only; a diagnostic for comparing the new build's files with the validated build's.
 * **The SELinux list is OTA-robust.** Every `(typepermissive T)` line of
   [`inject/odm_sepolicy.cil`](../inject/odm_sepolicy.cil) is packed as `(optional gb_ota_T (typepermissive T))`.
   Before, one type that a later build removes made init's boot-time policy compile fail, which means a reboot loop.
@@ -99,16 +107,27 @@ has the new build in its boot slot: in the VM (VM off) `python -I vnni_prepare.p
 libz), then `GB_WRITE_LAPIS=1 python -I build_esp.py`; for a dual-boot install, a new export and
 `install_dualboot.ps1 -UpdateEspOnly`. To go back instead, pick the previous slot's entry in the boot menu.
 
-**Boot-menu tokens** (press `e` on the entry and append to the line; one boot):
+**Boot-menu tokens** (press `e` on the entry, press End, then type a space and the token; one boot):
 
 * `gb.otagate=0` turns the gate off for that boot. The VNNI binds are still gated on the exact build fingerprint.
 * `gb.otagate=force` takes the "not validated" path on the validated build (to test it: `/odm/vnni` removed, the
   property set, the notification shown).
 
+**Checks (wave 6).** `verify_image.py` check V32 refuses an image whose gate would not work as built: the validated
+build in `/odm/etc/gb/ota_validated` must be exactly the build that the image's own initrd boots (otherwise every
+boot would be "not validated"), the gate's script, rc file and `gbinit` steps must be the pipeline's, the SELinux list
+must be the OTA-robust one, and `gb.otagate=` may appear only as `gb.otagate=force` in a VM test entry. For a test of
+the "not validated" path on a throwaway VM, `build_usb.py --vm-test --vm-test-otagate` builds the VM tree with
+`gb.otagate=force` on its boot entry (title "(VM test, OTA gate forced)").
+
 **Tested:** `gbinit`'s gate under the shipped busybox with the real slot a and slot b fingerprints, every token and
 every failure path (each one still reaches `exec /init`; 54 builder checks); the notification on a VM by rewriting the
-gate's state file; the validated path in every wave 5 boot (`/odm/etc/gb/ota_state` says `validated`). A real update
-to an unvalidated build has not happened yet. Design, classification of all 136 additions and tests:
+gate's state file; the validated path in every wave 5 boot (`/odm/etc/gb/ota_state` says `validated`); (wave 6) the
+image check V32 on the shipped ESPs and with one refused mutation per rule, the boot-log line under mksh with GNU and
+toybox tools, the analyzer item on synthetic logs. A real update to an unvalidated build has not happened yet. The forced
+path was booted on throwaway VMware VMs (wave 6): state unvalidated, no libz bind in any mount namespace, the stock
+libz files under emulation, the stock-file report in the kernel log, the notice shown to the signed-in user 10, and
+back to validated on the next boot without the token. Design, classification of all 136 additions and tests:
 [native/ota-gating/DESIGN.md](../native/ota-gating/DESIGN.md).
 
 ## Host-side rebuilds follow the slot
@@ -135,7 +154,8 @@ complete and no firmware is touched.
   `/data` already has it). The native fstab also names `fsverity` (wave 3), which adds nothing on top
   ([INPUTS.md](INPUTS.md#userdata-fs-verity)).
 * After an update the image marks the new build "not validated" and skips the libz patch on it (see
-  [The OTA gate](#the-ota-gate-wave-5)).
+  [The OTA gate](#the-ota-gate-wave-5)). From wave 6 the native boot log's summary says so in one line,
+  `ota gate: state=<validated|unvalidated|off> ...`, and `analyze_gblog.py` reports it as item `ota_gate`.
 * Natively, native modules we ship that are copies of lapis vendor modules (the HDA codecs) must match the booted
   build; `gb_audio.sh` swaps in the vendor_dlkm copies when they do not.
 * The ESP needs room for two initrds: 192 MiB in the VM, 512 MiB on USB/internal images.

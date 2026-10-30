@@ -2586,6 +2586,9 @@ int main(int argc, char **argv) {
   int rf = checks, rf_fails = fails;
   test_w2b_all();
   printf("wave-2b groups: %d checks, %d failures\n", checks - rf, fails - rf_fails);
+  int w6 = checks, w6_fails = fails;
+  test_w6_all();
+  printf("wave-6 groups: %d checks, %d failures\n", checks - w6, fails - w6_fails);
   set_root("tree_end");                           /* reaps every worker */
   printf("\n%d checks, %d failures\n", checks, fails);
   return fails ? 1 : 0;

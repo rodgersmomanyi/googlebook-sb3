@@ -213,8 +213,9 @@ python -I -B C:\GB-build\native\dualboot\build_internal.py --out C:\GB-x86\iso\w
 
   This uses the default internal ESP: systemd-boot entry `gb-<slot>` with `gb.hw=native gb.boot=internal` and the
   strict selector `androidboot.boot_part_uuid=<this export's super GUID>` (no `--boot-devices`, no
-  `--clear-nx-compat`, no `--test-*`, never `--reuse-guids`). It reads lapis.bin (the running VM may hold it;
-  read-only) and needs ~12.6 GiB on C: temporarily. After the cross-checks pass, BUILD deletes every `*.img` except
+  `--clear-nx-compat`, no `--test-*`, never `--reuse-guids`). It reads lapis.bin (read-only) and refuses while
+  the VMware VM runs or holds a lock (`--allow-running-vm` only on purpose; image audit IA-1), and needs ~12.6 GiB
+  on C: temporarily. After the cross-checks pass, BUILD deletes every `*.img` except
   `EFI-SYSTEM.img`, then renames `export.new` -> `export` (an old `export` is renamed `export.prev-<created>` first,
   then deleted).
 * Cross-checks (abort the build on any failure, with the message in brackets):

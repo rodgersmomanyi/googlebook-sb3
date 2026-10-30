@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Googlebook SB3 native (readiness A-L3): every user created on the device starts with Auto-rotate on. lapis's
+     SettingsProvider default (def_accelerometer_rotation) is false, because the stock lapis board has no
+     accelerometer. Auto-rotate only matters in tablet posture: in laptop posture lapis's WindowManager
+     (DisplayRotation.LaptopController) keeps the built-in display fixed to the user rotation, landscape, whatever
+     this setting says. The default is read once, when a user's settings are created
+     (DatabaseHelper.loadSystemSettings); the user's own Auto-rotate choice is never touched afterwards.
+     Static vendor RRO next to GbSb3SensorsOverlay; SettingsProvider declares no <overlayable>, so the vendor
+     partition policy applies (like lapis's own SettingsProviderDesktopOverlay on /product, priority 5). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.android.providers.settings.gb_sb3_rotation_rro_vendor__"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <application android:hasCode="false" />
+    <overlay android:targetPackage="com.android.providers.settings"
+        android:isStatic="true"
+        android:priority="10" />
+</manifest>

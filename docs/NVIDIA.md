@@ -2,8 +2,9 @@
 
 The Surface Book 3 13.5" has an NVIDIA GTX 1650 Max-Q (TU117, PCI `10DE:1F91`) in its keyboard base, behind root
 port `00:1d.4`. The 15" model's GTX 1660 Ti (TU116) or Quadro RTX 3000 (TU106) is not supported: the
-image has no firmware for those chips, so the probe fails, graphics stay on Intel and a "NVIDIA GPU problem"
-notification appears (a model gate that skips the probe there is planned). Native Googlebook OS images can use it for apps, the way Optimus works on Windows: games and the apps
+image has no firmware for those chips, so a model gate never loads the driver there. The dGPU stays off, graphics
+stay on Intel, and the Graphics tile and page say `Intel (NVIDIA not supported)` (see "Safety rails"; tested off the
+device only). Native Googlebook OS images can use it for apps, the way Optimus works on Windows: games and the apps
 you choose render on NVIDIA, while the screen and the system UI always stay on the Intel GPU. The images also include
 a local compute service (LLM inference on the GPU). This page covers what you get, how switching works, what happens
 when you detach the screen, and how to recover from a bad driver start.
@@ -64,6 +65,10 @@ GPU under Windows ([VMWARE.md](VMWARE.md)).
   fails an app: if NVK cannot be used, the app gets ANV.
 * **GbGpu** (`native/gpu-ui`, package `gb.sb3.gpu`) is the user interface: the tile, the Settings page, the
   notifications and the close-apps dialog. It holds no privileges. Every change goes through gb_power's socket.
+  (Wave 6) It follows the signed-in user: lapis's user 0 only shows the login screen, so state updates go to every
+  running full user, the notification permission and the tile are set up for your user, the app refreshes itself
+  when your user is unlocked, and the tile refreshes each time you open Quick Settings (it is no longer an "active"
+  tile, whose update requests lapis's SystemUI dropped). Notices from `gb_notify` are posted for all users.
 
 The full interface (properties, files, socket protocol, notification texts, state tables) is
 [native/dgpu/INTERFACES.md](../native/dgpu/INTERFACES.md), version 1.2 r2.
@@ -92,8 +97,8 @@ The full interface (properties, files, socket protocol, notification texts, stat
 
 The tile shows what an app you open **now** gets. It shows `NVIDIA`, `NVIDIA (busy 2)`, `Intel`,
 `Intel (testing NVIDIA)`, `Intel (starting NVIDIA)`, `Intel (NVIDIA test failed)`, `Unavailable (base detached)`,
-`Off (Intel mode)`, `Intel (recovered)`, `Disabled for this boot`, `Fault`, `Restart required` or `Unavailable` (VMware,
-or an image without the package). **Tap** cycles Auto → Intel → NVIDIA → Auto. A toast says when a change waits for
+`Off (Intel mode)`, `Intel (recovered)`, `Disabled for this boot`, `Fault`, `Restart required`,
+`Intel (NVIDIA not supported)` (a 15" Surface Book 3) or `Unavailable` (VMware, or an image without the package). **Tap** cycles Auto → Intel → NVIDIA → Auto. A toast says when a change waits for
 the base or for a restart. **Long-press** opens the Graphics page.
 
 ### Settings → System → Graphics
@@ -102,7 +107,8 @@ The page has:
 
 * the mode radios;
 * `Apps you open now use: ...`, with the reason when the answer is Intel;
-* the GPU line (`asleep (D3cold)`, `active`, `no driver`, `not connected`) and the apps using it;
+* the GPU line (`asleep (D3cold)`, `active`, `no driver`, `not supported (no driver)`, `not connected`) and the apps
+  using it;
 * the self-test result with **Run self-test again**;
 * **Use NVIDIA for all apps**;
 * the app list (games first, each with **Use NVIDIA** / **Always Intel**);
@@ -175,6 +181,7 @@ printf 'GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | toybo
 |---|---|
 | Late start | nouveau never loads before `sys.boot_completed`, and never from a boot-time module list. |
 | i915 guard | It loads only if `card0`/`renderD128` belong to i915 (Intel always owns the display). |
+| Model gate | Only a TU117 (PCI device `0x1f80`-`0x1fff`, the 13.5" model) is ever probed: the image has firmware for no other chip. Any other NVIDIA device id (the 15" model's TU116/TU106) gets `refused:model` before any marker, lock, payload, insmod or bind. The dGPU stays driverless and powered off, with one log line and no notification; the Graphics tile and page say `Intel (NVIDIA not supported)`, and gb_power does not retry it. An unreadable id is not gated (one warning line; the driver is tried as before), and ` gb.nouveau.model=any` in the boot menu turns the gate off for one boot. |
 | Argument whitelist | Only known nouveau options reach `insmod`. `runpm=1 modeset=2` (runtime PM, no NVIDIA display) always come last. |
 | ESP lock | The boot partition is never mounted while nouveau loads. Log writers and the slot follower take the same lock. |
 | Panic reboot | `kernel.panic=30` on every boot that loads nouveau. The kernel panics on an oops (`CONFIG_PANIC_ON_OOPS=y`), so a driver crash reboots after 30 s instead of freezing. |
@@ -194,8 +201,9 @@ printf 'GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | toybo
    choose Auto.
 
 Other boot-menu options: `gb.nouveau=once` (load once, whatever the mode), `gb.nouveau.fw=535` (use the GSP-RM
-535.113.01 firmware instead of the default 570.144), `module_blacklist=nouveau` (the same as `gb.nouveau=0`). Any
-other `gb.nouveau=` value counts as `0`.
+535.113.01 firmware instead of the default 570.144), `gb.nouveau.model=any` (turn the model gate off for this boot,
+see "Model gate" above; only for a report about a wrongly refused GPU), `module_blacklist=nouveau` (the same as
+`gb.nouveau=0`). Any other `gb.nouveau=` value counts as `0`.
 
 **The `[NVIDIA test]` boot entry** (`gb-<slot>-nvtest.conf`, never the default) adds `gb.nouveau=test`. It loads
 nouveau once with extra diagnostics and runs a scripted measurement sequence (power states, PM stress, a suspend test
@@ -208,6 +216,9 @@ The next normal boot is unaffected. `gb_slotsync` keeps this entry in step with 
   HWUI rendering always use Intel. Only third-party app content can use NVIDIA. Android allows one Vulkan HAL per
   process for the system, and system apps never get an updatable driver.
 * **Switching a running app.** An app keeps its GPU until it is restarted.
+* **The 15" Surface Book 3's dGPU** (GTX 1660 Ti TU116 or Quadro RTX 3000 TU106). The image stages TU117 firmware
+  only, so the dGPU stays off and every app uses Intel. **Intel only** mode gives the same result without the
+  refusal line in the log.
 * **NVIDIA driving a display.** The dGPU has no display outputs. Its frames cross PCIe into system memory and are
   composed by Intel.
 * **Forced ("surprise") detach while the GPU is in use.** It is refused. See above.

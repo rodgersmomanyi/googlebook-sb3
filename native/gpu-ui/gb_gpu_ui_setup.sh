@@ -1,13 +1,22 @@
 #!/system/bin/sh
 # gb_gpu_ui_setup.sh: boot-time setup for the GbGpu app (INTERFACES 13.2, 15.4).
 # Service gb_gpu_ui_setup (user shell, group shell, u:r:shell:s0), started at sys.boot_completed=1.
-#   1. Every boot: pm grant gb.sb3.gpu android.permission.POST_NOTIFICATIONS (a failure is ignored).
-#   2. Once ever: cmd statusbar add-tile gb.sb3.gpu/.GpuTileService, then create /data/vendor/gb/ui/tile_added
-#      (0644 shell:shell). The marker is written only after add-tile succeeded; while it exists nothing is added
-#      again, so a user who removed the tile keeps it removed. /data/vendor/gb is 0751 root:shell (shell cannot
-#      create entries there, INTERFACES 5.1), so the marker lives in the shell-owned /data/vendor/gb/ui (rc).
+# (Wave 6, notify) lapis runs in headless system user mode (ro.fw.mu.headless_system_user=true): user 0 is the headless
+# "System User" (the login screen), the person uses a FULL user (10, ...). POST_NOTIFICATIONS and the Quick Settings
+# tile list are per user, and at sys.boot_completed the current user is still 0. Measured on lapis 276.R4 (wave-6
+# notify evidence): a plain `pm grant` grants user 0 only; `cmd statusbar add-tile` adds to the CURRENT user's tiles.
+#   1. Every boot: pm grant --user <u> gb.sb3.gpu android.permission.POST_NOTIFICATIONS for every FULL user
+#      (pm list users: flag FULL 0x400; never the headless system user; a failure is ignored).
+#   2. Then wait until a FULL user is in the foreground (am get-current-user; at most 180 checks 10 s apart = 30 min):
+#      the person has signed in. Grant again for that user (it may have been created during this boot) and, once per
+#      user ever, cmd statusbar add-tile gb.sb3.gpu/.GpuTileService, then create /data/vendor/gb/ui/tile_added.<u>
+#      (0644 shell:shell). The marker is written only after add-tile succeeded; while it exists nothing is added again
+#      for that user, so a user who removed the tile keeps it removed. /data/vendor/gb is 0751 root:shell (shell cannot
+#      create entries there, INTERFACES 5.1), so the markers live in the shell-owned /data/vendor/gb/ui (rc). The
+#      pre-wave-6 marker tile_added (it recorded an add to user 0's tiles) is ignored and kept.
 # Does nothing unless /odm/etc/gb_hw is "native" and /odm/app/GbGpu/GbGpu.apk exists.
-# Never needs root. Test hooks: GB_ROOT (prefix for /odm and /data), GB_TEST_PATH (prepended to PATH).
+# Never needs root. Test hooks (never set by init): GB_ROOT (prefix for /odm and /data), GB_TEST_PATH (prepended to
+# PATH), GB_UI_WAIT_CHECKS (the number of foreground checks, default 180).
 PATH=${GB_TEST_PATH:+$GB_TEST_PATH:}/system/bin:/vendor/bin
 export PATH
 R=${GB_ROOT:-}
@@ -15,10 +24,46 @@ PKG=gb.sb3.gpu
 TILE=$PKG/.GpuTileService
 APK=$R/odm/app/GbGpu/GbGpu.apk
 D=$R/data/vendor/gb/ui
-M=$D/tile_added
+WAIT=${GB_UI_WAIT_CHECKS:-180}
+case $WAIT in '' | *[!0-9]*) WAIT=180 ;; esac
+set -f
 
 log_i() {
   log -p i -t gb_gpu_ui_setup "$*" > /dev/null 2>&1 || true
+}
+
+full_users() { # -> USERS: ids of the FULL users (pm list users, running or not); 1 = no list
+  USERS=
+  _ul=$(timeout 20 pm list users 2> /dev/null) || return 1
+  _nu=0
+  _ifs=$IFS
+  IFS='
+'
+  for _l in $_ul; do # "<tab>UserInfo{<id>:<name>:<hex flags>}[ running]" (the name may hold ':')
+    _l=${_l%' running'}
+    case $_l in *'UserInfo{'*'}') ;; *) continue ;; esac
+    _l=${_l%'}'}
+    _f=${_l##*:}
+    _i=${_l#*'UserInfo{'}
+    _i=${_i%%:*}
+    case $_i in '' | *[!0-9]*) continue ;; esac
+    case $_f in '' | *[!0-9a-fA-F]*) continue ;; esac
+    if [ ${#_i} -gt 4 ] || [ ${#_f} -gt 7 ]; then continue; fi
+    [ $((0x$_f & 0x400)) -ne 0 ] || continue # FLAG_FULL: never the headless system user (811), never a profile
+    USERS="$USERS $_i"
+    _nu=$((_nu + 1))
+    [ $_nu -lt 16 ] || break
+  done
+  IFS=$_ifs
+  return 0
+}
+
+grant() { # $1 = user id
+  if pm grant --user "$1" "$PKG" android.permission.POST_NOTIFICATIONS > /dev/null 2>&1; then
+    log_i "POST_NOTIFICATIONS granted for user $1"
+  else
+    log_i "pm grant POST_NOTIFICATIONS failed for user $1 (ignored)"
+  fi
 }
 
 hw=$(cat "$R/odm/etc/gb_hw" 2> /dev/null)
@@ -42,12 +87,39 @@ while [ -z "$(pm path "$PKG" 2> /dev/null)" ]; do
   sleep 5
 done
 
-if pm grant "$PKG" android.permission.POST_NOTIFICATIONS > /dev/null 2>&1; then
-  log_i "POST_NOTIFICATIONS granted"
+if full_users; then
+  [ -n "$USERS" ] || log_i "no full user yet"
+  for u in $USERS; do grant "$u"; done
 else
-  log_i "pm grant POST_NOTIFICATIONS failed (ignored)"
+  log_i "pm list users failed: no grant before the sign-in"
 fi
 
+# Wait for the person: a FULL user in the foreground (the headless system user 0 shows the login screen). The user list
+# is read again only when the foreground user changes to one it does not hold (a user created during this boot).
+cur=
+prev=
+n=0
+while :; do
+  c=$(timeout 20 am get-current-user 2> /dev/null)
+  case $c in '' | *[!0-9]*) c= ;; esac
+  if [ -n "$c" ]; then
+    case " $USERS " in
+      *" $c "*) cur=$c ;;
+      *) if [ "$c" != "$prev" ] && full_users; then case " $USERS " in *" $c "*) cur=$c ;; esac; fi ;;
+    esac
+    prev=$c
+  fi
+  [ -n "$cur" ] && break
+  n=$((n + 1))
+  if [ "$n" -ge "$WAIT" ]; then
+    log_i "no full user in the foreground after $WAIT checks: the tile is added at a later boot"
+    exit 0
+  fi
+  sleep 10
+done
+grant "$cur"
+
+M=$D/tile_added.$cur
 [ -e "$M" ] && exit 0
 if [ ! -d "$D" ]; then
   log_i "$D is missing: the tile is not added this boot"
@@ -55,11 +127,15 @@ if [ ! -d "$D" ]; then
 fi
 n=0
 while :; do
+  if [ "$(timeout 20 am get-current-user 2> /dev/null)" != "$cur" ]; then
+    log_i "user $cur left the foreground: the tile is added at a later boot"
+    exit 0
+  fi
   if cmd statusbar add-tile "$TILE" > /dev/null 2>&1; then
     if (umask 022 && : > "$M"); then
-      log_i "Quick Settings tile added"
+      log_i "Quick Settings tile added for user $cur"
     else
-      log_i "tile added, but $M could not be written"
+      log_i "tile added for user $cur, but $M could not be written"
     fi
     exit 0
   fi
@@ -67,5 +143,5 @@ while :; do
   [ "$n" -ge 3 ] && break
   sleep 10
 done
-log_i "cmd statusbar add-tile failed; trying again next boot"
+log_i "cmd statusbar add-tile failed for user $cur; trying again next boot"
 exit 1

@@ -210,7 +210,8 @@ class Mock:
         if st == "loading" or w["rebind"]:
             return "intel", "loading"
         if not self.gfx_bound():
-            return "intel", "nodriver"
+            # (wave 6, B-4) row 12 names a model refusal of a present dGPU (gb_power gfx_model_refused)
+            return "intel", "model" if w["result"] == "refused:model" and w["bdf"] else "nodriver"
         ok = w["gfx_ok"]
         if ok == -1:
             return "intel", "untested"

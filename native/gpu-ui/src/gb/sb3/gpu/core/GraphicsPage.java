@@ -63,10 +63,13 @@ public final class GraphicsPage {
         return Texts.STATUS_PREFIX + ("ok".equals(s.gfxReason) ? Texts.INTEL : r);
     }
 
-    /** {@code asleep (D3cold)} / {@code active} / {@code no driver} / {@code not connected}. */
+    /**
+     * {@code asleep (D3cold)} / {@code active} / {@code no driver} / {@code not connected}; (wave 6, B-4)
+     * {@code not supported (no driver)} for {@code gfx_reason} {@code model}.
+     */
     public static String gpuState(Status s) {
         if (s.bdf.isEmpty() || "unavailable".equals(s.state)) return Texts.GPU_NOT_CONNECTED;
-        if (!"nouveau".equals(s.driver)) return Texts.GPU_NO_DRIVER;
+        if (!"nouveau".equals(s.driver)) return "model".equals(s.gfxReason) ? Texts.GPU_NOT_SUPPORTED : Texts.GPU_NO_DRIVER;
         return "D3cold".equals(s.powerState) ? Texts.GPU_ASLEEP : Texts.GPU_ACTIVE;
     }
 

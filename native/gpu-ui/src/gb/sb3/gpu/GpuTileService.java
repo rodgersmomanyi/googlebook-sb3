@@ -11,7 +11,10 @@ import gb.sb3.gpu.core.WatchSession;
 
 /**
  * The "Graphics" Quick Settings tile (INTERFACES 27.1, 13.2; same component name as v1.1, so a tile the user added stays
- * added). It is an active, toggleable tile: SystemUI binds it when we ask ({@link Gb#requestTileUpdate}, after gb_power's
+ * added). (Wave 6) It is a normal (not an ACTIVE_TILE), toggleable tile: lapis's SystemUI dropped our requestListeningState
+ * ("TileServices: Couldn't find tile ...(10)"), so it now binds the tile whenever the Quick Settings panel is shown; the
+ * request below is still sent and works where SystemUI honours it. Before wave 6: SystemUI binds it when we ask
+ * ({@link Gb#requestTileUpdate}, after gb_power's
  * state broadcast), when it is tapped, and once at start. While listening it keeps a gb_power `watch` open, capped at 5
  * minutes per listening period. A tap cycles the graphics mode Auto -> Intel -> NVIDIA -> Auto with `set-mode` (never a
  * dialog); a long-press opens the Graphics page (the QS_TILE_PREFERENCES filter on SettingsActivity).

@@ -10,7 +10,11 @@ Same partitions as build_usb.py --export, but:
   * userdata is not exported: it is created by the installer to fill the space it was given (blank, first boot
     formats it). misc/metadata/frp_persist/desktop_security_* are blank too (zeroed by the installer).
 
-Only READS lapis.bin (the running VM may hold it open) and writes into --out.
+Only READS lapis.bin and writes into --out. (W6 prep, IA-1 of vnni-perf\\w5\\IMAGE_AUDIT.md) Refuses while the user's
+VM (C:\\GB-x86\\lapis-boot.vmx) runs or VMware holds a lapis*.lck lock: the export copies boot/super partitions from
+lapis.bin and must not read them while the guest may write them (an OTA in progress). --allow-running-vm overrides it
+on purpose (a warning is printed and the manifest records "source_vm_running": true); --dry-run and the --test-*
+exports only warn.
 
 The ESP is a native one (WAVE2_PLAN_v2 B-04): the [NVIDIA test] entry gb-<slot>-nvtest.conf and the dGPU payload
 gb/dgpu-<krel>.erofs + .sha256 (INTERFACES 6.1, 16), at least max(initrd) + 144 MiB left free. After manifest.json is
@@ -19,7 +23,7 @@ does not, manifest.json is renamed manifest.json.unverified and the exit code is
 option, which change or truncate the export and are never used by the ISO, problems are reported but not fatal).
 
 Usage: python -I build_internal.py --out D:\\gb-export [--esp-mib 512] [--boot-devices] [--reuse-guids OLD\\manifest.json]
-                                   [--clear-nx-compat] [--dry-run] [--test-super-mib N]
+                                   [--clear-nx-compat] [--dry-run] [--test-super-mib N] [--allow-running-vm]
   --reuse-guids   keep the GUIDs of an installed set (needed to rebuild only the ESP: install_dualboot.ps1 -UpdateEspOnly)
   --test-super-mib  TEST ONLY: export just the first N MiB of super (manifest marked test_truncated; the installer
                   refuses such a manifest on a real disk) for quick image-mode tests.
@@ -56,6 +60,28 @@ def clear_nx_compat(pe):
     return bytes(b), v
 
 
+VMRUN = r"C:\Program Files\VMware\VMware Workstation\vmrun.exe"
+
+
+def user_vm_busy(here=HERE, vmrun=VMRUN):
+    """(W6 prep, IA-1) Why the user's VM may be using lapis.bin now ([] = it is off): `vmrun list` names
+    here\\lapis-boot.vmx, VMware holds a lapis*.lck lock (build_esp.py's write guard), or vmrun cannot tell."""
+    why = []
+    try:
+        out = subprocess.run([vmrun, "-T", "ws", "list"], capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        why.append(f"vmrun list failed ({e.__class__.__name__}): cannot show that the VM is off")
+    else:
+        if os.path.join(here, "lapis-boot.vmx").lower() in out.lower():
+            why.append(f"VMware lists {os.path.join(here, 'lapis-boot.vmx')} as running")
+    try:
+        why += [f"VMware lock {n} present" for n in sorted(os.listdir(here))
+                if n.lower().startswith("lapis") and n.lower().endswith(".lck")]
+    except OSError as e:
+        why.append(f"cannot list {here} for VMware locks ({e})")
+    return why
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=r"D:\gb-export")
@@ -67,8 +93,16 @@ def main():
     ap.add_argument("--test-super-mib", type=int, default=0, help="TEST ONLY: truncate super")
     ap.add_argument("--test-userdata-min-mib", type=int, default=0, help="TEST ONLY: lower userdata minimum")
     ap.add_argument("--dry-run", action="store_true", help="print the layout and command line, write nothing")
+    ap.add_argument("--allow-running-vm", action="store_true",
+                    help="(IA-1) export although the user's VM runs (lapis.bin read while the guest may write it)")
     a = ap.parse_args()
     test = bool(a.test_super_mib or a.test_userdata_min_mib)
+    busy = user_vm_busy()
+    if busy and not (a.allow_running_vm or a.dry_run or test):
+        sys.exit("build_internal.py: refused: the user's VM may be using lapis.bin (" + "; ".join(busy) + "). Shut it "
+                 "down first (or pass --allow-running-vm on purpose)")
+    for w in busy:
+        print(f"WARNING: {w}; lapis.bin is read while the guest may write it", flush=True)
 
     src = bu.lapis_partitions(be.LAPIS)
     at = be.XS.slot_attrs(be.LAPIS)
@@ -161,6 +195,7 @@ def main():
         "disk_selector": "boot_devices" if a.boot_devices else "boot_part_uuid",
         "kernel_nx_compat_cleared": nx_note, "esp_files": sorted(files),
         "test_truncated": test,
+        "source_vm_running": bool(busy),
         "partitions": parts,
     }
     mpath = os.path.join(a.out, "manifest.json")

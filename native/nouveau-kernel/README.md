@@ -31,7 +31,7 @@ integration: `C:\GB-build\native\dgpu\integration\nouveau-policy.md` (section 7 
 | `native/gb_nouveau.sh` | `/vendor/bin/gb_nouveau.sh` (cpio `vup/bin/`, 0755) | `auto` (insmod path and, v1.2, the bind path), `off`, `dmesg-stream` (INTERFACES 7.1-7.8). |
 | `native/gb_nouveau.rc` | appended to the native `gb.rc` | Services and triggers, exactly INTERFACES 15.1-v12 (7 services). |
 | `native/gb_dgpu_report.sh` | `/vendor/bin/gb_dgpu_report.sh` | `report`: read-only report (every boot from gb_bootlog). `test`: the Phase 2B test sequence (`gb.nouveau=test` boots only). `selftest` (v1.2): the automatic NVIDIA app-graphics self-test (INTERFACES 25.3). |
-| `native/gb_notify.sh` | `/vendor/bin/gb_notify.sh` | Delivers the queue as user shell (INTERFACES 12.1): notifications (tags `gb_dgpu`, `gb_dtx`, `gb_dgpu_test`, v1.2 `gb_gfx`, wave 3 `gb_update` from gb_slotsync), the GbGpu broadcast, force-stops, and (v1.2) the three whitelisted Settings.Global writes. |
+| `native/gb_notify.sh` | `/vendor/bin/gb_notify.sh` | Delivers the queue as user shell (INTERFACES 12.1): notifications (tags `gb_dgpu`, `gb_dtx`, `gb_dgpu_test`, v1.2 `gb_gfx`, wave 3 `gb_update` from gb_slotsync), the GbGpu broadcast, force-stops, and (v1.2) the three whitelisted Settings.Global writes. (Wave 6, INTERFACES 12.1a: headless system user mode) notices are posted for UserHandle.ALL (`cmd notification post -u all -S bigtext`), the GbGpu broadcast goes to every running full user (`pm list users`), an unreadable message is logged and dropped. |
 | `native/gb_dgpu_check.sh` | `/vendor/bin/gb_dgpu_check.sh` | Read-only snapshot for the shell user (v1.2 lists the graphics properties). |
 | `native/modules.nouveau` | (not installed) | Documentation of the module set. |
 | `firmware_staged_sha256.txt` | `/odm/etc/gb/tu117.sha256` | sha256 of the 30 TU117 firmware files. Unchanged. |
@@ -81,13 +81,18 @@ unknown value, or `module_blacklist=...nouveau...`) is the kill switch for the b
    * `/dev/gb_dgpu/keep` (this boot's driver was unhealthy): `refused:keep`;
    * the dGPU is present and driverless: the **bind path** below;
    * no dGPU (base detached): `refused:nodgpu`.
-7. Probation (`mode=auto` and fewer than 3 clean boots: the dmesg-live stream runs, `probation n/3` is logged).
+7. Model gate (wave 6, B-4, before probation): if a dGPU is present and its `device` is a well-formed id outside
+   NVIDIA's TU117 block `0x1f80`-`0x1fff` (e.g. a 15-inch Surface Book 3's TU116 `0x2180`-`0x21ff` or TU106
+   `0x1f00`-`0x1f7f`), log one line and stop with `result=refused:model` (`booted=1`). An unreadable or malformed id is
+   not gated (one `model gate: ... not gated` line per run; everything goes on as without the gate), and the
+   boot-menu token `gb.nouveau.model=any` turns the gate off for one boot. Probation
+   (`mode=auto` and fewer than 3 clean boots: the dmesg-live stream runs, `probation n/3` is logged).
 8. Guards (`i915`: renderD128 and card0 are 0x8086/i915; `nodgpu`; `bar`; `module`), the 15 s wait for a detach in
    progress (`refused:detach`), the ESP lock (120 s, `refused:esp`), `loading=1`, the `used` flag.
 9. Payload stage (payload mode), whitelisted arguments, `kernel.panic=30` on every load, no ESP vfat mount
    (`refused:esp`), the marker written and synced. No `foreign` here any more (gb_power sets it before the first
    `gfx_active=nvidia`).
-10. insmod of the helpers, the late checks (detach, dGPU, BAR; each removes the marker), insmod `nouveau.ko`. An insmod
+10. insmod of the helpers, the late checks (detach, dGPU, TU117 model, BAR; each removes the marker), insmod `nouveau.ko`. An insmod
     killed by a signal, or an oops after the mark, keeps the marker, creates `keep` + `noload` and then sets
     `gfx_mode=intel`.
 11. Node permissions, the 30 s health check (bound, `suspended`, `D3cold`, no error or oops lines since the mark).
@@ -102,11 +107,11 @@ unknown value, or `module_blacklist=...nouveau...`) is the kill switch for the b
 `foreign` boot, or after a failed or skipped kernel re-bind on reattach):
 
 1. Wait up to 30 s while `init.svc.gb_nouveau_off` reads `running` (`refused:off`).
-2. Guards `i915`, `nodgpu`, `bar` (bound to nouveau meanwhile: permissions only).
+2. Guards `i915`, `nodgpu`, `model` (TU117 `0x1f80`-`0x1fff`, wave 6 B-4), `bar` (bound to nouveau meanwhile: permissions only).
 3. Detach wait (`refused:detach`), ESP lock (owner `gb_nouveau`, `refused:esp`), `loading=1`, `used`; in payload mode
    the mounted payload is verified (nothing is remounted when it is in place).
 4. No ESP vfat mount; marker `mode=bind t=<s> boot=<id> argv=-` + sync; `kernel.panic=30`.
-5. Late checks right before the write (detaching, dGPU present, driverless, BAR); each removes the marker.
+5. Late checks right before the write (detaching, dGPU present, driverless, TU117 model, BAR); each removes the marker.
 6. `bind-mark` in the kernel log, the BDF written to `/sys/bus/pci/drivers/nouveau/bind` from a background subshell,
    40 polls of 0.5 s:
    * still writing after 20 s: `wedged` + `keep` + `noload`, `gfx_mode=intel`, the marker stays, `bind-failed`, N05;
@@ -249,8 +254,16 @@ v1.2 (`TASKS_1B.md` 1.2):
 | NP-1B-VM | D8: the native-smoke image in VMware: `refused:i915`, nothing queued, self-test refused. |
 | NP-W2B | (Wave 2b, INTERFACES 5.4 r3) the ESP lock in both scripts: back-off while a steal is in progress (live / dead `.stale.<pid>`), an owner file in our new directory never overwritten, the release waits for a stealer's put-back, a put-back never over a newcomer's directory, an ownerless moved directory removed; `gb_dgpu_report.sh selftest` busy and owner cases. |
 | NP-W3-01 | (Wave 3, lead decision D-a, INTERFACES 12.1/12.2) gb_notify accepts the tag `gb_update` (N22/N23 from gb_slotsync) and still drops a near-miss tag. |
+| NP-W6-NOTIFY | (Wave 6, INTERFACES 12.1a) broadcasts only to running full users (profiles, the headless user 0, stopped users and names faking flags excluded), none at the login screen, `--user current` when `pm list users` fails, broadcast failures logged per user, every notice posted once for UserHandle.ALL, an unreadable (0600) message logged and dropped. |
 | NP-W3-02 | (Wave 3 item 18) the self-test report's `== hwui_vulkan` section counts the HWUI-on-Vulkan abort signature with `logcat -d` only, after the ESP lock is released; the verdict and no HWUI property are affected. |
 | NP-W3-03 | (Wave 3, INTERFACES 5.4 r4, wave 2b review L1/L2) no `mkdir` of the lock while a steal is in progress, and a lock naming the script's own pid is stale, in both scripts. |
+| NP-B4 | (Wave 6, B-4, INTERFACES 2.2/7.2-v12/7.2a/7.8) TU117 device-id gate (`0x1f80`-`0x1fff`): 15-inch Surface Book 3 TU116/TU106 ids (`0x2191`, `0x21d1`, `0x1f36`, `0x1f76`), another non-TU117 id (`0x1e90`), edge ids (`0x1f7f`, `0x2000`, `0x1e00`, `0x2180`, the HDA id `0x10fa`), `gb.nouveau=test`, repeated `auto` starts, HDA-only function, bind path, late insmod/bind race (`ctl/model_on_marker`), 7 TU117 ids (incl. upper-case hex) still loading cleanly, the fail-open rule: an unreadable `device` (insmod path, plain Auto with probation, bind path) and 9 malformed ids load exactly as before with one warning line, and the `gb.nouveau.model=any` override (insmod and bind path, any other value ignored and logged, last occurrence wins, the kill switch still wins). |
+
+Wave 6 (2026-10-30, readiness B-4 TU117 device-id gate; prepared in wave 5 by the display fix prep, deferred, then
+changed to fail open): 1249/1249 assertions with GNU coreutils and 1249/1249 with toybox + BWK awk (130 NP-B4
+assertions; 76 of them fail on the script without the gate); shellcheck 0; rc lint 0 findings; rc body byte-identical
+to 15.1-v12; 18/18 mutation tests killed (`w6prep\nvidia-b4\tests\np_b4_mutation.sh`). The test shims gained a
+one-shot `ctl/model_on_marker` hook in `sync`.
 
 Wave 2b (2026-10-26, INTERFACES section 30 E-1): 1102/1102 assertions with GNU coreutils and 1102/1102 with toybox +
 BWK awk (19 new NP-W2B assertions); shellcheck 0; rc lint 0 findings; rc body byte-identical to 15.1-v12

@@ -8,6 +8,7 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.UserManager;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
 import android.util.Log;
@@ -20,6 +21,7 @@ import gb.sb3.gpu.core.StateMapper;
 import gb.sb3.gpu.core.Status;
 import gb.sb3.gpu.core.Texts;
 import gb.sb3.gpu.core.Transport;
+import gb.sb3.gpu.core.UserPolicy;
 import gb.sb3.gpu.core.WatchSession;
 
 import java.util.ArrayList;
@@ -69,6 +71,12 @@ final class Gb {
 
     static Status lastStatus() {
         return lastStatus;
+    }
+
+    /** (Wave 6, notify) False in the headless system user of a headless-system-user-mode device (lapis): see UserPolicy. */
+    static boolean actsOnState(Context c) {
+        UserManager um = c.getSystemService(UserManager.class);
+        return UserPolicy.actsOnState(UserManager.isHeadlessSystemUserMode(), um != null && um.isSystemUser());
     }
 
     /**

@@ -3630,6 +3630,12 @@ static int gfx_loading(const char *state) {      /* the properties only select a
 static int gfx_bound(const char *state) {
   return g_inv.nouveau_bound && (!strcmp(state, "standby") || !strncmp(state, "busy:", 5));
 }
+static int gfx_model_refused(void) {             /* (B-4) gb_nouveau refused the present dGPU's model (not a TU117) */
+  char r[PROP_VALUE_MAX];                         /* the property selects a reason only, never a permission */
+  if (g_inv.vga < 0) return 0;
+  prop_result(r);
+  return !strcmp(r, "refused:model");
+}
 static const char *gfx_derive(const char *st) {
   int ok = gfx_ok_now();
   if (!g_gfx.cap) return "nopkg";                                       /* 1 */
@@ -3643,7 +3649,7 @@ static const char *gfx_derive(const char *st) {
   if (!gfx_attached()) return "detached";                               /* 9 */
   if (!strcmp(st, "detaching") || g_dtx.ec != EC_READY || g_pend.kind) return "detaching";   /* 10 */
   if (gfx_loading(st)) return "loading";                                /* 11 */
-  if (!gfx_bound(st)) return "nodriver";                                /* 12 */
+  if (!gfx_bound(st)) return gfx_model_refused() ? "model" : "nodriver"; /* 12 (B-4: model) */
   if (ok == -1) return "untested";                                      /* 13 */
   if (ok == -2) return "testerror";                                     /* 14 */
   if (ok == 0) return "selftest";                                       /* 15 */
@@ -4105,7 +4111,8 @@ static void reconcile_on(long long t) {
   derive_state(st, sizeof st, &bn);
   if (gfx_recovered(st)) return;
   prop_result(r);                                 /* a refusal that a retry cannot change (fail-safe if spoofed) */
-  if (!strncmp(r, "insmod-failed", 13) || !strcmp(r, "refused:i915") || !strcmp(r, "refused:hw") || !strcmp(r, "refused:module"))
+  if (!strncmp(r, "insmod-failed", 13) || !strcmp(r, "refused:i915") || !strcmp(r, "refused:hw") || !strcmp(r, "refused:module") ||
+      !strcmp(r, "refused:model"))                /* (B-4b) the dGPU's model does not change on a retry */
     return;
   if (t - g_nv.busy_at < RECONCILE_ON_GAP_MS || (g_nv.last_start > 0 && t - g_nv.last_start < RECONCILE_ON_GAP_MS)) return;
   if (g_nv.starts >= HOTATTACH_MAX) {

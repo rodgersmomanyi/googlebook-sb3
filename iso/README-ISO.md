@@ -20,20 +20,25 @@ options:
 Every destructive step asks you to type a confirmation, and the installer refuses disks it must not touch (see
 [The menu](#the-installer-menu)).
 
-**Current build** (2026-10-29, build `20261029-214311-0aac11da`): 7,472,459,776 bytes, SHA-256
-`8aa73f17927a84120660eb86bc6e1802eac0ed5dcdf426044c9c0ceaa5f42d4d`. It carries the Waves 4 and 5 USB image `b2714a63…`
-(the software lock-screen Gatekeeper, the VNNI `libz` patch for a faster start, the OTA gate and the
-native-readiness fixes: README-FLASH.md, "What is new") and a fresh dual-boot export (new GUIDs;
-made with `build_internal.py` on D: and then reused by `build_iso.py`, which ran all its export cross-checks and
-`verify_image.py` on it, so that C: stayed above its free-space floor). Only its two ESP objects differ from the
-previous ISO `b1c355b0…`; its 11 other payload objects are byte-identical.
+**Current build** (2026-10-30, build `20261030-091552-5b9fef10`): 7,472,447,488 bytes, SHA-256
+`afb68d3843b154396f9ab3341083cdda2b8a3d15b0ca04dfa00ede3edbc10d52`. It carries the Wave 6 USB image `f7a81cf5…`
+(notifications that reach the signed-in user, NVIDIA only on the 13.5" model, auto-rotate per posture, read-only VNNI libraries, log and safety follow-ups, on
+top of the Waves 4 and 5 software lock-screen Gatekeeper, VNNI `libz` patch, OTA gate and native-readiness fixes:
+README-FLASH.md, "What is new") and a fresh dual-boot export (new GUIDs;
+made with `build_internal.py` and then reused by `build_iso.py`, which ran all its export cross-checks and
+`verify_image.py` on it). Only its two ESP objects differ from the previous ISO `ad67f040…`; its 11 other payload
+objects are byte-identical.
+**Boot-menu edits** on an installed system (Wave 6 finding): the editor that **e** opens starts with the cursor at
+the start of the line; press **End** before typing an option (README-FLASH.md, "What is new").
 **Performance:** the system it installs started about 47 % faster in VMware with the VNNI patch (first boot until
-"boot completed" 587.7 s → 313.6 s, later boots 226.0 s → 118.0 s; README-FLASH.md). **Tests:** this build passed its VMware
-test subset on 2026-10-30 (T0, T1a, T1b, T3 with T3-build and the refusal cases T3n(d-f), T4: 264 checks, 0
-failed; option 1 wrote a disk byte-identical to the USB image `b2714a63…`; the dual-boot install left Windows'
-partitions and boot entries byte-identical, and the uninstall restored the GPT). The full suite was not re-run on
-this build. The previous ISO `b1c355b0…` (Wave 3) passed the full suite (all 38
-tests, `OVERALL PASS`) and is kept in `D:\GB-iso\prev\iso-w3-b1c355b0\`. Everything was still tested only in VMware
+"boot completed" 587.7 s → 313.6 s, later boots 226.0 s → 118.0 s; README-FLASH.md). **Tests:** T0, T1a/T1b, T2b/T2c/T2h, the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-10-30 (15 test ids, 402 checks, 0 failed); the other 22 test ids of the full suite passed the same day on the previous wave 6 build, whose installer is the same (only its two ESP objects differ). The previous Wave 6 ISO `ad67f040…` (before the notification fix; kept in
+`D:\GB-iso\prev\iso-w6a-ad67f040\`) passed 27 tests of its full run with 0 failed checks. The ISO `8aa73f17…`
+(Waves 4 and 5) passed its test subset on 2026-10-30 (T0, T1a,
+T1b, T3 with T3-build and the refusal cases T3n(d-f), T4: 264 checks, 0 failed; option 1 wrote a disk
+byte-identical to its USB image `b2714a63…`; the dual-boot install left Windows' partitions and boot entries
+byte-identical, and the uninstall restored the GPT) and is kept in `D:\GB-iso\prev\iso-w5-8aa73f17\`. The Wave 3
+ISO `b1c355b0…` passed the full suite (all 38
+tests, `OVERALL PASS`); it is no longer kept. Everything was still tested only in VMware
 and on disk image files, never on the real laptop.
 
 ---------------------------------------------------------------------------------------------------------------------
@@ -376,9 +381,9 @@ NVIDIA kernel modules and the Vulkan driver, about 60 MB): Googlebook copies and
 NVIDIA driver, so leave both files where they are. Every ISO built with a fresh export (Wave 2, and its review
 rebuild, DESIGN 13.4 and 13.8) carries **new** dual-boot GUIDs: it cannot remove a dual-boot install made with an
 earlier ISO; remove such an install with that earlier ISO's option 3 or with `uninstall_dualboot.ps1 -Force`. The
-earlier ISOs are kept in `D:\GB-iso\prev\iso-w3-b1c355b0\` (`b1c355b0…`, Wave 3), `D:\GB-iso\prev\` (`1718bcc1…`,
+earlier ISOs are kept in `D:\GB-iso\prev\iso-w5-8aa73f17\` (`8aa73f17…`, Waves 4 and 5), `D:\GB-iso\prev\` (`1718bcc1…`,
 before Wave 2) and `C:\GB-x86\out\prev\iso-w2fix-e0067b12\` (`e0067b12…`, the Wave 2 review ISO; moved to C: for disk
-space). The Wave 2 ISO `76fbb7ee…` is no longer kept. Since Waves 4 and 5 the ESP also carries the software
+space). The Wave 2 ISO `76fbb7ee…` and the Wave 3 ISO `b1c355b0…` are no longer kept. Since Waves 4 and 5 the ESP also carries the software
 Gatekeeper (lock-screen PIN): if a PIN is set on an install, clear it before an ESP update from an older ISO puts a
 tree without it on that install (README-FLASH.md, "What is new").
 

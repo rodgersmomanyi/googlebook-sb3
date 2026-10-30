@@ -38,7 +38,8 @@ device. In short:
 * **Our daemons and components** (`inject/native/components/*.json`): `gb_power` (batteries, charger, DTX detach,
   dGPU hot-plug, graphics switching, platform profile), `iptsd` (touch + pen), `gb_audio`, `gb_hw` (CPU power limits,
   backlight permissions, keyboard/touchpad IDCs, pen key layouts, input exclusions), `gb_sensors` (cros-ec style
-  sensors, auto-rotate overlay), the libcamera camera HAL (`camera.sb3.so`), the NVIDIA stack (`gb_nouveau`,
+  sensors, auto-rotate overlays: `config_supportAutoRotation` for the framework and Auto-rotate on by default for
+  new users; a read-only rotation log line per posture change), the libcamera camera HAL (`camera.sb3.so`), the NVIDIA stack (`gb_nouveau`,
   `nvk_probe` and the self-test, the per-app driver package GbGfxDriver with `ro.gfx.driver.0`, the GbGpu app with
   the "Graphics" tile and Settings page, the compute service `gb_gpu_compute`), `gb_slotsync`, `gb_bootlog`.
 
@@ -140,7 +141,9 @@ The same layout can also be installed from a bootable installer ISO that you bui
 * `8250.nr_uarts=4` is kept natively (wave 3): the GKI is built with `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, so
   without it `serial8250_init()` gives up before the 8250 driver registers, and the LPSS UART that carries the
   Surface Aggregator (base keyboard, touchpad, batteries, charger, detach) fails with `-22`. No `console=ttyS*` or
-  `earlycon` is added natively (the serdev core owns that UART). Finding credit: gbOS86 (their Surface Laptop 7 fix,
+  `earlycon` is added natively (the serdev core owns that UART; the screen-only `earlycon=efifb` of the
+  [debug boot](FLASHING.md#debug-boot-kernel-messages-on-the-screen) is a one-boot edit in the boot menu). Finding
+  credit: gbOS86 (their Surface Laptop 7 fix,
   github.com/linuxkid473/gbos-x86 @f8a5c1a, HANDOFF.md:423).
 * NVIDIA: nouveau is never part of the boot (no load list), loads only after Android is up, and every boot that
   loads it sets `kernel.panic=30` (the base command line keeps `panic=0`). The crash-loop guard and the `gb.nouveau=0`
@@ -152,6 +155,13 @@ The same layout can also be installed from a bootable installer ISO that you bui
   (seen with GRUB). We boot through systemd-boot with the flag set. If the boot stops right after the menu, clear the
   flag in the ESP's copy of the kernel: `native/dualboot/build_internal.py --clear-nx-compat` does that for the
   internal install; `build_usb.py` has no such option yet.
+* **An oops before Android** (while `gbinit` loads i915, IPTS, the camera or the Surface modules) stops the boot with
+  no screen console and no `gblog\` file (`panic=0`, `CONFIG_PANIC_ON_OOPS=y`). The kernel has `CONFIG_EFI_EARLYCON`:
+  the [debug boot](FLASHING.md#debug-boot-kernel-messages-on-the-screen) (`earlycon=efifb keep_bootcon` with
+  `loglevel=5`, typed in the boot menu for one boot) draws the error text on the firmware frame buffer. Tested in
+  VMware (Android still starts; a panic forced during `gbinit`'s module loading stays on the screen), not yet on the
+  laptop, where it is inferred that i915 keeps the firmware picture until Android draws. It is not a serial
+  `earlycon` and never part of an entry file (`verify_image.py` check V16 refuses `earlycon` there).
 * lapis's boot_control HAL rewrites the GPT of the disk that holds `vbmeta_a/b` when it updates the slot bits.
 * **AVX-IFMA**: our #UD emulator covers AVX-VNNI only; lapis's libinput is reported to use VEX AVX-IFMA too, which
   Ice Lake lacks (prior-art finding, unverified here).
@@ -171,7 +181,7 @@ gbinit applies to the `/odm` tree before Android starts (wave 3; design idea fro
 [how it works](https://gbos86.com/docs/how-it-works); the code is ours).
 
 * **Off by default, one boot at a time.** It runs only when the kernel command line carries both `gb.hw=native` and
-  `gb.overlay=1`. No shipped entry has `gb.overlay=1`: press `e` on the entry in the systemd-boot menu and append
+  `gb.overlay=1`. No shipped entry has `gb.overlay=1`: press `e` on the entry in the systemd-boot menu, press End and append
   ` gb.overlay=1` for one boot (recommended). Never put it into the default entry: gb_slotsync copies the default
   entry's options into the next slot's entry. A hand-made extra entry file (`loader\entries\gb-<x>-bringup.conf`)
   is not recommended: it names `/initrd-<x>.img`, which pins slot `<x>`, and gb_slotsync never updates it, so after

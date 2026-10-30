@@ -106,7 +106,7 @@ section per item and a table of the checklist steps that only a person at the la
 | 28 | gatekeeper | wave 4 | `gb_gatekeeper: registered ...IGatekeeper/default` | never registered, 3+ exits, `Could not find Gatekeeper device` |
 | 29 | zram | fstab / mmd | `Adding ...k swap on /dev/block/zram0` / summary `swaps:` | zram/swapon errors, or none after boot completed (mmd starts it after completion) |
 | 30 | vnni | cl. 24, K15.md | `-- gb_vnni`: `irqon == emulated` (notes: counts per snapshot, top comms, adler32 RIPs) | not equal; k15 without the node |
-| 31 | libz_bind | wave 5, vnni-perf | `processing action (ro.{system,vendor}.build.fingerprint=... && early-init) from (/odm/...)`, no failure | a `/odm/vnni` / libz.so command failed or the trigger was rejected (`gb.vnni=0` = UNKNOWN) |
+| 31 | libz_bind | wave 5, vnni-perf | `processing action (ro.{system,vendor}.build.fingerprint=... && early-init) from (/odm/...)`, no failure | a `/odm/vnni` / libz.so command failed or the trigger was rejected (`gb.vnni=0` = UNKNOWN); wave 6: the gbvnni read-only remount (`mount tmpfs gbvnni /odm/vnni remount ro`, ungated) failing with "No such file or directory" only means no `/odm/vnni` this boot (OTA gate, gbinit fallback) and is a note; any other error of it after the binds ran is a FAIL (the patched libz stays writable) |
 | 32 | fsverity | cl. 24 | summary `ext4 feature present` (or `Enabling ext4 verity on .../userdata`) | absent, `FS_STAT_ENABLE_VERITY_FAILED`, tune2fs failure |
 | 33 | apgetty | cl. 24 | `desktop.apgetty.enable` not 1 and the service not running | on |
 | 34 | slotsync | cl. 24, OTA.md | no `gb_slotsync: HOLD slot` | a HOLD |
@@ -235,11 +235,28 @@ commit there. The wave-5 line's `hwc:` part is noted as the three composer switc
 
 ### OTA gate
 
-`GB_BOOTLOG_SH` `cd94022f` has no summary line for the OTA gate (wave 5b), and the analyzer has no item for it. On a
-build that is not the one the ESP was made for, the gate shows up elsewhere in the snapshot: `gb_otagate: UNVALIDATED
-build: booted ..., ESP built for ... (token ...); skipped: ...` in the kernel log and `ro.vendor.gb.ota_gate=unvalidated`
-in `== getprop`. On such a build read that line before the items that use the skipped `/odm` parts (e.g.
-`libz_bind`); the analyzer does not relate them to the gate. Update the ESP to re-validate.
+From wave 6 (w6prep ota-followups, OTA follow-up F2) the summary has one line for the gate, right after
+`gb_slotsync HOLD:`, read from gbinit's `/odm/etc/gb/ota_state`:
+`ota gate: state=<validated|unvalidated|off> token=<none|force|0> prop=<ro.vendor.gb.ota_gate> vnni=<present|absent>
+notifier=<init.svc.gb_otagate> booted=<fingerprint> validated=<fingerprint>` (or `ota gate: no state file (an image
+without the OTA gate)`). Item `ota_gate` judges it:
+
+* PASS `validated` (this boot's build is the one the image was made for);
+* FAIL `unvalidated` with token `none` (booted after a Google update to another build: the VNNI libz patch was
+  skipped, everything else runs as built but untested on that build; update the ESP to re-validate);
+* FAIL `unvalidated` while `/odm/vnni` is still there or the property is not set (the gate did not take effect), a
+  `validated` line with the property set, or an unknown state;
+* UNKNOWN with the test token `gb.otagate=force` (when its path took effect), with `gb.otagate=0`, or without a state
+  file.
+
+Logs of wave-5 images (`GB_BOOTLOG_SH` `cd94022f`, no such line): FAIL when the kernel log has `gb_otagate: UNVALIDATED
+build: booted ..., ESP built for ...` or `== getprop` has `[ro.vendor.gb.ota_gate]: [unvalidated]`, else UNKNOWN. On an
+unvalidated build read this item before the items that use the skipped `/odm` parts (e.g. `libz_bind`). With OTA
+follow-up F3 the root notifier also writes, for each bind of the `/odm` rc files, `gb_otagate: stock <path>
+<sha256|hidden-by-our-bind|hidden-by-overlay|unreadable> ours <sha256|unreadable>` (a sha256 only where nothing of
+ours covers the path, e.g. the stock libz when the gated VNNI bind did not fire) and one `gb_otagate: stock report:
+...` line to the kernel log: a diagnostic only, to compare with the same lines of a `gb.otagate=force` boot of the
+validated build. Files of the `/vendor` overlay are only counted (no runtime path shows their stock version).
 
 ## Tests
 

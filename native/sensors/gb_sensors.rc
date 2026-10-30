@@ -21,3 +21,15 @@ on early-boot
 
 on property:sys.boot_completed=1
     start gb_sensors_diag
+
+# (readiness A-L3) one read-only 'GB_SENSORS: rotation:' line per DTX device-mode change (gb_power publishes
+# vendor.gb.dtx.mode) once Android is up: never started without DTX (VMware), only ever 'start'ed (never blocks init).
+service gb_sensors_rotation /system/bin/sh /odm/gb_sensors.sh rotation
+    user root
+    group root system shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1 && property:vendor.gb.dtx.mode=*
+    start gb_sensors_rotation

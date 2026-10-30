@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- lapis SettingsProvider (com.android.providers.settings, bool/def_accelerometer_rotation): false. -->
+    <bool name="def_accelerometer_rotation">true</bool>
+</resources>

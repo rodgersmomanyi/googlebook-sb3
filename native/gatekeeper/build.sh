@@ -5,6 +5,8 @@
 #
 #   sh build.sh           1. BoringSSL libcrypto.a for the host and for Android (once, cached)
 #                         2. host unit tests (ASan + UBSan) and the independent Python check;
+#                            the frozen on-disk vectors (SA-6: tests/test_frozen_v1.cpp + frozen_check.py,
+#                            the gk_key.v1 files and handles 0.2.0 enrolled must still verify; never regenerate);
 #                            the tests also run the service binary itself, linked with a fake
 #                            service manager (tests/fake_sm.cpp), as a child process
 #                            2b. optional (REGRESS_OLD=dir): the same tests against older
@@ -124,6 +126,14 @@ g++ $SAN $HOBJ "$H/obj/service_main.o" "$H/obj/fake_sm.o" "$LIBCRYPTO_HOST" -lpt
 grep -q "GK_HOST_TESTS: [0-9]* passed, 0 failed" "$H/test.log" || fail "host unit tests"
 python3 -I tests/ref_check.py "$H/vectors.json" | tee "$H/ref_check.log"
 grep -q "GK_REF_CHECK: PASS" "$H/ref_check.log" || fail "reference check"
+# SA-6: the frozen on-disk vectors through the production verify path (a scheme change would lock enrolled users out)
+g++ -std=c++17 -O1 -g $SAN -Wall -Wextra -Werror $INC -c tests/test_frozen_v1.cpp -o "$H/obj/test_frozen_v1.o"
+g++ $SAN $HOBJ "$H/obj/test_frozen_v1.o" "$LIBCRYPTO_HOST" -lpthread -o "$H/gk_frozen_tests"
+mkdir -p "$H/frozen_tmp"
+"$H/gk_frozen_tests" "$H/frozen_tmp" 2>&1 | tee "$H/frozen.log"
+grep -q "GK_FROZEN_V1: PASS" "$H/frozen.log" || fail "frozen on-disk vectors (SA-6): enrolled PINs would stop verifying"
+python3 -I tests/frozen_check.py tests/frozen_v1.json tests/test_frozen_v1.cpp | tee "$H/frozen_ref.log"
+grep -q "GK_FROZEN_REF: PASS" "$H/frozen_ref.log" || fail "frozen vector reference check (SA-6)"
 
 # ---- 2b. the same tests against older sources (optional): they must fail there ---------------
 if [ -n "${REGRESS_OLD:-}" ]; then
@@ -213,6 +223,10 @@ $CXX_A -pie -static-libstdc++ -Wl,-z,now -Wl,--no-undefined $TOBJ "$T/obj/test_m
 # the real service_main.cpp with the fake service manager, for test_registration
 $CXX_A -pie -static-libstdc++ -Wl,-z,now -Wl,--no-undefined $TOBJ "$T/obj/service_main.o" \
   "$T/obj/fake_sm.o" "$LIBCRYPTO_ANDROID" -llog -o "$T/gk_android_service_fake"
+# SA-6: the frozen on-disk vectors, Android build
+$CXX_A $CF -Wall -Wextra -Werror $INC -c tests/test_frozen_v1.cpp -o "$T/obj/test_frozen_v1.o"
+$CXX_A -pie -static-libstdc++ -Wl,-z,now -Wl,--no-undefined $TOBJ "$T/obj/test_frozen_v1.o" \
+  "$LIBCRYPTO_ANDROID" -llog -o "$T/gk_android_frozen_tests"
 if [ -n "${LAPIS_RT:-}" ] && [ -n "${LAPIS_SYSLIB:-}" ]; then
   LDP="$LAPIS_RT/lib64/bionic:$LAPIS_RT/lib64:$LAPIS_SYSLIB"
   run_lapis() { LD_LIBRARY_PATH=$LDP "$LAPIS_RT/bin/linker64" "$@" 2>&1 | grep -v "linker configuration"; }
@@ -222,6 +236,9 @@ if [ -n "${LAPIS_RT:-}" ] && [ -n "${LAPIS_SYSLIB:-}" ]; then
   grep -q "GK_HOST_TESTS: [0-9]* passed, 0 failed" "$T/test.log" || fail "Android unit tests"
   python3 -I tests/ref_check.py "$T/vectors.json" | tee "$T/ref_check.log"
   grep -q "GK_REF_CHECK: PASS" "$T/ref_check.log" || fail "reference check (Android build)"
+  mkdir -p "$T/frozen_tmp"
+  run_lapis "$T/gk_android_frozen_tests" "$T/frozen_tmp" | tee "$T/frozen.log"
+  grep -q "GK_FROZEN_V1: PASS" "$T/frozen.log" || fail "frozen on-disk vectors (Android build, SA-6)"
   run_lapis "$A/$BIN" --version | tee "$A/lapis_run.log"
   run_lapis "$A/$BIN" --selftest | tee -a "$A/lapis_run.log"
   grep -q "selftest: PASS" "$A/lapis_run.log" || fail "service binary self-test on lapis bionic"
@@ -254,6 +271,8 @@ fi
   [ -n "${COMPARE_WITH:-}" ] && echo "reproducible: SHA256SUMS identical to $COMPARE_WITH"
   echo "host: $(grep GK_HOST_TESTS "$H/test.log") (ASan+UBSan)"
   echo "host: $(grep GK_REF_CHECK "$H/ref_check.log")"
+  echo "host: $(grep GK_FROZEN_V1 "$H/frozen.log")"
+  echo "host: $(grep GK_FROZEN_REF "$H/frozen_ref.log")"
   if [ -n "${REGRESS_OLD:-}" ]; then
     echo "regress-old ($REGRESS_OLD): $(grep GK_HOST_TESTS "$OUT/regress/test.log")"
     grep "^regress-old:" "$OUT/regress/summary.txt"
@@ -261,6 +280,7 @@ fi
   if [ -f "$T/test.log" ]; then
     echo "android-on-lapis-bionic: $(grep GK_HOST_TESTS "$T/test.log")"
     echo "android-on-lapis-bionic: $(grep GK_REF_CHECK "$T/ref_check.log")"
+    echo "android-on-lapis-bionic: $(grep GK_FROZEN_V1 "$T/frozen.log")"
     echo "android-on-lapis-bionic: $(grep selftest "$A/lapis_run.log")"
   else
     echo "android-on-lapis-bionic: NOT RUN (LAPIS_RT/LAPIS_SYSLIB unset)"

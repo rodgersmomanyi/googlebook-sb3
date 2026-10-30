@@ -9,7 +9,8 @@ UI-01: aapt2 dump badging (package, versionCode = epoch minutes of the build, ve
 UI-02 / UI-1B-10 (INTERFACES 13.2 v1.2): the manifest (aapt2 dump xmltree of the built APK) has exactly the 13.2
        components with the right exported flags, guard permissions, intent actions and meta-data (Settings entry
        "Graphics" in category ia.system with keyhint graphics and summary_uri, no switch_uri; tile label "Graphics";
-       the non-exported ActionReceiver); every requested permission (POST_NOTIFICATIONS, QUERY_ALL_PACKAGES) is
+       the non-exported ActionReceiver; wave 6: the non-exported UserReceiver for BOOT_COMPLETED only); every
+       requested permission (POST_NOTIFICATIONS, QUERY_ALL_PACKAGES, wave 6 RECEIVE_BOOT_COMPLETED) is
        normal or dangerous and not privileged, and every guard permission is signature level, both judged by the
        platform's own framework manifest inside android.jar; the QUERY_ALL_PACKAGES justification is written down
        (source manifest comment, lint suppression); classes.dex carries the v1.2 command and intent strings.
@@ -193,7 +194,8 @@ def main():
     for needle in (b"get-mode", b"set-mode", b"set-app-policy", b"set-app-intel", b"set-app-nvidia", b"get-apps",
                    b"apps-begin", b"apps-add ", b"apps-commit", b"run-selftest", b"list-holders",
                    b"close-holders-and-detach", b"ui-caps", b"gb.sb3.gpu.action.CANCEL_DETACH", b"gb.sb3.gpu.extra.MODE",
-                   b"gb_gpu_detach"):
+                   b"gb_gpu_detach", b"android.intent.action.BOOT_COMPLETED",
+                   b"headless system user: state broadcast ignored"):
         check(needle in dex, "classes.dex has the string %r" % needle.decode())
     for gone in (b"checked_state", b"set_checked_error", b"nvidia_gpu", b"gb.sb3.gpu.extra.THEN_DISABLE"):
         check(gone not in dex, "classes.dex no longer has %r (v1.1 Settings switch / dialog)" % gone.decode())
@@ -223,7 +225,7 @@ def main():
             comps[(kind, n[len("gb.sb3.gpu"):] if n.startswith("gb.sb3.gpu.") else n)] = e
     want = {("service", ".GpuTileService"), ("service", ".DetachTileService"), ("activity", ".SettingsActivity"),
             ("activity", ".HoldersActivity"), ("provider", ".SwitchProvider"), ("receiver", ".StateReceiver"),
-            ("receiver", ".ActionReceiver")}
+            ("receiver", ".ActionReceiver"), ("receiver", ".UserReceiver")}
     check(set(comps) == want, "exactly the 13.2 (v1.2) components: %s" % sorted(n for _, n in comps))
 
     def comp(kind, name):
@@ -236,7 +238,8 @@ def main():
     check(actions(t) == ["android.service.quicksettings.action.QS_TILE"], "GpuTileService QS_TILE action")
     md = meta(t)
     check(md.get("android.service.quicksettings.TOGGLEABLE_TILE") == "true", "TOGGLEABLE_TILE=true")
-    check(md.get("android.service.quicksettings.ACTIVE_TILE") == "true", "ACTIVE_TILE=true")
+    check("android.service.quicksettings.ACTIVE_TILE" not in md,
+          "no ACTIVE_TILE (wave 6: lapis SystemUI drops requestListeningState; bound while the QS panel is shown)")
     check(label(t) == "Graphics", "tile label 'Graphics' (13.2 v1.2; same component name as v1.1)")
     check("android:icon" in t.attrs, "GPU tile icon")
 
@@ -291,6 +294,12 @@ def main():
     check(r.attrs.get("android:permission") == "android.permission.DUMP", "StateReceiver requires DUMP")
     check(actions(r) == ["gb.sb3.gpu.action.STATE_CHANGED"], "StateReceiver action gb.sb3.gpu.action.STATE_CHANGED")
 
+    r = comp("receiver", ".UserReceiver")
+    check(r.attrs.get("android:exported") == "false",
+          "UserReceiver not exported (wave 6: only the system's protected BOOT_COMPLETED reaches it)")
+    check(actions(r) == ["android.intent.action.BOOT_COMPLETED"], "UserReceiver action BOOT_COMPLETED only")
+    check("android:permission" not in r.attrs, "UserReceiver needs no guard (not exported)")
+
     open_exported = [n for (k, n), e in comps.items()
                      if e.attrs.get("android:exported") == "true" and "android:permission" not in e.attrs]
     check(open_exported == [".SettingsActivity"], "only SettingsActivity is exported without a permission (%s)"
@@ -301,8 +310,12 @@ def main():
     check(len(levels) > 500, "framework permissions read from android.jar (%d)" % len(levels))
     used = sorted(e.attrs.get("android:name", "") for e in man.find("uses-permission")
                   + man.find("uses-permission-sdk-23"))
-    check(used == ["android.permission.POST_NOTIFICATIONS", "android.permission.QUERY_ALL_PACKAGES"],
-          "uses-permission is exactly POST_NOTIFICATIONS + QUERY_ALL_PACKAGES (%s)" % used)
+    check(used == ["android.permission.POST_NOTIFICATIONS", "android.permission.QUERY_ALL_PACKAGES",
+                   "android.permission.RECEIVE_BOOT_COMPLETED"],
+          "uses-permission is exactly POST_NOTIFICATIONS + QUERY_ALL_PACKAGES + RECEIVE_BOOT_COMPLETED (%s)" % used)
+    lb = levels.get("android.permission.RECEIVE_BOOT_COMPLETED")
+    check(lb is not None and lb & 0xF == 0, "RECEIVE_BOOT_COMPLETED is protection level normal: %s"
+          % (hex(lb) if lb is not None else lb))
     lq = levels.get("android.permission.QUERY_ALL_PACKAGES")
     check(lq is not None and lq & 0xF == 0, "QUERY_ALL_PACKAGES is protection level normal (granted at install): %s"
           % (hex(lq) if lq is not None else lq))

@@ -74,7 +74,9 @@ SUMMARY_KEYS = ("serial 8250:", "serial errors:", "serial surface_serial_hub bou
                 "apgetty:", "fs-verity:",
                 # (wave 5) the lines GB_BOOTLOG_SH added (logs of older images lack them)
                 "kernel log:", "deferred probes", "buttons:", "posture:", "posture override:", "audio dsp_driver=",
-                "i915 PSR/underrun lines:", "wifi:", "bluetooth:", "camera:", "linker:")
+                "i915 PSR/underrun lines:", "wifi:", "bluetooth:", "camera:", "linker:",
+                # (wave 6, OTA gate F2) gbinit's verdict from /odm/etc/gb/ota_state
+                "ota gate:")
 # (wave 5, native-readiness A-L1) -517 = -EPROBE_DEFER: a probe deferred and retried later, never an error by itself
 # (on the SB3 surface_hotplug's first probe, before lapis's pinctrl-icelake, logs "failed to set up IRQ 0: -517")
 DEFERRED_RE = re.compile(r"-517(?!\d)|EPROBE_DEFER")
@@ -728,6 +730,15 @@ def c_cmdline(a, it):
                       ("gb.boot=usb", "booted from the USB stick")):
         if key in a.cmdline:
             it.note(f"{key}: {what}")
+    if any(t.startswith("earlycon=efifb") for t in a.cmdline):    # B-6: FLASHING.md section 7, "Debug boot"
+        lv = [t[len("loglevel="):] for t in a.cmdline if t.startswith("loglevel=")]
+        eff = lv[-1] if lv else "?"
+        full = "ignore_loglevel" in a.cmdline and not any(
+            t.replace("-", "_") == "printk.ignore_loglevel=0" for t in a.cmdline)
+        it.note("earlycon=efifb: debug boot (kernel messages drawn on the screen, so this boot is slower); "
+                f"effective loglevel={eff}" + ("" if eff == "5" and not full else
+                " - expected loglevel=5 and printk.ignore_loglevel=0 typed at the END of the line (press End "
+                "in the boot editor first)"))
     if bad:
         return it.set(FAIL, "; ".join(bad))
     it.set(PASS, "8250.nr_uarts, gb.hw=native, the SOF, reboot, blacklist and pstore tokens are all present")
@@ -1847,20 +1858,35 @@ def c_vnni(a, it):
 def c_libz(a, it):
     proc = a.b.dm(r"processing action \(([^()]*\bro\.(system|vendor)\.build\.fingerprint=[^()]*)\) from "
                   r"\((/odm/[^)]*)\)")
-    fail = a.b.dm(r"init: Command '[^']*(/odm/vnni|libz\.so)[^']*'.*failed")
+    # (wave 6, w6prep vnni-hardening) the vnni block's one ungated action, at `on init`: the gbvnni tmpfs goes read-only
+    # for every mount of it. "No such file or directory" = no /odm/vnni this boot (the OTA gate after a Google OTA, or
+    # gbinit's fallback; the gated actions report their own failures): not a bind failure. Any other error: the binds
+    # work, but the patched libz stays writable (the wave-5 state)
+    tail = a.b.dm(r"init: Command 'mount tmpfs gbvnni /odm/vnni remount ro'.*failed: (.*)")
+    tail_ev = {e for e, _m in tail}
+    tail_bad = [(e, m) for e, m in tail if "No such file or directory" not in m.group(1)]
+    fail = [(e, m) for e, m in a.b.dm(r"init: Command '[^']*(/odm/vnni|libz\.so)[^']*'.*failed") if e not in tail_ev]
     parse = a.b.dm(r"(unexported property trigger.*fingerprint|fingerprint.*unexported property trigger|"
                    r"/odm/\S*gb\.rc: \d+: .*(vnni|libz|fingerprint))")
-    it.add(proc[:2]).add(fail[:3]).add(parse[:2])
+    it.add(proc[:2]).add(fail[:3]).add(parse[:2]).add(tail[:1])
     if "gb.vnni=0" in a.cmdline:
         it.add([a.cmdline_ev])
         return it.set(UNKNOWN, "gb.vnni=0 on the command line: the binds are switched off for this boot")
     if fail or parse:
         return it.set(FAIL, "a libz bind action failed or was rejected (the stock libz stays under emulation)")
+    if tail and not tail_bad:
+        it.note("the gbvnni read-only remount (wave 6) found no /odm/vnni: removed this boot (OTA gate, gbinit "
+                "fallback)")
     if proc:
         parts = sorted({m.group(2) for _e, m in proc})
         if len(parts) < 2:
             it.note(f"only the {parts[0]} bind fired (the other partition's fingerprint did not match)")
+        if tail_bad:
+            return it.set(FAIL, f"the binds ran, but the gbvnni read-only remount (wave 6) failed "
+                                f"({tail_bad[0][1].group(1)[:80]}): the patched libz stays writable")
         return it.set(PASS, f"{len(proc)} fingerprint-gated bind action(s) ran ({', '.join(parts)}), no failure")
+    if tail_bad:
+        it.note(f"the gbvnni read-only remount (wave 6) failed: {tail_bad[0][1].group(1)[:80]}")
     if not a.b.klog_from_zero:
         return it.set(UNKNOWN, "the early-init part of the kernel log is not in any snapshot")
     it.set(UNKNOWN, "no fingerprint-gated /odm action ran: an image without the wave-5 libz patch, or a gate that "
@@ -1928,6 +1954,57 @@ def c_slotsync(a, it):
     if line or a.b.klog_from_zero:
         return it.set(PASS, "no HOLD line")
     it.set(UNKNOWN, "no summary line and the kernel log is wrapped")
+
+
+# (wave 6, OTA gate F2; ota-gating DESIGN.md 2.2) GB_BOOTLOG_SH's "ota gate:" line
+OTA_LINE_RE = re.compile(r"^ota gate: state=(\S*) token=(\S*) prop=(\S*) vnni=(\S*) notifier=(\S*) booted=(.*?) "
+                         r"validated=(.*)$")
+
+
+def _build_id(fp):
+    """The build id field of a fingerprint (brand/product/device:release/ID/incremental:type/tags), else the text."""
+    parts = fp.split("/")
+    return parts[3] if len(parts) >= 5 and parts[3] else (fp or "unknown")
+
+
+@check("ota_gate", "Booted build is the one the image was made for (OTA gate)", "checklist 24; OTA.md", "SW")
+def c_otagate(a, it):
+    line = a.b.newest_sline("ota gate:")
+    kl = a.b.dm(r"gb_otagate: UNVALIDATED build: booted (\S+), ESP built for (\S+)")
+    pv, pe = a.b.prop("ro.vendor.gb.ota_gate")
+    it.add([line] if line else []).add(kl[:1]).add([pe] if pe else [])
+    m = OTA_LINE_RE.match(line.text) if line else None
+    if line and not m:
+        if "no state file" in line.text:
+            return it.set(UNKNOWN, "no OTA gate in this image (no /odm/etc/gb/ota_state)")
+        return it.set(UNKNOWN, "the 'ota gate:' line has an unknown format")
+    if not m:                              # images before wave 6: the kernel line and the property only
+        if kl or pv == "unvalidated":
+            booted, built = (kl[-1][1].group(1), kl[-1][1].group(2)) if kl else ("?", "?")
+            return it.set(FAIL, f"this boot's build {_build_id(booted)} is not the build the image was made for "
+                                f"({_build_id(built)}): the VNNI libz patch was skipped; update the ESP to re-validate "
+                                "(OTA.md)")
+        return it.set(UNKNOWN, "no 'ota gate:' summary line (log written before wave 6) and no unvalidated sign")
+    state, token, prop, vnni, notifier, booted, built = m.groups()
+    it.note(f"booted {booted or '-'}; image made for {built or '-'}; token {token or '-'}; /odm/vnni {vnni}; "
+            f"ro.vendor.gb.ota_gate={prop or '(unset)'}; gb_otagate {notifier or 'not started'}")
+    if state == "validated":
+        if prop == "unvalidated":
+            return it.set(FAIL, "state validated but ro.vendor.gb.ota_gate=unvalidated is set (a packed property?)")
+        return it.set(PASS, f"validated: this boot's build {_build_id(booted)} is the one the image was made for")
+    if state == "off":
+        return it.set(UNKNOWN, "the gate was switched off for this boot (gb.otagate=0): every injection as built")
+    if state != "unvalidated":
+        return it.set(FAIL, f"unexpected gate state {state!r}")
+    if vnni != "absent" or prop != "unvalidated":
+        return it.set(FAIL, f"unvalidated, but the gate did not take effect (/odm/vnni {vnni}, "
+                            f"ro.vendor.gb.ota_gate={prop or '(unset)'})")
+    if token == "force":
+        return it.set(UNKNOWN, "forced with the test token gb.otagate=force: the unvalidated path took effect "
+                               "(/odm/vnni removed, the property set)")
+    it.set(FAIL, f"this boot's build {_build_id(booted)} is not the build the image was made for ({_build_id(built)}): "
+                 "the VNNI libz patch was skipped, the rest runs as built (untested on this build); update the ESP from "
+                 "the host to re-validate (OTA.md)")
 
 
 @check("esp_bringup", "ESP bring-up config (gb\\gb.cfg) not used, or applied cleanly", "checklist 24; FLASHING.md 8",

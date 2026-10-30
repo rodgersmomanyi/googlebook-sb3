@@ -64,7 +64,8 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
   * Row 14: kernel build #15 adds the opt-in "white veil" switch `i915.gb_ignore_user_gamma` (off). Build #15 also
     reworks the `#UD` AVX-VNNI emulator ([kernel/K15.md](../kernel/K15.md)); nouveau is unchanged from #14.
   * Every boot log starts with a one-screen `== summary` ([FLASHING.md](FLASHING.md#first-boot-checklist)); the
-    serial login console (`apgetty`) is off natively; the native fstab asks for fs-verity on userdata; the opt-in
+    serial login console (`apgetty`) is off natively (from wave 6 it is stopped at `on init`,
+    about 0.1 s after lapis starts it; earlier images stop it at `on boot`, about 20 s later); the native fstab asks for fs-verity on userdata; the opt-in
     `gb\gb.cfg` bring-up config can change module options, properties and input/audio files for one boot.
   * Rows 37-38: `native/nouveau-kernel/tools/fw_coverage.py` pins every staged firmware file to its package
     ([INPUTS.md](INPUTS.md#firmware-native-only)).
@@ -88,8 +89,8 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     touchscreen is suppressed while the Surface Pen hovers in proximity.
   * Rows 27, 28, 46 (A-L2, A-L3, A-L4): wake sources in row 46 exclude `surface_aggregator` (its wake IRQ is disabled
     by default upstream to avoid spurious wakeups, so keyboard keys do not wake); rows 27, 28 and 46 note that
-    upstream linux-surface marks Surface Book 3 sensors and S0ix as `?`; row 27 notes that `gb_sensors.sh` enables
-    auto-rotate on first boot across postures; `gb_hw.sh diag` logs the ACPI LPIT S0ix residency counters
+    upstream linux-surface marks Surface Book 3 sensors and S0ix as `?`; row 27 describes the auto-rotate behaviour
+    per posture; `gb_hw.sh diag` logs the ACPI LPIT S0ix residency counters
     (`low_power_idle_system_residency_us`, `low_power_idle_cpu_residency_us`).
   * **Row 29 (Cameras, C-1):** `native/camera-userspace/build-scripts/stage.sh` now runs `llvm-strip --strip-unneeded`
     **before** `patchelf` (with `--page-size` set to the file's largest `PT_LOAD` `p_align`) and checks `PT_LOAD`
@@ -113,6 +114,41 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     and the OTA gate ([OTA.md](OTA.md#the-ota-gate-wave-5)) are in the native images from wave 5 on.
   * [Readiness audit](#readiness-audit-wave-5-what-the-image-proves-and-what-needs-the-laptop) below: what the
     wave 5 audits verified in the image, and what only the laptop can show.
+* **Wave 6, 2026-10-30 (hardware-independent backlog; nothing has run on the hardware yet):**
+  * Row 17: only a TU117 (the 13.5" model) is ever probed. On a 15" Surface Book 3 (TU116/TU106; the image has no
+    firmware for them) `gb_nouveau.sh` stops before any write with `vendor.gb.nouveau.result=refused:model` and one
+    log line; the dGPU stays driverless (expected to sleep in D3cold, as in Intel mode; not yet seen on hardware),
+    there is no "NVIDIA GPU problem" notification, gb_power does not retry it, and the Graphics tile and page say
+    `Intel (NVIDIA not supported)`. An unreadable device id is not gated.
+  * Row 27 (A-L3): the laptop posture is rotation-locked by lapis's own WindowManager
+    (`DisplayRotation.LaptopController`, enabled by our `config_supportAutoRotation=true` overlay on a PC-type device),
+    the tablet posture follows the Auto-rotate setting. The per-device-state rotation lock of AOSP
+    (`config_perDeviceStateRotationLockDefaults`) is **not** used: on lapis 276 it is only enabled for foldables.
+    `gb_sensors.sh` now logs `GB_SENSORS: rotation: <trigger>: device_state=... fixed_to_user=... => ok|MISMATCH|WARN|info`
+    after boot and after every DTX mode change (read-only, bounded). `GbSb3SettingsOverlay.apk` makes Auto-rotate
+    default to on for every user (lapis's SettingsProvider default is off).
+  * Notifications reach the person. lapis runs in headless system user mode: user 0 only shows the login screen,
+    and you use user 10. Every notice of ours ("System update not validated", "System update held", the NVIDIA
+    notices from `gb_notify`) is now posted once for all users (`cmd notification post -u all`), so it shows in
+    whichever user is signed in; before wave 6 these notices went to user 0 and were never shown. GbGpu's state
+    updates, its notification permission and its Quick Settings tile now follow the signed-in user, and the native
+    OTA gate's queued notice is readable by `gb_notify` (it was written 0600 and dropped). Shown in a VMware boot
+    of the VM tree with the forced OTA gate: the update notice, a `gb_notify` notice and a GbGpu state change all
+    appeared in user 10's notification panel. The native paths (GbGpu as a system app, the real gb_power) need the
+    laptop (item 27).
+  * VNNI patch (PERFORMANCE.md): the two patched `libz.so` copies sit on their own tmpfs, which init remounts
+    read-only as a whole after the binds, so no mount of them accepts a write in any mount namespace (wave 5 left the
+    propagated copies writable); the image build refuses a patch folder for another build or slot.
+  * OTA gate (OTA.md): `verify_image.py` check V32 checks the gate inside an image; the boot-log summary has an
+    `ota gate:` line and the analyser an `ota_gate` item; an unvalidated build logs the stock sha256 of each file our
+    binds cover; `build_usb.py --vm-test --vm-test-otagate` makes a forced test boot (booted in VMware).
+  * Lock-screen PIN safety (GATEKEEPER.md): `build_esp.py` and the ESP rollback refuse a change of the PIN path;
+    frozen Gatekeeper test vectors; `build_usb.py` / `build_internal.py` refuse while the VMware VM runs. The serial
+    login console (`apgetty`) is stopped at `on init`, within about 0.1 s of lapis starting it (VMware VM-1).
+  * FLASHING.md section 7: a debug boot that draws the kernel's messages on the screen (`earlycon=efifb`) for a
+    boot that stops before Android, tested in VMware; and the boot-menu editor opens with the cursor at the start of
+    the line (press End before typing an option; FLASHING, NATIVE, OTA and PERFORMANCE now say so).
+  * Tested in VMware on the rebuilt images: VM-1 on the USB image (every wave 2, 3, 5 and 6 check that VMware can show; the hardware-test analyser 17 PASS, 0 FAIL, 23 UNKNOWN), a forced OTA-gate boot of the VM build (the update notice, a `gb_notify` notice and a GbGpu state change in user 10's panel), and on the installer ISO T0, T1a/T1b (whole disk), T2b/T2c/T2h (refusals), the dual-boot groups G1-G4 (T3 install with its refusal cases, T4/T4b uninstall, T9 off-disk GPT copy) and T8 (the Windows scripts): 402 checks, 0 failed. The other 22 ISO tests passed the same day on the build before the notification fix, which has the same installer.
 
 ## 1. Platform, CPU, firmware interfaces
 
@@ -139,7 +175,7 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 | 14 | Intel Iris Plus 8A52 (00:02.0) | `i915.ko` + video/wmi/drm helpers (ours, gbinit) | `i915/icl_dmc_ver1_09.bin` staged (GuC/HuC optional) | lapis Mesa ANV (gfx11 + i915 backend), ANGLE, minigbm (i915 table includes 0x8a52), hwc3-drm | Ready | Uses lapis's stock graphics stack; the VMware-only overrides stay out of the native tree. **Wave 5:** the native build.prop sets the composer's own colour defaults (`vendor.hwc.drm.force_color_mode=-1`, `vendor.hwc.drm.persistent_hdr=false`, `vendor.hwc.use_log_gamma_lut=false`). lapis sets `13`/`true`/`true` for Google's BT.2020 panel, and according to the composer binary that makes it put a BT.709→BT.2020 gamut matrix into i915's CTM and tag the eDP as BT.2020: the expected grey, pale "white veil" (gbOS86 saw it on another i915 laptop). With `enable_color_pipeline=false` the composer clears the gamma LUT on every frame anyway; with the defaults the CTM carries only SurfaceFlinger's matrix, so Night Light works. The kernel switch `i915.gb_ignore_user_gamma` (build #15, default 0) stays as a fallback, set only through `gb\gb.cfg`: `=4` drops the CTM (Night Light off); `3` does nothing natively ([FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)). INFERRED until the first boot on the laptop. Checklist 21. |
 | 15 | Internal panel "Surface Calibrated Panel" MEI96A2, 3000x2000 eDP, backlight | i915 → `intel_backlight` | – | hwc3-drm drives `/sys/class/backlight/*` [V, strings]; lights HAL disabled (`ro.vendor.lights.backlight.enabled=false`) [V]; lapis `init.device-x86.rc` chowns `intel_backlight` [V] | Ready + **New here** | `gb_hw.sh boot` also chowns every other backlight to system (for example `acpi_video0`, if it ever appears). Brightness keys arrive only as keyboard HID consumer keys: ACPI `BRTN` has no caller, so there are no duplicate ACPI events [V, DSDT]. If the panel flickers or shows ghost images, put `GB_MODOPTS_i915=enable_psr=0 enable_fbc=0` into `gb\gb.cfg` and boot once with ` gb.overlay=1` ([FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)). `i915.enable_psr=0` on the command line has no effect, because gbinit loads i915 with `insmod` (untested). |
 | 16 | External display: base USB-C (DP alt mode) and Surface Connect / SurfaceDock DP | i915 DDI | – | – | Ready [I] | The USB-C port sits behind the base USB hub (`XHC.RHUB.HS02.PRT1`, `_UPC` type 0x09) [V], so DP comes through a mux in the base that the EC/PD controller drives. There is no OS UCSI (row 33). Expected to work as a plain DP connector. Unverified. |
-| 17 | NVIDIA GTX 1650 Max-Q 10DE:1F91 (base, behind 00:1d.4; its HDA function stays driverless); MSHW0216 "IHV GPU Power Controller"; MSHW0153 hot-plug | **nouveau** (build #14 = #13 + 37 linux-6.18.y nouveau backports + hardening N1-N3; `runpm=1 modeset=2`, headless), in no boot-time load list: `gb_nouveau.sh` loads it after `sys.boot_completed` when the base is attached and the graphics mode is Auto/NVIDIA (default Auto), and binds it again on reattach. Intel mode: no driver, D3cold. `gb_power` owns detach (refcnt gate, unbind + PCI remove in a worker), rescan and the re-bind guard. `surface_hotplug`. MSHW0216: no Linux driver anywhere | `nvidia/tu117` (30 files, GSP-RM 570.144, 535.113.01 fallback; linux-firmware tag 20260916, with WHENCE + `LICENCE.nvidia`) in the `gb/dgpu-<krel>.erofs` payload on the ESP, mounted at `/odm/dgpu`; you fetch it | **Per-app NVIDIA graphics:** the driver package GbGfxDriver (`ro.gfx.driver.0`, Android's updatable-driver settings decided by gb_power) gives games and **Use NVIDIA** apps a shim that puts NVK (Mesa 26.3 + our Android patches) first. HWUI, SurfaceFlinger and the system UI stay on ANV. QS tile and Settings page "Graphics" (GbGpu). Automatic self-test (`nvk_probe`) before the first NVIDIA app. Compute service `gb_gpu_compute` (llama.cpp on NVK, UNIX socket). | Ready, untested on hardware | Everything runs headless: the dGPU has no display outputs, and its frames are composed by Intel. Apps switch GPU only when restarted, and detach is refused while apps hold the dGPU ("Close apps and detach"). Battery life depends on D3cold being reached when idle; check row 46 and the checklist. Recovery without a shell: `gb.nouveau=0` in the boot menu. Details: [NVIDIA.md](NVIDIA.md). |
+| 17 | NVIDIA GTX 1650 Max-Q 10DE:1F91 (base, behind 00:1d.4; its HDA function stays driverless); MSHW0216 "IHV GPU Power Controller"; MSHW0153 hot-plug | **nouveau** (build #14 = #13 + 37 linux-6.18.y nouveau backports + hardening N1-N3; `runpm=1 modeset=2`, headless), in no boot-time load list: `gb_nouveau.sh` loads it after `sys.boot_completed` when the base is attached and the graphics mode is Auto/NVIDIA (default Auto), and binds it again on reattach. Intel mode: no driver, D3cold. `gb_power` owns detach (refcnt gate, unbind + PCI remove in a worker), rescan and the re-bind guard. `surface_hotplug`. MSHW0216: no Linux driver anywhere | `nvidia/tu117` (30 files, GSP-RM 570.144, 535.113.01 fallback; linux-firmware tag 20260916, with WHENCE + `LICENCE.nvidia`) in the `gb/dgpu-<krel>.erofs` payload on the ESP, mounted at `/odm/dgpu`; you fetch it | **Per-app NVIDIA graphics:** the driver package GbGfxDriver (`ro.gfx.driver.0`, Android's updatable-driver settings decided by gb_power) gives games and **Use NVIDIA** apps a shim that puts NVK (Mesa 26.3 + our Android patches) first. HWUI, SurfaceFlinger and the system UI stay on ANV. QS tile and Settings page "Graphics" (GbGpu). Automatic self-test (`nvk_probe`) before the first NVIDIA app. Compute service `gb_gpu_compute` (llama.cpp on NVK, UNIX socket). | Ready, untested on hardware | Everything runs headless: the dGPU has no display outputs, and its frames are composed by Intel. Apps switch GPU only when restarted, and detach is refused while apps hold the dGPU ("Close apps and detach"). Battery life depends on D3cold being reached when idle; check row 46 and the checklist. Recovery without a shell: `gb.nouveau=0` in the boot menu. **Wave 6:** only a TU117 (PCI `10DE:1F80`-`1FFF`, the 13.5" model) is ever probed. On a 15" Surface Book 3 (TU116 GTX 1660 Ti or TU106 Quadro RTX 3000; the image has no firmware for them) `gb_nouveau.sh` stops before any write with `vendor.gb.nouveau.result=refused:model` and one log line; the dGPU stays driverless (expected D3cold), graphics stay on Intel, gb_power does not retry, and GbGpu shows `Intel (NVIDIA not supported)` instead of the "NVIDIA GPU problem" notification. An unreadable device id is not gated. Tested off the device only. Details: [NVIDIA.md](NVIDIA.md). |
 
 ## 3. Input
 
@@ -159,7 +195,7 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 
 | # | Device | Linux driver | Android side | Status | Notes |
 |---|---|---|---|---|---|
-| 27 | ISH 34FC + "HID Sensor Collection V2" 8087:0AC2 (accelerometer, gyro, ...) | lapis `intel-ish-*` + our `hid-sensor-*` (late list) with sensors patch 0001 (`cros-ec-accel` / `cros-ec-gyro`) | sensors component (lapis Desktop IIO sub-HAL, auto-rotate overlay, `gb_sensors.sh`) | Ready (unverified upstream; linux-surface: `?`) | ISH firmware comes from BIOS. QEMU-tested with a fake ISH; upstream linux-surface marks Surface Book 3 sensors as `?`. `gb_sensors.sh` sets `accelerometer_rotation=1` on the first boot, which also applies in laptop posture (the accelerometer is in the clipboard, so tilting the laptop can rotate the screen; turn **Auto-rotate** off in Quick Settings while the base is attached). |
+| 27 | ISH 34FC + "HID Sensor Collection V2" 8087:0AC2 (accelerometer, gyro, ...) | lapis `intel-ish-*` + our `hid-sensor-*` (late list) with sensors patch 0001 (`cros-ec-accel` / `cros-ec-gyro`) | sensors component (lapis Desktop IIO sub-HAL, auto-rotate overlay, `gb_sensors.sh`) | Ready (unverified upstream; linux-surface: `?`) | ISH firmware comes from BIOS. QEMU-tested with a fake ISH; upstream linux-surface marks Surface Book 3 sensors as `?`. Rotation follows the posture (Android's own laptop policy, not ours): with the base attached normally (device state `OPEN`) the screen stays in landscape whatever the Auto-rotate setting says; with the clipboard detached or the base reversed (`TABLET`) the **Auto-rotate** setting applies. Every user starts with Auto-rotate on (our SettingsProvider overlay, wave 6); turning it off in Quick Settings is remembered and only matters in tablet posture. `gb_sensors.sh` logs one `GB_SENSORS: rotation:` line at boot and at every attach/detach (unverified on the laptop). |
 | 28 | Ambient light MSHW0184 = APDS-9960 on I2C4 0x39, GpioInt pin 1 [V, DSDT] | `apds9960` with sensors patch 0002 (`cros-ec-light` companion) | sensors component | Ready (unverified upstream; linux-surface: `?`) | The IRQ needs pinctrl-icelake first; I2C probe deferral handles the order. Upstream linux-surface marks Surface Book 3 sensors as `?`. |
 | 29 | Cameras: front OV5693 INT33BE, rear OV8865 INT347A (+ DW9719 focus), IR OV7251 INT347E, INT3472 x3, ISP IPU4P 8086:8A19 | build #13: IPU4P port on the ipu6 driver (`intel-ipu6`, `intel-ipu6-isys`), `ov5693`, `ov8865`, `ov7251`, `dw9719`, `ipu-bridge`, `intel_skl_int3472_*`, `v4l2-cci` (gbinit) | libcamera simple pipeline + software ISP as `camera.sb3.so` (`ro.hardware.camera=sb3`) | Ready, untested (needs your IPU4P firmware) | Mainline Linux has no IPU4 driver; this is the project's own port. The HAL was tested against vimc on the builder only. The IR camera (Windows Hello) is not used by Android. USB UVC webcams should work independently (USB_VIDEO_CLASS=y + lapis USB camera provider). **Wave 5 (C-1):** `stage.sh` now strips before `patchelf` and gates `PT_LOAD` alignment (`V12b`); the re-staged camera libraries, the HAL, `lcam-probe` and `soft_ipa_proxy` load under lapis 276's bionic `linker64` (builder test; first device test pending). Expect front and rear preview/photos at modest quality and frame rate (CPU software ISP, manual focus only on DW9719, no IR camera use in Android). If the IPU4P driver misbehaves at bring-up, `GB_SKIPMOD=intel_ipu6_isys,intel_ipu6` in `gb\gb.cfg` (one boot with `gb.overlay=1`) skips it. |
 
@@ -223,7 +259,17 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 7. Dock: SurfaceDock Ethernet (r8152 firmware lines in dmesg), external DP and dock audio.
 8. Pen: pair the Surface Pen in Android Bluetooth settings. A top-button click should open the notes app; double-click takes a screenshot.
 9. Cameras: the boot-log summary shows `vendor.camera-provider-2-7-legacy-wrapper` `running` with `HAL load failures: 0`; `dmesg | grep -i ipu` shows firmware `intel/ipu/ipu4p_fw.bin` loaded and ISYS registered; `/odm/bin/lcam-probe -l` lists the front (`ov5693`) and rear (`ov8865`) sensors without `CANNOT LINK EXECUTABLE`; then test the Camera app (front and rear).
-10. Sensors: auto-rotate with the clipboard detached; auto-brightness (`gb_sensors` diag lines in the boot log; note that upstream linux-surface marks SB3 sensors as `?`). On the first boot `gb_sensors.sh` enables auto-rotate across postures: turn **Auto-rotate** off in Quick Settings if tilting in laptop mode rotates the screen.
+10. Sensors: auto-brightness, and rotation per posture (note that upstream linux-surface marks SB3 sensors as `?`).
+    Within 14 minutes after boot (the last boot-log snapshot is taken at 15 minutes): with the base attached, tilt
+    the laptop (the screen must stay landscape); detach the clipboard, wait 10 s, turn it to portrait (it must
+    rotate if **Auto-rotate** is on in Quick Settings); reattach (back to landscape). The next boot-log snapshot
+    then holds one `GB_SENSORS: rotation:` line per step: `ok: laptop posture, rotation locked` and `ok: tablet
+    posture, auto-rotate on|off ...` are the expected verdicts. `MISMATCH` means Android's posture policy did not
+    follow the hardware (the line shows the device state and whether the display is fixed to the user rotation);
+    `WARN: config_supportAutoRotation is off` means the sensors overlay did not apply (`cmd overlay list | grep
+    gb_sb3`); a `note: DTX mode ... disagrees with the device state` points at the lid switch or `SW_TABLET_MODE`
+    (item 25). The `GB_SENSORS: rotation: diag:` line shows the state at boot (usually the login screen; its
+    `user=` field says which user).
 11. Suspend: lid close → s2idle → lid open wakes. Power button sleeps and wakes (also with the clipboard detached, once `gb_hw.sh buttons` bound `MSHW0040:00`: item 25). Base keyboard keys are **not** expected to wake (`surface_aggregator` leaves wake off by default). After a sleep, check the battery drop, `/sys/power/suspend_stats` and `lpi_residency_us system=` on the `gb_hw: diag: mem_sleep` line (growing > 0 confirms S0ix residency), and check that the dGPU is in D3cold (`gb_hw: diag: dGPU ... power_state=D3cold`).
 12. Clock: compare Android time before and after Wi-Fi connects (row 6).
 13. Reboot and shutdown complete without hanging at the Surface logo.
@@ -232,7 +278,8 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     (`gb_dgpu_check.sh`). The Graphics tile goes `Intel (testing NVIDIA)` → `NVIDIA`, and Settings → System →
     Graphics shows the self-test as passed. If the boot hangs once Android is up, hold Power for 10 s and boot again:
     the next boot must come up on Intel with "Switched to Intel graphics". The manual override is `gb.nouveau=0` in the
-    boot menu.
+    boot menu. (Wave 6) `dmesg` has no `gb_nouveau: guard: ... not the 13.5-inch` line and no `gb_nouveau: model
+    gate:` line; `== dgpu` shows the dGPU as `0x10de` with a device id in `0x1f80`-`0x1fff`.
 15. NVIDIA apps: start a Vulkan game (or vkcube). `logcat -s gb_gfxdriver` shows `NVK: 1 NVIDIA physical device(s)
     first`, and `dumpsys gfxinfo` keeps HWUI on Intel. An **Always Intel** app does not map the driver package.
 16. Detach and reattach: idle → released within seconds, "Tablet mode - Intel graphics". With the game open →
@@ -262,6 +309,16 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     fs-verity present, apgetty off, the `-- gb_vnni` counter (`irqon` equals `emulated`), no HWUI abort lines, no
     `gb_slotsync HOLD:` line.
 25. (Wave 5, row 23) Power button and volume keys: the summary's `buttons:` line (and `gb_hw: buttons:` in `dmesg`, `[vendor.gb.buttons]` in `== getprop`) shows `MSHW0040:00` bound to `soc_button_array` with `2 gpio-keys input(s)`. A short Power press turns the screen off and wakes it again (including with the clipboard detached), and the volume rocker changes the volume.
+26. (Wave 6, row 17) 15" Surface Book 3 only: `vendor.gb.nouveau.result=refused:model`, one `gb_nouveau: guard:`
+    line naming `TU116` or `TU106` per gb_nouveau run (at most two per boot, plus one per base reattach), the dGPU
+    `D3cold` in `gb_dgpu_check.sh`, no "NVIDIA GPU problem" notification, and the Graphics tile `Intel (NVIDIA not
+    supported)`. The analyser shows `nouveau UNKNOWN` and `dgpu_power PASS`.
+27. (Wave 6) Notifications after you sign in: attach and detach the base and check that the notices appear in your
+    notification shade. `dumpsys notification` lists our notices as `-1|com.android.shell|2020|<tag>` (all users)
+    and GbGpu's as `10|gb.sb3.gpu|...` (your user), never as user 0; `dumpsys package gb.sb3.gpu` shows
+    versionCode 29889106 and POST_NOTIFICATIONS granted for user 10; the Graphics tile is in your Quick Settings
+    (`/data/vendor/gb/ui/tile_added.10`) and shows the current state each time you open the panel; logcat has
+    `GbGpu: user unlocked: refreshing state` after the sign-in.
 
 ## Readiness audit (wave 5): what the image proves and what needs the laptop
 
@@ -294,6 +351,11 @@ them were fixed in the image (the Wave 5 group above). The native image was then
   expected in VMware); the composer properties are `-1`/`false`/`false`; the OTA gate reports the build as
   validated; 0 enforced SELinux denials; the hardware-test analyser reports 0 FAIL (every hardware item UNKNOWN in
   VMware).
+* (Wave 6 prep, B-6) The [debug boot](FLASHING.md#debug-boot-kernel-messages-on-the-screen)
+  (` printk.ignore_loglevel=0 loglevel=5 earlycon=efifb keep_bootcon`, typed in the systemd-boot editor): kernel
+  text on the firmware frame buffer from the first second, kept through `gbinit`'s module loading; Android still
+  starts; a panic forced while `gbinit` loaded modules (right after `i915.ko`) stayed on the screen with its call
+  trace and left no `gblog\` file, as on the laptop.
 
 **Needs the Surface Book 3** (checklist items above):
 
@@ -302,13 +364,17 @@ them were fixed in the image (the Wave 5 group above). The native image was then
 * The picture: the white-veil result of the composer settings (item 21), Panel Self Refresh, which output feeds the
   base's USB-C port.
 * The dGPU reaching D3cold, and nouveau and NVK on the real GPU (items 14-18).
-* Sensors and S0ix (upstream linux-surface marks both `?` for this model), auto-rotate in laptop posture.
+* Sensors and S0ix (upstream linux-surface marks both `?` for this model); rotation per posture: locked in laptop
+  posture, Auto-rotate in tablet posture (item 10; it depends on the lid switch reading "open" while the clipboard
+  is detached, item 25).
 * The number of internal microphones and the headset jack's input name (item 22).
 * Joining a Wi-Fi network, the hotspot and Bluetooth pairing (item 23).
 * The cameras on the IPU4P hardware (item 9): libcamera's software ISP has never run on the device; expect modest
   quality and no autofocus.
 * The SD card reader type (item 6), the dock and USB-C (items 5, 7).
 * The PIN round trip, the VNNI patch's native effect and the OTA gate on the native install.
+* The debug boot on the 3000x2000 panel: whether its text stays readable while i915 loads, and how much slower that
+  boot is (only needed if a boot stops before Android).
 
 ## Cross-component notes
 

@@ -79,6 +79,13 @@ python -I -B build_esp.py      # builds the ESP (systemd-boot, kernel, initrd fo
 Never write the ESP while the VM runs. An OTA installed in the guest changes which slot boots; `build_esp.py`
 follows it automatically (it reads the slot state from lapis.bin, see [OTA.md](OTA.md)).
 
+If a lock-screen PIN may be set, `build_esp.py` refuses an ESP whose PIN path (Gatekeeper, KeyMint, fstab, ...)
+differs from the one on the disk; see [GATEKEEPER.md](GATEKEEPER.md#upgrading-an-existing-vm). To roll the ESP back
+from a backup made with `native/dgpu/w4/tools/gb_vmbackup.py`, power the VM off and run
+`python -I -B gb_vmbackup.py restore <backup> --esp-only --dry-run`, then the same with `--yes`. If the partition
+table was damaged as well, add `--with-gpt`: it writes the saved GPT copies back only when no OTA, slot switch or
+repartition happened since the backup, and reads them back.
+
 ## 6. Host helpers
 
 * **Battery**: build `host/gb_hostbatt.exe` (`csc -nologo -target:winexe -out:gb_hostbatt.exe gb_hostbatt.cs`) and

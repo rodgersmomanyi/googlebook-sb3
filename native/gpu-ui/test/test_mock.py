@@ -258,6 +258,16 @@ def mock_checks(mock, work):
               "mock status after the 26.3 set-mode intel: gfx_mode intel, persist 0, gfx_seq 2 (as the real daemon)")
         ctl(ctlp, {"set": {"gfx_mode": "", "state": "off", "driver": "", "refcnt": -1, "gfx_ok": -1, "test_t": 0,
                            "catalog": None, "mode": "default", "result": "idle"}})
+        # (wave 6, B-4) 23.2 row 12 names a model refusal of a present dGPU, like gb_power's gfx_model_refused()
+        b4 = []
+        for result, bdf in (("refused:model", "0000:02:00.0"), ("refused:esp", "0000:02:00.0"), ("refused:marker", "0000:02:00.0"),
+                            ("refused:model", "")):
+            ctl(ctlp, {"set": {"gfx_mode": "auto", "result": result, "bdf": bdf}})
+            st = json.loads(req(conn(sock), "status\n"))
+            b4.append("%s/%s" % (st.get("gfx_active"), st.get("gfx_reason")))
+        check(b4 == ["intel/model", "intel/nodriver", "intel/nodriver", "intel/nodriver"],
+              "mock 23.2 row 12 (B-4): refused:model -> model, other refusals and an absent dGPU -> nodriver (%s)" % b4)
+        ctl(ctlp, {"set": {"gfx_mode": "", "result": "idle", "bdf": "0000:02:00.0"}})
         # limits
         c = conn(sock)
         got = req(c, b"a" * 300 + b"\n")
