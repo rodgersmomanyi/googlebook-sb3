@@ -102,8 +102,12 @@ Services run as root with `seclabel u:r:shell:s0` (permissive), output to kmsg.
   `ro.system/vendor.build.fingerprint` it was made for, then remounts it read-only ([PERFORMANCE.md](PERFORMANCE.md)).
 * **crossystem stub**: reports a healthy, successfully booted vboot slot, so the boot_control HAL can mark the slot
   successful and vold does not reboot with "Checkpoint commit failed"; `bootctl mark-boot-successful` at post-fs-data.
-* **RescueParty off**, SetupWizard disabled, device provisioned, launcher made the HOME role holder (`gb_ui.sh`),
-  density from the panel width, one-time AOT compile of the UI apps (`gb_dexopt.sh`).
+* **RescueParty off**, SetupWizard disabled, device provisioned, launcher made the HOME role holder of every person's user and
+  density from the panel width (`gb_ui.sh`; wave 7: lapis runs in headless system user mode, so `gb_ui.sh` watches
+  the foreground user for the whole boot and sets up each full user when it is unlocked: display density, HOME,
+  `user_setup_complete`, at every boot; once per user ever, shortly after that first unlock, the VM build's
+  keep-awake values and, natively, the Auto-rotate default, so a one-time value you change later is never written
+  again), one-time AOT compile of the UI apps (`gb_dexopt.sh`).
 * **firmware updater stub** for `google_desktop_firmware_updater` (OTA postinstall), `preloads_copy.sh` no-op.
 * **gb_slotsync**, the A/B slot follower.
 

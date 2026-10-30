@@ -1861,7 +1861,9 @@ def c_libz(a, it):
     # (wave 6, w6prep vnni-hardening) the vnni block's one ungated action, at `on init`: the gbvnni tmpfs goes read-only
     # for every mount of it. "No such file or directory" = no /odm/vnni this boot (the OTA gate after a Google OTA, or
     # gbinit's fallback; the gated actions report their own failures): not a bind failure. Any other error: the binds
-    # work, but the patched libz stays writable (the wave-5 state)
+    # work, but the patched libz stays writable (the wave-5 state). (Wave 7) lapis 276's init logs no ENOENT of a
+    # builtin below its DEBUG log level, so without /odm/vnni there is no tail line at all (wave-6 forced OTA-gate
+    # boots); the ENOENT case only matters for a build that does log it
     tail = a.b.dm(r"init: Command 'mount tmpfs gbvnni /odm/vnni remount ro'.*failed: (.*)")
     tail_ev = {e for e, _m in tail}
     tail_bad = [(e, m) for e, m in tail if "No such file or directory" not in m.group(1)]

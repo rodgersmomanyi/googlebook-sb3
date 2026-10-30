@@ -22,11 +22,14 @@ Every destructive step asks you to type a confirmation. The installer refuses di
 [The installer menu](#the-installer-menu)).
 
 **Status.** Tested in VMware only, never on the real Surface Book 3. Rufus and Ventoy themselves were never run;
-equivalent stick layouts were tested in VMware. The last ISO built and tested is the wave 6 build (2026-10-30):
+equivalent stick layouts were tested in VMware. The last ISO built and tested is the wave 7 build (2026-10-30):
 kernel build #15, the native tree with the wave 3 fixes (the keyboard base's `8250.nr_uarts=4` among them, see
 [Boot entries](#boot-entries-and-the-nvidia-payload)), the wave 4/5 software Gatekeeper, the VNNI libz patch, the OTA
-gate, the wave 5 readiness fixes and the wave 6 changes (README, CHANGELOG), and a fresh dual-boot export with new
-GUIDs. Its VMware tests: T0, T1a/T1b, T2b/T2c/T2h, the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-10-30 (15 test ids, 402 checks, 0 failed); the other 22 test ids of the full suite passed the same day on the previous wave 6 build, whose installer is the same (only its two ESP objects differ). The full suite (`iso/test/run_all.py`, all 38 test ids: static, whole disk, dual boot install and uninstall,
+gate, the wave 5 readiness fixes, the wave 6 and wave 7 changes (README, CHANGELOG), and a fresh dual-boot export
+with new GUIDs. Its VMware tests: T0, T1a/T1b, the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9)
+and T8 (whose `-UpdateEspOnly` path wave 7 changed) passed on 2026-10-30 (11 test ids, 378 checks, 0 failed). Its
+installer is the same as the wave 6 builds' (only the two ESP objects differ): T2b/T2c/T2h passed on the final
+wave 6 build and the other 22 test ids of the full suite on the wave 6 build before it. The full suite (`iso/test/run_all.py`, all 38 test ids: static, whole disk, dual boot install and uninstall,
 media and the Windows side) last passed on the wave 3 build (2026-10-26), so all four options were exercised in
 VMware. Run the suite again on every ISO you build before you use options 2 and 3 on a real disk.
 

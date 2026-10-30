@@ -2,9 +2,11 @@
 # UI-06: gb_gpu_ui_setup.sh under mksh with a fake GB_ROOT and PATH shims for pm, am, cmd, log, sleep and timeout.
 #   sh test/test_gb_gpu_ui_setup.sh [<gb_gpu_ui_setup.sh>] [<work dir>]
 # Pass criterion (INTERFACES 18.6; wave 6 notify: per user in headless system user mode): `pm grant --user <u>` for
-# every FULL user every boot and again for the signed-in user, never for the headless system user 0; `add-tile` only
-# while a FULL user is in the foreground and only once ever per user (a user removal is respected; the pre-wave-6
-# marker is ignored); plus the guard and failure paths. Prints "N checks, M failures"; exit 1 on a failure.
+# every FULL user and for the signed-in user, (wave 7, headless-settings, notify O10) once per user ever (marker
+# granted.<u>), never for the headless system user 0; `add-tile` only while a FULL user is in the foreground and only
+# once ever per user (a user removal is respected; the pre-wave-6 marker is ignored); (wave 7) the markers of removed
+# user ids are removed; (wave 7, O14) at most 16 users; plus the guard and failure paths. Prints "N checks, M failures";
+# exit 1 on a failure.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT=${1:-$HERE/../gb_gpu_ui_setup.sh}
@@ -88,6 +90,7 @@ EOF
 for f in pm am cmd log sleep timeout; do chmod +x "$W/shims/$f"; done
 # The script resets PATH to <shims>:/system/bin:/vendor/bin (toybox on the device); give it the host's cat.
 ln -sf "$(command -v cat)" "$W/shims/cat"
+ln -sf "$(command -v rm)" "$W/shims/rm"
 
 TAB=$(printf '\t')
 HSUM="${TAB}UserInfo{0:System User:811} running
@@ -117,7 +120,9 @@ echo "== first boot, headless system user mode: the person (user 10) signs in af
 fresh
 boot
 is 0 "$RC" "exit 0"
-is 2 "$(count "$G10")" "user 10 granted before and after the sign-in"
+is 1 "$(count "$G10")" "user 10 granted once (before the sign-in; the marker stops the second grant)"
+ok "$([ -f "$UI/granted.10" ]; echo $?)" "marker granted.10 created"
+is 644 "$(stat -c %a "$UI/granted.10" 2> /dev/null)" "marker granted.10 mode 0644"
 is 0 "$(count "$G0")" "never a grant for the headless system user 0"
 is 0 "$(count "pm grant gb.sb3.gpu")" "no grant without --user (it would reach user 0 only)"
 is 1 "$(count "$ADD @10")" "add-tile once, while user 10 is in the foreground"
@@ -131,7 +136,7 @@ echo "== second boot (the user may have removed the tile since)"
 printf '0\n10\n' > "$GB_CTL/cur"
 boot
 is 0 "$RC" "exit 0"
-is 2 "$(count "$G10")" "user 10 granted again (every boot)"
+is 0 "$(count "$G10")" "user 10 not granted again (the person may have turned GbGpu's notifications off)"
 is 0 "$(count "$ADD")" "add-tile not repeated for user 10"
 
 echo "== pre-wave-6 marker (the tile went to user 0's list): ignored and kept"
@@ -159,6 +164,7 @@ printf '0\n11 users11\n' > "$GB_CTL/cur"
 boot
 is 0 "$RC" "exit 0"
 is 1 "$(count "pm grant --user 11 ")" "user 11 granted after the sign-in"
+ok "$([ -f "$UI/granted.10" ] && [ -f "$UI/granted.11" ]; echo $?)" "markers granted.10 and granted.11"
 is 1 "$(count "$ADD @11")" "add-tile for user 11"
 ok "$([ -f "$UI/tile_added.11" ]; echo $?)" "marker tile_added.11"
 is 3 "$(count "pm list users")" "the list is read again only when the foreground user changes to an unknown one"
@@ -192,6 +198,14 @@ fresh
 boot
 is 0 "$RC" "grant failure ignored"
 is 1 "$(count "$ADD")" "add-tile still done"
+ok "$([ ! -e "$UI/granted.10" ]; echo $?)" "no granted marker after a failed grant"
+rm -f "$GB_CTL/grant_fail"
+printf '0
+10
+' > "$GB_CTL/cur"
+boot
+is 1 "$(count "$G10")" "next boot: the grant is tried again (once) and recorded"
+ok "$([ -f "$UI/granted.10" ]; echo $?)" "next boot: marker granted.10"
 
 echo "== pm list users fails"
 fresh
@@ -208,7 +222,7 @@ printf '\tUserInfo{0:Owner:c13} running\n' > "$GB_CTL/users"
 printf '0\n' > "$GB_CTL/cur"
 boot
 is 0 "$RC" "exit 0"
-is 2 "$(count "pm grant --user 0 gb.sb3.gpu")" "user 0 granted (it is the person)"
+is 1 "$(count "pm grant --user 0 gb.sb3.gpu")" "user 0 granted once (it is the person)"
 is 1 "$(count "$ADD @0")" "add-tile for user 0"
 ok "$([ -f "$UI/tile_added.0" ]; echo $?)" "marker tile_added.0"
 
@@ -225,6 +239,40 @@ is 0 "$(count "pm grant --user 11 ")" "a name cannot fake the flags (they end th
 is 0 "$(count "pm grant --user 12 ")" "a work profile (1030, no FULL) is skipped"
 is 1 "$(count "pm grant --user 14 ")" "a name with a space"
 is 2 "$(count "pm grant --user ")" "only users 10 and 14 (no 1x, no 9-digit flags)"
+
+echo "== (wave 7) markers of removed users are removed; kept when the list does not name user 0"
+fresh
+for m in granted.10 tile_added.10 granted.12 tile_added.12 tile_added granted.x; do : > "$UI/$m"; done
+printf '0
+' > "$GB_CTL/cur"
+WAITN=1
+boot
+ok "$([ -f "$UI/granted.10" ] && [ -f "$UI/tile_added.10" ]; echo $?)" "user 10's markers kept"
+ok "$([ ! -e "$UI/granted.12" ] && [ ! -e "$UI/tile_added.12" ]; echo $?)" "removed user 12's markers removed"
+ok "$([ -f "$UI/tile_added" ] && [ -f "$UI/granted.x" ]; echo $?)" "the legacy marker and a non-numeric name are left alone"
+ok "$(grep -q 'user 12 no longer exists: granted.12 removed' "$GB_LOG"; echo $?)" "removal logged"
+is 0 "$(count "$G10")" "user 10 (marker) not granted"
+: > "$UI/granted.12"
+printf '%s
+' "${TAB}UserInfo{10:User:412}" > "$GB_CTL/users"
+boot
+ok "$([ -f "$UI/granted.12" ]; echo $?)" "a list without user 0: nothing removed"
+printf '%s
+' "$HSUM" "${TAB}UserInfo{120:Other:412}" > "$GB_CTL/users"
+boot
+ok "$([ ! -e "$UI/granted.12" ]; echo $?)" "user 120 does not keep user 12's marker"
+is 1 "$(count "pm grant --user 120 ")" "user 120 granted"
+
+echo "== (wave 7, notify O14) at most 16 users"
+fresh
+{ echo "${TAB}UserInfo{0:System User:811} running"; i=10; while [ $i -lt 30 ]; do echo "${TAB}UserInfo{$i:U$i:412}"; i=$((i + 1)); done; } > "$GB_CTL/users"
+printf '0
+' > "$GB_CTL/cur"
+WAITN=1
+boot
+is 16 "$(count "pm grant --user ")" "16 grants for 20 full users"
+is 1 "$(count "pm grant --user 25 ")" "the 16th user (25) is granted"
+is 0 "$(count "pm grant --user 26 ")" "the 17th user (26) is not"
 
 echo "== not native (VM)"
 fresh
@@ -247,8 +295,9 @@ fresh
 rm -rf "$W/root/data/vendor/gb/ui"
 boot
 is 0 "$RC" "exit 0"
-is 2 "$(count "$G10")" "pm grant done"
+is 2 "$(count "$G10")" "pm grant done (before and after the sign-in: it cannot be recorded)"
 is 0 "$(count "$ADD")" "no add-tile without the marker directory (it could not be recorded)"
+ok "$(grep -q 'is missing: not recorded' "$GB_LOG"; echo $?)" "unrecorded grant logged"
 
 echo "== package not installed"
 fresh

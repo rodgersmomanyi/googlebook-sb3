@@ -36,8 +36,13 @@ the hardware-independent backlog: NVIDIA only on the 13.5" model's TU117, rotati
 copies, OTA-gate image checks and a boot-log line, notifications that reach the signed-in user (lapis runs in
 headless system user mode, so notices sent to user 0 were never shown), a debug boot for early crashes, and checks
 that keep the lock-screen PIN working across ESP updates. The native outputs were rebuilt and tested in VMware
-(VM-1, a forced OTA-gate VM boot, and on the final ISO T0-T4b, T8 and T9: 402 checks, 0 failed); the long-running VM keeps its wave 5 boot partition until its next update
-([CHANGELOG.md](CHANGELOG.md)). Nothing has run on the laptop yet.
+(VM-1, a forced OTA-gate VM boot, and on the final ISO T0-T4b, T8 and T9: 402 checks, 0 failed). Wave 7
+(2026-10-30) finished the hardware-independent items: settings for your user after any sign-in (the headless
+system user mode again), a louder update notice from the third unvalidated boot, a retry for notices that a
+future build would silently refuse, and the wave 6 audit follow-ups, among them a PIN-path check for dual-boot ESP
+updates. The native outputs were rebuilt and tested in VMware again (a rehearsal of the VM build, VM-1, and on
+the ISO T0, T1a/T1b, T3-T4b, T8 and T9: 378 checks, 0 failed), and the long-running VM got the wave 7 boot
+partition after a verified backup of it ([CHANGELOG.md](CHANGELOG.md)). Nothing has run on the laptop yet.
 
 | Area | VMware VM | Native Surface Book 3 |
 |---|---|---|
@@ -58,7 +63,7 @@ that keep the lock-screen PIN working across ESP updates. The native outputs wer
 | Power / volume buttons, lid | VMware power button = clean shutdown | untested: `soc_button_array` (`MSHW0040:00`, rebound by `gb_hw.sh buttons` once lapis's `pinctrl-icelake` drives `INT3455:00`), lid wake via `surface_gpe` |
 | Platform profile, CPU power limits | n/a | untested: `surface_platform_profile`, set by `gb_power` (`persist.vendor.gb.perf_profile`); `gb_hw.sh` restores the Surface firmware's PL1/PL2 |
 | OTA system updates | **works** (one update so far, .271 -> .276): the A/B update installs and the VM boots the new slot; `gb_slotsync` switches the boot entry (see [OTA.md](docs/OTA.md) for what was observed). Since wave 3 it first compares the new slot's kernel interface (KMI) with our kernel's and holds the switch if they differ ([OTA.md](docs/OTA.md#kernel-check-before-the-switch)) | same mechanism, plus the notification "System update held" when it holds; untested on hardware |
-| Unvalidated updates (OTA gate, wave 5) | **tested in throwaway VMs**: the image records the build it was made for; after an update to another build `gbinit` skips the build-specific libz patch and the notification "System update not validated" appears (from wave 6 for the signed-in user; a forced test boot in VMware showed it in user 10's panel). Tokens `gb.otagate=0` / `gb.otagate=force` ([OTA.md](docs/OTA.md#the-ota-gate-wave-5)) | same in the native tree; untested on hardware |
+| Unvalidated updates (OTA gate, wave 5) | **tested in throwaway VMs**: the image records the build it was made for; after an update to another build `gbinit` skips the build-specific libz patch and the notification "System update not validated" appears (from wave 6 for the signed-in user; a forced test boot in VMware showed it in user 10's panel; from wave 7 it says "System update still not validated" from the third boot of the same build). Tokens `gb.otagate=0` / `gb.otagate=force` ([OTA.md](docs/OTA.md#the-ota-gate-wave-5)) | same in the native tree; untested on hardware |
 | AVX-VNNI (Ice Lake lacks it; parts of lapis use it) | **works**: our kernel emulates the VEX instructions on `#UD`. Build #15's reworked emulator passed a known-answer test of 9,235 cases in a throwaway VM; counter `/sys/kernel/gb_vnni/summary` | same kernel; the boot-log summary shows the counter; untested on hardware |
 | Performance: AVX-VNNI emulation load | wave 5: nearly all of the ~2.5×10⁸ emulations of a VM boot came from zlib's `adler32` in `libz.so`. Both `libz.so` (system, vendor) are bound at boot with a copy that takes zlib's scalar path (a 2-byte edit, made by `vnni_prepare.py` from your own image, sha256-pinned), only on the exact lapis build it was made for; kill switch `gb.vnni=0`. **Measured** in throwaway VMs: boot to `sys.boot_completed` 587.7 s -> 313.6 s (-46.6 %), warm boot 226.0 s -> 118.0 s, emulations at boot 211,368,597 -> 756 ([PERFORMANCE.md](docs/PERFORMANCE.md)) | same binds in the native tree (its measured load is mostly BoringSSL ML-KEM, which this does not change); untested on hardware |
 | Boot logs and triage | serial console log (`serial0.log`) and `gbsh.py` | `gblog\` on the stick's boot partition at 40 s to 15 min, even with a black screen; each file starts with a one-screen `== summary`. Symptom table and issue template: [FLASHING.md](docs/FLASHING.md#7-troubleshooting-symptom-log-line-boot-option) |

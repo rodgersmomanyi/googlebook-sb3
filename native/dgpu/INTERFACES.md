@@ -1368,6 +1368,15 @@ the whitelists of 12.1 are unchanged):
   and it stays visible across user switches. The same tag replaces it (never twice); nothing is posted for user 0.
   `bigtext` lets the shade expand the up to 200 characters. Same rule for gb_otagate_post (build_esp
   `GB_OTAGATE_SH`, VM tree and native without the queue).
+  **(Wave 7, headless-settings, notify O5)** `cmd notification post` exits 0 even when it posted nothing (measured on
+  lapis 276.R4: an unknown option prints its usage, `-u bogus` prints `Error occurred. ... Bad user number: bogus`, an
+  unknown style `Error occurred. ... unrecognized notification style: ...`), so gb_notify judges the post by its output
+  (`usage: cmd notification post` or `Error occurred` = nothing posted) and falls back once: a usage that lists
+  `-u|--user` but not `bigtext`, or an unknown style: `-u all` without `-S bigtext`; a usage without `-u|--user` (a
+  build that dropped the option): without `-u` (the shell's own user 0, i.e. the login screen only; logged); `Bad user`:
+  one `-u <id>` post per running full user (as for `kind=broadcast`, at most 8); anything else: logged with the reason
+  (at most 120 printable characters). At most 1 + 8 posts per notice. gb_otagate_post (build_esp) does not have this
+  fallback yet (its post is unchanged).
 * `kind=broadcast`: `pm list users` (timeout 20); for each line `UserInfo{<id>:<name>:<hex flags>} running` whose
   flags have FULL (0x400) -- never the headless system user (811), never a profile -- one
   `timeout 20 am broadcast --user <id> --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED -p gb.sb3.gpu`
@@ -1499,6 +1508,11 @@ signs in later refreshes at its `BOOT_COMPLETED` (12.1a); the instance in the he
   and, if `/data/vendor/gb/ui/tile_added.<u>` is absent, `cmd statusbar add-tile` (it goes to the current user's tiles)
   and create that marker (0644; only after add-tile succeeded; a user removal is respected per user). The v1.1 marker
   `tile_added` recorded an add to user 0's tiles: ignored and kept.
+  **(Wave 7, headless-settings, notify O10)** the grant is made ONCE per user ever: `/data/vendor/gb/ui/granted.<u>`
+  (0644) is created after a successful `pm grant --user <u>` and no grant is made while it exists, so a person who turns
+  GbGpu's notifications off keeps them off (a missing `ui` directory: granted, not recorded, logged). The markers
+  `granted.<u>` and `tile_added.<u>` of a user id that `pm list users` no longer lists are removed (only when that list
+  names user 0), so a later user that gets a reused id is granted and gets the tile. At most 16 users (O14: tested).
 * (Wave 6, notify) `.UserReceiver` (`android:exported="false"`, action `android.intent.action.BOOT_COMPLETED` only,
   permission `RECEIVE_BOOT_COMPLETED`, normal): at each user's unlock it runs the same refresh as `.StateReceiver`
   (`status`, notifications 12.3, tile, `ui-caps`, catalog when `apps_sync` = 0). `.StateReceiver` and `.UserReceiver`

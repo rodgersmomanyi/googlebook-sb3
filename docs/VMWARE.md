@@ -84,7 +84,9 @@ differs from the one on the disk; see [GATEKEEPER.md](GATEKEEPER.md#upgrading-an
 from a backup made with `native/dgpu/w4/tools/gb_vmbackup.py`, power the VM off and run
 `python -I -B gb_vmbackup.py restore <backup> --esp-only --dry-run`, then the same with `--yes`. If the partition
 table was damaged as well, add `--with-gpt`: it writes the saved GPT copies back only when no OTA, slot switch or
-repartition happened since the backup, and reads them back.
+repartition happened since the backup, and reads them back. Before it writes, the restore saves the current ESP
+and both GPT copies into `<backup>\..\pre-restore-<time>\` (wave 7). To undo the restore, run
+`restore <that folder> --esp-only --yes`. Delete such folders yourself once the VM boots as expected.
 
 ## 6. Host helpers
 
@@ -120,7 +122,8 @@ repartition happened since the backup, and reads them back.
 
 ## Troubleshooting
 
-* `serial0.log` has everything; useful markers: `GB_MODULES`, `GB_EDID`, `GB_UI`, `GB_P<n>` (boot progress loop),
+* `serial0.log` has everything; useful markers: `GB_MODULES`, `GB_EDID`, `GB_UI` (`GB_UI user=<u> ...` once per user per boot when that
+  user is unlocked; `GB_UI user=<u> first unlock: ...` once per user ever), `GB_P<n>` (boot progress loop),
   `gb_slotsync:`, `gb_vmaudio:`, `gb_netwatch:`.
 * `wipe_data.py --yes` (VM off) zeroes the start of userdata; the next boot formats a fresh /data.
 * `cycle.ps1` is the quick reboot-and-grep loop used during bring-up.

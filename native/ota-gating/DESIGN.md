@@ -529,7 +529,12 @@ The 10-26 run of the earlier patch without test updates showed these checks fail
   (via `/odm/vlower`) for comparison with `stock_scan_slot_b.tsv`. Diagnostic only.
 * **F4 = fixprep keymint-wifi (C-2).** Private sonames for the native KeyMint graft. It is already classified here. The
   VM tree keeps the stock-replacing names until a rehearsal.
-* **F5 systemd-boot boot counting** in gb_slotsync (`gb-<x>+3.conf` + blessing at `boot_completed`). A build that fails
+* **F5 systemd-boot boot counting** in gb_slotsync (`gb-<x>+3.conf` + blessing at `boot_completed`). Wave 7 status:
+  the count of unvalidated boots, with a louder notice from the 3rd one, is in `gb_otagate.sh` (`OTA_LOUD_AFTER`); the
+  automatic fallback is designed but not built. systemd-boot 262 matches the loader.conf `default` without looking at
+  the tries left (only `preferred` is matched with them), so a switch must write `preferred gb-<new>.conf` and keep
+  `default gb-<old>.conf`, bless the entry at `boot_completed`, and HOLD a slot whose entry used up its tries; it needs
+  a throwaway two-slot boot campaign. A build that fails
   to boot three times would fall back to the previous slot's entry by itself. This is a C change.
 * **F6 (no action).** The native ESP bring-up cannot set the gate property: its `GB_PROP` deny list refuses
   `ro.vendor.gb.*`.

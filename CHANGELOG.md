@@ -4,7 +4,37 @@ What each wave changed, newest first. Details per device: [docs/DEVICE-STATUS.md
 since the audit"). Nothing has run on the Surface Book 3 itself yet: every result below is from VMware VMs, QEMU, the
 Linux build machine or disk-image files.
 
-## Wave 6 (2026-10-30): the hardware-independent backlog
+## Wave 7 (2026-10-30): the last hardware-independent items
+
+* **Settings reach your user (headless system user mode).** Density, HOME, setup-complete and the one-time defaults
+  (VM screen timeout, Auto-rotate) are applied to every full user when it is unlocked, also after a late sign-in;
+  your later changes to the one-time values are kept (density and HOME are set again at every boot). The Graphics
+  app's notification permission is granted once per user. Notices whose post `cmd notification` silently refused
+  are now detected and retried once (native) ([ARCHITECTURE.md](docs/ARCHITECTURE.md), [OTA.md](docs/OTA.md)).
+* OTA gate: the "System update not validated" notice counts the boots of the same unvalidated build and gets louder
+  from the third one ("System update still not validated", naming the count and both remedies); test harness
+  follow-ups (the rotation emulation test, the F3 harness's notify post command, safety-misc and tooling tests
+  runnable after an integration).
+* Audit follow-ups (wave 6 safety and image audits):
+  - A new Gatekeeper build now also needs its frozen-vector results from the Android build on lapis's bionic and
+    from the reference check.
+  - The VMware ESP rollback keeps a copy of what it overwrites.
+  - A dual-boot `-UpdateEspOnly` refuses an ESP that would change the lock-screen PIN path.
+  - The first-boot Auto-rotate write runs only when the settings overlay is not applied.
+  - The test pins for the NVIDIA model-gate files now use their sha256.
+  - `build_esp.py` makes the PIN-path check once.
+  - `verify_image` V27 now also checks the early `stop apgetty`.
+  - The records no longer claim that init logs an ENOENT line for the gbvnni remount.
+* Tested in VMware: a rehearsal of the VM build (a fresh first boot, 33 of 33 checks: the new user 10 got its
+  settings at its first unlock and user 0 kept its own; three boots of a forced unvalidated update, 17 of 17 each,
+  with the boot count and the louder notice at the third in user 10's panel; a validated boot after them, 10 of
+  10), VM-1 on the rebuilt USB image (every wave 2, 3, 5, 6 and 7 check that VMware can show; the hardware-test
+  analyser 17 PASS, 0 FAIL, 23 UNKNOWN), and on the installer ISO T0, T1a/T1b (whole disk), the dual-boot groups
+  G1-G4 (T3 install with its refusal cases, T4/T4b uninstall, T9 off-disk GPT copy) and T8 (the Windows scripts):
+  378 checks, 0 failed. The long-running VM was updated to the wave 7 VM build after a verified backup of its boot
+  partition.
+
+## Wave 6 (2026-10-30), commit 0c1d750: the hardware-independent backlog
 
 * **Notifications reach the signed-in user.** lapis runs in headless system user mode (user 0 = the login screen, you =
   user 10). Our notices ("System update not validated", "System update held", the NVIDIA notices) were posted for

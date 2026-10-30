@@ -149,6 +149,32 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     boot that stops before Android, tested in VMware; and the boot-menu editor opens with the cursor at the start of
     the line (press End before typing an option; FLASHING, NATIVE, OTA and PERFORMANCE now say so).
   * Tested in VMware on the rebuilt images: VM-1 on the USB image (every wave 2, 3, 5 and 6 check that VMware can show; the hardware-test analyser 17 PASS, 0 FAIL, 23 UNKNOWN), a forced OTA-gate boot of the VM build (the update notice, a `gb_notify` notice and a GbGpu state change in user 10's panel), and on the installer ISO T0, T1a/T1b (whole disk), T2b/T2c/T2h (refusals), the dual-boot groups G1-G4 (T3 install with its refusal cases, T4/T4b uninstall, T9 off-disk GPT copy) and T8 (the Windows scripts): 402 checks, 0 failed. The other 22 ISO tests passed the same day on the build before the notification fix, which has the same installer.
+* **Wave 7, 2026-10-30 (the last hardware-independent items; nothing has run on the hardware yet):**
+  * Settings reach your user. lapis runs in headless system user mode: user 0 only shows the login screen and you use
+    user 10. Our per-user settings (display density, the launcher as HOME, "setup complete", the VM's screen
+    timeout, the Auto-rotate default) used to be written for whichever user was current right after boot, i.e. user 0,
+    or for you only if you signed in within a minute. They are now set for every full user when it is unlocked, at any
+    time during the boot: density, HOME and "setup complete" at every boot, the one-time values only once per user
+    (shortly after its first unlock), so your own later changes to them stay. The Graphics app's notification
+    permission is granted once per user, so turning its notifications off now sticks. Tested in VMware on a fresh
+    first boot (the new user 10), a late sign-in and a second user created later; user 0's settings did not change.
+  * The update notice gets louder ([OTA.md](OTA.md#the-ota-gate-wave-5)): the image counts the boots of the same
+    unvalidated build, and from the third one the notice reads "System update still not validated" and names the
+    count and both remedies. The automatic fallback to the previous slot is designed but not built.
+  * No silently lost notices (native): `cmd notification post` exits 0 even when it posted nothing; `gb_notify` now
+    reads its output and posts once more in a form the build accepts. The VM build's direct post does not do this yet.
+  * Row 27, item 10: the first-boot Auto-rotate write now runs only when the settings overlay is not applied.
+  * Audit follow-ups ([GATEKEEPER.md](GATEKEEPER.md), [VMWARE.md](VMWARE.md), [NATIVE.md](NATIVE.md)): a new
+    Gatekeeper build needs its frozen-vector results from the Android build on lapis's bionic and from the reference
+    check; the VMware ESP rollback first saves what it overwrites; a dual-boot `-UpdateEspOnly` refuses an ESP that
+    would change the lock-screen PIN path; `verify_image.py` V27 also checks the early `stop apgetty`.
+  * Tested in VMware: a rehearsal of the VM build (a fresh first boot, 33 of 33 checks; three boots of a forced
+    unvalidated update, 17 of 17 each, with the louder notice at the third in user 10's panel; a validated boot after
+    them, 10 of 10), VM-1 on the rebuilt USB image (every wave 2, 3, 5, 6 and 7 check that VMware can show; the
+    hardware-test analyser 17 PASS, 0 FAIL, 23 UNKNOWN), and on the installer ISO T0, T1a/T1b, the dual-boot groups
+    G1-G4 and T8 (378 checks, 0 failed). The long-running VM now runs the wave 7 VM build (after a verified backup of
+    its boot partition; its lock-screen PIN path is unchanged). On the native image the settings and notice changes act
+    after Android has started, which the native tree never reaches in VMware: checklist item 28.
 
 ## 1. Platform, CPU, firmware interfaces
 
@@ -270,6 +296,11 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     gb_sb3`); a `note: DTX mode ... disagrees with the device state` points at the lid switch or `SW_TABLET_MODE`
     (item 25). The `GB_SENSORS: rotation: diag:` line shows the state at boot (usually the login screen; its
     `user=` field says which user).
+    At the first boot the log also shows how Auto-rotate got its default (wave 7):
+    `GB_SENSORS: auto-rotate default from GbSb3SettingsOverlay (enabled): no first-boot write` is expected (the
+    overlay applied, and nothing writes a rotation setting); `GB_SENSORS: auto-rotate enabled (first boot)` means the
+    overlay is not applied (check `cmd overlay list --user 0 | grep gb_sb3`), and the old one-time write ran as a
+    fallback.
 11. Suspend: lid close → s2idle → lid open wakes. Power button sleeps and wakes (also with the clipboard detached, once `gb_hw.sh buttons` bound `MSHW0040:00`: item 25). Base keyboard keys are **not** expected to wake (`surface_aggregator` leaves wake off by default). After a sleep, check the battery drop, `/sys/power/suspend_stats` and `lpi_residency_us system=` on the `gb_hw: diag: mem_sleep` line (growing > 0 confirms S0ix residency), and check that the dGPU is in D3cold (`gb_hw: diag: dGPU ... power_state=D3cold`).
 12. Clock: compare Android time before and after Wi-Fi connects (row 6).
 13. Reboot and shutdown complete without hanging at the Surface logo.
@@ -319,6 +350,11 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     versionCode 29889106 and POST_NOTIFICATIONS granted for user 10; the Graphics tile is in your Quick Settings
     (`/data/vendor/gb/ui/tile_added.10`) and shows the current state each time you open the panel; logcat has
     `GbGpu: user unlocked: refreshing state` after the sign-in.
+28. (Wave 7) Your user's settings after the first sign-in: `settings get --user 10 system accelerometer_rotation`
+    is `1` and the boot log has `GB_SENSORS: user 10: auto-rotate already on` (the Auto-rotate default came from
+    our settings overlay) or `... auto-rotate enabled at its first unlock` (it did not); `GB_UI user=10` shows
+    density 320. Turn Auto-rotate off, reboot, sign in: it stays off. Turn the Graphics app's notifications off,
+    reboot: they stay off.
 
 ## Readiness audit (wave 5): what the image proves and what needs the laptop
 
@@ -375,6 +411,8 @@ them were fixed in the image (the Wave 5 group above). The native image was then
 * The PIN round trip, the VNNI patch's native effect and the OTA gate on the native install.
 * The debug boot on the 3000x2000 panel: whether its text stays readable while i915 loads, and how much slower that
   boot is (only needed if a boot stops before Android).
+* Your user's settings after the first sign-in (Auto-rotate default, density, the Graphics app's notification
+  permission kept off once you turn it off: item 28).
 
 ## Cross-component notes
 

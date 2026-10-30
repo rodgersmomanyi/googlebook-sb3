@@ -123,7 +123,7 @@ D1-D8 (INTERFACES 22.1) are implemented by gb_power and the other components; th
 | `AndroidManifest.xml`, `res/` | Manifest (v1.2 permissions, components, injection meta-data); strings, themes, two vector icons, data-extraction rules. |
 | `src/gb/sb3/gpu/core/*.java` | Protocol client and the host-tested models. |
 | `src/gb/sb3/gpu/*.java` | Android layer: tiles, Graphics page, summary provider, receivers (state, Cancel), dialog, notifications, LocalSocket transport, catalog query (`Gb`). |
-| `gb_gpu_ui.rc`, `gb_gpu_ui_setup.sh` | rc unchanged (INTERFACES 15.4). (Wave 6) setup per user: `pm grant --user <u>` for every full user, `add-tile` once per user while that full user is in the foreground (`tile_added.<u>`). |
+| `gb_gpu_ui.rc`, `gb_gpu_ui_setup.sh` | rc unchanged (INTERFACES 15.4). (Wave 6) setup per user: `pm grant --user <u>` for every full user, `add-tile` once per user while that full user is in the foreground (`tile_added.<u>`). (Wave 7, headless-settings) the grant once per user (`granted.<u>`), so a person's "notifications off" stays off; markers of removed users are removed. |
 | `gpu_ui.json` | Wave 2 component manifest: APK, setup script, rc, and (v1.2) the empty `gfx_app_prefs.default` seed -> `/odm/etc/gb/gfx_app_prefs.default` 0644. |
 | `gfx_app_prefs.default` | The per-app choices seed, empty (INTERFACES 24.2: "ships empty"). |
 | `build_apk.sh`, `build_on_builder.sh`, `run_tests.sh` | Build (unchanged toolchain) and the test runner. |

@@ -151,12 +151,25 @@ difference. A reviewed change needs `GB_PIN_MIGRATION=1` (build) or `--pin-migra
 `verify_image.py --expect-pin-path <ESP>` shows the same comparison. `gb_vmbackup.py restore --esp-only --dry-run`
 runs every check without writing.
 
+Since wave 7, `restore --esp-only` first saves the ESP and both GPT copies that it is about to overwrite into
+`<backup>\..\pre-restore-<time>\`. That folder is a backup of the same form, so
+`gb_vmbackup.py restore <that folder> --esp-only --yes` undoes the restore. The restore is refused when that
+drive lacks room for the save. On a dual-boot install, `install_dualboot.ps1 -UpdateEspOnly` makes the same PIN-path
+comparison before it rewrites the ESP:
+
+- it refuses a difference, and also refuses when the comparison cannot run (it needs `python` and the repository's
+  `verify_image.py`);
+- `-PinMigration` lets a reviewed migration through.
+
 ## Limits and open points
 
 * A later gb_gatekeeper must still verify the PINs enrolled with this one. `tests/frozen_v1.json` holds two key
   files and handles that version 0.2.0 enrolled; `tests/test_frozen_v1.cpp` verifies them through the service code
-  in every build (host and Android) and `ACCEPTANCE.txt` must say `GK_FROZEN_V1: PASS`, or `build_esp.py` refuses
-  the binary (wave 6; the 0.2.0 binary itself predates the test and is accepted by its pinned sha256). Eight
+  in every build (host and Android). Since wave 7, `ACCEPTANCE.txt` must hold all three results, or `build_esp.py`
+  refuses the binary: `host: GK_FROZEN_V1: PASS`; `host: GK_FROZEN_REF: PASS` (the independent Python check of the
+  same vectors); and `android-on-lapis-bionic: GK_FROZEN_V1: PASS`, the Android build run on lapis's own bionic, so
+  `build.sh` needs `LAPIS_RT` and `LAPIS_SYSLIB` (without them it writes `NOT RUN`, which is refused). The 0.2.0
+  binary itself predates the test and is accepted by its pinned sha256. Eight
   deliberate scheme changes (scrypt N or r, key-file magic or name, HMAC hash, key length, salt, key checksum)
   all fail that test.
 * The native tree is untested on hardware. An OTA with a PIN set has not been tested yet: the design keeps the

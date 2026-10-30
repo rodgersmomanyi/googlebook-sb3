@@ -4,7 +4,11 @@
 #           sub-HAL scans /sys/bus/iio/devices only once, so wait (bounded) until the ISH accelerometer
 #           (cros-ec-accel) and the APDS-9960 light device (cros-ec-light) have registered.
 #   diag  - after boot_completed: IIO + sensorservice state to the kernel log (gb_bootlog copies dmesg),
-#           and enable auto-rotate once (first native boot only).
+#           and enable auto-rotate once (first native boot only) for the CURRENT user, which at boot_completed is the
+#           headless system user 0 (the login screen; lapis runs in headless system user mode).
+#   user <id> - (wave 7, headless-settings) the person's FULL user <id>: gb_ui.sh runs it once per user ever, at the
+#           user's first unlock (gb_ui.sh's marker), so the person's own later choice is never overwritten. It turns
+#           auto-rotate on only when the user's value is not 1 already (GbSb3SettingsOverlay gives a new user 1).
 #   rotation - (readiness A-L3) after boot_completed and at every DTX device-mode change (vendor.gb.dtx.mode, set by
 #           gb_power): one read-only 'GB_SENSORS: rotation:' line (rot_report) per change, at most 3 per start.
 # Test hooks: GB_SENSORS_LOG=- logs to stdout instead of /dev/kmsg; GB_SENSORS_SETTLE = seconds to let Android apply a
@@ -107,12 +111,31 @@ diag)
 		[ -d $p ] && echo "GB_SENSORS: $p: $(for f in $p/*; do echo -n "$(basename $f)=$(cat $f) "; done)"
 	done
 	dumpsys sensorservice 2>&1 | head -n 60 | while IFS= read -r l; do echo "GB_SENSORS: $l"; done
-	if [ "$(getprop persist.gb.sensors.rotinit)" != 1 ]; then
+	# (W7, safety audit W6-S5) GbSb3SettingsOverlay.apk (readiness A-L3 D2) already makes Auto-rotate the default of
+	# every user created on the device: while it is enabled, nothing here writes a rotation setting, whatever
+	# persist.gb.sensors.rotinit says. The one-time write stays only as the fallback for an overlay that is not applied.
+	if timeout 20 cmd overlay list --user 0 2>/dev/null |
+		grep -q '^ *\[x\] com\.android\.providers\.settings\.gb_sb3_rotation_rro_vendor__$'; then
+		echo "GB_SENSORS: auto-rotate default from GbSb3SettingsOverlay (enabled): no first-boot write"
+	elif [ "$(getprop persist.gb.sensors.rotinit)" != 1 ]; then
 		settings put system accelerometer_rotation 1 && setprop persist.gb.sensors.rotinit 1
 		echo "GB_SENSORS: auto-rotate enabled (first boot)"
 	fi
 	echo "GB_SENSORS: accelerometer_rotation=$(settings get system accelerometer_rotation) screen_brightness_mode=$(settings get system screen_brightness_mode)"
 	rot_report diag
+	;;
+user)
+	u=${2:-}
+	case "$u" in ''|0*|*[!0-9]*) echo "GB_SENSORS: user: refused user id '$(rot_val "$u")' (a full user, never 0)"; exit 0;; esac
+	[ ${#u} -le 5 ] || { echo "GB_SENSORS: user: refused user id (more than 5 digits)"; exit 0; }
+	v=$(rot_val "$(timeout 20 settings get --user "$u" system accelerometer_rotation 2>/dev/null | head -n 1)")
+	if [ "$v" = 1 ]; then
+		echo "GB_SENSORS: user $u: auto-rotate already on (accelerometer_rotation=1, the GbSb3SettingsOverlay default)"
+	elif timeout 20 settings put --user "$u" system accelerometer_rotation 1 > /dev/null 2>&1; then
+		echo "GB_SENSORS: user $u: auto-rotate enabled at its first unlock (accelerometer_rotation was $v)"
+	else
+		echo "GB_SENSORS: user $u: settings put accelerometer_rotation failed (was $v)"
+	fi
 	;;
 rotation)
 	st=${GB_SENSORS_SETTLE:-3}; case "$st" in ''|*[!0-9]*) st=3;; esac; [ ${#st} -gt 2 ] && st=30
@@ -127,7 +150,7 @@ rotation)
 	done
 	;;
 *)
-	echo "usage: gb_sensors.sh wait|diag|rotation"
+	echo "usage: gb_sensors.sh wait|diag|rotation|user <id>"
 	;;
 esac
 exit 0

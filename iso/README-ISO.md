@@ -20,19 +20,23 @@ options:
 Every destructive step asks you to type a confirmation, and the installer refuses disks it must not touch (see
 [The menu](#the-installer-menu)).
 
-**Current build** (2026-10-30, build `20261030-091552-5b9fef10`): 7,472,447,488 bytes, SHA-256
-`afb68d3843b154396f9ab3341083cdda2b8a3d15b0ca04dfa00ede3edbc10d52`. It carries the Wave 6 USB image `f7a81cf5…`
-(notifications that reach the signed-in user, NVIDIA only on the 13.5" model, auto-rotate per posture, read-only VNNI libraries, log and safety follow-ups, on
-top of the Waves 4 and 5 software lock-screen Gatekeeper, VNNI `libz` patch, OTA gate and native-readiness fixes:
-README-FLASH.md, "What is new") and a fresh dual-boot export (new GUIDs;
-made with `build_internal.py` and then reused by `build_iso.py`, which ran all its export cross-checks and
-`verify_image.py` on it). Only its two ESP objects differ from the previous ISO `ad67f040…`; its 11 other payload
-objects are byte-identical.
+**Current build** (2026-10-30, build `20261030-144912-e8da3fb7`): 7,472,463,872 bytes, SHA-256
+`e223fdc9d0a933347fe9c3b20d6eeca5875cccff8332db37e62365ba15ea7180`. It carries the Wave 7 USB image `7ac6ad52…`
+(settings that reach the signed-in user after any sign-in, a louder update notice from the third unvalidated boot,
+audit follow-ups; on top of Wave 6's notifications that reach the signed-in user, NVIDIA only on the 13.5" model,
+auto-rotate per posture and read-only VNNI libraries, and the Waves 4 and 5 software lock-screen Gatekeeper, VNNI
+`libz` patch, OTA gate and native-readiness fixes: README-FLASH.md, "What is new") and a fresh dual-boot export
+(new GUIDs; made with `build_internal.py` and then reused by `build_iso.py`, which ran all its
+export cross-checks and `verify_image.py` on it). Only its two ESP objects differ from the previous ISO
+`afb68d38…`; its 11 other payload objects are byte-identical, and the installer's files are unchanged since that build.
 **Boot-menu edits** on an installed system (Wave 6 finding): the editor that **e** opens starts with the cursor at
 the start of the line; press **End** before typing an option (README-FLASH.md, "What is new").
 **Performance:** the system it installs started about 47 % faster in VMware with the VNNI patch (first boot until
-"boot completed" 587.7 s → 313.6 s, later boots 226.0 s → 118.0 s; README-FLASH.md). **Tests:** T0, T1a/T1b, T2b/T2c/T2h, the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-10-30 (15 test ids, 402 checks, 0 failed); the other 22 test ids of the full suite passed the same day on the previous wave 6 build, whose installer is the same (only its two ESP objects differ). The previous Wave 6 ISO `ad67f040…` (before the notification fix; kept in
-`D:\GB-iso\prev\iso-w6a-ad67f040\`) passed 27 tests of its full run with 0 failed checks. The ISO `8aa73f17…`
+"boot completed" 587.7 s → 313.6 s, later boots 226.0 s → 118.0 s; README-FLASH.md). **Tests:** T0, T1a/T1b (option 1 wrote a disk byte-identical to the USB image `7ac6ad52…`), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 (the Windows scripts; `-UpdateEspOnly` now checks the lock-screen PIN path) passed on 2026-10-30 (11 test ids, 378 checks, 0 failed). The installer's own code is unchanged since `afb68d38…`, so the other test ids were not repeated. The previous ISO `afb68d38…` (Wave 6; kept in
+`D:\GB-iso\prev\iso-w6b-afb68d38\`) passed T0, T1a/T1b, T2b/T2c/T2h, the dual-boot groups G1-G4 (T3 with its
+refusal cases, T4, T4b, T9) and T8 on 2026-10-30 (15 test ids, 402 checks, 0 failed); the other 22 test ids of the
+full suite passed the same day on the Wave 6 ISO `ad67f040…` (before the notification fix, same installer; kept in
+`D:\GB-iso\prev\iso-w6a-ad67f040\`), which passed 27 tests of its full run with 0 failed checks. The ISO `8aa73f17…`
 (Waves 4 and 5) passed its test subset on 2026-10-30 (T0, T1a,
 T1b, T3 with T3-build and the refusal cases T3n(d-f), T4: 264 checks, 0 failed; option 1 wrote a disk
 byte-identical to its USB image `b2714a63…`; the dual-boot install left Windows' partitions and boot entries
@@ -488,6 +492,11 @@ python -I C:\GB-x86\iso\build\build_iso.py               # full build
   removing one by hand beforehand frees the space when the preflight reports less than 25 GiB. If that is still not
   enough (2026-10-29: 23.9 GiB), the builder's `last/` copy of the previous ISO can go too, after checking that its
   sha256 equals the ISO kept on Windows: a successful build replaces it anyway.
+  The 2026-10-30 (Wave 7) build removed nothing instead: the builder's `last/` copy was moved to
+  `D:\GB-iso\prev\iso-w6b-afb68d38\builder-last\` (sha256 and byte comparison, then stored as an NTFS hard link to
+  the identical kept ISO), six chunk files of the old cache were moved to the builder's `/build/w7build/`, and the old
+  cache directory was renamed to the new image's key. `build_iso.py` then reused the 30 chunks whose raw sha256
+  matched its fresh scan (and whose compressed files matched the cache record) and recompressed 6.
 * `--test-tiny-payload` is a pipeline test only. It writes `D:\GB-iso\pipeline-test\` and its ISO cannot install
   Googlebook.
 

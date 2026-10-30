@@ -83,12 +83,22 @@ and checks it at every boot:
     `gb_update`; natively through `gb_notify`, in the VM posted directly) and one kmsg line is written. From wave 6
     the notice is posted once for all users (`cmd notification post -u all`): lapis runs in headless system user
     mode, and a notice posted for user 0 (the login screen) is never shown to the person in user 10, which is what
-    wave 5 images did. From wave 6
+    wave 5 images did. `cmd notification post` exits 0 even when it posts nothing (an unknown option prints its
+    usage; a refused user or style prints `Error occurred`). Since wave 7 the native notice path (gb_notify) reads
+    that output and tries once more without the missing option: for all users without the text style, for the
+    login screen only when a future build has no `-u` at all (logged), or once per signed-in user when `all` is
+    refused. The VM build's direct post (`gb_otagate_post`) does not have this fallback yet. From wave 6
     the kernel log also gets, after the notification, one line per bind mount of the image
     (`gb_otagate: stock <path> <sha256> ours <sha256>`): the Google file's sha256 where nothing of ours covers it on
     that boot (for example the stock `libz.so` when the libz patch was skipped), otherwise `hidden-by-our-bind` or
     `hidden-by-overlay`. Files of the `/vendor` overlay are only counted: no path shows their Google version while
     Android runs. Read only; a diagnostic for comparing the new build's files with the validated build's.
+    From wave 7 the notice also counts: the image keeps a small record in `/data/vendor/gb/ota_unvalidated` (the two
+    build fingerprints, the boot id, the count), and from the third boot of the same unvalidated build the notice
+    reads **"System update still not validated"**, "Unvalidated boot N of build ... Still paused: VNNI libz patch.
+    Update the ESP from the host, or boot the previous slot." The kernel log gets `gb_otagate: boot count: N
+    unvalidated boot(s) of this build pair`. Without a boot id or a usable record the plain notice is shown; nothing
+    changes on a validated build.
 * **The SELinux list is OTA-robust.** Every `(typepermissive T)` line of
   [`inject/odm_sepolicy.cil`](../inject/odm_sepolicy.cil) is packed as `(optional gb_ota_T (typepermissive T))`.
   Before, one type that a later build removes made init's boot-time policy compile fail, which means a reboot loop.
@@ -105,7 +115,10 @@ and checks it at every boot:
 tested on it. Most things are expected to work. To validate it, rebuild the ESP on the host from a `lapis.bin` that
 has the new build in its boot slot: in the VM (VM off) `python -I vnni_prepare.py` (optional; patches the new build's
 libz), then `GB_WRITE_LAPIS=1 python -I build_esp.py`; for a dual-boot install, a new export and
-`install_dualboot.ps1 -UpdateEspOnly`. To go back instead, pick the previous slot's entry in the boot menu.
+`install_dualboot.ps1 -UpdateEspOnly`. To go back instead, pick the previous slot's entry in the boot menu. The
+louder "still not validated" notice (from the third such boot) asks for the same thing. The image does not fall back
+to the previous slot by itself when a new build fails to boot: that needs systemd-boot boot counting in `gb_slotsync`
+(planned; see [native/ota-gating/DESIGN.md](../native/ota-gating/DESIGN.md) section 8, F5).
 
 **Boot-menu tokens** (press `e` on the entry, press End, then type a space and the token; one boot):
 
@@ -127,7 +140,9 @@ image check V32 on the shipped ESPs and with one refused mutation per rule, the 
 toybox tools, the analyzer item on synthetic logs. A real update to an unvalidated build has not happened yet. The forced
 path was booted on throwaway VMware VMs (wave 6): state unvalidated, no libz bind in any mount namespace, the stock
 libz files under emulation, the stock-file report in the kernel log, the notice shown to the signed-in user 10, and
-back to validated on the next boot without the token. Design, classification of all 136 additions and tests:
+back to validated on the next boot without the token. In wave 7 three forced boots in a row counted 1, 2 and 3
+unvalidated boots and showed the louder notice at the third, again in user 10's panel; the next boot without the
+token was validated and left the record unchanged. Design, classification of all 136 additions and tests:
 [native/ota-gating/DESIGN.md](../native/ota-gating/DESIGN.md).
 
 ## Host-side rebuilds follow the slot

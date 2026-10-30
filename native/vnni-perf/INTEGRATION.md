@@ -303,7 +303,8 @@ No service. Those fingerprint values are what init reported on this build (`dgpu
 block, the block before the overlay or twice, and a GBINIT without the kill switch.
 
 **(3) Kill switch.** GBINIT: `VN=1`; the exact token `gb.vnni=0` sets `VN=0`; right after `cp -a $SRC/. /odm/`:
-`[ "$VN" = 0 ] && /busybox rm -rf /odm/vnni`. The binds then fail (ENOENT), init logs and goes on; the stock libz
+`[ "$VN" = 0 ] && /busybox rm -rf /odm/vnni`. The binds then fail (ENOENT, which lapis's init does not log; the
+logged failures are each target's `remount bind ro`, EINVAL: wave 7) and init goes on; the stock libz
 stays under k15 emulation. For one boot, press `e` at the systemd-boot menu (`editor yes`, `timeout 3`) and append
 `gb.vnni=0`; to make it permanent across boots and slot switches, edit `loader/entries/gb-<x>.conf` on the ESP
 (`gb/bootconfig_extra` is not read by `gbinit`). Builder harness B11 (`tests\w3a\bringup\test_bringup.sh`, 9 cases):

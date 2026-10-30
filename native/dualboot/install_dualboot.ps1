@@ -33,6 +33,11 @@
   gblog\, gbinstall\, gb\gb.cfg and gb\overlay\ are copied out as files (gblog-preserved-<stamp>\). -NoEspBackup
   goes on when that raw save fails (an unreadable ESP). Idea: the gbOS86 update flow (gbos86.com/docs/updating,
   github.com/linuxkid473/gbos-x86 install.sh; no code taken).
+  (wave 7, safety audit W6-S4) Last check before the write: the lock-screen PIN path of the installed ESP (Gatekeeper,
+  KeyMint + graft, Trusty/Weaver masks, fstab, PIN SELinux types) must equal the export's (tools\pin_path_check.py
+  with verify_image.py; needs python), or the update is refused (exit 2), also when it cannot be compared.
+  -PinMigration goes on (a reviewed migration, or no PIN set); -VerifyImage names verify_image.py (default: the
+  repository root's, then C:\GB-x86\verify_image.py).
 
 .EXAMPLE
   .\install_dualboot.ps1                              # dry run against disk 0 (no elevation needed for most checks)
@@ -58,6 +63,8 @@ param(
     [switch]$RepairBootEntry,
     [switch]$VerifySources,
     [switch]$NoEspBackup,
+    [switch]$PinMigration,
+    [string]$VerifyImage,
     [switch]$Apply
 )
 $ErrorActionPreference = 'Stop'
@@ -346,6 +353,37 @@ if ($UpdateEspOnly -or $RepairBootEntry) {
                     }
                     Write-Ok "installed loader.conf default gb-$slot"
                 }
+            }
+
+            # (wave 7, safety audit W6-S4) the lock-screen PIN path. A native user may have set a PIN with the installed
+            # Gatekeeper/KeyMint; an ESP whose PIN path differs (Gatekeeper binary/fragment/service, KeyMint + graft,
+            # Trusty/Weaver masks, fstab, PIN SELinux types: verify_image.pin_path_problems) can leave it unverifiable.
+            # Read-only: the raw save of -Apply (image mode: the target image itself) against the export's ESP.
+            Write-Step 'PIN-path check: the update must keep the lock-screen PIN path of the installed ESP'
+            $pinWhy = $null; $pinArgs = $null
+            if ($Apply -and $script:EspSha) { $pinArgs = @('--old', $raw) }
+            elseif ($ImageMode) { $pinArgs = @('--old', $TargetImage, '--old-offset', "$([int64]$espPart.offset)", '--old-length', "$([int64]$espPart.length)") }
+            elseif ($Apply) { $pinWhy = 'the installed ESP was not saved (-NoEspBackup), so its PIN path is unknown' }
+            else { Write-Info 'would compare the PIN path of the installed ESP (its raw save, with -Apply) with the export''s, before the write' }
+            if ($pinArgs) {
+                $viList = if ($VerifyImage) { @($VerifyImage) } else { @((Join-Path $PSScriptRoot '..\..\verify_image.py'), 'C:\GB-x86\verify_image.py') }
+                $viPath = $viList | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+                $pyc = Get-Command python -ErrorAction SilentlyContinue
+                if (-not $pyc) { $pinWhy = 'python is not on PATH, so the PIN path (tools\pin_path_check.py) cannot be compared' }
+                elseif (-not $viPath) { $pinWhy = "no verify_image.py ($($viList -join ', ')), so the PIN path cannot be compared (-VerifyImage names it)" }
+                else {
+                    $viPath = [IO.Path]::GetFullPath($viPath); Write-Info "with $viPath"
+                    $pinOut = & $pyc.Source -I -B (Join-Path $PSScriptRoot 'tools\pin_path_check.py') --verify-image $viPath @pinArgs --new (Join-Path $ExportDir $espM.file)
+                    $pinCode = $LASTEXITCODE
+                    foreach ($l in @($pinOut)) { Write-Info "$l" }
+                    if ($pinCode -eq 0) { Write-Ok 'PIN path: the export keeps the installed one' }
+                    elseif ($pinCode -eq 3) { $pinWhy = 'the export changes the PIN path of the installed ESP (lines above)' }
+                    else { $pinWhy = "the PIN path cannot be compared (pin_path_check.py exit $pinCode, lines above)" }
+                }
+            }
+            if ($pinWhy) {
+                if ($PinMigration) { Write-Warn2 "$pinWhy - going on (-PinMigration)" }
+                else { Write-Bad "$pinWhy - refusing: a lock-screen PIN set in Googlebook may stop verifying. Remove the PIN in Googlebook first, or pass -PinMigration for a reviewed migration (README_DUALBOOT.md)"; exit 2 }
             }
 
             Write-Step 'Rewrite only EFI-SYSTEM (kernel/initrd update; userdata and system untouched)'

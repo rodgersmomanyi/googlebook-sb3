@@ -2029,13 +2029,15 @@ def v26(c):
 
 
 def v27(c):
-    """WAVE3 item 11 ([W3R-21]): apgetty off in the native gb.rc only."""
+    """WAVE3 item 11 ([W3R-21]): apgetty off in the native gb.rc only. (W7, image audit IA6-1) Including safety-misc
+    GX-05's `stop apgetty` in `on init` (wave 6: a getty that is already up is stopped before `on boot`)."""
     if c.kind != "native":
         rc = c.rc("gbstage") or ""
         return ["the VM gb.rc mentions apgetty (native only)"] if "apgetty" in rc else []
     secs = rc_sections(c.rc() or "")
     has = lambda head, line: any(s[0] == head and line in s[1:] for s in secs)
-    miss = [f"{h}: {ln}" for h, ln in (("on init", "setprop desktop.apgetty.enable 0"), ("on boot", "stop apgetty"),
+    miss = [f"{h}: {ln}" for h, ln in (("on init", "setprop desktop.apgetty.enable 0"), ("on init", "stop apgetty"),
+                                       ("on boot", "stop apgetty"),
                                        ("on property:init.svc.apgetty=running", "stop apgetty"),
                                        ("on property:init.svc.apgetty=restarting", "stop apgetty")) if not has(h, ln)]
     return [f"native gb.rc lacks {miss}"] if miss else []

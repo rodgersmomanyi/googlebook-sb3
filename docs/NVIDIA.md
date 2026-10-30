@@ -66,7 +66,8 @@ GPU under Windows ([VMWARE.md](VMWARE.md)).
 * **GbGpu** (`native/gpu-ui`, package `gb.sb3.gpu`) is the user interface: the tile, the Settings page, the
   notifications and the close-apps dialog. It holds no privileges. Every change goes through gb_power's socket.
   (Wave 6) It follows the signed-in user: lapis's user 0 only shows the login screen, so state updates go to every
-  running full user, the notification permission and the tile are set up for your user, the app refreshes itself
+  running full user, the notification permission and the tile are set up for your user (wave 7: the permission is
+  granted once per user, so if you turn the Graphics app's notifications off they stay off), the app refreshes itself
   when your user is unlocked, and the tile refreshes each time you open Quick Settings (it is no longer an "active"
   tile, whose update requests lapis's SystemUI dropped). Notices from `gb_notify` are posted for all users.
 

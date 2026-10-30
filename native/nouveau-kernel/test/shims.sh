@@ -412,6 +412,14 @@ if [ "$1 $2" = "gpu vkjson" ]; then
 fi
 for a in "$@"; do printf '%s|' "$a"; done >> "$GBT/log/cmd.log"
 echo >> "$GBT/log/cmd.log"
+# (wave 7, notify O5) a notification post prints ctl/post_reply.<form> when that file exists, as lapis's cmd does when it
+# posted nothing (its usage, or "Error occurred. ..."; exit 0 all the same). form: uall_s (-u all -S), uall (-u all),
+# u_s / u (-u <id> with / without -S), s (-S, no -u), plain (neither)
+if [ "$1 $2" = "notification post" ]; then
+  case " $* " in *" -u all "*) f=uall ;; *" -u "*) f=u ;; *) f= ;; esac
+  case " $* " in *" -S "*) f=${f:+${f}_}s ;; *) f=${f:-plain} ;; esac
+  [ -f "$GBT/ctl/post_reply.$f" ] && cat "$GBT/ctl/post_reply.$f"
+fi
 [ -e "$GBT/ctl/cmd_fail" ] && exit 1
 exit 0
 EOF

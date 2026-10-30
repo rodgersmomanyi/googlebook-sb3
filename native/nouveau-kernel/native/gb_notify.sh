@@ -10,6 +10,13 @@
 #                whichever user is in the foreground -- at the login screen, after the sign-in and after any user
 #                switch -- so nothing is lost before the person signs in and nothing is posted twice (the same tag
 #                replaces the record; nothing is posted for user 0 any more).
+#                (wave 7, notify O5) `cmd notification post` exits 0 even when it posted nothing (measured on lapis
+#                276.R4: an unknown option prints its usage, a bad -u value or style prints "Error occurred. ..."), so
+#                its OUTPUT decides (post_notice): a usage text = this build lacks one of our options, and the notice
+#                is posted again with the options that usage lists (for all users without -S bigtext when only the
+#                style is missing; without -u when -u is missing: the shell's own user 0, i.e. the login screen only,
+#                logged); "unrecognized notification style" = for all users without -S bigtext; "Bad user" = one
+#                post per running full user (-u <id>); any other error is logged. At most 1 + 8 posts per notice.
 #   broadcast -> one explicit broadcast per RUNNING FULL user (pm list users: flag FULL 0x400 and "running"), never the
 #                headless system user; a user that starts later (the sign-in) refreshes itself: GbGpu's UserReceiver
 #                runs the same refresh at that user's BOOT_COMPLETED. If pm list users fails: --user current.
@@ -89,6 +96,56 @@ full_users() {                           # -> USERS: ids of the running FULL use
     [ $_nu -lt 8 ] || break
   done
   IFS=$_ifs
+  return 0
+}
+
+cmd_post() {                             # cmd notification post "$@" -> PO = its output; 0 = no sign of a failure
+  PO=$(timeout 20 cmd notification post "$@" 2>&1)
+  _pr=$?
+  case $PO in *'usage: cmd notification post'* | *'Error occurred'*) return 1 ;; esac
+  [ $_pr -eq 0 ]
+}
+
+po_log() {                               # PO for a log line: printable ASCII, one line, at most 120 bytes
+  printf '%s' "$PO" | tr -c ' -~' ' ' | cut -c1-120
+}
+
+post_notice() {                          # $1 tag, $2 title, $3 text, $4 message file name (for the log)
+  cmd_post -u all -S bigtext -t "$2" "$1" "$3" && return 0
+  case $PO in
+    *'usage: cmd notification post'*)     # the usage lists the options this build has
+      case $PO in *bigtext*) _bt=1 ;; *) _bt=0 ;; esac
+      case $PO in
+        *'-u|--user'*)
+          if [ $_bt = 0 ] && cmd_post -u all -t "$2" "$1" "$3"; then
+            logn "$4 posted without -S bigtext (this build's cmd notification post has no bigtext style)"
+            return 0
+          fi
+          ;;
+        *)
+          if { [ $_bt = 1 ] && cmd_post -S bigtext -t "$2" "$1" "$3"; } || { [ $_bt = 0 ] && cmd_post -t "$2" "$1" "$3"; }; then
+            logn "this build's cmd notification post has no -u: $4 posted for user 0 only (the login screen; not seen after the sign-in)"
+            return 0
+          fi
+          ;;
+      esac
+      ;;
+    *'notification style'*)               # this build has no bigtext style
+      if cmd_post -u all -t "$2" "$1" "$3"; then
+        logn "$4 posted without -S bigtext (this build's cmd notification post has no bigtext style)"
+        return 0
+      fi
+      ;;
+    *'Bad user'*)                         # -u all refused: one post per running full user
+      if full_users && [ -n "$USERS" ]; then
+        _np=0
+        for _u in $USERS; do cmd_post -u "$_u" -S bigtext -t "$2" "$1" "$3" && _np=$((_np + 1)); done
+        logn "cmd notification post -u all refused for $4: posted per running full user ($_np of$USERS)"
+        return 0
+      fi
+      ;;
+  esac
+  logn "cmd notification post failed for $4 ($(po_log))"
   return 0
 }
 
@@ -219,8 +276,7 @@ handle() {                               # $1 = message file
       case $tag in gb_dgpu | gb_dtx | gb_dgpu_test | gb_gfx | gb_update) ;; *) logn "dropped ${1##*/}: bad tag"; return 0 ;; esac
       printable "$title" 40 || { logn "dropped ${1##*/}: bad title"; return 0; }
       printable "$text" 200 || { logn "dropped ${1##*/}: bad text"; return 0; }
-      timeout 20 cmd notification post -u all -S bigtext -t "$title" "$tag" "$text" > /dev/null 2>&1 ||
-        logn "cmd notification post failed for ${1##*/}"
+      post_notice "$tag" "$title" "$text" "${1##*/}"
       ;;
     broadcast) broadcast_state "${1##*/}" ;;
     force-stop)

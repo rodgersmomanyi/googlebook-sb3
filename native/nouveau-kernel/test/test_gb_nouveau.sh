@@ -2014,6 +2014,98 @@ text=x
   check "unreadable message: deleted all the same" eq "$(nmsg)" 0
 fi
 
+# (wave 7, notify O14) at most 8 running full users get the state broadcast
+if want NP-W7-CAP; then
+  new_case NP-W7-CAP
+  Q=$R/data/vendor/gb/notify
+  { printf '\tUserInfo{0:System User:811} running\n'; i=10; while [ $i -lt 20 ]; do printf '\tUserInfo{%s:U%s:412} running\n' $i $i; i=$((i + 1)); done; } > "$T/ctl/users"
+  printf 'kind=broadcast\n' > "$Q/1792900000201-60-1.msg"
+  run gb_notify.sh
+  check "exit 0" eq "$RC" 0
+  check "10 running full users: 8 broadcasts" eq "$(nlines "$T/log/am.log")" 8
+  check "the first 8 in list order (10..17)" eq "$(cut -d'|' -f3 "$T/log/am.log" | tr '\n' ' ')" "10 11 12 13 14 15 16 17 "
+  rm -f "$T/ctl/users"
+fi
+
+# (wave 7, notify O5) cmd notification post exits 0 when it posted nothing: its output decides, with the fallbacks
+if want NP-W7-O5; then
+  new_case NP-W7-O5
+  Q=$R/data/vendor/gb/notify
+  U="usage: cmd notification post [flags] <tag> <text>
+
+flags:
+  -h|--help
+  -t|--title <text>
+  -S|--style <style> [styleargs]"
+  nq() { printf 'kind=notify\ntag=gb_update\ntitle=System update held\ntext=x y\n' > "$Q/17929000003$1-70-$1.msg"; }
+  posts() { grep -c '^notification|post|' "$T/log/cmd.log"; }
+  # 1: a build without -u (its usage lists bigtext): posted again with -S bigtext, no -u (user 0, the login screen)
+  printf '%s\nstyles: (default none)\n  bigtext\n' "$U" > "$T/ctl/post_reply.uall_s"
+  : > "$T/log/cmd.log"; nq 01
+  run gb_notify.sh
+  check "no -u: two posts" eq "$(posts)" 2
+  check "no -u: the second without -u, with bigtext" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-S|bigtext|-t|System update held|gb_update|x y|"
+  check "no -u: logged" has "$R/dev/kmsg" "this build's cmd notification post has no -u: 1792900000301-70-01.msg posted for user 0 only"
+  # 2: a build without -u and without bigtext: plain post
+  printf '%s\nstyles: (default none)\n  inbox\n' "$U" > "$T/ctl/post_reply.uall_s"
+  : > "$T/log/cmd.log"; nq 02
+  run gb_notify.sh
+  check "no -u, no bigtext: plain second post" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-t|System update held|gb_update|x y|"
+  # 3: -u listed, bigtext not: for all users without -S
+  printf '%s\n  -u|--user <user_id>\nstyles: (default none)\n  inbox\n' "$U" > "$T/ctl/post_reply.uall_s"
+  : > "$T/log/cmd.log"; nq 03
+  run gb_notify.sh
+  check "no bigtext: second post -u all without -S" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-t|System update held|gb_update|x y|"
+  check "no bigtext: logged" has "$R/dev/kmsg" "1792900000303-70-03.msg posted without -S bigtext"
+  # 4: the style is unknown (an error, not the usage): for all users without -S
+  printf 'Error occurred. Check logcat for details. unrecognized notification style: bigtext\n' > "$T/ctl/post_reply.uall_s"
+  : > "$T/log/cmd.log"; nq 04
+  run gb_notify.sh
+  check "unknown style: second post -u all without -S" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-t|System update held|gb_update|x y|"
+  # 5: -u all refused ("Bad user"): one post per running full user (10 runs, 11 does not)
+  printf 'Error occurred. Check logcat for details. Bad user number: all\n' > "$T/ctl/post_reply.uall_s"
+  printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412} running\n\tUserInfo{11:B:412}\n' > "$T/ctl/users"
+  : > "$T/log/cmd.log"; nq 05
+  run gb_notify.sh
+  check "bad user: posts -u all, then -u 10 only" eq "$(cut -d'|' -f3,4 "$T/log/cmd.log" | tr '\n' ' ')" "-u|all -u|10 "
+  check "bad user: logged" has "$R/dev/kmsg" "cmd notification post -u all refused for 1792900000305-70-05.msg: posted per running full user (1 of 10)"
+  # 6: -u all refused at the login screen (no running full user): logged with the reason, nothing else posted
+  printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412}\n' > "$T/ctl/users"
+  : > "$T/log/cmd.log"; nq 06
+  run gb_notify.sh
+  check "bad user, login screen: one post" eq "$(posts)" 1
+  check "bad user, login screen: the reason logged" has "$R/dev/kmsg" "cmd notification post failed for 1792900000306-70-06.msg (Error occurred. Check logcat for details. Bad user number: all)"
+  rm -f "$T/ctl/users"
+  # 7: the fallback is refused too: two posts, one failure line
+  printf '%s\nstyles: (default none)\n  bigtext\n' "$U" > "$T/ctl/post_reply.uall_s"
+  printf '%s\n' "$U" > "$T/ctl/post_reply.s"
+  : > "$T/log/cmd.log"; nq 07
+  run gb_notify.sh
+  check "fallback refused: two posts" eq "$(posts)" 2
+  check "fallback refused: logged as a failure" has "$R/dev/kmsg" "cmd notification post failed for 1792900000307-70-07.msg (usage: cmd notification post"
+  rm -f "$T/ctl/post_reply.uall_s" "$T/ctl/post_reply.s"
+  # 8: any other error: logged, no second post
+  printf 'Error occurred. Check logcat for details. something else\n' > "$T/ctl/post_reply.uall_s"
+  : > "$T/log/cmd.log"; nq 08
+  run gb_notify.sh
+  check "other error: one post" eq "$(posts)" 1
+  check "other error: logged" has "$R/dev/kmsg" "cmd notification post failed for 1792900000308-70-08.msg (Error occurred. Check logcat for details. something else)"
+  rm -f "$T/ctl/post_reply.uall_s"
+  # 9: exit status 1 without output (as before wave 7): logged, no second post
+  : > "$T/ctl/cmd_fail"
+  : > "$T/log/cmd.log"; nq 09
+  run gb_notify.sh
+  rm -f "$T/ctl/cmd_fail"
+  check "cmd fails: one post" eq "$(posts)" 1
+  check "cmd fails: logged" has "$R/dev/kmsg" "cmd notification post failed for 1792900000309-70-09.msg"
+  # 10: a post that prints nothing is final (the normal case): one post, nothing logged about it
+  : > "$T/log/cmd.log"; nq 10
+  run gb_notify.sh
+  check "normal: one post" eq "$(posts)" 1
+  check "normal: no post line logged" eq "$(grep -c '1792900000310-70-10.msg' "$R/dev/kmsg")" 0
+  check "queue empty" eq "$(nmsg)" 0
+fi
+
 if want NP-1B-18; then
   new_case NP-1B-18
   Q=$R/data/vendor/gb/notify

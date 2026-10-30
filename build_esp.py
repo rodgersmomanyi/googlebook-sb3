@@ -766,41 +766,167 @@ GB_DEXOPT_SH = (b"#!/system/bin/sh\n"
           b"done\n"
           b"/system/bin/toybox touch $M\n"
           b"echo GB_DEXOPT done\n")
-# UI scale + animations (gb_ui service, on boot_completed). Density is per user, so wait for the signed-in user to take
-# over from the headless system user 0 first. 160 dpi * W/1280 keeps a 1280 dp wide desktop at any width >= 1920
-# (2560 -> 320 = 2 physical px per dp); smaller modes fall back to the panel default (ro.sf.lcd_density). The
-# animation/blur settings are set once (marker), so later changes in Settings / Developer options stick.
+# UI scale, animations and the person's own user (gb_ui service, both trees, started at boot_completed; init never
+# waits for it). (Wave 7, headless-settings: BACKLOG 9.4 notify O1-O3) lapis runs in headless system user mode, so
+# per-user settings must name the person's FULL user (10, 11, ...), not the current user at boot_completed (the
+# headless user 0, the login screen). The script polls the foreground user for the whole boot and sets up every full
+# user at its first unlock: per boot its density, HOME and user_setup_complete; once ever (a marker in /data/local)
+# the VM tree's keep-awake values of gb_provision and, natively, gb_sensors.sh's Auto-rotate default. User 0 keeps
+# exactly what it got before (gb_provision; its density when nobody signs in within 60 s). Its own comments say more.
 GB_UI_SH = (b"#!/system/bin/sh\n"
-          b"exec >/dev/kmsg 2>&1\n"
-          b"n=0; while [ \"$(/system/bin/am get-current-user 2>/dev/null)\" = 0 ] && [ $n -lt 30 ]; do /system/bin/sleep 2; n=$((n+1)); done\n"
-          b"W=$(/system/bin/wm size | /system/bin/toybox grep -o 'Physical size: [0-9]*' | /system/bin/toybox grep -o '[0-9]*$')\n"
-          # Write the user's own setting first: `wm density` alone targets WindowManager's current user, which can still be
-          # 0 while the switch is in flight (then the switch reloads the new user's unset value -> back to 260).
-          b"U=$(/system/bin/am get-current-user)\n"
-          b"cur=$(/system/bin/settings get --user $U secure display_density_forced)\n"
-          b"if [ \"${W:-0}\" -ge 1920 ]; then D=$((W / 8))\n"
-          # native Surface Book 3 (3000x2000, 267 ppi): 320 dpi = 1500x1000 dp, like Windows at 200%
-          b"  [ \"$(cat /odm/etc/gb_hw 2>/dev/null)\" = native ] && D=$((W * 16 / 150))\n"
-          b"  [ \"$cur\" = \"$D\" ] || { /system/bin/settings put --user $U secure display_density_forced $D; /system/bin/wm density $D; }\n"
-          b"else D=default; [ \"$cur\" = null ] || { /system/bin/settings delete --user $U secure display_density_forced; /system/bin/wm density reset; }; fi\n"
-          # Stock Googlebook launcher = HOME of the signed-in user. Never user 0: the headless system user's HOME is the
-          # login screen (com.google.android.desktop.identity.login/.LoginLauncherActivity).
-          b"if [ -n \"$U\" ] && [ \"$U\" != 0 ]; then\n"
-          b"  /system/bin/settings put --user $U secure user_setup_complete 1\n"
-          b"  case \"$(/system/bin/cmd role get-role-holders --user $U android.app.role.HOME 2>&1)\" in\n"
-          b"    *com.google.android.apps.nexuslauncher*) ;;\n"
-          b"    *) /system/bin/cmd role add-role-holder --user $U android.app.role.HOME com.google.android.apps.nexuslauncher 2>&1 ;;\n"
-          b"  esac\n"
-          b"fi\n"
-          b"M=/data/local/gb_anim.v1.done\n"
-          b"if [ ! -f $M ]; then\n"
-          b"  for k in window_animation_scale transition_animation_scale animator_duration_scale; do /system/bin/settings put global $k 1.0; done\n"
-          b"  /system/bin/settings put global disable_window_blurs 0\n"
-          b"  /system/bin/toybox touch $M\n"
-          b"fi\n"
-          b"echo \"GB_UI user=$U width=$W density=$D (was $cur) anim=$(/system/bin/settings get global animator_duration_scale)"
-          b" window_blurs_off=$(/system/bin/settings get global disable_window_blurs) sf_blurs_off=$(/system/bin/getprop persist.sys.sf.disable_blurs)"
-          b" home=$(/system/bin/cmd role get-role-holders --user $U android.app.role.HOME 2>&1)\"\n")
+            b"# gb_ui.sh: service gb_ui (both trees; user root, seclabel u:r:shell:s0), started at sys.boot_completed=1. init only\n"
+            b"# starts it and never waits for it. (Wave 7, headless-settings) lapis runs in headless system user mode: user 0 shows\n"
+            b"# the login screen, and the person uses a FULL user (10, 11, ...) that comes to the foreground at the sign-in, possibly\n"
+            b"# long after boot (a PIN). Settings written without --user reach the CURRENT user, i.e. user 0 at boot_completed\n"
+            b"# (wave-6 notify evidence 60/61). So this script:\n"
+            b"#  1. once per device (marker gb_anim.v1.done): animation scales 1.0, window blurs on (global settings);\n"
+            b"#  2. for every user that comes to the foreground other than user 0 (the foreground user is always a full user or\n"
+            b"#     the headless user 0; profiles never are), the first time this boot, once it is unlocked: the density for this\n"
+            b"#     display (its display_density_forced + wm density), the stock launcher as its HOME, user_setup_complete 1 (the\n"
+            b"#     SetupWizard is disabled, so nothing else sets it for a new user);\n"
+            b"#  3. for every such user ONCE EVER, 30 polls (>= 60 s) after that first unlock (marker /data/local/gb_ui.user.<u>.v1,\n"
+            b"#     created BEFORE the writes, so a marker that cannot be created never repeats them): VM tree: the keep-awake values\n"
+            b"#     gb_provision writes for user 0 (screen_off_timeout, sleep_timeout); native: the sensors component's Auto-rotate\n"
+            b"#     default (/odm/gb_sensors.sh user <u>). What the person changes later is never written again. The delay: on a\n"
+            b"#     first boot, lapis sets a new user's system defaults again around its first unlock and initialization (measured:\n"
+            b"#     gb_provision's screen_off_timeout for the first-boot user 10 was replaced by the default 600000);\n"
+            b"#  4. user 0 (the login screen, whose HOME is lapis's login launcher): only its density, as before, when nobody has\n"
+            b"#     signed in after 60 s.\n"
+            b"# It polls the foreground user (am get-current-user) every 2 s for 10 min, then every 10 s, for the whole boot, so a\n"
+            b"# late sign-in and a user created later are covered. At start, the markers of users that no longer exist are removed\n"
+            b"# (pm list users must answer and list user 0), so a reused user id starts fresh.\n"
+            b"# Test hooks (never set by init): GB_ROOT (prefix for /odm and /data), GB_TEST_PATH (prepended to PATH), GB_UI_LOG=-\n"
+            b"# (log to stdout instead of /dev/kmsg), GB_UI_MAXPOLL (stop after that many polls; default: never stop).\n"
+            b"[ \"${GB_UI_LOG:-}\" = - ] || exec > /dev/kmsg 2>&1\n"
+            b"PATH=${GB_TEST_PATH:+$GB_TEST_PATH:}/system/bin\n"
+            b"export PATH\n"
+            b"R=${GB_ROOT:-}\n"
+            b"MAX=${GB_UI_MAXPOLL:-}\n"
+            b"case $MAX in *[!0-9]*) MAX= ;; esac\n"
+            b"HW=$(cat \"$R/odm/etc/gb_hw\" 2> /dev/null)\n"
+            b"HOMEPKG=com.google.android.apps.nexuslauncher\n"
+            b"\n"
+            b"M=$R/data/local/gb_anim.v1.done\n"
+            b"if [ ! -f \"$M\" ]; then\n"
+            b"  for k in window_animation_scale transition_animation_scale animator_duration_scale; do settings put global \"$k\" 1.0; done\n"
+            b"  settings put global disable_window_blurs 0\n"
+            b"  (: > \"$M\") 2> /dev/null\n"
+            b"fi\n"
+            b"\n"
+            b"dens() { # $1 = user: 160 dpi * W/1280 keeps a 1280 dp wide desktop at any width >= 1920 (2560 -> 320 = 2 px per dp;\n"
+            b"  # native Surface Book 3, 3000x2000 at 267 ppi: 320 dpi = 1500x1000 dp, like Windows at 200%); smaller modes use the\n"
+            b"  # panel default (ro.sf.lcd_density). The user's own setting is written first: `wm density` alone targets\n"
+            b"  # WindowManager's current user, which can still be 0 while a switch is in flight.\n"
+            b"  W=$(wm size 2> /dev/null | sed -n 's/^Physical size: \\([0-9][0-9]*\\)x.*/\\1/p' | head -n 1)\n"
+            b"  cur=$(settings get --user \"$1\" secure display_density_forced 2> /dev/null)\n"
+            b"  if [ \"${W:-0}\" -ge 1920 ]; then\n"
+            b"    D=$((W / 8))\n"
+            b"    [ \"$HW\" = native ] && D=$((W * 16 / 150))\n"
+            b"    [ \"$cur\" = \"$D\" ] || { settings put --user \"$1\" secure display_density_forced \"$D\"; wm density \"$D\"; }\n"
+            b"  else\n"
+            b"    D=default\n"
+            b"    [ \"$cur\" = null ] || { settings delete --user \"$1\" secure display_density_forced; wm density reset; }\n"
+            b"  fi\n"
+            b"}\n"
+            b"\n"
+            b"show() { # $1 = user: the summary line (as before wave 7)\n"
+            b"  echo \"GB_UI user=$1 width=$W density=$D (was $cur) anim=$(settings get global animator_duration_scale)\" \\\n"
+            b"    \"window_blurs_off=$(settings get global disable_window_blurs) sf_blurs_off=$(getprop persist.sys.sf.disable_blurs)\" \\\n"
+            b"    \"home=$(cmd role get-role-holders --user \"$1\" android.app.role.HOME 2>&1)\"\n"
+            b"}\n"
+            b"\n"
+            b"unlocked() { # $1 = user: RUNNING_UNLOCKED. am get-current-user names the user as soon as a switch starts, before the\n"
+            b"  # user has started (\"User is not started: <u>\"). An answer without a known state counts as unlocked.\n"
+            b"  case \"$(timeout 20 am get-started-user-state \"$1\" 2>&1)\" in\n"
+            b"    *RUNNING_UNLOCKED*) return 0 ;;\n"
+            b"    *BOOTING* | *RUNNING_LOCKED* | *RUNNING_UNLOCKING* | *STOPPING* | *SHUTDOWN* | *'not started'*) return 1 ;;\n"
+            b"  esac\n"
+            b"  return 0\n"
+            b"}\n"
+            b"\n"
+            b"user_ui() { # $1 = a full user in the foreground, the first time this boot\n"
+            b"  dens \"$1\"\n"
+            b"  [ \"$(settings get --user \"$1\" secure user_setup_complete 2> /dev/null)\" = 1 ] ||\n"
+            b"    settings put --user \"$1\" secure user_setup_complete 1\n"
+            b"  case \"$(cmd role get-role-holders --user \"$1\" android.app.role.HOME 2>&1)\" in\n"
+            b"    *\"$HOMEPKG\"*) ;;\n"
+            b"    *) cmd role add-role-holder --user \"$1\" android.app.role.HOME \"$HOMEPKG\" 2>&1 ;;\n"
+            b"  esac\n"
+            b"}\n"
+            b"\n"
+            b"user_once() { # $1 = a full user at its first unlock ever seen here\n"
+            b"  O=$R/data/local/gb_ui.user.$1.v1\n"
+            b"  [ -e \"$O\" ] && return 0\n"
+            b"  if ! (umask 077 && : > \"$O\") 2> /dev/null; then\n"
+            b"    echo \"GB_UI user=$1 first unlock: cannot create $O, nothing written (it is never retried without the marker)\"\n"
+            b"    return 0\n"
+            b"  fi\n"
+            b"  case $HW in\n"
+            b"    vm)\n"
+            b"      settings put --user \"$1\" system screen_off_timeout 2147483647\n"
+            b"      settings put --user \"$1\" secure sleep_timeout -1\n"
+            b"      echo \"GB_UI user=$1 first unlock: screen_off_timeout=$(settings get --user \"$1\" system screen_off_timeout)\" \\\n"
+            b"        \"sleep_timeout=$(settings get --user \"$1\" secure sleep_timeout) (once; gb_provision's user-0 values)\"\n"
+            b"      ;;\n"
+            b"    native)\n"
+            b"      if [ -f \"$R/odm/gb_sensors.sh\" ]; then\n"
+            b"        GB_SENSORS_LOG=- sh \"$R/odm/gb_sensors.sh\" user \"$1\"\n"
+            b"      else\n"
+            b"        echo \"GB_UI user=$1 first unlock: no /odm/gb_sensors.sh\"\n"
+            b"      fi\n"
+            b"      ;;\n"
+            b"    *) echo \"GB_UI user=$1 first unlock: gb_hw '$HW': nothing to set\" ;;\n"
+            b"  esac\n"
+            b"}\n"
+            b"\n"
+            b"cleanup() { # markers of users that no longer exist\n"
+            b"  _l=$(timeout 20 pm list users 2> /dev/null) || return 0\n"
+            b"  case $_l in *'UserInfo{0:'*) ;; *) return 0 ;; esac\n"
+            b"  for f in \"$R\"/data/local/gb_ui.user.*.v1; do\n"
+            b"    [ -e \"$f\" ] || continue\n"
+            b"    _u=${f##*/gb_ui.user.}\n"
+            b"    _u=${_u%.v1}\n"
+            b"    case $_u in '' | *[!0-9]*) continue ;; esac\n"
+            b"    case $_l in *\"UserInfo{$_u:\"*) ;; *) rm -f \"$f\" && echo \"GB_UI user=$_u no longer exists: marker removed\" ;; esac\n"
+            b"  done\n"
+            b"}\n"
+            b"\n"
+            b"cleanup\n"
+            b"SEEN=\n"
+            b"PEND=\n"
+            b"Z=0\n"
+            b"n=0\n"
+            b"while :; do\n"
+            b"  c=$(timeout 20 am get-current-user 2> /dev/null)\n"
+            b"  case $c in '' | *[!0-9]*) c= ;; esac\n"
+            b"  [ ${#c} -le 5 ] || c=\n"
+            b"  if [ -n \"$c\" ] && [ \"$c\" != 0 ]; then\n"
+            b"    case \" $SEEN \" in\n"
+            b"      *\" $c \"*) ;;\n"
+            b"      *)\n"
+            b"        if unlocked \"$c\"; then\n"
+            b"          SEEN=\"$SEEN $c\"\n"
+            b"          user_ui \"$c\"\n"
+            b"          show \"$c\"\n"
+            b"          PEND=\"$PEND $c:$n\"\n"
+            b"        fi\n"
+            b"        ;;\n"
+            b"    esac\n"
+            b"  elif [ \"$c\" = 0 ] && [ $Z = 0 ] && [ -z \"$SEEN\" ] && [ $n -ge 30 ]; then\n"
+            b"    Z=1\n"
+            b"    dens 0\n"
+            b"    show 0\n"
+            b"  fi\n"
+            b"  _left=\n"
+            b"  for _p in $PEND; do\n"
+            b"    if [ $((n - ${_p#*:})) -ge 30 ]; then user_once \"${_p%%:*}\"; else _left=\"$_left $_p\"; fi\n"
+            b"  done\n"
+            b"  PEND=$_left\n"
+            b"  n=$((n + 1))\n"
+            b"  if [ -n \"$MAX\" ] && [ $n -ge \"$MAX\" ]; then break; fi\n"
+            b"  if [ $n -lt 300 ]; then sleep 2; else sleep 10; fi\n"
+            b"done\n"
+            b"exit 0\n")
 GB_CONSOLE_SH = (b"#!/system/bin/sh\n"
           b"/system/bin/toybox stty 115200 -echo -onlcr 2>/dev/null\n"
           b"export PATH=/system/bin:/system/xbin:/vendor/bin:/odm/bin HOME=/data/local/tmp\n"
@@ -1583,6 +1709,21 @@ OTA_TEXT = (b"Build $B is not the build this boot setup was made for ($V). Pause
             + ", ".join(OTA_SKIP_LABELS).encode() + b".")
 assert len(OTA_TITLE) <= 40 and len(OTA_TEXT.replace(b"$B", b"x" * 24).replace(b"$V", b"x" * 24)) <= 200 \
     and all(32 <= c <= 126 for c in OTA_TITLE + OTA_TEXT), "gb_otagate: notification title/text limits (12.1)"
+# (wave 7, harness-followups, OTA-F5) a bounded number of unvalidated boots, then a louder notice. gb_otagate.sh
+# counts the unvalidated boots of one (booted, validated) build pair: the root service keeps the record
+# /data/vendor/gb/ota_unvalidated (key, boot id, boots; 0644 in the 0751 directory native init creates, made the same
+# way in the VM tree), and both services derive the same count from it and /proc/sys/kernel/random/boot_id, so the
+# order in which init runs them does not matter. From the OTA_LOUD_AFTER-th boot of a pair on, the notice says how
+# many and names both remedies. No boot id, no readable record or a failed write = the plain notice (fail-safe: it
+# runs only after boot_completed on an unvalidated build, like the rest of the script). Same limits as 12.1.
+OTA_LOUD_AFTER = b"3"
+OTA_TITLE_LOUD = b"System update still not validated"
+OTA_TEXT_LOUD = (b"Unvalidated boot $N of build $B (setup made for $V). Still paused: " + ", ".join(OTA_SKIP_LABELS).encode()
+                 + b". Update the ESP from the host, or boot the previous slot.")
+assert len(OTA_TITLE_LOUD) <= 40 and len(OTA_TEXT_LOUD.replace(b"$N", b"9" * 6).replace(b"$B", b"x" * 24)
+                                          .replace(b"$V", b"x" * 24)) <= 200 \
+    and all(32 <= c <= 126 for c in OTA_TITLE_LOUD + OTA_TEXT_LOUD) and OTA_LOUD_AFTER.isdigit(), \
+    "gb_otagate: louder notice limits (12.1)"
 GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"# gb_otagate (OTA gate, wave 5b). /odm/etc/init/gb_otagate.rc starts it at boot_completed only when gbinit\n"
                  b"# found that this boot's build is not the one the ESP was built for (ro.vendor.gb.ota_gate=unvalidated;\n"
@@ -1608,6 +1749,22 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"B=$(bid \"$(val booted)\"); V=$(bid \"$(val validated)\")\n"
                  b"TITLE='" + OTA_TITLE + b"'\n"
                  b"TEXT=\"" + OTA_TEXT + b"\"\n"
+                 # (wave 7, OTA-F5) this build pair's unvalidated boots, the same in both services: the record is read
+                 # once (a rename between two reads cannot mix two records); no boot id or no matching record = the
+                 # first such boot; the count is capped at 6 digits (the notice text limit)
+                 b"C=$R/data/vendor/gb/ota_unvalidated\n"
+                 b"K=\"$(val booted) $(val validated)\"\n"
+                 b"I=$(head -c 64 \"$R/proc/sys/kernel/random/boot_id\" 2>/dev/null | tr -cd '0-9a-f-')\n"
+                 b"D=$(head -c 1024 \"$C\" 2>/dev/null | tr -cd ' -~\\n')\n"
+                 b"rec() { printf '%s\\n' \"$D\" | sed -n \"s/^$1=//p\" | tail -n 1; }\n"
+                 b"N=$(rec boots | tr -cd 0-9 | sed 's/^0*//' | cut -c1-6)\n"
+                 b"if [ -z \"$I\" ] || [ \"$(rec key)\" != \"$K\" ]; then N=1\n"
+                 b"elif [ \"$(rec boot)\" != \"$I\" ]; then N=$((${N:-0} + 1)); [ \"$N\" -le 999999 ] || N=999999\n"
+                 b"else N=${N:-1}; fi\n"
+                 b"if [ \"$N\" -ge " + OTA_LOUD_AFTER + b" ]; then\n"
+                 b"  TITLE='" + OTA_TITLE_LOUD + b"'\n"
+                 b"  TEXT=\"" + OTA_TEXT_LOUD + b"\"\n"
+                 b"fi\n"
                  # the gb_notify queue is used only where gb_notify ships (native tree) and its queue is a real directory
                  b"qok() { [ -f \"$R/odm/vup/bin/gb_notify.sh\" ] && [ -d \"$Q\" ] && [ ! -L \"$Q\" ]; }\n"
                  b"if [ \"${1:-}\" = post ]; then\n"
@@ -1619,6 +1776,18 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"log1 \"UNVALIDATED build: booted $(val booted), ESP built for $(val validated) (token $(val token)); "
                  b"skipped: " + ", ".join(OTA_SKIP_LABELS).encode() + b"; kept as built (needed to boot): "
                  + ", ".join(OTA_KEEP_LABELS).encode() + b"; update the ESP to re-validate\"\n"
+                 # (wave 7, OTA-F5) the root service records this boot; never fatal, never on a validated build
+                 b"if [ -n \"$I\" ] && [ ! -L \"$R/data/vendor/gb\" ]; then\n"
+                 b"  [ -d \"$R/data/vendor/gb\" ] || mkdir -m 0751 \"$R/data/vendor/gb\" 2>/dev/null\n"
+                 b"  rm -f \"$C.tmp\" 2>/dev/null\n"
+                 b"  if [ ! -d \"$C\" ] && (umask 022; set -C; printf 'key=%s\\nboot=%s\\nboots=%s\\n' \"$K\" \"$I\" \"$N\" > \"$C.tmp\") 2>/dev/null &&\n"
+                 b"     mv -f \"$C.tmp\" \"$C\" 2>/dev/null; then\n"
+                 b"    log1 \"boot count: $N unvalidated boot(s) of this build pair (from " + OTA_LOUD_AFTER
+                 + b" on, the notice says so)\"\n"
+                 b"  else\n"
+                 b"    rm -f \"$C.tmp\" 2>/dev/null; log1 \"boot count: cannot record it\"\n"
+                 b"  fi\n"
+                 b"fi\n"
                  b"if qok; then\n"
                  b"  ms=\"$(date +%s)000\"; f=$Q/$ms-$$-1.msg\n"
                  # (wave 6, notify) 0644 as 12.1 asks: gb_notify reads it as the shell user, and init starts this
@@ -1712,6 +1881,11 @@ GK_MIN_VERSION = (0, 2, 0)                                # W4-GK-1 (must before
 # test_frozen_v1.cpp: the gk_key.v1 files + handles 0.2.0 enrolled for the PIN "1234" still verify): ACCEPTANCE.txt
 # "host: GK_FROZEN_V1: PASS". 0.2.0 itself predates the test; it passed it on its own sources (w6prep\safety-misc SA-6).
 GK_FROZEN_PREDATES = ("505b404d0606bf80bcb41ff8a66a80c962934e3791d3b8db13645608da143d51",)
+# (W7, safety audit W6-S1) ... and not on the host only: a build after 0.2.0 needs all three frozen-vector results in
+# ACCEPTANCE.txt, the host run, the independent Python reference over the same vectors (frozen_check.py) and the
+# Android build run on lapis's own bionic (the code that runs on the device). build.sh skips the Android run without
+# LAPIS_RT/LAPIS_SYSLIB and then writes 'android-on-lapis-bionic: NOT RUN', which does not match.
+GK_FROZEN_LINES = ("host: GK_FROZEN_V1: PASS", "host: GK_FROZEN_REF: PASS", "android-on-lapis-bionic: GK_FROZEN_V1: PASS")
 GK_LLNDK = ("libbinder_ndk.so", "libc.so", "libdl.so", "liblog.so", "libm.so")
 GK_IFACE = b"interface aidl android.hardware.gatekeeper.IGatekeeper/default"
 GK_TRUSTY_BIND = (b"    mount none /odm/empty_vintf.xml "
@@ -1779,8 +1953,10 @@ def _gatekeeper_inputs(manifest=GK_MANIFEST):
         f"gatekeeper ACCEPTANCE.txt: version {ver.group(0) if ver else '?'} < {'.'.join(map(str, GK_MIN_VERSION))}"
     assert f"sha256: {_hl.sha256(gbin).hexdigest()}  {os.path.basename(bsrc)}" in acc.splitlines(), \
         "gatekeeper ACCEPTANCE.txt does not name this binary's sha256"
-    assert _hl.sha256(gbin).hexdigest() in GK_FROZEN_PREDATES or re.search(r"^host: GK_FROZEN_V1: PASS", acc, re.M), \
-        "gatekeeper ACCEPTANCE.txt lacks 'host: GK_FROZEN_V1: PASS' (SA-6: enrolled PINs must keep verifying)"
+    frozen_miss = [ln for ln in GK_FROZEN_LINES if not re.search("^" + re.escape(ln), acc, re.M)]
+    assert _hl.sha256(gbin).hexdigest() in GK_FROZEN_PREDATES or not frozen_miss, \
+        f"gatekeeper ACCEPTANCE.txt lacks {frozen_miss} (SA-6, W6-S1: enrolled PINs must keep verifying, on the host " \
+        f"and with the Android build on lapis's bionic)"
     interp, needed = _elf_dynamic(gbin)
     assert interp == "/system/bin/linker64" and needed and set(needed) <= set(GK_LLNDK), \
         f"gatekeeper binary: interpreter {interp}, NEEDED {needed} (LLNDK only: {GK_LLNDK})"
@@ -1868,8 +2044,10 @@ def _vnni_gbinit_ro_ok(gi):
 assert _vnni_gbinit_ro_ok(GBINIT), "GBINIT: the gbvnni read-only tmpfs block (after the kill switch and the OTA gate)"
 # (W6) the last action of the vnni block, on the init trigger (init runs it after every early-init action, so after every
 # gated relabel + bind; the VM gb.rc keeps one `on early-init` section, V28): the gbvnni superblock goes read-only. Not
-# gated (it binds nothing; without /odm/vnni, or if it is not a mount root, init logs the failure and goes on: it can
-# never touch /odm itself, do_remount needs the mount root).
+# gated (it binds nothing; if /odm/vnni is not a mount root, init logs the failure and goes on: it can never touch /odm
+# itself, do_remount needs the mount root). (W7) Without /odm/vnni init logs nothing at all: AOSP init reports a
+# builtin's ENOENT only at its DEBUG log level (builtins.cpp ErrnoErrorIgnoreEnoent); the wave-6 forced OTA-gate boots
+# show no line for this action (w7prep\audit-lows tests\test_enoent_evidence.py).
 VNNI_RC_TAIL = (b"\n# (W6) every library above is relabelled and bound (early-init): the gbvnni tmpfs (gbinit) now goes read-only\n"
                 b"# for all its mounts, the binds in every mount namespace and their propagated copies included.\n"
                 b"on init\n"
@@ -3753,8 +3931,9 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
     # write ESP into lapis.bin's EFI-SYSTEM partition (only that region); the guard is checked again right before it
     if _lapis_write_refused():
         sys.exit(f"build_esp.py: refused: {_lapis_write_refused()}")
-    if _pin_path_refused(ESP):                          # (W6 prep, SA-7) after the VM-off guard, before the write
-        sys.exit(f"build_esp.py: refused: {_pin_path_refused(ESP)}")
+    why = _pin_path_refused(ESP)                        # (W6 prep, SA-7) after the VM-off guard, before the write;
+    if why:                                             # (W7, W6-S7) once: one read of lapis.bin's ESP, one report
+        sys.exit(f"build_esp.py: refused: {why}")
     with open(LAPIS, "r+b") as f:
         f.seek(ESP_OFFSET)
         f.write(ESP)

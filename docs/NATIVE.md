@@ -224,7 +224,10 @@ gbinit applies to the `/odm` tree before Android starts (wave 3; design idea fro
   It is the one ESP access outside the ESP lock (read-only, at rdinit, before any lock user exists; INTERFACES 5.4).
 * **Updates.** `install_dualboot.ps1 -UpdateEspOnly` rewrites the whole ESP and so removes `gb\gb.cfg` and
   `gb\overlay\`; it copies them out first and says where ([README_DUALBOOT.md](../native/dualboot/README_DUALBOOT.md)).
-  gb_slotsync never touches them.
+  gb_slotsync never touches them. Since wave 7, `-UpdateEspOnly` refuses an export whose lock-screen PIN path differs from the installed ESP (for
+  example a Gatekeeper or KeyMint change), so a PIN set in Googlebook keeps working. Remove the PIN first, or pass
+  `-PinMigration` for a reviewed migration. The check needs `python` on PATH and the repository's `verify_image.py`;
+  `-VerifyImage <path>` names another copy.
 
 ## Google apps
 

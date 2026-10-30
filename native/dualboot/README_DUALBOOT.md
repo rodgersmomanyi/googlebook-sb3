@@ -213,6 +213,13 @@ installer refuses.
    `build_internal.py --reuse-guids <installed manifest>`), then retry. `--reuse-guids` alone would rebuild the same
    stale content.
 3. **Loader default.** When the installed ESP is readable, its `loader\loader.conf` default must be `gb-<s>`.
+4. **Lock-screen PIN path (wave 7).** The installed ESP (its raw save with `-Apply`) and the export's ESP must boot
+   the same PIN path: Gatekeeper binary, VINTF fragment and service, KeyMint service and its library graft, the
+   Trusty/Weaver masks, the fstab and the PIN SELinux types (`tools\pin_path_check.py` with
+   `verify_image.pin_path_problems`, the check `build_esp.py` and `gb_vmbackup.py` make before they write the VM's
+   ESP). Otherwise a PIN set in Googlebook can stop verifying, so the update is refused, also when the check cannot
+   run (no `python` on PATH, no `verify_image.py`: `-VerifyImage <repository>\verify_image.py`). Remove the PIN in
+   Googlebook first, or pass `-PinMigration` for a reviewed migration (or when no PIN is set).
 
 **What is saved first.** With `-Apply` the whole installed EFI-SYSTEM is saved raw before the rewrite (the
 installer's run folder, `esp-before-<stamp>.img` + `.sha256`, 512 MiB, read back once; `gbdisk dump`, read-only).

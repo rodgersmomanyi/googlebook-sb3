@@ -33,7 +33,10 @@ restore  VM must be off. Verifies the backup first. --esp-only (needs DEST\\mani
          happened: use the full restore, VM_UPGRADE.md 3.3). If neither live copy parses: only with
          --accept-unreadable-live-gpt. Both regions are read back and must equal SHA256SUMS, then the live GPT is
          parsed again. Nothing is written when the live regions already equal the backup. --dry-run (--esp-only):
-         every check, nothing written, no --yes needed. Full (needs
+         every check (and the free space for the save below), nothing written, no --yes needed. (W7, safety audit
+         W6-S2) Before its first write --esp-only saves the live ESP and both live GPT regions into
+         DEST\\..\\pre-restore-<time>\\ (an --esp-only backup of their own: SHA256SUMS + manifest.json, read back,
+         read-only; undo: restore <it> --esp-only --yes [--with-gpt]); refused if that drive lacks the room. Full (needs
          DEST\\SHA256SUMS + lapis.bin, so it also works on a plain copy): rewrites only the 4 MiB blocks of lapis.bin
          that differ from the backup (in place: no extra space on C:), re-hashes lapis.bin against SHA256SUMS, restores the small
          files (the current ones are kept in DEST\\..\\pre-restore-<time>\\ first) and makes them writable.
@@ -420,6 +423,70 @@ def pin_problems(src, live_esp, new_esp):
     return check(old, vi.fat_files(new_esp))
 
 
+def pre_restore_dir(dest):
+    """(W7, safety audit W6-S2) A new DEST\\..\\pre-restore-<time>[-<n>] path (not created yet)."""
+    base = os.path.join(os.path.dirname(os.path.abspath(dest)), "pre-restore-" + time.strftime("%Y%m%d-%H%M%S"))
+    keep, n = base, 1
+    while os.path.exists(keep):
+        n += 1
+        keep = f"{base}-{n}"
+    return keep
+
+
+def save_live(keep, lapis, size, es, ee, live_esp, dry_run=False):
+    """(W7, safety audit W6-S2) restore --esp-only overwrites the ESP and, with --with-gpt, both GPT regions; before W7
+    the live ones were not kept, so a restore could not be undone. Before the first write they are saved into keep
+    (DEST\\..\\pre-restore-<time>\\) as an --esp-only backup of their own: lapis-esp.img (the bytes at es..ee that
+    the restore overwrites), gpt-primary.bin, gpt-backup.bin, manifest.json (esp, gpt_sha256, lapis_bin bytes, and the
+    partitions and slot attributes of the live GPT when a copy parses) and SHA256SUMS. Every file is read back against
+    its sha256 and made read-only. Undo: restore <keep> --esp-only --yes (--with-gpt also puts the old GPT back). Dies
+    before anything is written to lapis.bin when that drive would fall below the 3 GB floor + 1 GB margin, when the ESP
+    changed since it was checked, or when a file does not read back. dry_run: only the space check. Returns keep."""
+    need = (ee - es) + G1 + G2 + (1 << 20)
+    free = shutil.disk_usage(os.path.dirname(keep)).free
+    if free < need + FLOOR + MARGIN:
+        die(f"refused: saving the live ESP and GPT regions ({need:,} B) into {keep} needs that much + 3 GB floor + 1 GB "
+            f"margin free; the drive has {free / GB:.2f} GB (nothing written)")
+    if dry_run:
+        return keep
+    with open(lapis, "rb") as f:
+        l1 = f.read(G1); f.seek(size - G2); l2 = f.read(G2); f.seek(es); esp = f.read(ee - es)
+    if esp != live_esp:
+        die("refused: the ESP in lapis.bin changed since it was checked (is the VM running?); nothing written")
+    lbas, parts = size // 512, None
+    for reg, base, prim in ((l1, 0, True), (l2, lbas - 33, False)):
+        try:
+            parts = gpt_region(reg, base, lbas, prim)["parts"]
+            break
+        except ValueError:
+            continue
+    os.makedirs(keep)
+    sums = {}
+    for n, d in (("lapis-esp.img", esp), ("gpt-primary.bin", l1), ("gpt-backup.bin", l2)):
+        with open(os.path.join(keep, n), "wb") as f:
+            f.write(d); f.flush(); os.fsync(f.fileno())
+        sums[n] = hashlib.sha256(d).hexdigest()
+    man = {"tool": "gb_vmbackup.py", "kind": "pre-restore (W7, W6-S2): the live regions restore --esp-only overwrote",
+           "saved_local": time.strftime("%Y-%m-%d %H:%M:%S"), "lapis_bin": {"bytes": size},
+           "esp": {"offset": es, "bytes": ee - es, "sha256": sums["lapis-esp.img"]},
+           "gpt_sha256": {"primary": sums["gpt-primary.bin"], "backup": sums["gpt-backup.bin"]},
+           "partitions": None if parts is None else {k: [v[0] * 512, (v[1] - v[0] + 1) * 512] for k, v in parts.items()},
+           "slot_attrs": None if parts is None else slot_attrs(parts)}
+    with open(os.path.join(keep, "manifest.json"), "w", encoding="ascii") as f:
+        json.dump(man, f, indent=1)
+    sums["manifest.json"] = sha_file(os.path.join(keep, "manifest.json"))
+    with open(os.path.join(keep, "SHA256SUMS"), "w", encoding="ascii", newline="\n") as f:
+        f.write("".join(f"{s} *{n}\n" for n, s in sorted(sums.items())))
+    for n, s in sums.items():
+        if sha_file(os.path.join(keep, n)) != s:
+            die(f"refused: {os.path.join(keep, n)} does not read back equal; nothing written to lapis.bin")
+    for n in os.listdir(keep):
+        os.chmod(os.path.join(keep, n), stat.S_IREAD)
+    print(f"saved the live ESP ({ee - es:,} B at {es}, sha256 {sums['lapis-esp.img']}) and both GPT regions"
+          f"{'' if parts else ' (neither parses)'} to {keep}", flush=True)
+    return keep
+
+
 def cmd_restore(dest, src, vmx, esp_only, with_gpt=False, pin_migration=False, dry_run=False, unreadable_ok=False):
     probs, _ = vm_guard(src, vmx)
     if probs:
@@ -452,8 +519,10 @@ def cmd_restore(dest, src, vmx, esp_only, with_gpt=False, pin_migration=False, d
                 f"undoes a reviewed migration, when the live ESP is unreadable, or when no PIN is set")
         print("PIN path: " + ("differences ALLOWED by --pin-migration" if pin else "the same as the ESP now in "
                               "lapis.bin"), flush=True)
+        keep = save_live(pre_restore_dir(dest), lapis, size, es, ee, live_esp, dry_run)   # (W7, W6-S2) before any write
         if dry_run:
-            print(f"dry run OK: would write {'the GPT regions, then ' if plan else ''}{ee - es:,} B of ESP at {es} "
+            print(f"dry run OK: would save the live ESP and GPT regions to {os.path.dirname(keep)}\\pre-restore-<time>, "
+                  f"then write {'the GPT regions, then ' if plan else ''}{ee - es:,} B of ESP at {es} "
                   f"(sha256 {sums['lapis-esp.img']}); nothing written")
             return
         if plan:
@@ -474,7 +543,8 @@ def cmd_restore(dest, src, vmx, esp_only, with_gpt=False, pin_migration=False, d
             f.seek(es); back = hashlib.sha256(f.read(ee - es)).hexdigest()
         if back != sums["lapis-esp.img"]:
             die("ESP read-back does not match the backup")
-        print(f"restore --esp-only OK: {ee - es:,} B at {es}, sha256 {back}")
+        print(f"restore --esp-only OK: {ee - es:,} B at {es}, sha256 {back}; the overwritten regions are in {keep} "
+              f"(undo: gb_vmbackup.py restore {keep} --esp-only --yes; add --with-gpt for the old GPT too)")
         return
     if sha_file(os.path.join(dest, DISK)) != sums[DISK]:
         die("the backup lapis.bin does not match SHA256SUMS")
