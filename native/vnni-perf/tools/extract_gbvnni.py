@@ -14,7 +14,9 @@ import json, os, re, sys
 
 TOT = re.compile(r"emulated (\d+) vex128 (\d+) vex256 (\d+) word (\d+) byte (\d+) irqon (\d+) efault (\d+) "
                  r"sse_init (\d+) ymm_init (\d+) zmmhi (\d+)")
-LRU = re.compile(r"comm=(.{0,16}?) rip=([0-9a-f]+) count=(\d+)")
+# (wave 8, LOW-3 F-2) kernel build #16 prints the task name escaped (`\xHH` for control bytes, `\` and `=`): a 15-byte
+# name can be up to 60 characters, so the window is 64 (a k15 name is at most 15 characters: the same matches)
+LRU = re.compile(r"comm=(.{0,64}?) rip=([0-9a-f]+) count=(\d+)")
 KMSG = re.compile(r"\[\s*([0-9.]+)\].*gb_vnni: emulating VEX AVX-VNNI for comm=(.*?)\s*$")
 TS = re.compile(r"\[\s*([0-9]+\.[0-9]+)\]")
 FOREIGN = re.compile(r"other processes emulated during the run \(([^)]*)\)")

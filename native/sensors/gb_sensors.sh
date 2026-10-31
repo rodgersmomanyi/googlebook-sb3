@@ -4,7 +4,8 @@
 #           sub-HAL scans /sys/bus/iio/devices only once, so wait (bounded) until the ISH accelerometer
 #           (cros-ec-accel) and the APDS-9960 light device (cros-ec-light) have registered.
 #   diag  - after boot_completed: IIO + sensorservice state to the kernel log (gb_bootlog copies dmesg),
-#           and enable auto-rotate once (first native boot only) for the CURRENT user, which at boot_completed is the
+#           and, only when GbSb3SettingsOverlay is not enabled, enable auto-rotate once (first native boot only)
+#           for the CURRENT user (with the overlay: no write, rotinit set), which at boot_completed is the
 #           headless system user 0 (the login screen; lapis runs in headless system user mode).
 #   user <id> - (wave 7, headless-settings) the person's FULL user <id>: gb_ui.sh runs it once per user ever, at the
 #           user's first unlock (gb_ui.sh's marker), so the person's own later choice is never overwritten. It turns
@@ -114,9 +115,13 @@ diag)
 	# (W7, safety audit W6-S5) GbSb3SettingsOverlay.apk (readiness A-L3 D2) already makes Auto-rotate the default of
 	# every user created on the device: while it is enabled, nothing here writes a rotation setting, whatever
 	# persist.gb.sensors.rotinit says. The one-time write stays only as the fallback for an overlay that is not applied.
+	# (W8, BACKLOG AL-F2) Seen enabled, the one-time flag is set too: user 0 took its default from the static RRO when
+	# it was created at the first boot (an install that predates the overlay ran the fallback write then), so a later
+	# boot where the list does not show [x] (an OTA that makes the RRO not applicable, a slow cmd) writes nothing.
 	if timeout 20 cmd overlay list --user 0 2>/dev/null |
 		grep -q '^ *\[x\] com\.android\.providers\.settings\.gb_sb3_rotation_rro_vendor__$'; then
 		echo "GB_SENSORS: auto-rotate default from GbSb3SettingsOverlay (enabled): no first-boot write"
+		[ "$(getprop persist.gb.sensors.rotinit)" = 1 ] || setprop persist.gb.sensors.rotinit 1
 	elif [ "$(getprop persist.gb.sensors.rotinit)" != 1 ]; then
 		settings put system accelerometer_rotation 1 && setprop persist.gb.sensors.rotinit 1
 		echo "GB_SENSORS: auto-rotate enabled (first boot)"

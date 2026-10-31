@@ -5,7 +5,7 @@
                             [--no-gfxdriver] [--compare-export ESP] [--expect-inject-sha256 HEX]
   python -I verify_image.py --esp FILE [--boot usb|internal] [--super-guid G] [--expect-tree ...] [--krel FILE]
                             [--no-gfxdriver] [--compare-export ESP] [--expect-bringup-test] [--esp-size BYTES]
-                            [--expect-inject-sha256 HEX]
+                            [--expect-inject-sha256 HEX] [--expect-slot a|b]
   python -I verify_image.py --extract IMG ESP_PATH OUTDIR     (IMG: a disk image or an ESP image; OUTDIR new or empty)
 
 Image mode (IMG, default C:\\GB-x86\\out\\googlebook-sb3-usb.img):
@@ -17,7 +17,8 @@ Image mode (IMG, default C:\\GB-x86\\out\\googlebook-sb3-usb.img):
 ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-tree names it):
   V1  FAT32 parses; size 536,870,912 B (--esp-size: e.g. 201,326,592 for the user VM's lapis ESP) == the partition/file
       size; native: free >= max(initrd-*.img) + 144 MiB; (W4) VM kinds: free >= max(initrd-*.img) + 16 MiB
-  V2  loader.conf default gb-<slot> + editor yes; entries exactly gb-<slot>.conf (+ gb-<slot>-nvtest.conf native);
+  V2  loader.conf default gb-<slot>.conf (or the pre-wave-8 gb-<slot>: V33) + editor yes; entries exactly
+      gb-<slot>.conf (+ gb-<slot>-nvtest.conf native);
       nvtest = default + " [NVIDIA test]" title + " gb.nouveau=test" options; no gb.nouveau= in the default entry, no
       gb.gfxdriver= anywhere; every androidboot.boot_part_uuid= names the super GUID; --boot: a native default entry
       has gb.boot=<boot> (VM entries have no gb.boot=)
@@ -33,7 +34,8 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
       gbstage)
   V12 native: every component manifest's files/payload/symlinks/rc/build_prop are in the image; every kind (wave 3,
       wave 2b review L5): gbinit, gb_bootlog.sh, gbbringup.sh (build_esp.py, read with ast) and gb_slotsync
-      (inject\\slotsync) are byte-identical to their sources
+      (inject\\slotsync) are byte-identical to their sources; (wave 8, image audit IA7-1) every kind: the tree's
+      gb_ui.sh (0755) == build_esp's GB_UI_SH
   V12b (W5, C-1) every x86-64 executable / shared object in the cpio (every tree and kind) is mappable by bionic: each
       PT_LOAD has a power-of-two p_align, p_offset == p_vaddr modulo max(p_align, 4 KiB) and lies inside the file
   V13 the vulkan.nouveau.so symlink and the empty payload mount points   V14 no libvulkan.so
@@ -81,6 +83,12 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
       section remounts that superblock read-only (VNNI_RO_TAIL); no entry of any type named libz.so* (a directory too)
       outside the packed files; each gate value is the reviewed deploy.gate_value (SA-3); a note (not a problem) names
       the gates' build against etc/gb/ota_validated (SA-2: "INERT" when they differ; build_esp refuses that)
+  V33 (W8, SLOT-DEFAULT) loader.conf as systemd-boot 262.1 reads it (the last "default"/"preferred" line, fnmatch
+      against the entry ids: file name, lowercase, boot counter removed, ".conf" included): the default is the literal
+      id gb-<slot>.conf and matches exactly that entry (never the nvtest entry, a glob, or "gb-<slot>", which matches no
+      entry, so the loader would start the first entry in its own order: gb-b.conf whenever it exists); one default
+      line; a "preferred" line matches exactly the same entry; image mode: <slot> is the slot the vbmeta GPT attributes
+      want (gb_slotsync's wanted_slot); --esp: the --expect-slot slot when given
 Read-only: images, lapis.bin and the host inputs are opened "rb"; only --extract writes (into OUTDIR).
 Exit 0 and last line "RESULT: OK"; exit 1 and "RESULT: <n> problem(s)" with one "PROBLEM: V<n> ..." line each;
 exit 2 = usage. Module API (build_iso.py imports this file by path): esp_of_disk, fat_files, fat_parse, cpio_entries,
@@ -93,6 +101,7 @@ VP (W6 prep, SA-7) --expect-pin-path ESP (an ESP image or a disk image; before a
 """
 import argparse
 import ast
+import fnmatch
 import glob
 import hashlib
 import io
@@ -974,13 +983,86 @@ def fstab_userdata(fstab):
     return out
 
 
+# (W8, SLOT-DEFAULT) systemd-boot 262.1 reads loader.conf "default"/"preferred" as fnmatch patterns (the last line of
+# each wins) and matches them against the entry id: the file name, lowercase, with a boot counter "+<n>[-<m>]" before
+# ".conf" removed, ".conf" included (w8prep\lows-b F5A_DESIGN 1.2/1.3: "default gb-a" started gb-b.conf,
+# "default gb-a.conf" started gb-a.conf). Readers of an ESP written before wave 8 (pin_tree, Ctx.slot) take both forms.
+def loader_keys(text):
+    """[(key, value)] of a loader.conf as systemd-boot reads it: blank and '#' lines skipped, leading and trailing blanks
+    (and a CR) stripped, key = the first word, value = the rest without its leading blanks and one pair of quotes."""
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip(" \t\r")
+        if not ln or ln.startswith("#"):
+            continue
+        m = re.match(r"([^ \t]+)[ \t]*(.*)$", ln)
+        k, v = m.group(1), m.group(2)
+        if len(v) >= 2 and v[0] == v[-1] == '"':
+            v = v[1:-1]
+        out.append((k, v))
+    return out
+
+
+def loader_slot(text):
+    """The slot a loader.conf's (last) default line names as gb-<x>.conf or (before wave 8) gb-<x>; None otherwise."""
+    d = [v for k, v in loader_keys(text) if k == "default"]
+    m = re.fullmatch(r"gb-([a-z])(?:\.conf)?", d[-1]) if d else None
+    return m.group(1) if m else None
+
+
+def entry_id(name):
+    """systemd-boot's id of loader/entries/<name> (gb-a+3.conf and gb-a+0-3.conf -> gb-a.conf); None: not an entry"""
+    m = re.fullmatch(r"(.+?)(?:\+\d+(?:-\d+)?)?\.conf", name, re.I | re.S)
+    return (m.group(1) + ".conf").lower() if m and "/" not in name else None
+
+
+def loader_match_problems(files, slot, expect_slot=None):
+    """(W8, V33) loader.conf's default/preferred patterns against the ESP's entries, the way systemd-boot 262.1 matches
+    them: the last default must be the literal id gb-<slot>.conf and match exactly that entry; one default line; a
+    preferred line must match exactly the same entry; expect_slot (the GPT's wanted slot, or --expect-slot) == slot."""
+    lc = files.get("loader/loader.conf")
+    if lc is None:
+        return ["no loader/loader.conf"]
+    keys = loader_keys(lc.decode("utf-8", "replace"))
+    ids = {}
+    for k in files:
+        if k.startswith("loader/entries/"):
+            i = entry_id(k[len("loader/entries/"):])
+            if i:
+                ids.setdefault(i, []).append(k[len("loader/entries/"):])
+    want = f"gb-{slot}.conf" if slot else None
+    p = []
+    defaults = [v for k, v in keys if k == "default"]
+    if not defaults:
+        return ["loader.conf has no 'default' line (the loader would start the first entry in its own order)"]
+    if len(defaults) > 1:
+        p.append(f"{len(defaults)} 'default' lines {defaults} (systemd-boot uses the last; write one)")
+    for key, pat in [("default", defaults[-1])] + [("preferred", v) for k, v in keys if k == "preferred"][-1:]:
+        hit = sorted(i for i in ids if fnmatch.fnmatchcase(i, pat))
+        if re.search(r"[*?\[\]\\]", pat):
+            p.append(f"the {key} pattern '{pat}' is a glob (matches {hit}): write the entry id gb-<slot>.conf")
+        elif not hit:
+            p.append(f"{key} '{pat}' matches no entry id {sorted(ids)}: write '{key} {want or 'gb-<slot>.conf'}' "
+                     f"(systemd-boot 262.1 matches the id with its '.conf'; with no match it starts the first entry in "
+                     f"its own order, gb-b.conf whenever it exists - SLOT-DEFAULT)")
+        elif want is None or hit != [want]:
+            p.append(f"{key} '{pat}' matches {hit}, not exactly the default slot's entry {want or 'gb-<slot>.conf'}")
+        elif len(ids[want]) > 1:
+            p.append(f"{key} '{pat}': the id {want} has {len(ids[want])} entry files {sorted(ids[want])}")
+        elif pat != want:
+            p.append(f"{key} '{pat}' is not the literal entry id '{want}'")
+    if expect_slot and slot and slot != expect_slot:
+        p.append(f"loader.conf's default names slot {slot}, but the slot to boot is {expect_slot} (wrong slot)")
+    return p
+
+
 class Ctx:
     """Everything the ESP checks look at, parsed once. files: {ESP path: bytes}; info: fat_parse info (None in unit
     tests that build files directly); cpio / listing: parsed from files unless given."""
 
     def __init__(self, files, info=None, kind="auto", super_guid=None, boot=None, part_size=None, krel_file=None,
                  no_gfxdriver=False, compare=None, cpio=None, listing=None, bringup_test=False, esp_size=None,
-                 expect_inject=None):
+                 expect_inject=None, expect_slot=None):
         self.files, self.info, self.boot, self.part_size = files, info, boot, part_size
         self.bringup_test = bringup_test                 # the R-12b test ESP (build_usb.py --bringup-test)
         self.esp_size = esp_size or ESP_SIZE             # (W4) --esp-size: the user VM's lapis ESP is 192 MiB
@@ -988,9 +1070,8 @@ class Ctx:
         self.super_guid = super_guid.lower() if super_guid else None
         self.krel_file, self.no_gfxdriver, self.compare = krel_file, no_gfxdriver, compare
         self.notes = []                                 # (check id, text): informational lines for the report
-        lc = files.get("loader/loader.conf", b"").decode("utf-8", "replace")
-        m = re.search(r"^default gb-([a-z])\s*$", lc, re.M)
-        self.slot = m.group(1) if m else None
+        self.expect_slot = expect_slot                  # (W8) V33: the slot the GPT (image) or --expect-slot wants
+        self.slot = loader_slot(files.get("loader/loader.conf", b"").decode("utf-8", "replace"))
         self.entries = {k[len("loader/entries/"):]: v.decode("utf-8", "replace")
                         for k, v in files.items() if k.startswith("loader/entries/")}
         self.base = parse_entry(self.entries.get(f"gb-{self.slot}.conf"))
@@ -1069,10 +1150,9 @@ PIN_TYPES = ("init", "vendor_init", "hal_gatekeeper_default", "gatekeeperd", "ke
 
 def pin_tree(files):
     """The tree the ESP's default entry boots: gbinit takes /gbnative only with gb.hw=native (else /gbstage)."""
-    lc = files.get("loader/loader.conf", b"").decode("utf-8", "replace")
-    m = re.search(r"^default gb-([a-z])\s*$", lc, re.M)
-    e = parse_entry(files[f"loader/entries/gb-{m.group(1)}.conf"].decode("utf-8", "replace")) if m and \
-        f"loader/entries/gb-{m.group(1)}.conf" in files else None
+    x = loader_slot(files.get("loader/loader.conf", b"").decode("utf-8", "replace"))     # (W8) either form
+    e = parse_entry(files[f"loader/entries/gb-{x}.conf"].decode("utf-8", "replace")) if x and \
+        f"loader/entries/gb-{x}.conf" in files else None
     hw = [t[6:] for t in (e["tokens"] if e else []) if t.startswith("gb.hw=")]
     return "gbnative" if hw and hw[-1] == "native" else "gbstage"
 
@@ -1245,7 +1325,7 @@ def v2(c):
     if lc is None:
         return ["no loader/loader.conf"]
     if not c.slot:
-        return ["loader.conf has no 'default gb-<slot>' line"]
+        return ["loader.conf has no 'default gb-<slot>.conf' line"]
     if "editor yes" not in [ln.strip() for ln in lc.decode("utf-8", "replace").splitlines()]:
         p.append("loader.conf lacks 'editor yes'")
     want = {f"gb-{c.slot}.conf"} | ({f"gb-{c.slot}-nvtest.conf"} if c.kind == "native" else set())
@@ -1635,6 +1715,7 @@ def tree_sources(c):
     out = []
     names = [("gbinit", "GBINIT")] + ([("gbnative/gb_bootlog.sh", "GB_BOOTLOG_SH"), ("gbbringup.sh", "GB_BRINGUP_SH")]
                                       if c.kind == "native" else [])
+    names.append((f"{tr}/gb_ui.sh", "GB_UI_SH"))     # (wave 8, image audit IA7-1) both trees, every kind
     for path, const in names:
         try:
             out.append(("build_esp.py", path, 0o100755, be_const(const)))
@@ -2596,6 +2677,10 @@ def v32(c):
     return p
 
 
+def v33(c):
+    return loader_match_problems(c.files, c.slot, c.expect_slot)
+
+
 ALL, NATIVE, VMS = "all", "native", "vm"
 CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("V5", v5, NATIVE),
           ("V6", v6, ALL), ("V7", v7, ALL), ("V8", v8, NATIVE), ("V8b", v8b, NATIVE), ("V9", v9, ALL),
@@ -2604,7 +2689,7 @@ CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("
           ("V15", v15, NATIVE), ("V16", v16, NATIVE), ("V17", v17, ALL), ("V18", v18, ALL), ("V19", v19, NATIVE),
           ("V20", v20, NATIVE), ("V21", v21, NATIVE), ("V22", v22, NATIVE), ("V23", v23, ALL), ("V24", v24, VMS),
           ("V25", v25, ALL), ("V26", v26, ALL), ("V27", v27, ALL), ("V28", v28, ALL), ("V29", v29, ALL),
-          ("V30", v30, ALL), ("V31", v31, ALL), ("V32", v32, ALL)]
+          ("V30", v30, ALL), ("V31", v31, ALL), ("V32", v32, ALL), ("V33", v33, ALL)]
 
 
 def run_checks(c, only=None):
@@ -2637,7 +2722,7 @@ class Report:
         return 1 if self.problems else 0
 
 
-def esp_report(rep, files, info, a, super_guid, part_size, label):
+def esp_report(rep, files, info, a, super_guid, part_size, label, expect_slot=None):
     compare = None
     if a.compare_export:
         try:
@@ -2647,7 +2732,7 @@ def esp_report(rep, files, info, a, super_guid, part_size, label):
     c = Ctx(files, info=info, kind=a.expect_tree, super_guid=super_guid, boot=a.boot, part_size=part_size,
             krel_file=a.krel, no_gfxdriver=a.no_gfxdriver, compare=compare,
             bringup_test=getattr(a, "expect_bringup_test", False), esp_size=getattr(a, "esp_size", None),
-            expect_inject=getattr(a, "expect_inject_sha256", None))
+            expect_inject=getattr(a, "expect_inject_sha256", None), expect_slot=expect_slot)
     print(f"{label}: tree {c.kind}, slot {c.slot}, krel {c.krel}, {len(c.cpio)} cpio entries, "
           f"{len(files)} ESP files" + (f", free {info['free'] / MiB:.1f} MiB" if info and 'free' in info else ""),
           flush=True)
@@ -2664,6 +2749,17 @@ def esp_report(rep, files, info, a, super_guid, part_size, label):
             if nid == vid:
                 print(f"  {vid} note: {text}", flush=True)
     print(f"  ESP checks took {time.time() - t0:.1f} s", flush=True)
+
+
+def wanted_slot(attrs):
+    """(W8) The slot gb_slotsync boots (gb_slotsync.c wanted_slot, bit for bit): the highest priority (bits 48-51)
+    among the slots that are successful (bit 56) or have tries left (52-55), the first slot on a tie; None: none."""
+    best, bestp = None, 0
+    for s, at in zip("ab", attrs):
+        prio, tries, okb = (at >> 48) & 15, (at >> 52) & 15, (at >> 56) & 1
+        if prio > 0 and (okb or tries > 0) and prio > bestp:
+            best, bestp = s, prio
+    return best
 
 
 def image_mode(a, rep):
@@ -2709,6 +2805,7 @@ def image_mode(a, rep):
             rep.bad("VS", "no slot marked successful in vbmeta attributes (boot_control HAL would find no bootable slot)")
         else:
             print("  VS ok", flush=True)
+        gpt_slot = wanted_slot([parts.get("vbmeta_" + s, {}).get("attrs", 0) for s in "ab"])   # (W8) V33
         lap.seek(SECTOR)
         lh = lap.read(92)
         le, ln, les = struct.unpack_from("<QII", lh, 72)
@@ -2772,8 +2869,8 @@ def image_mode(a, rep):
         files, info = {}, {"error": str(e)}
     part_size = len(espb)
     del espb
-    print(f"  ESP: super GUID {sup}", flush=True)
-    esp_report(rep, files, info, a, sup, part_size, "ESP")
+    print(f"  ESP: super GUID {sup}; the GPT wants slot {gpt_slot or '-'}", flush=True)
+    esp_report(rep, files, info, a, sup, part_size, "ESP", expect_slot=gpt_slot)
     pin_report(rep, files, a)
 
 
@@ -2784,7 +2881,7 @@ def esp_mode(a, rep):
         files, info = fat_parse(espb)
     except (ValueError, struct.error) as e:
         files, info = {}, {"error": str(e)}
-    esp_report(rep, files, info, a, a.super_guid, len(espb), "ESP")
+    esp_report(rep, files, info, a, a.super_guid, len(espb), "ESP", expect_slot=a.expect_slot)
     pin_report(rep, files, a)
 
 
@@ -2828,6 +2925,8 @@ def main(argv=None):
                     help="--esp: the R-12b test ESP (build_usb.py --bringup-test): gb/gb.cfg and gb.overlay=1 expected")
     ap.add_argument("--esp-size", type=int, metavar="BYTES",
                     help=f"--esp: the expected FAT size (default {ESP_SIZE:,}; the user VM's lapis ESP: 201326592)")
+    ap.add_argument("--expect-slot", choices=["a", "b"],
+                    help="--esp: V33, loader.conf's default must name this slot (image mode: the GPT's wanted slot)")
     ap.add_argument("--expect-inject-sha256", metavar="HEX",
                     help="V30: gb/inject.gz must have this sha256 (build_usb.py --vm-test-rehearsal's .vmtree.sha256)")
     ap.add_argument("--krel", help="file whose first line is the expected kernel release")
@@ -2845,8 +2944,8 @@ def main(argv=None):
         return extract_mode(*a.extract)
     if a.esp and a.img:
         ap.error("give either IMG or --esp FILE")
-    if not a.esp and (a.boot or a.super_guid or a.expect_bringup_test or a.esp_size):
-        ap.error("--boot, --super-guid, --expect-bringup-test and --esp-size are only used with --esp")
+    if not a.esp and (a.boot or a.super_guid or a.expect_bringup_test or a.esp_size or a.expect_slot):
+        ap.error("--boot, --super-guid, --expect-bringup-test, --esp-size and --expect-slot are only used with --esp")
     if a.expect_inject_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", a.expect_inject_sha256):
         ap.error("--expect-inject-sha256 needs 64 hex digits")
     if a.esp_size is not None and (a.esp_size <= 0 or a.esp_size % SECTOR):

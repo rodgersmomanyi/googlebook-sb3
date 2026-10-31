@@ -5,7 +5,8 @@
 Googlebook OS (lapis) is compiled for a CPU target that includes **VEX AVX-VNNI** (`vpdpwssd`, `vpdpbusd` in their
 VEX encoding). The Surface Book 3's i7-1065G7 (Ice Lake) has the EVEX form (`avx512_vnni`) but **not** the VEX form.
 In the VM our `.vmx` hides AVX-VNNI from the guest as well. Every such instruction therefore raises `#UD`, and our
-kernel (build #15, [kernel/K15.md](../kernel/K15.md)) emulates it in the trap handler. This is correct, but each
+kernel (build #15, [kernel/K15.md](../kernel/K15.md); build #16 since wave 8 with the same emulator arithmetic,
+[kernel/K16.md](../kernel/K16.md)) emulates it in the trap handler. This is correct, but each
 instruction costs a trap.
 
 We measured where those traps come from (in [native/vnni-perf/MEASURE.md](../native/vnni-perf/MEASURE.md); *measured*

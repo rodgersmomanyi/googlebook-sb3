@@ -10,10 +10,13 @@ The same ESP layout and initrd format as the VM, but the boot entries pass `gb.h
 native tree (`/gbnative`). See [ARCHITECTURE.md](ARCHITECTURE.md) for the tree and [DRIVERS.md](DRIVERS.md) for every
 device. In short:
 
-* **Kernel:** native images run kernel build #15 (wave 3): build #14 (build #13 plus nouveau-only patches) plus the
-  reworked `#UD` VNNI emulator and the opt-in i915 gamma switch. The config, KMI and exports are the same as #13, so
-  every module and lapis vendor module behaves as with #13 ([kernel/K15.md](../kernel/K15.md)). The VM keeps
-  whatever kernel its ESP was last built with.
+* **Kernel:** native images run kernel build #16 (wave 8; [kernel/K16.md](../kernel/K16.md)): build #15 plus the
+  escaped task name in the VNNI counter and the Realtek SD-card reader modules (`rtsx_usb`, `rtsx_usb_sdmmc`,
+  `rtsx_pci`, `rtsx_pci_sdmmc`, loaded only by modalias from `/odm/lib/modules`). Its KMI symbol list is the same
+  and every earlier export keeps its CRC (seven exports for those drivers are added), so lapis's vendor modules
+  behave as before. Build #15 (wave 3) is build #14 (build #13 plus nouveau-only patches) plus the reworked `#UD`
+  VNNI emulator and the opt-in i915 gamma switch, with the config, KMI and exports of #13
+  ([kernel/K15.md](../kernel/K15.md)). The VM keeps whatever kernel its ESP was last built with.
 * **Wave 5 additions (both trees):** the software Gatekeeper (lock-screen PIN, [GATEKEEPER.md](GATEKEEPER.md)), the
   build-gated VNNI libz patch ([PERFORMANCE.md](PERFORMANCE.md)) and the OTA gate ([OTA.md](OTA.md#the-ota-gate-wave-5));
   natively also the readiness fixes ([DEVICE-STATUS.md](DEVICE-STATUS.md), the Wave 5 group).
@@ -65,7 +68,9 @@ protected exports and first-stage init gave up (seen in the VMware test of the n
 whose only entry boots the **native** tree (`gb.hw=native`, serial console kept). It cannot reach a desktop (no
 i915 in VMware), but `serial0.log` shows whether `gbinit` loads every module against lapis's vendor modules, the late
 pass, the native rc and the services. The NVIDIA stack stays inert there (`refused:i915`, GbGpu `Unavailable`). The
-next normal `build_esp.py` restores the VM entry. To test a whole USB image instead, boot a copy of it in a
+next normal `build_esp.py` restores the VM entry. Since wave 8 this write also needs `GB_EXPECT_ESP_SHA256` (the
+sha256 of exactly the ESP it builds), and the PIN path check applies; on a VM that has a lock-screen PIN, boot the
+native tree in a throwaway VM instead. To test a whole USB image instead, boot a copy of it in a
 throwaway VM (`build_usb.py --vm-test` builds the same layout with the VM tree).
 
 ## Build a USB stick
@@ -129,7 +134,9 @@ The same layout can also be installed from a bootable installer ISO that you bui
   futility executor), `fwupd` idles, and OTA postinstall's Googlebook firmware updater is skipped. lapis's
   `android-desktop-install` (it erases the whole disk) refuses.
 * `module_blacklist=tpm,tpm_tis,tpm_tis_core,tpm_tis_spi,tpm_tis_i2c_cr50,spi_intel_pci,spi_intel,spi_nor,mtd,gsmi`:
-  no TPM access, no BIOS SPI flash access, no Google SMI.
+  no TPM access, no BIOS SPI flash access, no Google SMI. The kernel keeps only the **last** `module_blacklist=` on
+  the command line, so a boot-menu edit must add to this list (or repeat it in full with the new names); a second
+  `module_blacklist=<name>` alone would drop this protection for that boot. To keep NVIDIA off use `gb.nouveau=0`.
 * `efi_pstore.pstore_disable=1`: panics are not written into the UEFI variable store; `efivarfs` is not built.
 * `reboot=pci` (the Surface Book 3 hangs with other reboot methods, per linux-surface).
 * `iommu.passthrough=1` (IPTS DMA faults under the IOMMU; replaces linux-surface's IOMMU quirk).

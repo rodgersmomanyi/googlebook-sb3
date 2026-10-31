@@ -49,8 +49,30 @@ def _pin_path_refused(new_esp, lapis=None):
     return (f"the new ESP changes the PIN path of the user's VM ({len(probs)} difference(s) above): an enrolled "
             f"lock-screen PIN may stop verifying. Set GB_PIN_MIGRATION=1 only for a reviewed migration")
 
+def _esp_expect_refused(esp=None):
+    """(W8 lows-a, safety audit W7-S4) Why lapis.bin must not get this ESP (None = allowed): the write is tied to the
+    reviewed preview. GB_EXPECT_ESP_SHA256 must be the sha256 (64 hex digits) of the preview ESP that was checked
+    right before (dgpu\\w4\\tools\\vm_esp_preview.py; verify_image --expect-tree vm --expect-inject-sha256 <tree>
+    --expect-pin-path lapis.bin: RESULT OK and VP ok), and the ESP built here must have exactly that sha256, or
+    nothing is written. esp=None checks only the variable (before anything is built)."""
+    want = os.environ.get("GB_EXPECT_ESP_SHA256", "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", want):
+        return ("GB_EXPECT_ESP_SHA256 must name the sha256 (64 hex digits) of the reviewed preview ESP (W7-S4: the "
+                "lapis.bin write is tied to the preview checked with verify_image, VP ok)")
+    if esp is None:
+        return None
+    import hashlib
+    got = hashlib.sha256(esp).hexdigest()
+    if got != want:
+        return (f"the ESP built now (sha256 {got}) is not the reviewed preview (GB_EXPECT_ESP_SHA256 {want}): "
+                f"nothing written; rebuild and review the preview again")
+    print(f"ESP sha256 {got} == GB_EXPECT_ESP_SHA256 (the reviewed preview)", flush=True)
+    return None
+
 if __name__ == "__main__" and _lapis_write_refused():      # refuse before reading anything
     sys.exit(f"build_esp.py: refused: {_lapis_write_refused()}")
+if __name__ == "__main__" and _esp_expect_refused():       # (W8, W7-S4) no reviewed preview named: refuse early
+    sys.exit(f"build_esp.py: refused: {_esp_expect_refused()}")
 
 SDBOOT  = open(os.path.join(HERE, "debs", "systemd-bootx64.efi"), "rb").read()
 KERNEL  = open(os.path.join(BOOT, "kernel.bin"), "rb").read()
@@ -772,7 +794,10 @@ GB_DEXOPT_SH = (b"#!/system/bin/sh\n"
 # headless user 0, the login screen). The script polls the foreground user for the whole boot and sets up every full
 # user at its first unlock: per boot its density, HOME and user_setup_complete; once ever (a marker in /data/local)
 # the VM tree's keep-awake values of gb_provision and, natively, gb_sensors.sh's Auto-rotate default. User 0 keeps
-# exactly what it got before (gb_provision; its density when nobody signs in within 60 s). Its own comments say more.
+# exactly what it got before (gb_provision; its density when nobody signs in within 60 s). (Wave 8, lows-a: safety
+# audit W7-S1, W7-S2) None of it overrides the person's own choice: density and HOME only while they are unset or
+# still what gb_ui set (records /data/local/gb_ui.user.<u>.dens / .home), the once-ever values only over an unset
+# value, one of ours or a platform default (dumpsys settings' pkg:). Its own comments say more.
 GB_UI_SH = (b"#!/system/bin/sh\n"
             b"# gb_ui.sh: service gb_ui (both trees; user root, seclabel u:r:shell:s0), started at sys.boot_completed=1. init only\n"
             b"# starts it and never waits for it. (Wave 7, headless-settings) lapis runs in headless system user mode: user 0 shows\n"
@@ -783,18 +808,26 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"#  2. for every user that comes to the foreground other than user 0 (the foreground user is always a full user or\n"
             b"#     the headless user 0; profiles never are), the first time this boot, once it is unlocked: the density for this\n"
             b"#     display (its display_density_forced + wm density), the stock launcher as its HOME, user_setup_complete 1 (the\n"
-            b"#     SetupWizard is disabled, so nothing else sets it for a new user);\n"
+            b"#     SetupWizard is disabled, so nothing else sets it for a new user). (Wave 8, W7-S1) Never over the person's own\n"
+            b"#     choice: the density only while the user's value is unset or still the one gb_ui set last (the record\n"
+            b"#     /data/local/gb_ui.user.<u>.dens), so a display change is followed but a Display size the person picked stays;\n"
+            b"#     HOME only while nobody holds the role or before the stock launcher ever held it for this user (marker\n"
+            b"#     gb_ui.user.<u>.home, made once it does), so a launcher the person picks stays;\n"
             b"#  3. for every such user ONCE EVER, 30 polls (>= 60 s) after that first unlock (marker /data/local/gb_ui.user.<u>.v1,\n"
             b"#     created BEFORE the writes, so a marker that cannot be created never repeats them): VM tree: the keep-awake values\n"
             b"#     gb_provision writes for user 0 (screen_off_timeout, sleep_timeout); native: the sensors component's Auto-rotate\n"
             b"#     default (/odm/gb_sensors.sh user <u>). What the person changes later is never written again. The delay: on a\n"
             b"#     first boot, lapis sets a new user's system defaults again around its first unlock and initialization (measured:\n"
-            b"#     gb_provision's screen_off_timeout for the first-boot user 10 was replaced by the default 600000);\n"
+            b"#     gb_provision's screen_off_timeout for the first-boot user 10 was replaced by the default 600000). (Wave 8, W7-S2)\n"
+            b"#     Each value is written only over a value nobody chose: dumpsys settings names the package that last wrote it,\n"
+            b"#     and only an unset value, one of ours (root: gb_ui, gb_provision, gb_sensors) or a platform default (android, the\n"
+            b"#     value equal to its default) is replaced, and only if it did not change since the first unlock (unless the value\n"
+            b"#     then was ours); anything else is kept and logged (see prov and decide);\n"
             b"#  4. user 0 (the login screen, whose HOME is lapis's login launcher): only its density, as before, when nobody has\n"
             b"#     signed in after 60 s.\n"
             b"# It polls the foreground user (am get-current-user) every 2 s for 10 min, then every 10 s, for the whole boot, so a\n"
-            b"# late sign-in and a user created later are covered. At start, the markers of users that no longer exist are removed\n"
-            b"# (pm list users must answer and list user 0), so a reused user id starts fresh.\n"
+            b"# late sign-in and a user created later are covered. At start, the markers and records of users that no longer exist\n"
+            b"# are removed (pm list users must answer and list user 0), so a reused user id starts fresh.\n"
             b"# Test hooks (never set by init): GB_ROOT (prefix for /odm and /data), GB_TEST_PATH (prepended to PATH), GB_UI_LOG=-\n"
             b"# (log to stdout instead of /dev/kmsg), GB_UI_MAXPOLL (stop after that many polls; default: never stop).\n"
             b"[ \"${GB_UI_LOG:-}\" = - ] || exec > /dev/kmsg 2>&1\n"
@@ -805,6 +838,7 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"case $MAX in *[!0-9]*) MAX= ;; esac\n"
             b"HW=$(cat \"$R/odm/etc/gb_hw\" 2> /dev/null)\n"
             b"HOMEPKG=com.google.android.apps.nexuslauncher\n"
+            b"L=$R/data/local/gb_ui.user.\n"
             b"\n"
             b"M=$R/data/local/gb_anim.v1.done\n"
             b"if [ ! -f \"$M\" ]; then\n"
@@ -819,20 +853,44 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"  # WindowManager's current user, which can still be 0 while a switch is in flight.\n"
             b"  W=$(wm size 2> /dev/null | sed -n 's/^Physical size: \\([0-9][0-9]*\\)x.*/\\1/p' | head -n 1)\n"
             b"  cur=$(settings get --user \"$1\" secure display_density_forced 2> /dev/null)\n"
+            b"  DK=\n"
+            b"  HK=\n"
             b"  if [ \"${W:-0}\" -ge 1920 ]; then\n"
             b"    D=$((W / 8))\n"
             b"    [ \"$HW\" = native ] && D=$((W * 16 / 150))\n"
-            b"    [ \"$cur\" = \"$D\" ] || { settings put --user \"$1\" secure display_density_forced \"$D\"; wm density \"$D\"; }\n"
             b"  else\n"
             b"    D=default\n"
-            b"    [ \"$cur\" = null ] || { settings delete --user \"$1\" secure display_density_forced; wm density reset; }\n"
+            b"  fi\n"
+            b"  # (wave 8, W7-S1) a full user: only while its value is unset (null), still the one gb_ui set last (the record; \"\"\n"
+            b"  # after gb_ui's own `wm density reset`, record \"default\"), or already right (\"\" is WindowManager's \"default\");\n"
+            b"  # anything else is the person's own Display size and stays\n"
+            b"  _r=\n"
+            b"  if [ \"$1\" != 0 ]; then\n"
+            b"    _r=$(head -c 16 \"$L$1.dens\" 2> /dev/null | tr -cd 'a-z0-9')\n"
+            b"    if [ \"$cur\" = null ] || { [ -n \"$_r\" ] && [ \"$cur\" = \"$_r\" ]; } || [ \"$cur\" = \"$D\" ] ||\n"
+            b"      { [ \"$_r\" = default ] && [ -z \"$cur\" ]; } || { [ \"$D\" = default ] && [ -z \"$cur\" ]; }; then\n"
+            b"      :\n"
+            b"    else\n"
+            b"      DK=\"; the person's own Display size kept, not $D\"\n"
+            b"      D=$cur\n"
+            b"      return 0\n"
+            b"    fi\n"
+            b"  fi\n"
+            b"  _ok=0\n"
+            b"  if [ \"$D\" = default ]; then\n"
+            b"    case $cur in null | '') ;; *) settings delete --user \"$1\" secure display_density_forced || _ok=1; wm density reset ;; esac\n"
+            b"  else\n"
+            b"    [ \"$cur\" = \"$D\" ] || { settings put --user \"$1\" secure display_density_forced \"$D\" || _ok=1; wm density \"$D\"; }\n"
+            b"  fi\n"
+            b"  if [ \"$1\" != 0 ] && [ $_ok = 0 ] && [ \"$_r\" != \"$D\" ]; then\n"
+            b"    (umask 077 && printf '%s\\n' \"$D\" > \"$L$1.dens\") 2> /dev/null\n"
             b"  fi\n"
             b"}\n"
             b"\n"
-            b"show() { # $1 = user: the summary line (as before wave 7)\n"
-            b"  echo \"GB_UI user=$1 width=$W density=$D (was $cur) anim=$(settings get global animator_duration_scale)\" \\\n"
+            b"show() { # $1 = user: the summary line (as before wave 7; a kept value adds a note)\n"
+            b"  echo \"GB_UI user=$1 width=$W density=$D (was $cur$DK) anim=$(settings get global animator_duration_scale)\" \\\n"
             b"    \"window_blurs_off=$(settings get global disable_window_blurs) sf_blurs_off=$(getprop persist.sys.sf.disable_blurs)\" \\\n"
-            b"    \"home=$(cmd role get-role-holders --user \"$1\" android.app.role.HOME 2>&1)\"\n"
+            b"    \"home=$(cmd role get-role-holders --user \"$1\" android.app.role.HOME 2>&1)$HK\"\n"
             b"}\n"
             b"\n"
             b"unlocked() { # $1 = user: RUNNING_UNLOCKED. am get-current-user names the user as soon as a switch starts, before the\n"
@@ -848,29 +906,122 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"  dens \"$1\"\n"
             b"  [ \"$(settings get --user \"$1\" secure user_setup_complete 2> /dev/null)\" = 1 ] ||\n"
             b"    settings put --user \"$1\" secure user_setup_complete 1\n"
-            b"  case \"$(cmd role get-role-holders --user \"$1\" android.app.role.HOME 2>&1)\" in\n"
+            b"  # (wave 8, W7-S1) the stock launcher as HOME only while nobody holds the role or before it ever held it for this\n"
+            b"  # user (marker gb_ui.user.<u>.home, made once it does): a launcher the person picks afterwards stays\n"
+            b"  _h=$(cmd role get-role-holders --user \"$1\" android.app.role.HOME 2>&1)\n"
+            b"  case $_h in\n"
             b"    *\"$HOMEPKG\"*) ;;\n"
-            b"    *) cmd role add-role-holder --user \"$1\" android.app.role.HOME \"$HOMEPKG\" 2>&1 ;;\n"
+            b"    *)\n"
+            b"      if [ -z \"$_h\" ] || [ ! -e \"$L$1.home\" ]; then\n"
+            b"        cmd role add-role-holder --user \"$1\" android.app.role.HOME \"$HOMEPKG\" 2>&1\n"
+            b"        _h=$(cmd role get-role-holders --user \"$1\" android.app.role.HOME 2>&1)\n"
+            b"      else\n"
+            b"        HK=\"; the person's own launcher kept\"\n"
+            b"      fi\n"
+            b"      ;;\n"
             b"  esac\n"
+            b"  case $_h in *\"$HOMEPKG\"*) [ -e \"$L$1.home\" ] || (umask 077 && : > \"$L$1.home\") 2> /dev/null ;; esac\n"
             b"}\n"
             b"\n"
-            b"user_once() { # $1 = a full user at its first unlock ever seen here\n"
+            b"prov() { # $1 = user, $2 = system|secure, $3 = key, $4 = its value now -> WHO: who set it (wave 8, W7-S2)\n"
+            b"  # dumpsys settings prints, in the section \"<SYSTEM|SECURE> SETTINGS (user <u>)\", one row per value:\n"
+            b"  # \"_id:<n> name:<key> pkg:<package> value:<value> default:<default> ...\". unset: no row and no value; ours: pkg root\n"
+            b"  # (gb_ui, gb_provision and gb_sensors run as root); platform: pkg android with the value equal to its default (a\n"
+            b"  # new user's default, lapis's first-unlock reset). Anything else is someone's choice and is kept: another package\n"
+            b"  # (Settings, SystemUI, an app, adb's com.android.shell), android with a value other than its default, or a row that\n"
+            b"  # cannot be read. SettingsProvider makes every write of a system package its default too (measured: wm density 280\n"
+            b"  # -> pkg:android value:280 default:280), so a change made through a system service (the Auto-rotate toggle goes\n"
+            b"  # through WindowManager) also reads \"platform\": once() also compares with the value seen at the first unlock.\n"
+            b"  case $2 in system) _n=SYSTEM ;; *) _n=SECURE ;; esac\n"
+            b"  _w=$(timeout 20 dumpsys settings 2> /dev/null |\n"
+            b"    sed -n \"/^ *$_n SETTINGS (user $1)/,/^ *[A-Z][A-Z]* SETTINGS (user /s/^ *_id:[0-9]* name:$3 \\(.*\\)/\\1/p\" | head -n 1)\n"
+            b"  case $_w in\n"
+            b"    '') if [ \"$4\" = null ]; then WHO=\"unset\"; else WHO=\"unknown: no dumpsys settings row\"; fi; return 0 ;;\n"
+            b"    'pkg:'*' value:'*) ;;\n"
+            b"    *) WHO=\"unknown: $(printf '%s' \"$_w\" | tr -cd 'A-Za-z0-9:._ -' | cut -c1-60)\"; return 0 ;;\n"
+            b"  esac\n"
+            b"  _pk=${_w#pkg:}\n"
+            b"  _pk=$(printf '%s' \"${_pk%% *}\" | tr -cd 'A-Za-z0-9._' | cut -c1-64)\n"
+            b"  _v=${_w#* value:}\n"
+            b"  _v=${_v%% *}\n"
+            b"  _d=\n"
+            b"  case $_w in *' default:'*) _d=${_w#* default:}; _d=${_d%% *} ;; esac\n"
+            b"  if [ \"$_pk\" = root ]; then\n"
+            b"    WHO=ours\n"
+            b"  elif [ \"$_pk\" = android ] && [ -n \"$_d\" ] && [ \"$_v\" = \"$_d\" ]; then\n"
+            b"    WHO=platform\n"
+            b"  elif [ \"$_pk\" = android ]; then\n"
+            b"    WHO=\"android, not its default $(printf '%s' \"$_d\" | tr -cd 'A-Za-z0-9-' | cut -c1-12)\"\n"
+            b"  else\n"
+            b"    WHO=\"set by ${_pk:-?}\"\n"
+            b"  fi\n"
+            b"}\n"
+            b"\n"
+            b"tok() { printf '%s' \"$1\" | tr -cd 'A-Za-z0-9-' | cut -c1-12; }   # a value as one safe word\n"
+            b"\n"
+            b"case $HW in                                                       # the once-ever values (wave 8: captured first)\n"
+            b"  vm) KEYS=\"system:screen_off_timeout secure:sleep_timeout\" ;;\n"
+            b"  native) KEYS=system:accelerometer_rotation ;;\n"
+            b"  *) KEYS= ;;\n"
+            b"esac\n"
+            b"\n"
+            b"capture() { # $1 = user at its first unlock this boot -> CAP: \"<value>/<r|o>\" per KEYS key, \",\" separated (wave 8,\n"
+            b"  # W7-S2): the value then and whether gb_ui/gb_provision/gb_sensors (root) set it\n"
+            b"  CAP=\n"
+            b"  for _k in $KEYS; do\n"
+            b"    _c=$(settings get --user \"$1\" \"${_k%%:*}\" \"${_k#*:}\" 2> /dev/null)\n"
+            b"    prov \"$1\" \"${_k%%:*}\" \"${_k#*:}\" \"$_c\"\n"
+            b"    case $WHO in ours) _f=r ;; *) _f=o ;; esac\n"
+            b"    _c=$(tok \"$_c\")\n"
+            b"    CAP=\"$CAP${CAP:+,}${_c:-x}/$_f\"\n"
+            b"  done\n"
+            b"}\n"
+            b"\n"
+            b"decide() { # $1 = user, $2 = system|secure, $3 = key, $4 = its value now, $5 = \"<value>/<r|o>\" from capture (or empty)\n"
+            b"  # -> 0 = it may be replaced: nobody chose it (prov), and it did not change since the first unlock unless the value\n"
+            b"  # then was ours (lapis's first-unlock reset of gb_provision's or gb_sensors' first-boot write is not a choice)\n"
+            b"  prov \"$1\" \"$2\" \"$3\" \"$4\"\n"
+            b"  case $WHO in unset | ours | platform) ;; *) return 1 ;; esac\n"
+            b"  if [ -n \"$5\" ] && [ \"${5##*/}\" = o ] && [ \"$(tok \"$4\")\" != \"${5%/*}\" ]; then\n"
+            b"    WHO=\"changed since the first unlock: ${5%/*} -> $(tok \"$4\")\"\n"
+            b"    return 1\n"
+            b"  fi\n"
+            b"  return 0\n"
+            b"}\n"
+            b"\n"
+            b"once() { # $1 = user, $2 = system|secure, $3 = key, $4 = value, $5 = captured: written unless someone chose the value\n"
+            b"  _c=$(settings get --user \"$1\" \"$2\" \"$3\" 2> /dev/null)\n"
+            b"  [ \"$_c\" = \"$4\" ] && return 0\n"
+            b"  if decide \"$1\" \"$2\" \"$3\" \"$_c\" \"$5\"; then\n"
+            b"    settings put --user \"$1\" \"$2\" \"$3\" \"$4\"\n"
+            b"  else\n"
+            b"    KEPT=\"$KEPT; $3 kept ($WHO)\"\n"
+            b"  fi\n"
+            b"}\n"
+            b"\n"
+            b"user_once() { # $1 = a full user at its first unlock ever seen here, $2 = CAP from that unlock\n"
             b"  O=$R/data/local/gb_ui.user.$1.v1\n"
             b"  [ -e \"$O\" ] && return 0\n"
             b"  if ! (umask 077 && : > \"$O\") 2> /dev/null; then\n"
             b"    echo \"GB_UI user=$1 first unlock: cannot create $O, nothing written (it is never retried without the marker)\"\n"
             b"    return 0\n"
             b"  fi\n"
+            b"  KEPT=\n"
             b"  case $HW in\n"
             b"    vm)\n"
-            b"      settings put --user \"$1\" system screen_off_timeout 2147483647\n"
-            b"      settings put --user \"$1\" secure sleep_timeout -1\n"
+            b"      once \"$1\" system screen_off_timeout 2147483647 \"${2%%,*}\"\n"
+            b"      once \"$1\" secure sleep_timeout -1 \"$(case $2 in *,*) echo \"${2#*,}\" ;; esac)\"\n"
             b"      echo \"GB_UI user=$1 first unlock: screen_off_timeout=$(settings get --user \"$1\" system screen_off_timeout)\" \\\n"
-            b"        \"sleep_timeout=$(settings get --user \"$1\" secure sleep_timeout) (once; gb_provision's user-0 values)\"\n"
+            b"        \"sleep_timeout=$(settings get --user \"$1\" secure sleep_timeout) (once; gb_provision's user-0 values$KEPT)\"\n"
             b"      ;;\n"
             b"    native)\n"
             b"      if [ -f \"$R/odm/gb_sensors.sh\" ]; then\n"
-            b"        GB_SENSORS_LOG=- sh \"$R/odm/gb_sensors.sh\" user \"$1\"\n"
+            b"        _c=$(settings get --user \"$1\" system accelerometer_rotation 2> /dev/null)\n"
+            b"        if [ \"$_c\" = 1 ] || decide \"$1\" system accelerometer_rotation \"$_c\" \"$2\"; then\n"
+            b"          GB_SENSORS_LOG=- sh \"$R/odm/gb_sensors.sh\" user \"$1\"\n"
+            b"        else\n"
+            b"          echo \"GB_UI user=$1 first unlock: accelerometer_rotation=$_c kept ($WHO)\"\n"
+            b"        fi\n"
             b"      else\n"
             b"        echo \"GB_UI user=$1 first unlock: no /odm/gb_sensors.sh\"\n"
             b"      fi\n"
@@ -879,15 +1030,17 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"  esac\n"
             b"}\n"
             b"\n"
-            b"cleanup() { # markers of users that no longer exist\n"
+            b"cleanup() { # markers and records of users that no longer exist\n"
             b"  _l=$(timeout 20 pm list users 2> /dev/null) || return 0\n"
             b"  case $_l in *'UserInfo{0:'*) ;; *) return 0 ;; esac\n"
-            b"  for f in \"$R\"/data/local/gb_ui.user.*.v1; do\n"
+            b"  for f in \"$L\"*; do\n"
             b"    [ -e \"$f\" ] || continue\n"
-            b"    _u=${f##*/gb_ui.user.}\n"
-            b"    _u=${_u%.v1}\n"
+            b"    _u=${f#\"$L\"}\n"
+            b"    _s=${_u#*.}\n"
+            b"    _u=${_u%%.*}\n"
+            b"    case $_s in v1 | dens | home) ;; *) continue ;; esac\n"
             b"    case $_u in '' | *[!0-9]*) continue ;; esac\n"
-            b"    case $_l in *\"UserInfo{$_u:\"*) ;; *) rm -f \"$f\" && echo \"GB_UI user=$_u no longer exists: marker removed\" ;; esac\n"
+            b"    case $_l in *\"UserInfo{$_u:\"*) ;; *) rm -f \"$f\" && echo \"GB_UI user=$_u no longer exists: marker removed ($_s)\" ;; esac\n"
             b"  done\n"
             b"}\n"
             b"\n"
@@ -908,7 +1061,9 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"          SEEN=\"$SEEN $c\"\n"
             b"          user_ui \"$c\"\n"
             b"          show \"$c\"\n"
-            b"          PEND=\"$PEND $c:$n\"\n"
+            b"          CAP=\n"
+            b"          [ -e \"$R/data/local/gb_ui.user.$c.v1\" ] || capture \"$c\"\n"
+            b"          PEND=\"$PEND $c:$n:$CAP\"\n"
             b"        fi\n"
             b"        ;;\n"
             b"    esac\n"
@@ -918,8 +1073,10 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"    show 0\n"
             b"  fi\n"
             b"  _left=\n"
-            b"  for _p in $PEND; do\n"
-            b"    if [ $((n - ${_p#*:})) -ge 30 ]; then user_once \"${_p%%:*}\"; else _left=\"$_left $_p\"; fi\n"
+            b"  for _p in $PEND; do                       # <user>:<poll of its first unlock>:<CAP>\n"
+            b"    _pu=${_p%%:*}\n"
+            b"    _pt=${_p#*:}\n"
+            b"    if [ $((n - ${_pt%%:*})) -ge 30 ]; then user_once \"$_pu\" \"${_pt#*:}\"; else _left=\"$_left $_p\"; fi\n"
             b"  done\n"
             b"  PEND=$_left\n"
             b"  n=$((n + 1))\n"
@@ -1695,7 +1852,8 @@ OTA_GBINIT_UNVALIDATED = (b"  if [ \"$OS\" = unvalidated ]; then\n"
                           b"    echo \"ro.vendor.gb.ota_gate=unvalidated\" >> /odm/etc/build.prop\n"
                           b"  fi\n")
 assert GBINIT.count(OTA_GBINIT_TOKENS) == 1 and GBINIT.count(OTA_GBINIT_UNVALIDATED) == 1, "GBINIT: the OTA gate"
-# gb_otagate.sh (both trees): kmsg line + the gb_update notification; nothing else. Text <= 200 printable (INTERFACES 12.1).
+# gb_otagate.sh (both trees): kmsg line + the gb_update notification; (wave 7, OTA-F5, below) the root service also
+# keeps the unvalidated-boot record; nothing else. Text <= 200 printable (INTERFACES 12.1).
 # Two services run it at boot_completed on an unvalidated build: gb_otagate (root) writes the kmsg line and, where
 # gb_notify ships and its queue exists (native), queues the message like every other producer; gb_otagate_post (user
 # shell, the identity gb_notify posts with; INTERFACES D6: posting as uid 0 is unverified) posts it directly everywhere
@@ -1704,6 +1862,8 @@ assert GBINIT.count(OTA_GBINIT_TOKENS) == 1 and GBINIT.count(OTA_GBINIT_UNVALIDA
 # screen's headless "System User") and SystemUI hides it from the person's user 10 (forced OTA-gate boot: sysui
 # NotCurrentUserFilter). Both paths now post ONE record for UserHandle.ALL (`cmd notification post -u all`, as
 # gb_notify does), which SystemUI shows to whichever user is in the foreground, before and after the sign-in.
+# (Wave 8, lows-a: BACKLOG HS-O5-otagate, notify O5) `cmd notification post` exits 0 when it posted nothing, so
+# gb_otagate_post judges it by its output and falls back like gb_notify's post_notice (INTERFACES 12.1a).
 OTA_TITLE = b"System update not validated"
 OTA_TEXT = (b"Build $B is not the build this boot setup was made for ($V). Paused until the next ESP update: "
             + ", ".join(OTA_SKIP_LABELS).encode() + b".")
@@ -1731,7 +1891,10 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"# notification (tag gb_update, INTERFACES 12.1) queued for gb_notify where gb_notify and its queue exist\n"
                  b"# (native). Service gb_otagate_post (argument post, user shell): posts it directly everywhere else (VM).\n"
                  b"# (wave 6, notify) Posted for UserHandle.ALL (-u all): headless system user mode hides user 0's posts.\n"
-                 b"# It changes nothing else. Test hooks (never set by init): GB_ROOT (path prefix), GB_TEST_PATH.\n"
+                 b"# (wave 8, notify O5) The post's output decides, with gb_notify's fallbacks (INTERFACES 12.1a).\n"
+                 b"# (wave 7, OTA-F5) gb_otagate also keeps the unvalidated-boot record /data/vendor/gb/ota_unvalidated\n"
+                 b"# (and makes /data/vendor/gb 0751 where it is missing). It changes nothing else. Test hooks (never set\n"
+                 b"# by init): GB_ROOT (path prefix), GB_TEST_PATH.\n"
                  b"# (wave 6, OTA-F3) gb_otagate then logs the stock sha256 of each bind target nothing of ours covers.\n"
                  b"LC_ALL=C; export LC_ALL\n"
                  b"PATH=${GB_TEST_PATH:+$GB_TEST_PATH:}/system/bin:/vendor/bin; export PATH\n"
@@ -1769,8 +1932,75 @@ GB_OTAGATE_SH = (b"#!/system/bin/sh\n"
                  b"qok() { [ -f \"$R/odm/vup/bin/gb_notify.sh\" ] && [ -d \"$Q\" ] && [ ! -L \"$Q\" ]; }\n"
                  b"if [ \"${1:-}\" = post ]; then\n"
                  b"  qok && exit 0\n"
-                 b"  timeout 20 cmd notification post -u all -S bigtext -t \"$TITLE\" gb_update \"$TEXT\" > /dev/null 2>&1 || "
-                 b"log1 \"cmd notification post failed\"\n"
+                 b"  # (wave 8, notify O5) cmd notification post exits 0 even when it posted nothing (lapis 276.R4: an unknown option\n"
+                 b"  # prints its usage, a bad -u value or style \"Error occurred. ...\"): its output decides (npost), and one fallback\n"
+                 b"  # follows gb_notify's post_notice (INTERFACES 12.1a): a usage listing -u|--user but not bigtext, or an unknown\n"
+                 b"  # style: for all users without -S bigtext; a usage without -u|--user (a build that dropped it): without -u, i.e.\n"
+                 b"  # for user 0 only (the login screen), logged; \"Bad user\": one -u <id> post per running full user (at most 8);\n"
+                 b"  # anything else is logged with the output. At most 1 + 8 posts.\n"
+                 b"  npost() { PO=$(timeout 20 cmd notification post \"$@\" 2>&1); _pr=$?\n"
+                 b"    case $PO in *'usage: cmd notification post'* | *'Error occurred'*) return 1 ;; esac\n"
+                 b"    return $_pr; }\n"
+                 b"  fusers() { # -> US: ids of the running FULL users (pm list users: flags with 0x400; ids <= 4 digits, at most 8)\n"
+                 b"    US=\n"
+                 b"    _ul=$(timeout 20 pm list users 2> /dev/null) || return 1\n"
+                 b"    _nu=0\n"
+                 b"    _ifs=$IFS\n"
+                 b"    IFS='\n"
+                 b"'\n"
+                 b"    for _l in $_ul; do\n"
+                 b"      case $_l in *'UserInfo{'*'} running') ;; *) continue ;; esac\n"
+                 b"      _l=${_l%'} running'}\n"
+                 b"      _f=${_l##*:}\n"
+                 b"      _i=${_l#*'UserInfo{'}\n"
+                 b"      _i=${_i%%:*}\n"
+                 b"      case $_i in '' | *[!0-9]*) continue ;; esac\n"
+                 b"      case $_f in '' | *[!0-9a-fA-F]*) continue ;; esac\n"
+                 b"      if [ ${#_i} -gt 4 ] || [ ${#_f} -gt 7 ]; then continue; fi\n"
+                 b"      [ $((0x$_f & 0x400)) -ne 0 ] || continue\n"
+                 b"      US=\"$US $_i\"\n"
+                 b"      _nu=$((_nu + 1))\n"
+                 b"      [ $_nu -lt 8 ] || break\n"
+                 b"    done\n"
+                 b"    IFS=$_ifs\n"
+                 b"    return 0\n"
+                 b"  }\n"
+                 b"  npost -u all -S bigtext -t \"$TITLE\" gb_update \"$TEXT\" && exit 0\n"
+                 b"  case $PO in\n"
+                 b"    *'usage: cmd notification post'*)\n"
+                 b"      case $PO in *bigtext*) _bt=1 ;; *) _bt=0 ;; esac\n"
+                 b"      case $PO in\n"
+                 b"        *'-u|--user'*)\n"
+                 b"          if [ $_bt = 0 ] && npost -u all -t \"$TITLE\" gb_update \"$TEXT\"; then\n"
+                 b"            log1 \"notice posted without -S bigtext (this build's cmd notification post has no bigtext style)\"\n"
+                 b"            exit 0\n"
+                 b"          fi\n"
+                 b"          ;;\n"
+                 b"        *)\n"
+                 b"          if { [ $_bt = 1 ] && npost -S bigtext -t \"$TITLE\" gb_update \"$TEXT\"; } ||\n"
+                 b"            { [ $_bt = 0 ] && npost -t \"$TITLE\" gb_update \"$TEXT\"; }; then\n"
+                 b"            log1 \"this build's cmd notification post has no -u: notice posted for user 0 only (the login screen; not seen after the sign-in)\"\n"
+                 b"            exit 0\n"
+                 b"          fi\n"
+                 b"          ;;\n"
+                 b"      esac\n"
+                 b"      ;;\n"
+                 b"    *'notification style'*)\n"
+                 b"      if npost -u all -t \"$TITLE\" gb_update \"$TEXT\"; then\n"
+                 b"        log1 \"notice posted without -S bigtext (this build's cmd notification post has no bigtext style)\"\n"
+                 b"        exit 0\n"
+                 b"      fi\n"
+                 b"      ;;\n"
+                 b"    *'Bad user'*)\n"
+                 b"      if fusers && [ -n \"$US\" ]; then\n"
+                 b"        _np=0\n"
+                 b"        for _u in $US; do npost -u \"$_u\" -S bigtext -t \"$TITLE\" gb_update \"$TEXT\" && _np=$((_np + 1)); done\n"
+                 b"        log1 \"cmd notification post -u all refused: notice posted per running full user ($_np of$US)\"\n"
+                 b"        exit 0\n"
+                 b"      fi\n"
+                 b"      ;;\n"
+                 b"  esac\n"
+                 b"  log1 \"cmd notification post failed ($(printf '%s' \"$PO\" | tr -c ' -~' ' ' | cut -c1-120))\"\n"
                  b"  exit 0\n"
                  b"fi\n"
                  b"log1 \"UNVALIDATED build: booted $(val booted), ESP built for $(val validated) (token $(val token)); "
@@ -2157,11 +2387,45 @@ NATIVE_FW = _tree(NATIVE_FW_DIR)
 # reach the initrd. The opt-in dGPU modules (stage_kernel.NATIVE_OPTIN) go into the payload, not the cpio (A-06).
 _NATIVE_MODS_ALL = _tree(NATIVE_MOD_DIR)
 assert all("/" not in _n for _n, _ in _NATIVE_MODS_ALL), "inject\\native\\modules must be flat"
-_is_mod = lambda n: n.endswith(".ko") or n in ("modules.load", "modules.load.late")
+_is_mod = lambda n: n.endswith(".ko") or n in ("modules.load", "modules.load.late", "modules.alias", "modules.dep")
 NATIVE_MODS = [(_n, _d) for _n, _d in _NATIVE_MODS_ALL if _is_mod(_n)]
 _stray = [_n for _n, _ in _NATIVE_MODS_ALL if not _is_mod(_n)]
 print(f"native modules: {len(NATIVE_MODS)} files, {len(_stray)} other file(s) ignored"
       + (f" (e.g. {', '.join(_stray[:3])})" if _stray else ""), flush=True)
+
+# (wave 8, k16) The modalias set (stage_kernel.NATIVE_MODALIAS: the Realtek SD-card reader drivers) is in no load list:
+# lapis's ueventd (modalias_handling enabled) reads /odm/lib/modules/modules.alias + modules.dep before
+# /vendor/lib/modules and loads a module when its device appears. Both files come together; every module they name is a
+# packed .ko that neither load list names; every dependency is a packed .ko or a lapis /vendor/lib/modules one (a lapis
+# first-stage module, already loaded: EEXIST). The libmodprobe format: single spaces, '#' comments.
+def _modalias_set(files):
+    """{module file: [dependency paths]} of the native modalias set ({} without one); AssertionError if inconsistent."""
+    if "modules.alias" not in files and "modules.dep" not in files:
+        return {}
+    assert "modules.alias" in files and "modules.dep" in files, "native modules: modules.alias and modules.dep go together"
+    lines = lambda n: [l for l in files[n].decode("ascii").split("\n") if l and not l.startswith("#")]
+    canon = lambda f: f[:-3].replace("-", "_")
+    loaded = {l.split()[0] for n in ("modules.load", "modules.load.late") if n in files for l in lines(n)}
+    aliased, deps = set(), {}
+    for l in lines("modules.alias"):
+        w = l.split(" ")
+        assert len(w) == 3 and w[0] == "alias" and w[1] and w[2], f"modules.alias: bad line {l!r}"
+        aliased.add(w[2])
+    for l in lines("modules.dep"):
+        w = l.split(" ")
+        assert w[0].startswith("/odm/lib/modules/") and w[0].endswith(".ko:"), f"modules.dep: bad line {l!r}"
+        f = w[0][len("/odm/lib/modules/"):-1]
+        assert f in files and f not in loaded, f"modules.dep: {f} is not packed or is also in a load list"
+        for d in w[1:]:
+            assert (d.startswith("/odm/lib/modules/") and d[len("/odm/lib/modules/"):] in deps) or \
+                (d.startswith("/vendor/lib/modules/") and d.endswith(".ko") and "/" not in d[20:]), \
+                f"modules.dep: {f} depends on {d!r} (not an earlier packed module or a lapis vendor module)"
+        deps[f] = w[1:]
+    assert aliased == {canon(f) for f in deps}, f"modules.alias names {sorted(aliased)}, modules.dep {sorted(deps)}"
+    return deps
+NATIVE_MODALIAS_SET = _modalias_set(dict(NATIVE_MODS))
+if NATIVE_MODALIAS_SET:
+    print(f"native modalias set (ueventd): {', '.join(NATIVE_MODALIAS_SET)}", flush=True)
 
 # Second-stage module pass (exec_start at early-init, before the composer starts). gbinit already loaded
 # modules.load before Android init; this retries anything it could not load and then loads modules.load.late: modules
@@ -3567,7 +3831,9 @@ KAT_RC = (b"\n# ---- VNNI KAT (VM test only) ----\n"         # one literal: veri
 # the shell part lives in a file: `$` in an rc line is a property reference
 GB_VNNI_KAT_SH = (b"#!/system/bin/sh\n"
                   b"# Test-only (WAVE3_PLAN 6.4, R-13): the throwaway VMware KAT image only, never a shipped tree.\n"
-                  b"k() { echo \"$1\" > /dev/kmsg; }\n"
+                  # (wave 8, LOW-3 F-1) printf, not echo: mksh's echo decodes backslash escapes, so it would turn the
+                  # \xHH of k16's escaped comm=<name> (patch 0112) back into newlines and forge kmsg lines
+                  b"k() { printf '%s\\n' \"$1\" > /dev/kmsg; }\n"
                   b"k 'gb_vnni_kat: start'\n"
                   # (W4) mmd's zram swap (the VM tree's own zram): wait at most 300 s for zram0 in /proc/swaps
                   b"z=0\n"
@@ -3701,10 +3967,13 @@ BOOTCONFIG = bootconfig(SLOT, VBC)
 
 _GZ = {}
 def inject_gz(cpio):
-    """gzip of the gb cpio, zero-padded to 4 bytes (= the initrd's first segment and the ESP's /gb/inject.gz)."""
-    k = id(cpio)
+    """gzip of the gb cpio, zero-padded to 4 bytes (= the initrd's first segment and the ESP's /gb/inject.gz).
+    Cached by the cpio's sha256 (wave 8, BACKLOG 8.2 "inject_gz cache": id(cpio) can be reused by a later, different
+    cpio once the first one is freed, and stays the same for a bytearray changed in place)."""
+    data = bytes(cpio)
+    k = _hl.sha256(data).digest()
     if k not in _GZ:
-        gz = bytearray(gzip.compress(bytes(cpio), 9, mtime=0))
+        gz = bytearray(gzip.compress(data, 9, mtime=0))
         while len(gz) % 4: gz.append(0)
         _GZ[k] = bytes(gz)
     return _GZ[k]
@@ -3744,7 +4013,9 @@ VM_BOOT_DEVICES = "pci0000:00/0000:00:15.2"            # VMware virtual NVMe
 CMDLINE_VM = CMDLINE + " gb.hw=vm androidboot.boot_devices=" + VM_BOOT_DEVICES
 
 def slot_files(cmdline, inject_cpio, title, default=None, timeout=3, native=False):
-    """ESP files for systemd-boot: entry gb-<slot> + initrd-<slot>.img for the boot slot (the default). The other
+    """ESP files for systemd-boot: entry gb-<slot> + initrd-<slot>.img for the boot slot (the default; (wave 8,
+    SLOT-DEFAULT) loader.conf names it 'default gb-<slot>.conf': systemd-boot 262.1 matches the pattern against the
+    entry id, '.conf' included, and the old 'default gb-<slot>' matched no entry). The other
     slot's entry is created in the guest by gb_slotsync when an OTA completes into it (from /gb/inject.gz,
     /gb/bootconfig_extra and that slot's partitions); a stale entry for a slot that was never booted is not offered.
     native=True (USB stick, internal/dual-boot, ISO objects): also the NVIDIA test entry gb-<slot>-nvtest
@@ -3755,7 +4026,7 @@ def slot_files(cmdline, inject_cpio, title, default=None, timeout=3, native=Fals
     gz = inject_gz(inject_cpio)
     files = {
         "EFI/BOOT/BOOTX64.EFI": SDBOOT,
-        "loader/loader.conf": f"default gb-{default}\ntimeout {timeout}\nconsole-mode max\neditor yes\n".encode(),
+        "loader/loader.conf": f"default gb-{default}.conf\ntimeout {timeout}\nconsole-mode max\neditor yes\n".encode(),
         "vmlinuz": KERNEL,
         "gb/inject.gz": gz,
         "gb/bootconfig_extra": BOOTCONFIG_EXTRA,
@@ -3910,14 +4181,14 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
     if os.environ.get("GB_NATIVE_TEST"):
         # One-off VMware boot of the NATIVE tree as the default entry (no display driver in VMware, so it does not
         # reach a desktop): checks gbinit module loading against lapis's vendor modules, the late pass, the native rc
-        # and services, via serial0.log (console kept). gb_slotsync resets the default to gb-<slot> if it gets that far;
+        # and services, via serial0.log (console kept). gb_slotsync makes gb-<slot>.conf the default if it gets that far;
         # a normal rebuild drops this entry.
         ntest = (f"{CMDLINE} gb.hw=native androidboot.boot_devices={VM_BOOT_DEVICES} "
                  f"firmware_class.path=/odm/firmware,/vendor/firmware snd_intel_dspcfg.dsp_driver=3")
         # the native initrd (Surface firmware, camera stack, nouveau) no longer fits next to the VM entry in the
         # 192 MiB VM ESP: this one-off ESP holds only the test entry (the next normal build restores the VM entry)
         FILES = {"EFI/BOOT/BOOTX64.EFI": SDBOOT, "vmlinuz": KERNEL,
-                 "loader/loader.conf": b"default gb-ntest\ntimeout 3\nconsole-mode max\neditor yes\n",
+                 "loader/loader.conf": b"default gb-ntest.conf\ntimeout 3\nconsole-mode max\neditor yes\n",
                  "loader/entries/gb-ntest.conf": (f"title   Googlebook native tree (VM test)\nlinux   /vmlinuz\n"
                                                   f"initrd  /initrd-ntest.img\noptions {ntest}\n").encode(),
                  "initrd-ntest.img": make_initrd(native_cpio(), SLOT)}
@@ -3933,6 +4204,9 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
         sys.exit(f"build_esp.py: refused: {_lapis_write_refused()}")
     why = _pin_path_refused(ESP)                        # (W6 prep, SA-7) after the VM-off guard, before the write;
     if why:                                             # (W7, W6-S7) once: one read of lapis.bin's ESP, one report
+        sys.exit(f"build_esp.py: refused: {why}")
+    why = _esp_expect_refused(ESP)                      # (W8, W7-S4) only the reviewed preview's bytes are written
+    if why:
         sys.exit(f"build_esp.py: refused: {why}")
     with open(LAPIS, "r+b") as f:
         f.seek(ESP_OFFSET)

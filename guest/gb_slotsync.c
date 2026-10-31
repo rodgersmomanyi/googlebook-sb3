@@ -7,7 +7,7 @@
  * itself back. gb_slotsync is the bootloader's slot choice: it picks the slot the way depthcharge does (highest
  * priority among slots that are successful or have tries left), rebuilds /initrd-<x>.img on the ESP from that slot's
  * init_boot/vendor_boot (+ androidboot.slot_suffix=_<x>), writes loader/entries/gb-<x>.conf (and, if the current
- * slot has one, gb-<x>-nvtest.conf, the "[NVIDIA test]" entry) and makes gb-<x> the systemd-boot default. The previous
+ * slot has one, gb-<x>-nvtest.conf, the "[NVIDIA test]" entry) and makes gb-<x>.conf the systemd-boot default. The previous
  * slot's entries stay in the menu as a fallback while they still match that slot (wave 3 safety review, MEDIUM): a
  * rebuild removes the slot's older entries before it writes the new initrd, and with no switch pending the
  * non-running slot's entries are checked once per boot and whenever its GPT bootable state changes -- they are removed
@@ -38,6 +38,12 @@
  * stale) with a put-back that never replaces, retried every 50 ms for up to 5 s, release only our own lock and wait up
  * to 7 polls for a put-back first). After 600 s of waiting this cycle is skipped (the --watch loop retries 60 s later).
  * The ESP is mounted with "flush". The loader.conf default is matched as a whole line (gb-<x>, not gb-<x>-nvtest).
+ * (Wave 8, SLOT-DEFAULT) systemd-boot 262.1 matches "default" (and "preferred") against the whole entry id, which
+ * includes ".conf": the line written is "default gb-<x>.conf". "default gb-<x>" (every ESP before wave 8) matches no
+ * entry, so the loader started the first entry in its own order (gb-b.conf whenever it exists); such a line, and any
+ * "preferred" line (nothing here writes one; it would override the default), is rewritten once to the running slot's
+ * "default gb-<cur>.conf" (on a HOLD too, before the held slot's entries are written). Reading a default that names
+ * a slot (the dangling-default guard of the other slot's entries) still takes both forms.
  *
  * Usage: gb_slotsync [--watch SECONDS] [--dry-run]
  * Build (builder, NDK r27c): /build/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=x86_64-linux-android34
@@ -46,8 +52,8 @@
  *        the boot id, the by-name directory, the update_engine prefs file, the vbmeta attributes, uname and the
  *        notification queue come from GB_SLOTSYNC_* environment variables, mount/umount2/sync/setprop are no-ops, the
  *        lock's 1 s polls run on a fake clock (10 ms each), and --test-copy-entry / --test-lock / --test-ticks /
- *        --test-wanted-slot / --test-kmi exist (lock race injections: GB_SLOTSYNC_TEST_RACE_OWNER, _DISPLACE,
- *        _PUTBACK[_POLLS], _STEAL_RACE, _INTRUDE_POLLS, _OWN_ORPHAN).
+ *        --test-wanted-slot / --test-kmi / --test-loader-default exist (lock race injections:
+ *        GB_SLOTSYNC_TEST_RACE_OWNER, _DISPLACE, _PUTBACK[_POLLS], _STEAL_RACE, _INTRUDE_POLLS, _OWN_ORPHAN).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -597,50 +603,69 @@ static int copy_entry(char s, char cur, const char *sfx, int required) {
   return r;
 }
 
+/* (Wave 8, SLOT-DEFAULT) the key of a loader.conf line as systemd-boot reads it: optional leading blanks, then the key
+ * as a whole word (followed by a blank, a CR or the end of the line). Returns the offset of its value (after the
+ * blanks), or 0 when the line has another key. */
+static size_t conf_key(const char *p, size_t n, const char *key) {
+  size_t a = 0, k = strlen(key);
+  while (a < n && (p[a] == ' ' || p[a] == '\t')) a++;
+  if (n - a < k || strncmp(p + a, key, k)) return 0;
+  a += k;
+  if (a < n && p[a] != ' ' && p[a] != '\t' && p[a] != '\r') return 0;
+  while (a < n && (p[a] == ' ' || p[a] == '\t')) a++;
+  return a;
+}
+
 /* Whole-line match (finding 5 of the Wave 2 safety review): a substring test also took "default gb-b-nvtest" (or
  * "#default gb-b") for "default gb-b". mode 0: 1 when every "default" line (the key "default" as a whole word, then
- * blanks) names exactly gb-<s>, ignoring a CR and trailing blanks, and there is at least one; mode 1: 1 when any
- * "default" line names exactly gb-<s>. */
+ * blanks) names exactly gb-<s>.conf, ignoring a CR and trailing blanks, there is at least one, and there is no
+ * "preferred" line; mode 1: 1 when any "default" line names gb-<s>.conf or gb-<s>.
+ * (Wave 8, SLOT-DEFAULT) systemd-boot 262.1 matches the pattern against the entry id, which includes ".conf": only
+ * gb-<s>.conf selects slot s's entry. The old form gb-<s> matches no entry (the loader then starts the first entry in
+ * its own order), so mode 0 does not accept it (it is rewritten once), and mode 1 (only the dangling-default guard of
+ * check_other) still takes it. A "preferred" line would override the default, so mode 0 asks for its removal. */
 static int loader_default(const char *conf, char s, int any) {
-  char want[8]; snprintf(want, sizeof want, "gb-%c", s);
+  char want[16], old[8];
+  snprintf(want, sizeof want, "gb-%c.conf", s); snprintf(old, sizeof old, "gb-%c", s);
   int seen = 0, right = 1, hit = 0;
   for (const char *p = conf; *p;) {
     const char *e = strchr(p, '\n');
-    size_t n = e ? (size_t)(e - p) : strlen(p);
-    if (n >= 7 && !strncmp(p, "default", 7) && (n == 7 || p[7] == ' ' || p[7] == '\t' || p[7] == '\r')) {
-      size_t a = 7, z = n;
-      while (a < z && (p[a] == ' ' || p[a] == '\t')) a++;
+    size_t n = e ? (size_t)(e - p) : strlen(p), a;
+    if (conf_key(p, n, "preferred")) right = 0;
+    else if ((a = conf_key(p, n, "default"))) {
+      size_t z = n;
       while (z > a && (p[z - 1] == ' ' || p[z - 1] == '\t' || p[z - 1] == '\r')) z--;
       seen = 1;
-      if (z - a != strlen(want) || strncmp(p + a, want, z - a)) right = 0;
-      else hit = 1;
+      int is_new = z - a == strlen(want) && !strncmp(p + a, want, z - a);
+      int is_old = z - a == strlen(old) && !strncmp(p + a, old, z - a);
+      if (!is_new) right = 0;
+      if (is_new || is_old) hit = 1;
     }
     p += n + (e ? 1 : 0);
   }
   return any ? hit : seen && right;
 }
 
-/* loader/entries/gb-<s>.conf (+ gb-<s>-nvtest.conf) from the current slot's entries, and loader.conf default -> gb-<s> */
-static int select_entry(char s, char cur) {
-  if (copy_entry(s, cur, "", 1)) return -1;
-  if (copy_entry(s, cur, "-nvtest", 0))                    /* optional: never blocks the switch */
-    logmsg("slot %c: the [NVIDIA test] entry was not copied (the default entry is unaffected)", s);
+/* loader.conf -> "default gb-<s>.conf": every "default" line is replaced (one is appended if there is none) and every
+ * "preferred" line is removed (wave 8, SLOT-DEFAULT); nothing is written when it already says exactly that. */
+static int set_default(char s) {
   char lcp[PATH_MAX]; snprintf(lcp, sizeof lcp, "%s/loader/loader.conf", mnt);
   unsigned char *lc = NULL; size_t ll = 0;
   if (read_all(lcp, &lc, &ll)) { logmsg("cannot read %s", lcp); return -1; }
-  char *conf = realloc(lc, ll + 1);
+  char *conf = ll < SIZE_MAX / 4 ? realloc(lc, ll + 1) : NULL;
   if (!conf) { free(lc); logmsg("cannot read %s: out of memory", lcp); return -1; }
   conf[ll] = 0;
-  char want[32]; snprintf(want, sizeof want, "default gb-%c", s);
+  char want[32]; snprintf(want, sizeof want, "default gb-%c.conf", s);
   if (loader_default(conf, s, 0)) { free(conf); return 0; }
-  size_t cap = 2 * ll + 64, rem = cap;
+  size_t cap = 3 * ll + 64, rem = cap;                      /* a bare "default\n" (8 bytes) becomes 18 */
   char *outb = malloc(cap), *o = outb, *save = NULL;
   if (!outb) { free(conf); logmsg("loader.conf: out of memory"); return -1; }
-  int done = 0, bad = 0;
+  int done = 0, bad = 0, dropped = 0;
   for (char *line = strtok_r(conf, "\n", &save); line && !bad; line = strtok_r(NULL, "\n", &save)) {
     size_t n = strlen(line);
     const char *cr = n && line[n - 1] == '\r' ? "\r" : "";
-    if (!strncmp(line, "default", 7) && (line[7] == 0 || line[7] == ' ' || line[7] == '\t' || line[7] == '\r')) {
+    if (conf_key(line, n, "preferred")) dropped++;
+    else if (conf_key(line, n, "default")) {
       bad = appendf(&o, &rem, "%s%s\n", want, cr);
       done = 1;
     }
@@ -649,9 +674,18 @@ static int select_entry(char s, char cur) {
   if (!done && !bad) bad = appendf(&o, &rem, "%s\n", want);
   int r = bad ? -1 : dry_run ? 0 : write_file(lcp, outb, (size_t)(o - outb));
   free(outb); free(conf);
-  if (!r) logmsg("systemd-boot default -> gb-%c", s);
+  if (!r) logmsg("systemd-boot default -> gb-%c.conf%s", s, dropped ? " ('preferred' line removed)" : "");
   else logmsg("writing %s failed", lcp);
   return r;
+}
+
+/* loader/entries/gb-<s>.conf (+ gb-<s>-nvtest.conf) from the current slot's entries, then loader.conf default ->
+ * gb-<s>.conf (the entries first: the default never names a missing entry) */
+static int select_entry(char s, char cur) {
+  if (copy_entry(s, cur, "", 1)) return -1;
+  if (copy_entry(s, cur, "-nvtest", 0))                    /* optional: never blocks the switch */
+    logmsg("slot %c: the [NVIDIA test] entry was not copied (the default entry is unaffected)", s);
+  return set_default(s);
 }
 
 static int read_line(const char *path, char *buf, size_t cap) {
@@ -935,8 +969,11 @@ static void unlock_esp(void) {
 }
 
 /* HOLD (kernel check failed): the initrd is built and gb-<s>.conf (+ gb-<s>-nvtest.conf) written, so "(slot S)" is in
- * the systemd-boot menu, but loader.conf is not touched: the default stays on the slot that booted. */
+ * the systemd-boot menu, but loader.conf is not touched: the default stays on the slot that booted. (Wave 8,
+ * SLOT-DEFAULT) Only a default that does not already name it as "gb-<cur>.conf" (the old "gb-<cur>" form, which the
+ * loader ignores, so it would start gb-b.conf first) is rewritten to the running slot, before the held entries exist. */
 static int hold_entries(char s, char cur) {
+  if (set_default(cur)) return -1;
   if (copy_entry(s, cur, "", 1)) return -1;
   if (copy_entry(s, cur, "-nvtest", 0))
     logmsg("slot %c: the [NVIDIA test] entry was not copied (the default entry is unaffected)", s);
@@ -1106,6 +1143,17 @@ int main(int argc, char **argv) {
     int rc = select_entry(argv[2][0], argv[3][0]);
     printf("test: select_entry rc=%d\n", rc);
     return rc ? 1 : 0;
+  }
+  if (argc == 4 && !strcmp(argv[1], "--test-loader-default")) {    /* --test-loader-default S 0|1 -> loader_default() */
+    char lp[PATH_MAX]; unsigned char *lb = NULL; size_t ln = 0;  /* of GB_SLOTSYNC_MNT/loader/loader.conf: 0 or 1 */
+    snprintf(lp, sizeof lp, "%s/loader/loader.conf", mnt);
+    if (read_all(lp, &lb, &ln)) return 2;
+    char *lcs = realloc(lb, ln + 1);
+    if (!lcs) { free(lb); return 2; }
+    lcs[ln] = 0;
+    printf("%d\n", loader_default(lcs, argv[2][0], atoi(argv[3])));
+    free(lcs);
+    return 0;
   }
   if (argc == 4 && !strcmp(argv[1], "--test-wanted-slot")) {       /* --test-wanted-slot HEX_A HEX_B -> a, b or - */
     uint64_t at[2] = {strtoull(argv[2], NULL, 16), strtoull(argv[3], NULL, 16)};

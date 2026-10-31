@@ -4,8 +4,8 @@
   python -I -B gb_vmbackup.py verify  DEST [--foreground]
   python -I -B gb_vmbackup.py compare DEST [--src DIR] [--foreground]
   python -I -B gb_vmbackup.py restore DEST --yes [--esp-only [--with-gpt [--accept-unreadable-live-gpt]]
-                                                  [--pin-migration]] [--src DIR] [--vmx NAME]
-  python -I -B gb_vmbackup.py restore DEST --esp-only [--with-gpt ...] [--pin-migration] --dry-run
+                                                  [--pin-migration] [--accept-slot-mismatch]] [--src DIR] [--vmx NAME]
+  python -I -B gb_vmbackup.py restore DEST --esp-only [--with-gpt ...] [--pin-migration] [--accept-slot-mismatch] --dry-run
 
 DIR defaults to C:\\GB-x86, NAME to lapis-boot.vmx. DEST is a new or empty folder (D:\\GB-vm-backup\\<date>).
 backup   refuses while VMware runs the VM (vmrun list, VMware lock folders); refuses unless DEST's drive has N GB
@@ -36,13 +36,22 @@ restore  VM must be off. Verifies the backup first. --esp-only (needs DEST\\mani
          every check (and the free space for the save below), nothing written, no --yes needed. (W7, safety audit
          W6-S2) Before its first write --esp-only saves the live ESP and both live GPT regions into
          DEST\\..\\pre-restore-<time>\\ (an --esp-only backup of their own: SHA256SUMS + manifest.json, read back,
-         read-only; undo: restore <it> --esp-only --yes [--with-gpt]); refused if that drive lacks the room. Full (needs
+         read-only; undo: restore <it> --esp-only --yes [--with-gpt]); refused if that drive lacks the room. (W8, safety
+         audit W8-S1) --esp-only also refuses an ESP of another slot: since wave 8 a Google update really switches
+         the VM to the other slot, and every ESP backup taken before that boots the old one (after the update's merge
+         that slot fails dm-verity and restarts forever; before it, the restore is a downgrade over /data whose newer
+         key the KeyMint can refuse, so the right PIN fails). The saved ESP's loader.conf default slot (gb-<x>.conf or
+         the pre-wave-8 gb-<x>, with its entry) must be the slot gb_slotsync's wanted_slot picks from the live GPT's
+         vbmeta_a/b attributes (with --with-gpt: from the GPT about to be written), and the live ESP must hold no entry
+         or initrd of another slot (an update into it was installed). --accept-slot-mismatch overrides it after the
+         printed 'slot:' lines were read (e.g. the other slot's files are left over from an update that never started);
+         after a Google update switched the slot, rebuild the ESP from the host instead. Full (needs
          DEST\\SHA256SUMS + lapis.bin, so it also works on a plain copy): rewrites only the 4 MiB blocks of lapis.bin
          that differ from the backup (in place: no extra space on C:), re-hashes lapis.bin against SHA256SUMS, restores the small
          files (the current ones are kept in DEST\\..\\pre-restore-<time>\\ first) and makes them writable.
 Reads lapis.bin "rb" except restore. Standard library only; Windows only (sparse files, background mode).
 """
-import ctypes, hashlib, importlib.util, json, msvcrt, os, shutil, stat, struct, subprocess, sys, time, zlib
+import ctypes, hashlib, importlib.util, json, msvcrt, os, re, shutil, stat, struct, subprocess, sys, time, zlib
 from ctypes import wintypes
 
 VMRUN = r"C:\Program Files\VMware\VMware Workstation\vmrun.exe"
@@ -423,6 +432,75 @@ def pin_problems(src, live_esp, new_esp):
     return check(old, vi.fat_files(new_esp))
 
 
+def slot_problems(src, lapis, size, live_esp, new_esp, man, with_gpt):
+    """(W8, safety audit W8-S1) (backup slot, wanted slot, problems); [] = the saved ESP boots the slot the disk wants.
+    The saved ESP's slot is its loader.conf default (verify_image.loader_slot: gb-<x>.conf or the pre-wave-8 gb-<x>)
+    and must have its loader/entries/gb-<x>.conf. The wanted slot is verify_image.wanted_slot (gb_slotsync's rule) of
+    the vbmeta_a/b GPT attributes: of the live GPT (the primary copy, else the backup copy), or with --with-gpt of the
+    GPT about to be written (manifest.json's slot_attrs; gpt_plan already required every live copy that parses to have
+    them). The live ESP must hold no loader entry (counted or -nvtest ones included) or initrd of another slot. Unknown
+    = a problem (refuse)."""
+    vp = os.path.join(src, "verify_image.py")
+    try:
+        spec = importlib.util.spec_from_file_location("gb_vmbackup_verify_image_slot", vp)
+        vi = importlib.util.module_from_spec(spec); spec.loader.exec_module(vi)
+        loader_slot, wanted_slot, fat_files = vi.loader_slot, vi.wanted_slot, vi.fat_files
+    except (OSError, AttributeError, ImportError, SyntaxError) as e:
+        return None, None, [f"cannot load the slot check from {vp} ({e.__class__.__name__}: {e})"]
+    probs = []
+    try:
+        new = fat_files(new_esp)
+    except (ValueError, struct.error) as e:
+        return None, None, [f"the saved ESP is not a readable FAT32 ({e}): its slot is unknown"]
+    bslot = loader_slot(new.get("loader/loader.conf", b"").decode("utf-8", "replace"))
+    if bslot is None:
+        probs.append("the saved ESP's loader.conf names no slot ('default gb-<x>.conf' or 'default gb-<x>')")
+    elif f"loader/entries/gb-{bslot}.conf" not in new:
+        probs.append(f"the saved ESP's loader.conf names slot {bslot}, but it has no loader/entries/gb-{bslot}.conf")
+    raw = None
+    if with_gpt:
+        sa = man.get("slot_attrs") or {}
+        try:
+            raw = [(int(sa[x][0]) << 48) | (int(sa[x][1]) << 52) | (int(sa[x][2]) << 56) for x in "ab"]
+        except (KeyError, IndexError, TypeError, ValueError):
+            probs.append("manifest.json has no slot_attrs for a and b: the slot the restored GPT boots is unknown")
+    else:
+        with open(lapis, "rb") as f:
+            l1 = f.read(G1); f.seek(size - G2); l2 = f.read(G2)
+        lbas = size // 512
+        for reg, base, prim in ((l1, 0, True), (l2, lbas - 33, False)):
+            try:
+                parts = gpt_region(reg, base, lbas, prim)["parts"]
+            except ValueError:
+                continue
+            raw = [parts.get("vbmeta_" + x, (0, 0, 0))[2] for x in "ab"]
+            break
+        if raw is None:
+            probs.append("neither live GPT copy parses: the slot the VM boots is unknown")
+    want = wanted_slot(raw) if raw is not None else None
+    if raw is not None and want is None:
+        probs.append("the GPT's vbmeta_a/b attributes make no slot bootable: the slot the VM boots is unknown")
+    if bslot and want and bslot != want:
+        probs.append(f"the saved ESP boots slot {bslot}, but the GPT wants slot {want} (a Google update switched the "
+                     f"VM to it: restoring an ESP of the old slot loops on dm-verity after the update's merge, or "
+                     f"downgrades /data before it; rebuild the ESP from the host instead)")
+    try:
+        live = fat_files(live_esp)
+    except (ValueError, struct.error) as e:
+        live = None
+        probs.append(f"the ESP now in lapis.bin is not a readable FAT32 ({e}): whether it holds another slot's "
+                     f"entries is unknown")
+    if live is not None and bslot:
+        other = sorted(n for n in live
+                       if (re.fullmatch(r"loader/entries/gb-([a-z])(?:-nvtest)?(?:\+\d+(?:-\d+)?)?\.conf", n, re.I) or
+                           re.fullmatch(r"initrd-([a-z])\.img", n, re.I)) and
+                       re.search(r"(?:gb|initrd)-([a-z])", n.rsplit("/", 1)[-1], re.I).group(1).lower() != bslot)
+        if other:
+            probs.append(f"the ESP now in lapis.bin holds another slot's files {other} (an update into that slot was "
+                         f"installed; an ESP of slot {bslot} would drop them)")
+    return bslot, want, probs
+
+
 def pre_restore_dir(dest):
     """(W7, safety audit W6-S2) A new DEST\\..\\pre-restore-<time>[-<n>] path (not created yet)."""
     base = os.path.join(os.path.dirname(os.path.abspath(dest)), "pre-restore-" + time.strftime("%Y%m%d-%H%M%S"))
@@ -487,7 +565,8 @@ def save_live(keep, lapis, size, es, ee, live_esp, dry_run=False):
     return keep
 
 
-def cmd_restore(dest, src, vmx, esp_only, with_gpt=False, pin_migration=False, dry_run=False, unreadable_ok=False):
+def cmd_restore(dest, src, vmx, esp_only, with_gpt=False, pin_migration=False, dry_run=False, unreadable_ok=False,
+                slot_ok=False):
     probs, _ = vm_guard(src, vmx)
     if probs:
         die("refused: " + "; ".join(probs))
@@ -519,6 +598,19 @@ def cmd_restore(dest, src, vmx, esp_only, with_gpt=False, pin_migration=False, d
                 f"undoes a reviewed migration, when the live ESP is unreadable, or when no PIN is set")
         print("PIN path: " + ("differences ALLOWED by --pin-migration" if pin else "the same as the ESP now in "
                               "lapis.bin"), flush=True)
+        bslot, want, sp = slot_problems(src, lapis, size, live_esp, data, man, with_gpt)     # (W8, W8-S1)
+        for p in sp:
+            print(f"slot: {p}", flush=True)
+        if sp and not slot_ok:
+            die(f"refused: the saved ESP does not boot the slot this disk wants, or that cannot be checked "
+                f"({len(sp)} line(s) above; safety audit W8-S1). These ESP backups are valid only while the VM boots "
+                f"their slot: after a Google update switched the VM to the other slot, rebuild the ESP from the host "
+                f"(build_esp.py with the preview procedure) instead of restoring an older one. Pass "
+                f"--accept-slot-mismatch only after reading the lines above")
+        print("slot: " + ("differences ALLOWED by --accept-slot-mismatch" if sp else
+                          f"the saved ESP boots slot {bslot}, the slot the "
+                          f"{'restored' if with_gpt else 'live'} GPT wants; the live ESP holds no other slot's files"),
+              flush=True)
         keep = save_live(pre_restore_dir(dest), lapis, size, es, ee, live_esp, dry_run)   # (W7, W6-S2) before any write
         if dry_run:
             print(f"dry run OK: would save the live ESP and GPT regions to {os.path.dirname(keep)}\\pre-restore-<time>, "
@@ -598,7 +690,7 @@ def main():
         cmd_compare(dest, src)
     else:
         eo, dry = "--esp-only" in a, "--dry-run" in a
-        for f in ("--with-gpt", "--pin-migration", "--dry-run", "--accept-unreadable-live-gpt"):
+        for f in ("--with-gpt", "--pin-migration", "--dry-run", "--accept-unreadable-live-gpt", "--accept-slot-mismatch"):
             if f in a and not eo:
                 die(f"{f} is used with --esp-only (a full restore rewrites the whole disk, GPT included)")
         if "--accept-unreadable-live-gpt" in a and "--with-gpt" not in a:
@@ -606,7 +698,7 @@ def main():
         if "--yes" not in a and not dry:
             die("restore overwrites the VM image: pass --yes (or --dry-run to only check)")
         cmd_restore(dest, src, vmx, eo, "--with-gpt" in a, "--pin-migration" in a, dry,
-                    "--accept-unreadable-live-gpt" in a)
+                    "--accept-unreadable-live-gpt" in a, "--accept-slot-mismatch" in a)
 
 
 if __name__ == "__main__":

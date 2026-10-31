@@ -20,30 +20,30 @@ options:
 Every destructive step asks you to type a confirmation, and the installer refuses disks it must not touch (see
 [The menu](#the-installer-menu)).
 
-**Current build** (2026-10-30, build `20261030-144912-e8da3fb7`): 7,472,463,872 bytes, SHA-256
-`e223fdc9d0a933347fe9c3b20d6eeca5875cccff8332db37e62365ba15ea7180`. It carries the Wave 7 USB image `7ac6ad52…`
-(settings that reach the signed-in user after any sign-in, a louder update notice from the third unvalidated boot,
-audit follow-ups; on top of Wave 6's notifications that reach the signed-in user, NVIDIA only on the 13.5" model,
-auto-rotate per posture and read-only VNNI libraries, and the Waves 4 and 5 software lock-screen Gatekeeper, VNNI
-`libz` patch, OTA gate and native-readiness fixes: README-FLASH.md, "What is new") and a fresh dual-boot export
-(new GUIDs; made with `build_internal.py` and then reused by `build_iso.py`, which ran all its
-export cross-checks and `verify_image.py` on it). Only its two ESP objects differ from the previous ISO
-`afb68d38…`; its 11 other payload objects are byte-identical, and the installer's files are unchanged since that build.
+**Current build** (2026-10-31, build `20261031-012525-c2e567c5`): 7,472,746,496 bytes, SHA-256
+`547b454e6dcf72bac62544daeaec55abf787f7b1ffc2821c50a1de509d9146ce`. It carries the Wave 8 USB image `35d6043d…`
+(kernel build #16 with the Realtek SD-card reader drivers and an escaped VNNI summary, the person's own Display size
+and launcher kept, updates into slot A that really start; on top of Wave 7's settings that reach the signed-in user
+after any sign-in and louder update notice, Wave 6's notifications that reach the signed-in user, NVIDIA only on the
+13.5" model, auto-rotate per posture and read-only VNNI libraries, and the Waves 4 and 5 software lock-screen
+Gatekeeper, VNNI `libz` patch, OTA gate and native-readiness fixes: README-FLASH.md, "What is new") and a fresh
+dual-boot export (new GUIDs; made with `build_internal.py` and then reused by `build_iso.py`,
+which ran all its export cross-checks and `verify_image.py` on it). Only its two ESP objects differ from the previous
+ISO `e223fdc9…`; its 11 other payload objects are byte-identical, and the installer's files are unchanged since
+`afb68d38…`.
 **Boot-menu edits** on an installed system (Wave 6 finding): the editor that **e** opens starts with the cursor at
 the start of the line; press **End** before typing an option (README-FLASH.md, "What is new").
 **Performance:** the system it installs started about 47 % faster in VMware with the VNNI patch (first boot until
-"boot completed" 587.7 s → 313.6 s, later boots 226.0 s → 118.0 s; README-FLASH.md). **Tests:** T0, T1a/T1b (option 1 wrote a disk byte-identical to the USB image `7ac6ad52…`), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 (the Windows scripts; `-UpdateEspOnly` now checks the lock-screen PIN path) passed on 2026-10-30 (11 test ids, 378 checks, 0 failed). The installer's own code is unchanged since `afb68d38…`, so the other test ids were not repeated. The previous ISO `afb68d38…` (Wave 6; kept in
-`D:\GB-iso\prev\iso-w6b-afb68d38\`) passed T0, T1a/T1b, T2b/T2c/T2h, the dual-boot groups G1-G4 (T3 with its
-refusal cases, T4, T4b, T9) and T8 on 2026-10-30 (15 test ids, 402 checks, 0 failed); the other 22 test ids of the
-full suite passed the same day on the Wave 6 ISO `ad67f040…` (before the notification fix, same installer; kept in
-`D:\GB-iso\prev\iso-w6a-ad67f040\`), which passed 27 tests of its full run with 0 failed checks. The ISO `8aa73f17…`
-(Waves 4 and 5) passed its test subset on 2026-10-30 (T0, T1a,
-T1b, T3 with T3-build and the refusal cases T3n(d-f), T4: 264 checks, 0 failed; option 1 wrote a disk
-byte-identical to its USB image `b2714a63…`; the dual-boot install left Windows' partitions and boot entries
-byte-identical, and the uninstall restored the GPT) and is kept in `D:\GB-iso\prev\iso-w5-8aa73f17\`. The Wave 3
-ISO `b1c355b0…` passed the full suite (all 38
-tests, `OVERALL PASS`); it is no longer kept. Everything was still tested only in VMware
-and on disk image files, never on the real laptop.
+"boot completed" 587.7 s → 313.6 s, later boots 226.0 s → 118.0 s; README-FLASH.md). **Tests:** this build passed T0, T1a/T1b (option 1 wrote a disk byte-identical to the USB image `35d6043d…`), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 (the Windows scripts; since Wave 8 the `-UpdateEspOnly` check reads either form of the boot menu's default line) on 2026-10-31 (11 test ids, 378 checks, 0 failed). The previous ISO `e223fdc9…` (Wave 7; kept in
+`D:\GB-iso\prev\iso-w7-e223fdc9\`) passed T0, T1a/T1b (option 1 wrote a disk byte-identical to the USB image
+`7ac6ad52…`), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 (the Windows scripts;
+`-UpdateEspOnly` checks the lock-screen PIN path) on 2026-10-30 (11 test ids, 378 checks, 0 failed). The ISO
+`afb68d38…` (Wave 6; kept in `D:\GB-iso\prev\iso-w6b-afb68d38\`) passed T0, T1a/T1b, T2b/T2c/T2h, the dual-boot
+groups G1-G4 and T8 on 2026-10-30 (15 test ids, 402 checks, 0 failed); the other 22 test ids of the full suite
+passed the same day on the Wave 6 ISO `ad67f040…` (before the notification fix, same installer; no longer kept).
+The ISOs `8aa73f17…` (Waves 4 and 5; its test subset, 264 checks, 0 failed) and `b1c355b0…` (Wave 3; the full
+suite, all 38 tests, `OVERALL PASS`) are no longer kept. Everything was still tested only in VMware and on disk
+image files, never on the real laptop.
 
 ---------------------------------------------------------------------------------------------------------------------
 
@@ -378,16 +378,19 @@ Do these in Windows, in this order:
 ## Boot entries and the NVIDIA payload
 
 Since Wave 2 (DESIGN 13), the Googlebook ESP of both options (the stick of option 1 and the dual-boot ESP of option 2)
-has two systemd-boot entries for the system slot (today B): the default `... (slot B)` and
+has two systemd-boot entries for the system slot (today B): the default `... (slot B)` (since Wave 8
+`loader\loader.conf` names it as `default gb-b.conf`) and
 `... (slot B) [NVIDIA test]`, which adds `gb.nouveau=test` (a test load of the NVIDIA driver; it is never the
 default, choose it in the menu only when you want that test). The ESP also holds `gb\dgpu-<kernel release>.erofs` and its `.sha256` (the NVIDIA firmware, the
 NVIDIA kernel modules and the Vulkan driver, about 60 MB): Googlebook copies and checks it before it ever loads the
 NVIDIA driver, so leave both files where they are. Every ISO built with a fresh export (Wave 2, and its review
 rebuild, DESIGN 13.4 and 13.8) carries **new** dual-boot GUIDs: it cannot remove a dual-boot install made with an
 earlier ISO; remove such an install with that earlier ISO's option 3 or with `uninstall_dualboot.ps1 -Force`. The
-earlier ISOs are kept in `D:\GB-iso\prev\iso-w5-8aa73f17\` (`8aa73f17…`, Waves 4 and 5), `D:\GB-iso\prev\` (`1718bcc1…`,
-before Wave 2) and `C:\GB-x86\out\prev\iso-w2fix-e0067b12\` (`e0067b12…`, the Wave 2 review ISO; moved to C: for disk
-space). The Wave 2 ISO `76fbb7ee…` and the Wave 3 ISO `b1c355b0…` are no longer kept. Since Waves 4 and 5 the ESP also carries the software
+earlier ISOs are kept in `D:\GB-iso\prev\iso-w7-e223fdc9\` (`e223fdc9…`, Wave 7),
+`D:\GB-iso\prev\iso-w6b-afb68d38\` (`afb68d38…`, Wave 6), `D:\GB-iso\prev\` (`1718bcc1…`, before Wave 2) and
+`C:\GB-x86\out\prev\iso-w2fix-e0067b12\` (`e0067b12…`, the Wave 2 review ISO; moved to C: for disk space). The
+Wave 2 ISO `76fbb7ee…`, the Wave 3 ISO `b1c355b0…`, `8aa73f17…` (Waves 4 and 5) and `ad67f040…` (Wave 6 before the
+notification fix) are no longer kept. Since Waves 4 and 5 the ESP also carries the software
 Gatekeeper (lock-screen PIN): if a PIN is set on an install, clear it before an ESP update from an older ISO puts a
 tree without it on that install (README-FLASH.md, "What is new").
 
@@ -497,6 +500,12 @@ python -I C:\GB-x86\iso\build\build_iso.py               # full build
   the identical kept ISO), six chunk files of the old cache were moved to the builder's `/build/w7build/`, and the old
   cache directory was renamed to the new image's key. `build_iso.py` then reused the 30 chunks whose raw sha256
   matched its fresh scan (and whose compressed files matched the cache record) and recompressed 6.
+  The 2026-10-31 (Wave 8) build did the same: the builder's `last/` copy went to
+  `D:\GB-iso\prev\iso-w7-e223fdc9\builder-last\` (an NTFS hard link to the identical kept ISO), seven chunk files of
+  the old cache and the older chunks parked on the builder were moved to the PC (`D:\gb-w8build\builder-moved\`,
+  sha256 checked on both ends), the old cache directory was renamed to the new key, and `build_iso.py` reused 29
+  chunks and recompressed 7. Its dual-boot export was made on D: and only its `manifest.json` and
+  `EFI-SYSTEM.img` were copied into a new `work\export\`, as described above.
 * `--test-tiny-payload` is a pipeline test only. It writes `D:\GB-iso\pipeline-test\` and its ISO cannot install
   Googlebook.
 

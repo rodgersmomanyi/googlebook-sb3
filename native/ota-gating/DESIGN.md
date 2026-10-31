@@ -535,7 +535,15 @@ The 10-26 run of the earlier patch without test updates showed these checks fail
   the tries left (only `preferred` is matched with them), so a switch must write `preferred gb-<new>.conf` and keep
   `default gb-<old>.conf`, bless the entry at `boot_completed`, and HOLD a slot whose entry used up its tries; it needs
   a throwaway two-slot boot campaign. A build that fails
-  to boot three times would fall back to the previous slot's entry by itself. This is a C change.
+  to boot three times would fall back to the previous slot's entry by itself. This is a C change. Wave 8 measured the
+  loader half on a throwaway VMware VM: systemd-boot 262.1 renames `gb-a+3.conf` down to `gb-a+0-3.conf` and then
+  starts the `default`, but only when both patterns carry `.conf`; today's `default gb-<x>` matches no entry (the
+  loader then starts `gb-b.conf` whenever it exists), so the `.conf` form is needed first (BACKLOG SLOT-DEFAULT).
+  Wave 8 status: SLOT-DEFAULT is fixed (images, `gb_slotsync` and the checks write `default gb-<x>.conf`; a switch
+  into slot A was started on a throwaway VM), so this prerequisite is met; the counting and blessing are still not
+  built. The wave 8 safety audit adds one rule for them (W8-S3): fall back automatically only for a slot that never
+  reached `boot_completed`, because after a sign-in on the new build the older slot is a downgrade over `/data`
+  (and, after the merge, does not start at all).
 * **F6 (no action).** The native ESP bring-up cannot set the gate property: its `GB_PROP` deny list refuses
   `ro.vendor.gb.*`.
 * **F7 Harness.** If the gate is added to `tests\w3a\bringup\test_bringup.sh`, its `boot()` sed list must also rewrite

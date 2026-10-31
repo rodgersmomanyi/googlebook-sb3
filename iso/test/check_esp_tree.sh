@@ -61,9 +61,10 @@ ro_mount "$REF" "$T/mnt/esp_ref"
 N=$T/mnt/esp_new; R=$T/mnt/esp_ref
 
 # Wave 2 (DESIGN 13.5): the [NVIDIA test] entry and the dGPU payload on the installed ESP; X = the reference ESP's
-# default slot. The nvtest entry is never the default and carries gb.nouveau=test; no entry has the retired gfxtest
+# default slot ('default gb-X.conf' since wave 8, SLOT-DEFAULT; 'default gb-X' before). The nvtest entry is never the
+# default and carries gb.nouveau=test; no entry has the retired gfxtest
 # form or gb.gfxdriver=; exactly one gb/dgpu-*.erofs with its .sha256 line (sha256sum format, names the image).
-X=$(sed -n 's/^default gb-\([a-z]\)[[:space:]]*$/\1/p' "$R/loader/loader.conf" | head -n 1)
+X=$(sed -n 's/^default gb-\([a-z]\)\(\.conf\)\{0,1\}[[:space:]]*$/\1/p' "$R/loader/loader.conf" | head -n 1)
 [ -n "$X" ]; check $? "the reference loader.conf names the default slot (gb-${X:-?})"
 E=$N/loader/entries
 X=${X:-none}

@@ -143,14 +143,18 @@ Step "W3 (2) restore vendor_boot_$sl" {
     $fs = [IO.File]::Open($Image, 'Open', 'ReadWrite'); $fs.Position = [int64]$vb.offset + 4096; $b1 = $fs.ReadByte()
     $fs.Position = [int64]$vb.offset + 4096; $fs.WriteByte(($b1 -bxor 0x5A)); $fs.Close(); $global:LASTEXITCODE = 0 } | Out-Null
 
-Step "W3 (4c) loader.conf default -> gb-$ot on the installed ESP" { & $py -I -B $fa $Image replace "default gb-$sl\ntimeout" "default gb-$ot\ntimeout" } | Out-Null
+# (wave 8 final step) an export written since wave 8 says 'default gb-<slot>.conf'; one written before (the 2026-10-24
+# fixture D:\gb-test\export_small the ISO harness's T8 uses) says 'default gb-<slot>', and -UpdateEspOnly accepts both:
+# edit whichever form the installed ESP (a copy of the export's) has
+$cf = if ([string](& $py -I -B $fa $Image count "default gb-$sl.conf\ntimeout") -eq '1') { '.conf' } else { '' }
+Step "W3 (4c) loader.conf default -> gb-$ot$cf on the installed ESP" { & $py -I -B $fa $Image replace "default gb-$sl$cf\ntimeout" "default gb-$ot$cf\ntimeout" } | Out-Null
 Snap
 Step "W3 (4c) -UpdateEspOnly -Apply refused: the installed loader.conf default is not gb-$sl" { Exit2 { PS1 'install_dualboot.ps1' ($upd + '-Apply') } } | Out-Null
 $gbb = "$Image.gbbackup"
 Step '  the refusal came after the read-only backup (raw ESP saved, nothing written to the image)' {
     $r = @(Get-ChildItem -Recurse -Filter 'esp-before-*.img' $gbb); if ($r.Count -ge 1) { "$($r.Count) raw backup(s)"; $global:LASTEXITCODE = 0 } else { 'no raw backup'; $global:LASTEXITCODE = 1 } } | Out-Null
 SameAsSnap 'loader.conf mismatch refused'
-Step "W3 (4c) restore loader.conf default gb-$sl" { & $py -I -B $fa $Image replace "default gb-$ot\ntimeout" "default gb-$sl\ntimeout" } | Out-Null
+Step "W3 (4c) restore loader.conf default gb-$sl$cf" { & $py -I -B $fa $Image replace "default gb-$ot$cf\ntimeout" "default gb-$sl$cf\ntimeout" } | Out-Null
 
 $w3 = Join-Path (Split-Path $Image) 'w3_esp_files'
 if (Test-Path $w3) { Remove-Item -Recurse -Force $w3 }

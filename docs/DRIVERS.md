@@ -5,8 +5,11 @@ our GKI build, *lapis* = lapis's vendor_ramdisk / vendor_dlkm), **firmware**, an
 our component). Module load order: `stage_kernel.py` (`VM_MODS`, `NATIVE_EARLY`, `NATIVE_LATE`; `NATIVE_OPTIN` is
 staged in the dGPU payload and loaded only by the nouveau policy); kernel config: [kernel/config/gki_defconfig.diff](../kernel/config/gki_defconfig.diff)
 plus the component config lines that `kernel/scripts/kbuild13_native.sh` adds (build #13). Native images run build
-#15 (`kernel/scripts/kbuild15_native.sh`: build #14, which is build #13 plus nouveau-only patches, plus the reworked
-AVX-VNNI emulator and the opt-in i915 gamma switch; same config and KMI as #13, [kernel/K15.md](../kernel/K15.md)). The full
+#16 since wave 8 (`kernel/scripts/kbuild16_native.sh`: build #15 plus the escaped task name in the VNNI counter and
+the Realtek SD-card reader modules, which load only by modalias; the same KMI symbol list,
+[kernel/K16.md](../kernel/K16.md)). Build #15 (`kernel/scripts/kbuild15_native.sh`) is build #14, which is build #13
+plus nouveau-only patches, plus the reworked AVX-VNNI emulator and the opt-in i915 gamma switch; same config and KMI as
+#13 ([kernel/K15.md](../kernel/K15.md)). The full
 device-by-device audit, with ACPI evidence and a first-boot checklist: [DEVICE-STATUS.md](DEVICE-STATUS.md). The
 NVIDIA stack in detail: [NVIDIA.md](NVIDIA.md).
 

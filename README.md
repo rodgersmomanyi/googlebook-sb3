@@ -16,9 +16,10 @@ them. You have to get the lapis image yourself (see [Requirements](#requirements
 
 Build tested: lapis **CL3B.260622.271.R1** (installed from the recovery image) updated in the VM by OTA to
 **CL3B.260622.276.R4**; our GKI kernel **android17-6.18 (6.18.21)**, built with Kleaf. The current kernel is
-**build #15** (wave 3, 2026-10-26) for both the VM and the native tree: build #13 plus the nouveau backports and
-hardening of build #14, the reworked `#UD` AVX-VNNI emulator and an opt-in i915 gamma switch, with the same config and
-KMI as #13 ([kernel/K15.md](kernel/K15.md)). Build #15 was boot-tested in throwaway VMware VMs: the VM tree, where
+**build #16** (wave 8, 2026-10-31) for both the VM and the native tree: build #15 (build #13 plus the nouveau
+backports and hardening of build #14, the reworked `#UD` AVX-VNNI emulator and an opt-in i915 gamma switch) plus an
+escaped task name in the emulator's counter and the Realtek SD-card reader drivers, with the same KMI symbol list
+([kernel/K16.md](kernel/K16.md), [kernel/K15.md](kernel/K15.md)). Build #15 was boot-tested in throwaway VMware VMs: the VM tree, where
 its emulator passed a known-answer test of 9,235 cases, and the native tree. The long-running VM was upgraded to
 build #15 in wave 4 (2026-10-26), together with zram, fs-verity for /data and the software Gatekeeper (lock-screen
 PIN), after a full backup and a rehearsal on a throwaway VM
@@ -42,7 +43,14 @@ system user mode again), a louder update notice from the third unvalidated boot,
 future build would silently refuse, and the wave 6 audit follow-ups, among them a PIN-path check for dual-boot ESP
 updates. The native outputs were rebuilt and tested in VMware again (a rehearsal of the VM build, VM-1, and on
 the ISO T0, T1a/T1b, T3-T4b, T8 and T9: 378 checks, 0 failed), and the long-running VM got the wave 7 boot
-partition after a verified backup of it ([CHANGELOG.md](CHANGELOG.md)). Nothing has run on the laptop yet.
+partition after a verified backup of it. Wave 8 (2026-10-31) moved both trees to kernel build #16 (a program's name
+can no longer add lines to the boot-log counter, and the base's SD-card reader works whichever Realtek type it
+is), made the boot loader really start an update in slot A (the `loader.conf` default now names the entry file,
+`gb-<x>.conf`; before, slot B always started), keeps your own Display size, launcher and one-time settings, and
+closed the last hardware-independent audit items. The native outputs were rebuilt and tested in VMware again (a
+rehearsal of the VM build with the emulator's known-answer test on build #16, VM-1, and on the ISO T0, T1a/T1b,
+T3-T4b, T8 and T9: 378 checks, 0 failed), and the long-running VM got the wave 8 boot partition, kernel build #16
+included, after a verified backup of it ([CHANGELOG.md](CHANGELOG.md)). Nothing has run on the laptop yet.
 
 | Area | VMware VM | Native Surface Book 3 |
 |---|---|---|
@@ -62,9 +70,9 @@ partition after a verified backup of it ([CHANGELOG.md](CHANGELOG.md)). Nothing 
 | Cameras (IPU4P, 8086:8A19) | n/a | untested: our IPU4P port of the Linux ipu6 driver + OV5693 (front), OV8865 + DW9719 (rear), and libcamera's simple pipeline with the software ISP as the Android camera HAL (tested against vimc only; since wave 5 its libraries load under lapis's linker, which refused the earlier builds). Needs Intel's IPU4P firmware from your own Windows driver package ([INPUTS.md](docs/INPUTS.md#firmware-native-only)) |
 | Power / volume buttons, lid | VMware power button = clean shutdown | untested: `soc_button_array` (`MSHW0040:00`, rebound by `gb_hw.sh buttons` once lapis's `pinctrl-icelake` drives `INT3455:00`), lid wake via `surface_gpe` |
 | Platform profile, CPU power limits | n/a | untested: `surface_platform_profile`, set by `gb_power` (`persist.vendor.gb.perf_profile`); `gb_hw.sh` restores the Surface firmware's PL1/PL2 |
-| OTA system updates | **works** (one update so far, .271 -> .276): the A/B update installs and the VM boots the new slot; `gb_slotsync` switches the boot entry (see [OTA.md](docs/OTA.md) for what was observed). Since wave 3 it first compares the new slot's kernel interface (KMI) with our kernel's and holds the switch if they differ ([OTA.md](docs/OTA.md#kernel-check-before-the-switch)) | same mechanism, plus the notification "System update held" when it holds; untested on hardware |
+| OTA system updates | **works** (one update so far, .271 -> .276): the A/B update installs and the VM boots the new slot; `gb_slotsync` switches the boot entry (see [OTA.md](docs/OTA.md) for what was observed). Since wave 8 the `loader.conf` default names the entry file (`gb-<x>.conf`), so an update into slot A is really started (before, systemd-boot matched no entry and always started slot B; a switch to slot A was tested on a throwaway VM). Since wave 3 it first compares the new slot's kernel interface (KMI) with our kernel's and holds the switch if they differ ([OTA.md](docs/OTA.md#kernel-check-before-the-switch)) | same mechanism, plus the notification "System update held" when it holds; untested on hardware |
 | Unvalidated updates (OTA gate, wave 5) | **tested in throwaway VMs**: the image records the build it was made for; after an update to another build `gbinit` skips the build-specific libz patch and the notification "System update not validated" appears (from wave 6 for the signed-in user; a forced test boot in VMware showed it in user 10's panel; from wave 7 it says "System update still not validated" from the third boot of the same build). Tokens `gb.otagate=0` / `gb.otagate=force` ([OTA.md](docs/OTA.md#the-ota-gate-wave-5)) | same in the native tree; untested on hardware |
-| AVX-VNNI (Ice Lake lacks it; parts of lapis use it) | **works**: our kernel emulates the VEX instructions on `#UD`. Build #15's reworked emulator passed a known-answer test of 9,235 cases in a throwaway VM; counter `/sys/kernel/gb_vnni/summary` | same kernel; the boot-log summary shows the counter; untested on hardware |
+| AVX-VNNI (Ice Lake lacks it; parts of lapis use it) | **works**: our kernel emulates the VEX instructions on `#UD`. Build #15's reworked emulator passed a known-answer test of 9,235 cases in a throwaway VM, build #16 again (wave 8); counter `/sys/kernel/gb_vnni/summary` (since build #16 it prints task names escaped, so a program cannot add lines to it) | same kernel; the boot-log summary shows the counter; untested on hardware |
 | Performance: AVX-VNNI emulation load | wave 5: nearly all of the ~2.5×10⁸ emulations of a VM boot came from zlib's `adler32` in `libz.so`. Both `libz.so` (system, vendor) are bound at boot with a copy that takes zlib's scalar path (a 2-byte edit, made by `vnni_prepare.py` from your own image, sha256-pinned), only on the exact lapis build it was made for; kill switch `gb.vnni=0`. **Measured** in throwaway VMs: boot to `sys.boot_completed` 587.7 s -> 313.6 s (-46.6 %), warm boot 226.0 s -> 118.0 s, emulations at boot 211,368,597 -> 756 ([PERFORMANCE.md](docs/PERFORMANCE.md)) | same binds in the native tree (its measured load is mostly BoringSSL ML-KEM, which this does not change); untested on hardware |
 | Boot logs and triage | serial console log (`serial0.log`) and `gbsh.py` | `gblog\` on the stick's boot partition at 40 s to 15 min, even with a black screen; each file starts with a one-screen `== summary`. Symptom table and issue template: [FLASHING.md](docs/FLASHING.md#7-troubleshooting-symptom-log-line-boot-option) |
 | Hardware bring-up without a rebuild | n/a | opt-in `gb\gb.cfg` on the boot partition, read only on a boot with `gb.overlay=1`: module options, Android properties, input/audio config files, each checked against an allow-list (tested in VMware): [NATIVE.md](docs/NATIVE.md#bring-up-configuration-on-the-esp-gbgbcfg) |
@@ -147,7 +155,8 @@ vm/                  VMware .vmx template, lapis.vmdk descriptor generator
 inject/              our text configs for the overlay tree (fstab, VINTF manifest, sepolicy CIL, audio, ADB, native manifests)
 guest/               guest daemons in C (gb_vmtools, gb_absmouse, gb_layout, gb_slotsync, vkenum) + NDK build script
 host/                Windows helpers (gb_hostbatt battery bridge, scrcpy launcher)
-kernel/              kernel patches (incl. patches/k14: nouveau backports, patches/k15: build #15), config deltas, Kleaf
+kernel/              kernel patches (incl. patches/k14: nouveau backports, patches/k15: build #15, patches/k16:
+                     build #16), config deltas (config/k16_card_readers.fragment: k15 -> k16), Kleaf
                      build scripts, pinned manifest, tools/ (the AVX-VNNI emulator's known-answer test, sources only)
 graphics/            Mesa svga build + patches, SwiftShader build notes, minigbm patcher, EGL/AHB probes
 native/              Surface Book 3 components: audio, iptsd, power, sensors, hw-gap-audit, dualboot, camera-*, the
@@ -174,6 +183,7 @@ docs/                architecture, VMware, native, flashing, device status, NVID
 | `GB_BUILDER`, `GB_BUILDER_KEY` | `builder@192.168.115.132`, `C:\GB-build\builder_key` | `stage_kernel.py`, `vnni_prepare.py`, `linkref_prepare.py` (ssh to the builder) |
 | `GB_PIPE` | `\\.\pipe\lapis_con` | `gbsh.py` (the VM's serial console pipe) |
 | `GB_WRITE_LAPIS` | unset | `build_esp.py`: running it writes the ESP into `lapis.bin` only with `GB_WRITE_LAPIS=1`, and never while VMware has the VM open (`build_usb.py` does not need it) |
+| `GB_EXPECT_ESP_SHA256` | unset | (wave 8) `build_esp.py`'s `lapis.bin` write also needs this: the sha256 of the reviewed preview ESP; any other ESP is refused before `lapis.bin` is opened for writing |
 | `GB_SLOT` | read from lapis.bin's GPT | `build_esp.py`: force slot a/b |
 | `GB_NATIVE_TEST` | unset | `build_esp.py`: `1` writes a one-off VM ESP that boots the native tree (module/service test in VMware, [NATIVE.md](docs/NATIVE.md)) |
 | `GB_NO_BUILDER` | unset | `build_esp.py` / `build_usb.py`: `1` forbids builder calls (the dGPU payload must then come from `cache\dgpu\`) |

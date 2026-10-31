@@ -1375,8 +1375,9 @@ the whitelists of 12.1 are unchanged):
   `-u|--user` but not `bigtext`, or an unknown style: `-u all` without `-S bigtext`; a usage without `-u|--user` (a
   build that dropped the option): without `-u` (the shell's own user 0, i.e. the login screen only; logged); `Bad user`:
   one `-u <id>` post per running full user (as for `kind=broadcast`, at most 8); anything else: logged with the reason
-  (at most 120 printable characters). At most 1 + 8 posts per notice. gb_otagate_post (build_esp) does not have this
-  fallback yet (its post is unchanged).
+  (at most 120 printable characters). At most 1 + 8 posts per notice. **(Wave 8, lows-a: BACKLOG HS-O5-otagate)**
+  gb_otagate_post (build_esp `GB_OTAGATE_SH`, the VM tree and native without the queue) judges its post the same
+  way and has the same fallbacks (its log lines go to kmsg or, as the shell user, to logcat `gb_otagate`).
 * `kind=broadcast`: `pm list users` (timeout 20); for each line `UserInfo{<id>:<name>:<hex flags>} running` whose
   flags have FULL (0x400) -- never the headless system user (811), never a profile -- one
   `timeout 20 am broadcast --user <id> --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED -p gb.sb3.gpu`

@@ -161,6 +161,10 @@ it by hand), so every reader would need a mount and the SELinux debugfs access. 
   its init state; `zmmhi` = emulations that zeroed a ZMM_Hi256 slot. Then up to 16 lines
   `comm=<comm> rip=<hex> count=<N>` from a fixed 16-entry LRU (newest wins). The text is built on read, under the
   spinlock, into the sysfs page (< 2 KiB).
+  (k16, backlog LOW-3, kernel patch 0112) `<comm>` is escaped in the summary and in the kmsg line below: printable
+  ASCII and the blank pass unchanged except `\` and `=`, every other byte is `\xHH` (lower-case hex), so a task name
+  can never add a line or a field. A name without such bytes prints exactly as on k15. Worst case (16 buckets of 15
+  escaped bytes): about 2.1 KiB, still inside the sysfs page.
 * **`/sys/kernel/gb_vnni/reset`** (0200): writing `1` clears everything.
 * Rate limit: when a new comm/RIP bucket is inserted, one `printk_ratelimited(KERN_INFO "gb_vnni: emulating
   VEX AVX-VNNI for comm=%s\n")` (no RIP in kmsg). The hot path only bumps counters under the spinlock, outside the

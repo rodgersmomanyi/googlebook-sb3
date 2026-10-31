@@ -26,6 +26,10 @@
 #       the default; not in --dry-run); a HOLD still in effect is logged again
 #   S11 (Wave 3 item 7) the wanted_slot truth table (block wanted_slot-vectors below; install_dualboot.ps1's
 #       Get-GbWantedSlot runs the same block, dualboot test\test_wanted_slot.ps1)
+#   S13 (Wave 8, SLOT-DEFAULT) systemd-boot 262.1 matches "default" against the entry id incl. ".conf": the matcher
+#       (--test-loader-default, both modes), every write is "default gb-<x>.conf", an old "default gb-<x>" line is
+#       rewritten once to the running slot (the user VM's slot-b ESP, a switch, a HOLD), a "preferred" line is
+#       removed, the [NVIDIA test] entry is never the default, --dry-run writes nothing
 set -u
 S=$(cd "$1" && pwd); W=$2
 NDK_CC=/build/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang
@@ -52,7 +56,7 @@ OPTS='androidboot.boot_part_uuid=11111111-2222-4333-8444-555555555555 console=tt
 TITLE='Googlebook OS - USB image (Surface Book 3)'
 mkesp() {   # mkesp DIR [nvtest]
   rm -rf "$1"; mkdir -p "$1/loader/entries" "$1/gb"
-  printf 'default gb-a\ntimeout 4\nconsole-mode max\neditor yes\n' > "$1/loader/loader.conf"
+  printf 'default gb-a.conf\ntimeout 4\nconsole-mode max\neditor yes\n' > "$1/loader/loader.conf"
   printf 'title   %s (slot A)\nlinux   /vmlinuz\ninitrd  /initrd-a.img\noptions %s\n' "$TITLE" "$OPTS" \
     > "$1/loader/entries/gb-a.conf"
   [ "${2:-}" = nvtest ] && printf 'title   %s (slot A) [NVIDIA test]\nlinux   /vmlinuz\ninitrd  /initrd-a.img\noptions %s gb.nouveau=test\n' \
@@ -71,7 +75,7 @@ expect_b "$E/loader/entries/gb-a.conf" | cmp -s - "$E/loader/entries/gb-b.conf";
 expect_b "$E/loader/entries/gb-a-nvtest.conf" | cmp -s - "$E/loader/entries/gb-b-nvtest.conf"
 ok $? "S1 gb-b-nvtest.conf == gb-a-nvtest.conf except (slot B) and initrd-b"
 grep -q '^title   .*(slot B) \[NVIDIA test\]$' "$E/loader/entries/gb-b-nvtest.conf"; ok $? "S1 the nvtest title keeps its suffix"
-printf 'default gb-b\ntimeout 4\nconsole-mode max\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; ok $? "S1 loader.conf default -> gb-b, rest unchanged"
+printf 'default gb-b.conf\ntimeout 4\nconsole-mode max\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; ok $? "S1 loader.conf default -> gb-b.conf, rest unchanged"
 [ "$(cd "$E/loader/entries" && ls)" = "$(printf 'gb-a-nvtest.conf\ngb-a.conf\ngb-b-nvtest.conf\ngb-b.conf')" ]
 ok $? "S1 entries are exactly gb-{a,b}{,-nvtest}.conf (no -gfxtest, no .tmp left)"
 clean "$W/s1/err"; ok $? "S1 no sanitizer report"
@@ -266,8 +270,12 @@ ok $? "S8b L1 put-back retried at 50 ms: a newcomer in the way for 60 tries (3 s
 kill "$HP" 2> /dev/null; wait "$HP" 2> /dev/null
 rm -rf "$LK" "$LK".stale.*
 
-# ---- S9: loader.conf default as a whole line (Wave 2b: safety finding 5), select_entry b a
-for v in nvtest:'default gb-b-nvtest' hash:'#default gb-b' crlf:'default gb-b\r' last:'default gb-b\ndefault gb-a' ok:'default gb-b'; do
+# ---- S9: loader.conf default as a whole line (Wave 2b: safety finding 5), select_entry b a; (wave 8, SLOT-DEFAULT)
+#      the line names the entry id with ".conf"; the old form, a glob, the nvtest id and "preferred" are rewritten
+for v in nvtest:'default gb-b-nvtest' nvconf:'default gb-b-nvtest.conf' hash:'#default gb-b.conf' \
+         crlf:'default gb-b.conf\r' last:'default gb-b.conf\ndefault gb-a.conf' ok:'default gb-b.conf' \
+         old:'default gb-b' oldcr:'default gb-b\r' glob:'default gb-b*' upper:'default GB-B.CONF' \
+         lead:'  default gb-b.conf' pref:'default gb-b.conf\npreferred gb-a.conf' preflead:'\tpreferred gb-b.conf'; do
   k=${v%%:*}; line=${v#*:}
   E=$W/s9-$k/esp; mkesp "$E" nvtest
   printf "$line"'\ntimeout 4\neditor yes\n' > "$E/loader/loader.conf"
@@ -275,13 +283,16 @@ for v in nvtest:'default gb-b-nvtest' hash:'#default gb-b' crlf:'default gb-b\r'
   GB_SLOTSYNC_MNT=$E "$T" --test-copy-entry b a > "$W/s9-$k/out" 2> "$W/s9-$k/err"; rc=$?
   after=$(sha256sum < "$E/loader/loader.conf")
   case $k in
-    nvtest) printf 'default gb-b\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
-    hash) printf '#default gb-b\ntimeout 4\neditor yes\ndefault gb-b\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
-    crlf|ok) [ "$before" = "$after" ]; r=$? ;;
-    last) printf 'default gb-b\ndefault gb-b\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    nvtest|nvconf|old|glob|upper|pref) printf 'default gb-b.conf\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    hash) printf '#default gb-b.conf\ntimeout 4\neditor yes\ndefault gb-b.conf\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    preflead) printf 'timeout 4\neditor yes\ndefault gb-b.conf\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    crlf|ok|lead) [ "$before" = "$after" ]; r=$? ;;
+    last) printf 'default gb-b.conf\ndefault gb-b.conf\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    oldcr) printf 'default gb-b.conf\r\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
   esac
+  case $k in pref|preflead) grep -q "systemd-boot default -> gb-b.conf ('preferred' line removed)" "$W/s9-$k/out" || r=1 ;; esac
   [ $rc = 0 ] && [ $r = 0 ] && clean "$W/s9-$k/err"
-  ok $? "S9 loader.conf '$line' -> $(tr '\r\n' '^|' < "$E/loader/loader.conf")"
+  ok $? "S9 loader.conf '$line' -> $(tr '\r\n\t' '^|>' < "$E/loader/loader.conf")"
 done
 cat "$L5"/*.err 2> /dev/null > "$L5/all.err"; clean "$L5/all.err"; ok $? "S5 no sanitizer report"
 
@@ -340,7 +351,7 @@ s10() {   # s10 TAG BOOT_B [extra env assignments...]: fresh fake device, 3 tick
 lc() { grep -c -F -- "$2" "$W/s10-$1/out"; }
 same() { grep -q -F " ./$2" "$W/s10-$1/before" &&
          [ "$(grep -F " ./$2" "$W/s10-$1/before")" = "$(grep -F " ./$2" "$W/s10-$1/after")" ]; }
-default_is() { grep -q -x "default gb-$2" "$W/s10-$1/esp/loader/loader.conf"; }
+default_is() { grep -q -x "default gb-$2.conf" "$W/s10-$1/esp/loader/loader.conf"; }
 bcfg() { same "$1" gb/gb.cfg && same "$1" gb/overlay/usr/idc/x.idc; }
 nnote() { find "$W/s10-$1/notify" -type f | wc -l; }
 
@@ -348,7 +359,7 @@ s10 same "$REL_A"
 [ "$(cat "$W/s10-same/rc")" = 0 ] && default_is same b && [ -f "$W/s10-same/esp/initrd-b.img" ] &&
   [ -f "$W/s10-same/esp/loader/entries/gb-b.conf" ] && [ "$(lc same 'kernel check passed (GKI unchanged')" = 1 ] &&
   [ "$(lc same 'HOLD slot')" = 0 ] && [ "$(nnote same)" = 0 ] && bcfg same && clean "$W/s10-same/err"
-ok $? "S10 same release in boot_b: switched (default gb-b, initrd-b + gb-b.conf), logged once, no notification, gb.cfg/overlay untouched"
+ok $? "S10 same release in boot_b: switched (default gb-b.conf, initrd-b + gb-b.conf), logged once, no notification, gb.cfg/overlay untouched"
 
 s10 gki "6.18.30-android17-5-g0123456789ab-ab16302999"
 [ "$(cat "$W/s10-gki/rc")" = 0 ] && default_is gki b && [ "$(lc gki "GKI changed $REL_A -> 6.18.30-android17-5-g0123456789ab-ab16302999 (same KMI 6.18-android17-5")" = 1 ] &&
@@ -465,7 +476,7 @@ s12run old t1 test-boot-id "$WANT_B" --test-ticks 1
 [ "$(cat "$X/t1.rc")" = 1 ] && [ ! -e "$E/loader/entries/gb-b.conf" ] && [ ! -e "$E/loader/entries/gb-b-nvtest.conf" ] &&
   [ ! -e "$E/gb/slot_b.stamp" ] && [ "$(c12 old t1 'slot b: removed its older boot entries before rebuilding initrd-b.img')" = 1 ] &&
   [ "$(c12 old t1 'writing initrd-b.img failed')" = 1 ] && [ "$(n12 old)" = 0 ] && [ ! -e "$E/initrd-b.img.tmp" ] &&
-  grep -q -x 'default gb-a' "$E/loader/loader.conf" && clean "$X/t1.err"
+  grep -q -x 'default gb-a.conf' "$E/loader/loader.conf" && clean "$X/t1.err"
 ok $? "S12 rebuild of slot b fails after an older gb-b(-nvtest).conf existed: old entries + stamp removed first, no .tmp left, no notification"
 rm -rf "$E/initrd-b.img"
 s12run old t2 test-boot-id "$WANT_B" --test-ticks 1
@@ -477,7 +488,7 @@ ok $? "S12 the retry builds initrd-b, writes gb-b.conf again from the template a
 s12dev held "$KMI_B"; s12run held t0 test-boot-id "$WANT_B" --test-ticks 1
 H=$W/s12-held; [ -f "$H/esp/loader/entries/gb-b.conf" ] && [ -f "$H/esp/gb/slot_b.stamp" ] && [ "$(cat "$H/t0.rc")" = 0 ]
 ok $? "S12 fixture: slot b held with its initrd, entries and stamp"
-for t in keep stale dead dry dflt; do rm -rf "$W/s12-$t"; cp -a "$H" "$W/s12-$t"; done
+for t in keep stale dead dry dflt dflt2; do rm -rf "$W/s12-$t"; cp -a "$H" "$W/s12-$t"; done
 s12run keep t1 next-boot "$WANT_B" --test-ticks 3
 [ "$(cat "$W/s12-keep/t1.rc")" = 0 ] && [ "$(tree12 held)" = "$(tree12 keep)" ] &&
   [ "$(c12 keep t1 'gb_slotsync: HOLD slot b: KMI 6.18-android17-6 != running 6.18-android17-5; default stays gb-a')" = 1 ] &&
@@ -489,7 +500,7 @@ E=$W/s12-stale/esp
 [ "$(cat "$W/s12-stale/t1.rc")" = 0 ] && [ ! -e "$E/loader/entries/gb-b.conf" ] && [ ! -e "$E/loader/entries/gb-b-nvtest.conf" ] &&
   [ ! -e "$E/gb/slot_b.stamp" ] && [ -f "$E/loader/entries/gb-a.conf" ] && [ -f "$E/loader/entries/gb-a-nvtest.conf" ] &&
   [ "$(c12 stale t1 'slot b: removed its boot entries (2): its initrd does not match')" = 1 ] &&
-  [ "$(c12 stale t1 'HOLD slot')" = 0 ] && grep -q -x 'default gb-a' "$E/loader/loader.conf" &&
+  [ "$(c12 stale t1 'HOLD slot')" = 0 ] && grep -q -x 'default gb-a.conf' "$E/loader/loader.conf" &&
   cmp -s "$E/gb/gb.cfg" "$H/esp/gb/gb.cfg" && clean "$W/s12-stale/t1.err"
 ok $? "S12 later boot, slot b's init_boot changed after its initrd was built: gb-b(-nvtest).conf + stamp removed once, slot a and gb.cfg untouched"
 s12run dead t1 next-boot "$B_DEAD" --test-ticks 1
@@ -501,13 +512,16 @@ flip_ib "$W/s12-dry/bn/init_boot_b"
 before=$(tree12 dry); s12run dry t1 next-boot "$WANT_B" --dry-run; after=$(tree12 dry)
 [ "$before" = "$after" ] && [ "$(c12 dry t1 'dry-run: would remove the boot entries of slot b')" = 1 ]
 ok $? "S12 --dry-run with stale slot-b entries: nothing removed, the removal is reported"
-flip_ib "$W/s12-dflt/bn/init_boot_b"
-printf 'default gb-b\ntimeout 4\n' > "$W/s12-dflt/esp/loader/loader.conf"
-s12run dflt t1 next-boot "$WANT_B" --test-ticks 1
-E=$W/s12-dflt/esp
-[ ! -e "$E/loader/entries/gb-b.conf" ] && grep -q -x 'default gb-a' "$E/loader/loader.conf" &&
-  awk '/systemd-boot default -> gb-a/{d=NR} /slot b: removed its boot entries/{r=NR} END {exit !(d && r && d < r)}' "$W/s12-dflt/t1"
-ok $? "S12 stale slot-b entries while loader.conf names gb-b: the running slot a is made the default first, then they are removed"
+flip_ib "$W/s12-dflt/bn/init_boot_b"; flip_ib "$W/s12-dflt2/bn/init_boot_b"
+printf 'default gb-b\ntimeout 4\n' > "$W/s12-dflt/esp/loader/loader.conf"            # the form before wave 8
+printf 'default gb-b.conf\ntimeout 4\n' > "$W/s12-dflt2/esp/loader/loader.conf"      # (wave 8) the form that matches
+for t in dflt dflt2; do
+  s12run $t t1 next-boot "$WANT_B" --test-ticks 1
+  E=$W/s12-$t/esp
+  [ ! -e "$E/loader/entries/gb-b.conf" ] && grep -q -x 'default gb-a.conf' "$E/loader/loader.conf" &&
+    awk '/systemd-boot default -> gb-a.conf/{d=NR} /slot b: removed its boot entries/{r=NR} END {exit !(d && r && d < r)}' "$W/s12-$t/t1"
+  ok $? "S12 stale slot-b entries while loader.conf names gb-b$([ $t = dflt2 ] && echo .conf): the running slot a is made the default (gb-a.conf) first, then they are removed"
+done
 
 # ---- S11: the wanted_slot truth table (also run by install_dualboot.ps1's Get-GbWantedSlot, test_wanted_slot.ps1)
 # Columns: GPT attributes of vbmeta_a and vbmeta_b (hex), wanted slot (a, b, - = none), ambiguous (1 = both bootable
@@ -543,6 +557,151 @@ while read -r _ a b want amb; do
 done < "$W/wsv.txt"
 [ "$nv" -ge 20 ]; ok $(( v + $? )) "S11 wanted_slot truth table: $nv vectors (shared with install_dualboot.ps1)"
 
+# ---- S13 (wave 8, SLOT-DEFAULT): systemd-boot 262.1 matches "default"/"preferred" against the entry id, which includes
+#      ".conf" (w8prep\lows-b F5A_DESIGN 1.2/1.3: "default gb-a" started gb-b.conf, "default gb-a.conf" started gb-a.conf)
+# S13a the matcher, mode 0 (every default line is exactly gb-<s>.conf, no preferred line) and mode 1 (any default line
+#      names gb-<s>.conf or the old gb-<s>: the dangling-default guard of check_other)
+X=$W/s13a; mkdir -p "$X/esp/loader"; v=0; nv=0
+while IFS='|' read -r conf s m want; do
+  [ -n "$conf" ] || continue
+  nv=$((nv + 1)); printf "$conf" > "$X/esp/loader/loader.conf"
+  got=$(GB_SLOTSYNC_MNT="$X/esp" "$T" --test-loader-default "$s" "$m" 2> "$X/err")
+  [ "$got" = "$want" ] && clean "$X/err" || { echo "  loader_default('$conf', $s, $m) = '$got', want '$want'"; v=$((v + 1)); }
+done <<'VEC'
+default gb-a.conf\n|a|0|1
+default gb-a.conf\r\ntimeout 3\n|a|0|1
+default gb-a.conf  \t\n|a|0|1
+  default gb-a.conf\n|a|0|1
+default\tgb-a.conf\n|a|0|1
+default gb-a\n|a|0|0
+default gb-a\n|a|1|1
+default gb-a.conf\n|a|1|1
+default gb-b.conf\n|a|0|0
+default gb-b.conf\n|a|1|0
+default gb-b\n|a|1|0
+default gb-a-nvtest.conf\n|a|0|0
+default gb-a-nvtest.conf\n|a|1|0
+default gb-a-nvtest\n|a|1|0
+default gb-a.confx\n|a|1|0
+default gb-a.conf\ndefault gb-b.conf\n|a|0|0
+default gb-a.conf\ndefault gb-b.conf\n|a|1|1
+default gb-a.conf\npreferred gb-a.conf\n|a|0|0
+default gb-a.conf\npreferred gb-b.conf\n|a|0|0
+default gb-a.conf\n  preferred gb-b.conf\n|a|0|0
+default gb-a.conf\npreferredx gb-b.conf\n|a|0|1
+default gb-a.conf\n#preferred gb-b.conf\n|a|0|1
+#default gb-a.conf\n|a|0|0
+#default gb-a.conf\n|a|1|0
+defaultx gb-a.conf\n|a|1|0
+timeout 3\n|a|0|0
+default\n|a|0|0
+default gb-*\n|a|0|0
+default GB-A.CONF\n|a|0|0
+default gb-b.conf\n|b|0|1
+default gb-b\n|b|1|1
+VEC
+[ "$nv" -ge 30 ]; ok $(( v + $? )) "S13a loader_default(): $nv vectors (mode 0 only gb-<s>.conf and no preferred; mode 1 both forms)"
+
+s13run() {   # s13run TAG SUFFIX BOOT_ID ATTRS ARGS...: one run on $W/s13-TAG (fake device as S12); output $X/out{,.err,.rc}
+  X=$W/s13-$1; sfx=$2; b=$3; at=$4; shift 4
+  env GB_SLOTSYNC_MNT="$X/esp" GB_SLOTSYNC_LOCK="$X/gb_esp.lock" GB_SLOTSYNC_SLOT_SUFFIX="$sfx" GB_SLOTSYNC_BOOT_ID="$b" \
+    GB_SLOTSYNC_BYNAME="$X/bn" GB_SLOTSYNC_UE_PREFS="$X/ue/done" GB_SLOTSYNC_NOTIFY="$X/notify" \
+    GB_SLOTSYNC_TEST_ATTRS="$at" GB_SLOTSYNC_TEST_UNAME="$RUN" "$T" "$@" > "$X/out" 2> "$X/out.err"
+  echo $? > "$X/out.rc"
+}
+s13dev() {   # s13dev TAG LOADER_CONF_TEXT [b]: a fake device whose ESP has slot a's entries (or slot b's with "b")
+  X=$W/s13-$1; rm -rf "$X"; mkdir -p "$X/bn" "$X/notify" "$X/ue"
+  E=$X/esp; mkesp "$E" nvtest
+  if [ "${3:-}" = b ]; then
+    for f in "" -nvtest; do expect_b "$E/loader/entries/gb-a$f.conf" > "$E/loader/entries/gb-b$f.conf"; rm "$E/loader/entries/gb-a$f.conf"; done
+    mv "$E/initrd-a.img" "$E/initrd-b.img"
+  fi
+  printf "$2" > "$E/loader/loader.conf"
+  printf 'gzip-cpio' > "$E/gb/inject.gz"; printf 'androidboot.gb = 1\n' > "$E/gb/bootconfig_extra"
+  mkboot "$X/bn/boot_a" "$REL_A"; mkboot "$X/bn/boot_b" "$REL_A"; mkramdisks "$X/bn" a; mkramdisks "$X/bn" b
+  echo test-boot-id > "$X/ue/done"
+}
+t13() { (cd "$W/s13-$1/esp" && find . -type f -exec sha256sum {} + | sort); }
+A_DEAD='0000000000000000 01ff000000000000'                    # the user VM / USB image: a priority 0, b successful
+
+# S13b the user VM today (wave-7 ESP, slot b, "default gb-b", only gb-b(-nvtest).conf), first boot with this binary:
+#      the line becomes "default gb-b.conf" (still slot b), nothing else changes; the next boot (a new process) writes nothing
+s13dev uvm 'default gb-b\ntimeout 3\nconsole-mode max\neditor yes\n' b
+before=$(t13 uvm | grep -v ' ./loader/loader.conf$')
+s13run uvm _b boot-1 "$A_DEAD" --test-ticks 2
+X=$W/s13-uvm; E=$X/esp
+printf 'default gb-b.conf\ntimeout 3\nconsole-mode max\neditor yes\n' | cmp -s - "$E/loader/loader.conf" &&
+  [ "$before" = "$(t13 uvm | grep -v ' ./loader/loader.conf$')" ] && [ "$(cat "$X/out.rc")" = 0 ] &&
+  [ "$(grep -c 'systemd-boot default -> gb-b.conf' "$X/out")" = 1 ] && clean "$X/out.err"
+ok $? "S13b the user VM's slot-b ESP with 'default gb-b': rewritten once to 'default gb-b.conf' (2 ticks), every other file unchanged"
+h1=$(t13 uvm); s13run uvm _b boot-2 "$A_DEAD" --test-ticks 1
+[ "$h1" = "$(t13 uvm)" ] && ! grep -q 'systemd-boot default' "$X/out" && [ "$(cat "$X/out.rc")" = 0 ]
+ok $? "S13b the next boot: nothing written (the .conf line is accepted as it is)"
+
+# S13c a native ESP running a with the old line (an ESP written before wave 8 after a manual pick of slot A)
+s13dev olda 'default gb-a\ntimeout 4\nconsole-mode max\neditor yes\n'
+s13run olda _a boot-1 '' --test-ticks 1
+E=$W/s13-olda/esp
+printf 'default gb-a.conf\ntimeout 4\nconsole-mode max\neditor yes\n' | cmp -s - "$E/loader/loader.conf" &&
+  [ ! -e "$E/loader/entries/gb-b.conf" ] && clean "$W/s13-olda/out.err"
+ok $? "S13c running slot a with 'default gb-a': rewritten to 'default gb-a.conf' (a manual pick sticks)"
+
+# S13d the switch b -> a (the next Google OTA after today's slot-b installs), old line on the ESP: the switch writes
+#      gb-a(-nvtest).conf and then "default gb-a.conf"
+s13dev sw 'default gb-b\ntimeout 3\nconsole-mode max\neditor yes\n' b
+s13run sw _b test-boot-id '01ff000000000000 010e000000000000' --test-ticks 2
+X=$W/s13-sw; E=$X/esp
+printf 'default gb-a.conf\ntimeout 3\nconsole-mode max\neditor yes\n' | cmp -s - "$E/loader/loader.conf" &&
+  [ -f "$E/loader/entries/gb-a.conf" ] && [ -f "$E/loader/entries/gb-a-nvtest.conf" ] && [ -f "$E/initrd-a.img" ] &&
+  grep -q '^initrd  /initrd-a.img$' "$E/loader/entries/gb-a.conf" && [ "$(grep -c 'systemd-boot default -> gb-a.conf' "$X/out")" = 1 ] &&
+  [ "$(grep -c 'kernel check passed' "$X/out")" = 1 ] && [ "$(cat "$X/out.rc")" = 0 ] && clean "$X/out.err"
+ok $? "S13d update completed into a while b runs ('default gb-b'): gb-a(-nvtest).conf + initrd-a written, then 'default gb-a.conf'"
+
+# S13e a HOLD while the old line is on the ESP: the running slot's line is made to match first, the held entries after
+s13dev hold 'default gb-a\ntimeout 4\n'
+mkboot "$W/s13-hold/bn/boot_b" "$KMI_B"
+s13run hold _a test-boot-id "$WANT_B" --test-ticks 2
+X=$W/s13-hold; E=$X/esp
+printf 'default gb-a.conf\ntimeout 4\n' | cmp -s - "$E/loader/loader.conf" && [ -f "$E/loader/entries/gb-b.conf" ] &&
+  [ "$(grep -c 'HOLD slot b: KMI 6.18-android17-6' "$X/out")" = 1 ] && [ "$(grep -c 'systemd-boot default -> gb-a.conf' "$X/out")" = 1 ] &&
+  ! grep -q 'default -> gb-b' "$X/out" && [ "$(cat "$X/out.rc")" = 0 ] && clean "$X/out.err"
+ok $? "S13e HOLD of b with 'default gb-a' on the ESP: 'default gb-a.conf' (still the running slot), gb-b.conf held in the menu"
+s13dev hold2 'default gb-a.conf\ntimeout 4\n'
+mkboot "$W/s13-hold2/bn/boot_b" "$KMI_B"
+h1=$(sha256sum < "$W/s13-hold2/esp/loader/loader.conf")
+s13run hold2 _a test-boot-id "$WANT_B" --test-ticks 1
+[ "$h1" = "$(sha256sum < "$W/s13-hold2/esp/loader/loader.conf")" ] && [ -f "$W/s13-hold2/esp/loader/entries/gb-b.conf" ] &&
+  ! grep -q 'systemd-boot default' "$W/s13-hold2/out"
+ok $? "S13e HOLD with 'default gb-a.conf': loader.conf untouched (byte for byte)"
+
+# S13f a 'preferred' line (would override the default): removed when the running slot is made the default
+s13dev pref 'default gb-a.conf\npreferred gb-b.conf\ntimeout 4\n'
+s13run pref _a boot-1 '' --test-ticks 1
+printf 'default gb-a.conf\ntimeout 4\n' | cmp -s - "$W/s13-pref/esp/loader/loader.conf" &&
+  grep -q "systemd-boot default -> gb-a.conf ('preferred' line removed)" "$W/s13-pref/out"
+ok $? "S13f 'preferred gb-b.conf' while a runs: removed, 'default gb-a.conf' kept"
+
+# S13g the [NVIDIA test] entry is never the default: a default naming it is replaced by the running slot's entry
+s13dev nv 'default gb-a-nvtest.conf\n'
+s13run nv _a boot-1 '' --test-ticks 1
+printf 'default gb-a.conf\n' | cmp -s - "$W/s13-nv/esp/loader/loader.conf"
+ok $? "S13g 'default gb-a-nvtest.conf' -> 'default gb-a.conf'"
+
+# S13h --dry-run on the old line: the rewrite is reported, nothing written
+s13dev dry 'default gb-a\n'
+before=$(t13 dry); s13run dry _a boot-1 '' --dry-run
+[ "$before" = "$(t13 dry)" ] && grep -q 'systemd-boot default -> gb-a.conf' "$W/s13-dry/out"
+ok $? "S13h --dry-run with 'default gb-a': nothing written, the rewrite to gb-a.conf reported"
+
+# S13i a switch whose entry cannot be written (no template gb-b.conf): loader.conf unchanged (never names a missing entry)
+s13dev noent 'default gb-b.conf\ntimeout 3\n' b
+rm "$W/s13-noent/esp/loader/entries/gb-b.conf"
+h1=$(sha256sum < "$W/s13-noent/esp/loader/loader.conf")
+s13run noent _b test-boot-id '01ff000000000000 010e000000000000' --test-ticks 1
+[ "$h1" = "$(sha256sum < "$W/s13-noent/esp/loader/loader.conf")" ] && [ ! -e "$W/s13-noent/esp/loader/entries/gb-a.conf" ] &&
+  [ "$(cat "$W/s13-noent/out.rc")" = 1 ] && grep -q 'no template entry' "$W/s13-noent/out" && clean "$W/s13-noent/out.err"
+ok $? "S13i switch to a without a template entry: fails, loader.conf unchanged (the default never names a missing entry)"
+
 # ---- S6: --dry-run end to end on a fake ESP dir, no OTA pending
 E=$W/s6/esp; mkesp "$E" nvtest
 before=$(cd "$E" && find . -type f -exec sha256sum {} + | sort)
@@ -575,6 +734,8 @@ ok $? "S7 no test hooks in the binary (no GB_SLOTSYNC_*, --test-, 'test: ' strin
 strings -a "$N/gb_slotsync" | grep -q 'gb_slotsync %ld' && strings -a "$N/gb_slotsync" | grep -q -- '-nvtest'
 ok $? "S7 the binary has the lock owner format and the -nvtest copy"
 ! strings -a "$N/gb_slotsync" | grep -q -- '-gfxtest'; ok $? "S7 no -gfxtest"
+strings -a "$N/gb_slotsync" | grep -q -x 'default gb-%c.conf' && ! strings -a "$N/gb_slotsync" | grep -q -x 'default gb-%c'
+ok $? "S7 (wave 8) the binary writes 'default gb-%c.conf' (never the old 'default gb-%c')"
 echo "  $(sha256sum "$N/gb_slotsync" | cut -c1-64) $(stat -c %s "$N/gb_slotsync") B"
 
 if [ "$FAILS" = 0 ]; then echo "TB-1 RESULT: OK"; else echo "TB-1 RESULT: $FAILS failure(s)"; exit 1; fi

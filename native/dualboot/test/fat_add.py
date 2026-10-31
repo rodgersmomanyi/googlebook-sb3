@@ -4,6 +4,7 @@ so the -UpdateEspOnly image tests (wave 3, item 7) have an installed ESP that di
   python -I fat_add.py IMAGE add ESP_PATH HOST_FILE        add a file (directories are created), e.g. gblog/x.txt
   python -I fat_add.py IMAGE replace OLD NEW                replace a byte string (same length, exactly once) in the ESP
   python -I fat_add.py IMAGE sha                            sha256 of the whole EFI-SYSTEM partition
+  python -I fat_add.py IMAGE count TEXT                     (wave 8) how often a byte string occurs in the ESP (read-only)
 
 The partition is found by its GPT name EFI-SYSTEM. Names that do not fit 8.3 get long-name entries. Device paths are
 refused. The FSInfo free-cluster hint is set to "unknown" after an add.
@@ -191,7 +192,7 @@ def main():
     img, cmd = sys.argv[1], sys.argv[2]
     if img.startswith(("\\\\.\\", "\\\\?\\", "//./", "/dev/")) or "PhysicalDrive" in img:
         sys.exit("fat_add: image files only")
-    with open(img, "r+b" if cmd != "sha" else "rb") as f:
+    with open(img, "r+b" if cmd not in ("sha", "count") else "rb") as f:
         off, ln = esp_range(f)
         if cmd == "add":
             Fat(f, off).add(sys.argv[3], open(sys.argv[4], "rb").read())
@@ -215,6 +216,9 @@ def main():
                 h.update(b)
                 left -= len(b)
             print(h.hexdigest())
+        elif cmd == "count":
+            f.seek(off)
+            print(f.read(ln).count(sys.argv[3].encode().decode("unicode_escape").encode("latin-1")))
         else:
             sys.exit(__doc__)
 

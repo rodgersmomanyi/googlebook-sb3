@@ -66,6 +66,7 @@ cleanly first); Workstation rewrites the .vmx from its own copy otherwise.
 
 ```powershell
 $env:GB_WRITE_LAPIS = "1"      # build_esp.py refuses to write lapis.bin without it (boot_live/cycle inherit it)
+$env:GB_EXPECT_ESP_SHA256 = "<sha256 of the preview ESP you checked>"   # wave 8: build_esp.py writes only that ESP
 python -I -B build_esp.py      # builds the ESP (systemd-boot, kernel, initrd for the booted slot) and writes it
                                # into lapis.bin's EFI-SYSTEM partition - only with the VM powered off: it refuses
                                # while VMware has the VM open (a lapis*.lck folder next to lapis.bin)
@@ -75,6 +76,13 @@ python -I -B build_esp.py      # builds the ESP (systemd-boot, kernel, initrd fo
 `build_esp.py` prints what it included (`GPU (Mesa svga / SkiaGL): ON`, `absolute mouse: ON`, `network (vmxnet3)`,
 `host battery`, `VM sound`, `slot follower` ...). First boot formats /data and runs dexopt; expect several minutes.
 `wait_boot.sh` waits for `sys.boot_completed` over the console.
+
+Since wave 8 `build_esp.py` also refuses to write `lapis.bin` unless `GB_EXPECT_ESP_SHA256` names the sha256 of
+the ESP it builds: build the preview first (`native/dgpu/w4/tools/vm_esp_preview.py`, the ESP that would be
+written, into a file), check it with `verify_image.py --esp <preview> --expect-tree vm --esp-size 201326592
+--expect-pin-path lapis.bin`, then set the variable to the preview's sha256. A different build refuses before it
+opens `lapis.bin` for writing, so only the reviewed bytes are ever written (`boot_live.ps1` / `cycle.ps1` need the
+variable too).
 
 Never write the ESP while the VM runs. An OTA installed in the guest changes which slot boots; `build_esp.py`
 follows it automatically (it reads the slot state from lapis.bin, see [OTA.md](OTA.md)).
@@ -87,6 +95,14 @@ table was damaged as well, add `--with-gpt`: it writes the saved GPT copies back
 repartition happened since the backup, and reads them back. Before it writes, the restore saves the current ESP
 and both GPT copies into `<backup>\..\pre-restore-<time>\` (wave 7). To undo the restore, run
 `restore <that folder> --esp-only --yes`. Delete such folders yourself once the VM boots as expected.
+
+An ESP backup boots the A/B slot that was current when it was taken. Since wave 8 a Google system update really
+switches the VM to the other slot, and from then on every older ESP backup is the wrong rollback: after the
+update's merge its slot no longer starts (dm-verity, a restart loop), and before the merge it is a downgrade over
+`/data` that can make the lock screen refuse your PIN. So `restore --esp-only` (wave 8) also refuses a backup whose
+`loader.conf` default is not the slot the disk's GPT wants (with `--with-gpt`: the GPT it writes back), and one
+made while the live ESP already holds the other slot's entry or initrd (an update into it was installed); it
+prints `slot:` lines. After such an update, build a new ESP for the new slot on the host instead.
 
 ## 6. Host helpers
 

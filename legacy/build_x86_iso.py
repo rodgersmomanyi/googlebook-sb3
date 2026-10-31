@@ -51,7 +51,7 @@ ADD = ("console=ttyS0,115200 console=tty0 earlycon=uart8250,io,0x3f8,115200 igno
        "androidboot.boot_devices=0000:05:00.0 bootconfig")
 CMDLINE = " ".join(keep) + " " + ADD
 
-LOADER_CONF = "default gb\ntimeout 5\nconsole-mode max\neditor yes\n"
+LOADER_CONF = "default gb.conf\ntimeout 5\nconsole-mode max\neditor yes\n"   # (wave 8) the id incl. .conf
 GB_ENTRY = f"title   Googlebook lapis x86\nlinux   /vmlinuz\ninitrd  /initrd.img\noptions {CMDLINE}\n"
 
 # =============== FAT32 writer (from tools/build_iso.py) ===============

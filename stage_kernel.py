@@ -3,6 +3,8 @@
   inject/modules/*.ko             <- the VM module set (MODULE_SIG_PROTECT: every module must come from the same build)
   inject/native/modules/*.ko      <- the native Surface Book 3 set + modules.load (loaded by gbinit before Android init)
                                      + modules.load.late (loaded by gb_modules at early-init, after lapis's first stage)
+                                     + modules.alias / modules.dep for NATIVE_MODALIAS only (k16: the SD-card reader
+                                       drivers, in no load list: lapis's ueventd loads them by modalias)
 Every module's 'depends' is checked against the load order (an earlier entry, a built-in, or -- late list only --
 a lapis first-stage module), and all vermagics must match. Previous files (incl. both load lists) are copied once to
 <archive>\\pre-<TAG>\\<path below C:\\GB-x86>, never next to the live file: build_esp packs inject\\native\\modules.
@@ -61,6 +63,16 @@ NATIVE_LATE = [
     "hid-sensor-hub", "hid-sensor-iio-common", "hid-sensor-trigger", "hid-sensor-accel-3d", "hid-sensor-gyro-3d",
     "hid-sensor-als", "hid-sensor-rotation", "hid-sensor-incl-3d", "hid-sensor-magn-3d",
 ]
+# (wave 8, k16) in NO load list: loaded by lapis's ueventd when the device appears (modalias_handling enabled in
+# lapis's vendor ueventd.fatcat.rc; its ModaliasHandler reads /odm/lib/modules before /vendor/lib/modules). Staged in
+# inject\native\modules (build_esp packs them into /odm/lib/modules) with a modules.alias + modules.dep that name only
+# these. The Realtek card readers: vendor-class USB (rtsx_usb, 0bda:0129/0139/0140; its mfd cell rtsx_usb_sdmmc) and
+# PCIe (rtsx_pci; rtsx_pci_sdmmc), so the SB3 base's SD reader works whichever type it is (a mass-storage-class reader
+# needs nothing: usb-storage and uas are built in). Dependency order. A lapis first-stage dependency (mfd-core) is
+# written with its /vendor/lib/modules path: ueventd finds it already loaded (EEXIST); our copy is never staged.
+NATIVE_MODALIAS = ["rtsx_usb", "rtsx_usb_sdmmc", "rtsx_pci", "rtsx_pci_sdmmc"]
+ODM_MOD_PATH = "/odm/lib/modules"           # where build_esp packs inject\native\modules in the native tree
+VENDOR_MOD_PATH = "/vendor/lib/modules"     # lapis vendor_dlkm (its modules.dep has /vendor/lib/modules/mfd-core.ko)
 # exactly what lapis's vendor ramdisk modules.load loads in first-stage init
 LAPIS_FIRST_STAGE_LOAD = {"8250_dw", "intel-lpss-pci", "intel-lpss", "intel_iommu_vendor_hooks", "mfd-core",
                           "pinctrl-intel-platform", "pinctrl-intel"}
@@ -115,16 +127,18 @@ def main():
     if extra:
         sys.exit(f"unknown arguments {extra}")
     print(f"dist {DIST}; backups -> {os.path.join(ARCHIVE, 'pre-' + tag)}")
-    wanted = sorted(set(VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN))
+    wanted = sorted(set(VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN + NATIVE_MODALIAS))
     info = ssh("cd %s && for m in %s; do f=$m.ko; [ -f $f ] || f=$(echo $m | tr - _).ko; "
-               "if [ -f $f ]; then echo \"$m|$f|$(modinfo -F depends $f)|$(modinfo -F vermagic $f)\"; "
-               "else echo \"$m|MISSING||\"; fi; done; md5sum bzImage" % (DIST, " ".join(wanted)))
+               "if [ -f $f ]; then echo \"$m|$f|$(modinfo -F depends $f)|$(modinfo -F vermagic $f)|"
+               "$(modinfo -F alias $f | tr '\\n' ' ')\"; "
+               "else echo \"$m|MISSING|||\"; fi; done; md5sum bzImage" % (DIST, " ".join(wanted)))
     lines = info.strip().splitlines()
     bz_md5 = lines[-1].split()[0]
-    mods = {}
+    mods, aliases = {}, {}
     for l in lines[:-1]:
-        name, f, deps, vm = l.split("|", 3)
+        name, f, deps, vm, al = l.split("|", 4)
         mods[name] = (f, [d for d in deps.split(",") if d], vm)
+        aliases[name] = al.split()
     missing = [n for n, (f, _, _) in mods.items() if f == "MISSING"]
     vermagics = {vm for f, _, vm in mods.values() if f != "MISSING"}
     print(f"bzImage md5 {bz_md5}; {len(mods) - len(missing)} modules found, missing: {missing or 'none'}")
@@ -157,10 +171,18 @@ def main():
     clash = sorted({norm(n) for n in NATIVE_EARLY + NATIVE_LATE} & {norm(n) for n in LAPIS_FIRST_STAGE_LOAD})
     if clash:
         problems.append(f"native list preloads lapis first-stage modules {clash} (fatal at boot)")
+    listed = {norm(n) for n in VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN}
+    both = sorted({norm(n) for n in NATIVE_MODALIAS} & (listed | {norm(n) for n in LAPIS_FIRST_STAGE_LOAD}))
+    if both:
+        problems.append(f"modalias modules {both} are also in a load list or lapis first-stage modules")
+    noalias = [n for n in NATIVE_MODALIAS if n not in missing and not aliases[n]]
+    if noalias:
+        problems.append(f"modalias modules without an alias (nothing would load them): {noalias}")
     early = check(NATIVE_EARLY)
     late = check(NATIVE_LATE, extra_ok=early | LAPIS_FIRST_STAGE)
     check(NATIVE_OPTIN, extra_ok=early | late | LAPIS_FIRST_STAGE)
     check(VM_MODS)
+    check(NATIVE_MODALIAS, extra_ok=LAPIS_FIRST_STAGE)
     for p in problems:
         print("PROBLEM:", p)
     if problems and "--force" not in sys.argv:
@@ -194,7 +216,7 @@ def main():
             put(os.path.join(vm_dir, n + ".ko"), blobs[mods[n][0]])
     nat = os.path.join(HERE, "inject", "native", "modules")
     os.makedirs(nat, exist_ok=True)
-    for n in NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN:
+    for n in NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN + NATIVE_MODALIAS:
         if n not in missing:
             put(os.path.join(nat, mods[n][0]), blobs[mods[n][0]])
     hdr = f"# kernel build {tag} (bzImage md5 {bz_md5})\n"
@@ -221,9 +243,34 @@ def main():
         f.write(hdr + "".join(early))
     with open(os.path.join(nat, "modules.load.late"), "w", newline="\n") as f:
         f.write(hdr + "".join(line(n) for n in NATIVE_LATE if n not in missing))
+    # modules.alias / modules.dep in the libmodprobe format lapis's ueventd parses (single spaces, absolute paths, '#'
+    # comments); a dependency line lists the deepest dependency last (ueventd loads the list in reverse)
+    ma = [n for n in NATIVE_MODALIAS if n not in missing]
+    byn = {norm(n): n for n in ma}
+
+    def dep_path(d):
+        return f"{ODM_MOD_PATH}/{mods[byn[norm(d)]][0]}" if norm(d) in byn else f"{VENDOR_MOD_PATH}/{d}.ko"
+
+    def closure(n, out):
+        for d in mods[n][1]:
+            if dep_path(d) not in out:
+                out.append(dep_path(d))
+                if norm(d) in byn:
+                    closure(byn[norm(d)], out)
+        return out
+    mhdr = hdr + "# stage_kernel.NATIVE_MODALIAS only: loaded by lapis's ueventd (modalias_handling), in no load list\n"
+    backup(os.path.join(nat, "modules.alias"))
+    backup(os.path.join(nat, "modules.dep"))
+    with open(os.path.join(nat, "modules.alias"), "w", newline="\n") as f:
+        f.write(mhdr + "".join(f"alias {a} {norm(n)}\n" for n in ma for a in aliases[n]))
+    with open(os.path.join(nat, "modules.dep"), "w", newline="\n") as f:
+        f.write(mhdr + "".join(f"{ODM_MOD_PATH}/{mods[n][0]}:" + "".join(" " + p for p in closure(n, [])) + "\n"
+                               for n in ma))
+    print(f"modalias: {len(ma)} modules, {sum(len(aliases[n]) for n in ma)} aliases in modules.alias, modules.dep")
     if audio:
         print(f"audio: {len(audio)} lapis HDA codec modules after i915")
-    print(f"staged bzImage, {len(VM_MODS)} VM modules, {len(NATIVE_EARLY)}+{len(NATIVE_LATE)} native modules")
+    print(f"staged bzImage, {len(VM_MODS)} VM modules, {len(NATIVE_EARLY)}+{len(NATIVE_LATE)} native modules, "
+          f"{len(NATIVE_MODALIAS)} modalias modules")
 
 
 if __name__ == "__main__":

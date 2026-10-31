@@ -30,7 +30,7 @@ python -I C:\GB-build\native\hwtest\analyze_gblog.py E:\gblog -o TRIAGE.md --jso
 | `--json FILE` | the same result as JSON (`items[]` with `id`, `status`, `reason`, `notes`, `evidence[]`) |
 | `--boot N` | the boot to analyze (default: the newest; the newest 8 boots stay on the stick) |
 | `--env surface\|vmware\|other\|unknown` | override the platform detected from `== dmi` |
-| `--expect-kernel REL` | expected `uname -r` (default k15: `6.18.21-android17-5-g3c2c2f588d3f-ab16302715`) |
+| `--expect-kernel REL` | expected `uname -r` (default k16: `6.18.21-android17-5-gace3ce479bb5-ab16302716`; k15 `6.18.21-android17-5-g3c2c2f588d3f-ab16302715` and k14 are named) |
 | `--strict` | exit 1 if any item is FAIL (exit 2 = no snapshot / unknown boot) |
 
 The console prints one summary line and each FAIL. TRIAGE.md has a header (result counts, platform, kernel,
@@ -76,7 +76,7 @@ section per item and a table of the checklist steps that only a person at the la
 
 | # | id | DEVICE-STATUS | PASS when | FAIL when (UNKNOWN otherwise) |
 |---|---|---|---|---|
-| 1 | kernel | header, K15.md | `Linux version` / report `uname_r=` is the k15 release | another release (k14 is named) |
+| 1 | kernel | header, K16.md | `Linux version` / report `uname_r=` is the k16 release (or `--expect-kernel`) | another release (k15 and k14 are named) |
 | 2 | cmdline | rows 9-12, 39, 47; cl. 19 | `8250.nr_uarts>=1`, `gb.hw=native`, `snd_intel_dspcfg.dsp_driver=3`, `reboot=pci`, `module_blacklist` with tpm + spi_intel_pci, `efi_pstore.pstore_disable=1` | any of them missing (notes: `gb.nouveau=0`, `gb.vnni=0`, `gb.overlay=1`) |
 | 3 | gbinit | modules.load | no `FAILED x.ko` (off the laptop: only `No such device`, e.g. surface_gpe's DMI check) | any other insmod failure |
 | 4 | serial8250 | row 12; cl. 19 | `Serial: 8250/16550 driver, N ports` (N>=1), no `dw-apb-uart ... -22`; on the laptop also an MMIO UART in `/proc/tty/driver/serial` | `-22`, a serial IRQ failure (not a `-517` deferral), or no banner although the log starts at 0 s |
@@ -105,7 +105,7 @@ section per item and a table of the checklist steps that only a person at the la
 | 27 | gfx_switching | row 17; cl. 15 | `ro.gfx.driver.0=gb.sb3.gfxdriver`, vulkan intel, egl angle, gb_power api 1 + running + `get-mode` ok, `gfx_active` set, 0 HWUI queueCount aborts | any of them wrong |
 | 28 | gatekeeper | wave 4 | `gb_gatekeeper: registered ...IGatekeeper/default` | never registered, 3+ exits, `Could not find Gatekeeper device` |
 | 29 | zram | fstab / mmd | `Adding ...k swap on /dev/block/zram0` / summary `swaps:` | zram/swapon errors, or none after boot completed (mmd starts it after completion) |
-| 30 | vnni | cl. 24, K15.md | `-- gb_vnni`: `irqon == emulated` (notes: counts per snapshot, top comms, adler32 RIPs) | not equal; k15 without the node |
+| 30 | vnni | cl. 24, K15.md, K16.md | `-- gb_vnni`: `irqon == emulated` (notes: counts per snapshot, top comms, adler32 RIPs; k16 prints `comm=` escaped, `\xHH` for control bytes) | not equal; k15/k16 without the node |
 | 31 | libz_bind | wave 5, vnni-perf | `processing action (ro.{system,vendor}.build.fingerprint=... && early-init) from (/odm/...)`, no failure | a `/odm/vnni` / libz.so command failed or the trigger was rejected (`gb.vnni=0` = UNKNOWN); wave 6: the gbvnni read-only remount (`mount tmpfs gbvnni /odm/vnni remount ro`, ungated) failing with "No such file or directory" only means no `/odm/vnni` this boot (OTA gate, gbinit fallback) and is a note; any other error of it after the binds ran is a FAIL (the patched libz stays writable). (Wave 7) lapis 276's init does not log that ENOENT (AOSP init reports a builtin's ENOENT only at its DEBUG log level), so such a boot shows no tail line and no note; on a forced OTA-gate test boot the gated binds' `remount bind ro` fail with EINVAL instead (a FAIL, as in wave 5) |
 | 32 | fsverity | cl. 24 | summary `ext4 feature present` (or `Enabling ext4 verity on .../userdata`) | absent, `FS_STAT_ENABLE_VERITY_FAILED`, tune2fs failure |
 | 33 | apgetty | cl. 24 | `desktop.apgetty.enable` not 1 and the service not running | on |

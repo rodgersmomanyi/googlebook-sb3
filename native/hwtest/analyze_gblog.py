@@ -23,7 +23,10 @@ from collections import Counter, OrderedDict
 VERSION = "1.0"
 PASS, FAIL, UNKNOWN = "PASS", "FAIL", "UNKNOWN"
 K15_RELEASE = "6.18.21-android17-5-g3c2c2f588d3f-ab16302715"
+K16_RELEASE = "6.18.21-android17-5-gace3ce479bb5-ab16302716"     # wave 8: k15 + LOW-3 (escaped comm) + SD-reader modules
+EXPECT_KERNEL = K16_RELEASE          # the kernel the current images ship
 KNOWN_KERNELS = {
+    K16_RELEASE: "kernel build #16 (k16)",
     K15_RELEASE: "kernel build #15 (k15)",
     "6.18.21-android17-5-g9629ced3e50e-ab16302714": "kernel build #14 (k14)",
 }
@@ -483,7 +486,7 @@ class Item:
 
 
 class Analysis:
-    def __init__(self, boot, env_override=None, expect_kernel=K15_RELEASE):
+    def __init__(self, boot, env_override=None, expect_kernel=EXPECT_KERNEL):
         self.b = boot
         self.expect_kernel = expect_kernel
         sn = boot.newest_with("dmi")
@@ -691,9 +694,9 @@ def c_kernel(a, it):
         blk = sn.sblock("gb_vnni")
         if blk:
             if any("No such file" in x.text for x in blk):
-                it.note("/sys/kernel/gb_vnni/summary is missing (a k15-only node)")
+                it.note("/sys/kernel/gb_vnni/summary is missing (a node of k15 and later)")
             else:
-                it.note("/sys/kernel/gb_vnni/summary is present (a k15-only node)")
+                it.note("/sys/kernel/gb_vnni/summary is present (a node of k15 and later)")
             break
 
 
@@ -1824,8 +1827,8 @@ def c_vnni(a, it):
     if not series:
         it.add(blk[:2])
         if any("No such file" in e.text for e in blk):
-            if a.b.dm(r"Linux version " + re.escape(K15_RELEASE)):
-                return it.set(FAIL, "k15 kernel but /sys/kernel/gb_vnni/summary is missing")
+            if any(a.b.dm(r"Linux version " + re.escape(k)) for k in (K15_RELEASE, K16_RELEASE)):
+                return it.set(FAIL, "k15/k16 kernel but /sys/kernel/gb_vnni/summary is missing")
             return it.set(UNKNOWN, "/sys/kernel/gb_vnni/summary is missing (kernel before k15)")
         return it.set(UNKNOWN, "the gb_vnni block has no counter line")
     sn, e, m = series[-1]
@@ -2344,7 +2347,7 @@ def load_boot(src, boot_no=None):
     return Boot(n, ss, aa), [x for x in boots if x != n], folder
 
 
-def analyze(src, boot_no=None, env=None, expect_kernel=K15_RELEASE):
+def analyze(src, boot_no=None, env=None, expect_kernel=EXPECT_KERNEL):
     """Analysis object (with .items) for one boot of a gblog folder."""
     boot, others, folder = load_boot(src, boot_no)
     a = Analysis(boot, env_override=env, expect_kernel=expect_kernel)
@@ -2369,7 +2372,7 @@ def main(argv=None):
     ap.add_argument("--boot", type=int, help="boot number N (default: the newest in the folder)")
     ap.add_argument("--env", choices=("surface", "vmware", "other", "unknown"),
                     help="override the environment detected from == dmi")
-    ap.add_argument("--expect-kernel", default=K15_RELEASE, help=f"expected uname -r (default {K15_RELEASE})")
+    ap.add_argument("--expect-kernel", default=EXPECT_KERNEL, help=f"expected uname -r (default k16: {EXPECT_KERNEL})")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any item is FAIL")
     args = ap.parse_args(argv)
     try:

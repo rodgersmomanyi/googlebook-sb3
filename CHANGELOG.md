@@ -4,7 +4,47 @@ What each wave changed, newest first. Details per device: [docs/DEVICE-STATUS.md
 since the audit"). Nothing has run on the Surface Book 3 itself yet: every result below is from VMware VMs, QEMU, the
 Linux build machine or disk-image files.
 
-## Wave 7 (2026-10-30): the last hardware-independent items
+## Wave 8 (2026-10-31): kernel build #16, updates into slot A, your own settings kept
+
+* Kernel build #16 (k16): the `gb_vnni` summary escapes task names, so a program can no longer forge lines in the
+  boot-log summary (LOW-3), and the Realtek SD-card reader drivers (USB vendor class and PCIe) are built and loaded
+  by modalias in the native image, so the base's SD reader works whichever type it is. The KMI symbol list is
+  unchanged; lapis's vendor modules load as before. Tested on the build machine and in a throwaway VMware VM (module
+  loads, the VNNI emulator known-answer test, the hostile-name test). Published as patches `kernel/patches/k16/`
+  (0112 also as `kernel/patches/0006`), the `.config` difference `kernel/config/k16_card_readers.fragment` and
+  [kernel/K16.md](kernel/K16.md); no binaries.
+* **Updates into slot A now start (finding SLOT-DEFAULT).** systemd-boot matches the `loader.conf` default against
+  the entry's file name including `.conf`. The line `default gb-<x>` written so far matched no entry, so the loader
+  always started slot B's entry when one existed: an update into slot A was prepared but never started, and a
+  boot-menu pick of slot A did not stick. Images, `gb_slotsync` (it rewrites an existing ESP's line once, for the slot
+  that booted), `verify_image` (new check V33), the dual-boot `-UpdateEspOnly` check and the installer tests now use
+  `default gb-<x>.conf`. Tested on a VMware VM: the default line picks slot A or B, a switch and a menu pick stick.
+  Pick an older slot by hand only while the newer build has not reached the lock screen ([OTA.md](docs/OTA.md)).
+* **Your own settings stay.** `gb_ui.sh` keeps your own Display size, launcher and one-time values (safety audit W7-S1, W7-S2);
+  `build_esp.py` writes `lapis.bin` only with `GB_EXPECT_ESP_SHA256` = the reviewed preview (W7-S4);
+  `verify_image.py` V12 checks `gb_ui.sh` in both trees (IA7-1); the VM build's update notice judges
+  `cmd notification post` by its output with `gb_notify`'s fallbacks (HS-O5-otagate) and its stale "changes nothing
+  else" comment is corrected.
+* Sensors: once the Auto-rotate overlay is seen enabled, the one-time first-boot flag is recorded too, so a later
+  boot never writes the login screen's Auto-rotate (BACKLOG AL-F2); header wording (AL-X1). Also: a corrected header
+  comment in the audio module list, and `build_esp.py` caches its compressed `inject.gz` by the content's sha256
+  instead of a Python object id (the output is byte-identical).
+* Audit follow-ups (wave 8 safety audit): the VMware ESP rollback (`gb_vmbackup.py restore --esp-only`) refuses a
+  backup of the other A/B slot, since after a Google update switched the VM's slot every older ESP backup is the
+  wrong rollback (W8-S1); the docs say to boot the previous slot only before a sign-in on the new build (W8-S2) and
+  never to type a second `module_blacklist=` at the boot menu (it would replace the TPM / SPI-flash list, W8-S4);
+  the dual-boot image test's loader edit accepts both `default` forms, so the ISO test T8 passes with an export made
+  before wave 8 as well; the evidence extractor `native/vnni-perf/tools/extract_gbvnni.py` records escaped task
+  names (LOW-3 F-2).
+* Tested in VMware: a rehearsal of the VM build on kernel build #16 (a fresh first boot 42 of 42; a forced
+  unvalidated update 25 of 25, with the notice in user 10's panel and the person's own Display size and screen
+  timeout kept; the emulator's known-answer test, 9,235 cases, and a hostile-task-name test, 15 of 15; a validated
+  boot 17 of 17; a switch to slot A 11 of 11), VM-1 on the rebuilt USB image (every wave 2, 3, 5, 6, 7 and 8 check
+  that VMware can show; the hardware-test analyser 17 PASS, 0 FAIL, 23 UNKNOWN), and on the installer ISO T0,
+  T1a/T1b, the dual-boot groups G1-G4 and T8: 378 checks, 0 failed. The long-running VM was updated to the wave 8 VM
+  build (kernel build #16) after a verified backup of its boot partition; its check boot passed without a sign-in.
+
+## Wave 7 (2026-10-30), commit a7d8d1e: the last hardware-independent items
 
 * **Settings reach your user (headless system user mode).** Density, HOME, setup-complete and the one-time defaults
   (VM screen timeout, Auto-rotate) are applied to every full user when it is unlocked, also after a late sign-in;

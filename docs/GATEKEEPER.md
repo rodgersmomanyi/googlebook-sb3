@@ -147,7 +147,10 @@ Both write paths now check this themselves (wave 6): `build_esp.py` (`GB_WRITE_L
 `gb_vmbackup.py restore --esp-only` compare the "PIN path" of the ESP they would write with the ESP now on the
 disk (the Gatekeeper binary and rc service, every VINTF fragment the image adds, the KeyMint service and its
 libraries, the Trusty and Weaver masks, the fstab and the SELinux types the PIN path runs in) and refuse any
-difference. A reviewed change needs `GB_PIN_MIGRATION=1` (build) or `--pin-migration` (rollback);
+difference. A reviewed change needs `GB_PIN_MIGRATION=1` (build) or `--pin-migration` (rollback); since wave 8
+`build_esp.py` also writes only the ESP whose sha256 `GB_EXPECT_ESP_SHA256` names (the preview that was checked), and
+`restore --esp-only` also refuses an ESP backup of the other A/B slot (after a Google update switched the slot, an
+older ESP would be a downgrade that can refuse the PIN; [VMWARE.md](VMWARE.md#5-build-the-esp-and-boot));
 `verify_image.py --expect-pin-path <ESP>` shows the same comparison. `gb_vmbackup.py restore --esp-only --dry-run`
 runs every check without writing.
 

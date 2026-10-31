@@ -5,7 +5,7 @@
 ```
 UEFI (VMware EFI, or Surface UEFI with Secure Boot off)
  └─ \EFI\BOOT\BOOTX64.EFI = systemd-boot 262.1           (ESP "EFI-SYSTEM", FAT32, written by build_esp.py)
-     └─ loader/entries/gb-<slot>.conf                     default = the A/B slot to boot
+     └─ loader/entries/gb-<slot>.conf                     the A/B slot to boot (loader.conf: default gb-<slot>.conf)
         (native ESPs also: gb-<slot>-nvtest.conf "[NVIDIA test]" = the same + gb.nouveau=test; gb/dgpu-<krel>.erofs)
          linux  /vmlinuz          our GKI kernel (android17-6.18, 6.18.21, Kleaf build, EFI stub)
          initrd /initrd-<slot>.img
@@ -107,7 +107,11 @@ Services run as root with `seclabel u:r:shell:s0` (permissive), output to kmsg.
   the foreground user for the whole boot and sets up each full user when it is unlocked: display density, HOME,
   `user_setup_complete`, at every boot; once per user ever, shortly after that first unlock, the VM build's
   keep-awake values and, natively, the Auto-rotate default, so a one-time value you change later is never written
-  again), one-time AOT compile of the UI apps (`gb_dexopt.sh`).
+  again; wave 8: none of these overrides your own choice: the density only while it is unset or still the value
+  `gb_ui.sh` set last (recorded per user in `/data/local`), the stock launcher only until it has held HOME once or
+  while no launcher holds it, and the one-time values only over an unset value, one of ours or a platform default,
+  as `dumpsys settings` names the package that last wrote it, and only if the value did not change since the user's
+  first sign-in), one-time AOT compile of the UI apps (`gb_dexopt.sh`).
 * **firmware updater stub** for `google_desktop_firmware_updater` (OTA postinstall), `preloads_copy.sh` no-op.
 * **gb_slotsync**, the A/B slot follower.
 

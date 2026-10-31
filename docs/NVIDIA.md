@@ -42,10 +42,12 @@ GPU under Windows ([VMWARE.md](VMWARE.md)).
  NVK (libgb_nvk.so) -> nouveau render node -> TU117     frames: LINEAR buffers from minigbm/i915, sync_fd release
 ```
 
-* **Kernel:** native images run kernel build #15 since wave 3 ([kernel/README.md](../kernel/README.md)): build #14
-  (k13 plus 40 nouveau-only patches) plus two patches that do not touch nouveau (the AVX-VNNI emulator rework and the
-  opt-in i915 gamma switch), so the nouveau source is the same as in #14 ([kernel/K15.md](../kernel/K15.md)). The
-  payload file name carries the build #15 kernel release. nouveau and its helpers (`drm_exec`, `drm_gpuvm`,
+* **Kernel:** native images run kernel build #16 since wave 8 ([kernel/README.md](../kernel/README.md)): build #15
+  plus two patches that do not touch nouveau (the escaped VNNI task name and the SD-card reader modules,
+  [kernel/K16.md](../kernel/K16.md)); build #15 is build #14 (k13 plus 40 nouveau-only patches) plus two patches that
+  do not touch nouveau either (the AVX-VNNI emulator rework and the opt-in i915 gamma switch), so the nouveau source
+  is the same as in #14 ([kernel/K15.md](../kernel/K15.md)). The payload file name carries the kernel release (build
+  #16's since wave 8). nouveau and its helpers (`drm_exec`, `drm_gpuvm`,
   `gpu-sched`, `drm_ttm_helper`) are in no boot-time load list.
 * **Payload:** the NVIDIA firmware (30 `nvidia/tu117` files with their WHENCE excerpt and `LICENCE.nvidia`), the five
   modules, the NVK ICD and the compute libraries live in one erofs image on the boot partition,
@@ -203,8 +205,9 @@ printf 'GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | toybo
 
 Other boot-menu options: `gb.nouveau=once` (load once, whatever the mode), `gb.nouveau.fw=535` (use the GSP-RM
 535.113.01 firmware instead of the default 570.144), `gb.nouveau.model=any` (turn the model gate off for this boot,
-see "Model gate" above; only for a report about a wrongly refused GPU), `module_blacklist=nouveau` (the same as
-`gb.nouveau=0`). Any other `gb.nouveau=` value counts as `0`.
+see "Model gate" above; only for a report about a wrongly refused GPU). Any other `gb.nouveau=` value counts as
+`0`. Do not type `module_blacklist=nouveau`: the kernel keeps only the last `module_blacklist=` on the line, so it
+would replace the entry's own list (TPM, SPI flash, GSMI) for that boot; `gb.nouveau=0` is the switch ([NATIVE.md](NATIVE.md#safety)).
 
 **The `[NVIDIA test]` boot entry** (`gb-<slot>-nvtest.conf`, never the default) adds `gb.nouveau=test`. It loads
 nouveau once with extra diagnostics and runs a scripted measurement sequence (power states, PM stress, a suspend test
@@ -297,6 +300,7 @@ above works as the shell user, for example over Wireless debugging in Developer 
 |---|---|
 | [kernel/patches/k14/](../kernel/patches/k14/), [kernel/K14.md](../kernel/K14.md) | 37 linux-6.18.y nouveau backports and the hardening patches N1-N3 |
 | [kernel/patches/k15/](../kernel/patches/k15/), [kernel/K15.md](../kernel/K15.md) | build #15 on top of k14 (no nouveau change): the AVX-VNNI emulator rework and the i915 gamma switch |
+| [kernel/patches/k16/](../kernel/patches/k16/), [kernel/K16.md](../kernel/K16.md) | build #16 on top of k15 (no nouveau change): the escaped VNNI task name and the Realtek SD-card reader modules |
 | [native/nouveau-kernel/](../native/nouveau-kernel/) | `gb_nouveau.sh` (auto/off/bind path), `gb_nouveau.rc`, `gb_dgpu_report.sh` (report, test sequence, self-test), `gb_notify.sh`, `gb_dgpu_check.sh`, the payload builder, the TU117 firmware fetcher with WHENCE/licence |
 | [native/power/](../native/power/) | `gb_power` (batteries, DTX detach, dGPU hot-plug, graphics derivation, control socket) |
 | [native/nvk-android/](../native/nvk-android/) | Mesa NVK for Android (patch set 8a), `nvk_probe`, chroot/ELF checks |

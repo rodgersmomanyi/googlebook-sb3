@@ -12,6 +12,8 @@ modules. Built with Kleaf on the Linux builder ([builder/README.md](../builder/R
 | [patches/0002-x86-traps-...](patches/) | #UD emulation of VEX AVX-VNNI (GB_VNNI_EMULATION); **v4 in build #15** (IRQs on, xstate init state, MAXVL, `/sys/kernel/gb_vnni` counter; adds `arch/x86/kernel/gb_vnni_core.h`) | VM + native |
 | [patches/0003-mei-me-...](patches/) | MEI device ID 8086:34E4 (IPTS) | native |
 | [patches/0005-i915-optional-ignore-user-gamma.patch](patches/) | i915 display param `gb_ignore_user_gamma` (default 0; the "white veil" switch), build #15 | native |
+| [patches/0006-x86-traps-gb_vnni-escape-the-task-name.patch](patches/) | `/sys/kernel/gb_vnni/summary` and the `gb_vnni: emulating` kmsg line print the task name escaped (`\xHH` for control bytes, `\` and `=`), so a task name cannot add lines or fields (LOW-3), build #16; applies on top of 0002 | VM + native |
+| [patches/k16/0113-gki-realtek-card-reader-modules.patch](patches/k16/) | `MISC_RTSX_PCI`, `MISC_RTSX_USB`, `MMC_REALTEK_PCI`, `MMC_REALTEK_USB` `=m` and their four `.ko` outputs (the SD-card reader in the base, if it is a Realtek vendor-class USB or a PCIe reader), build #16; applies on top of the k13 config diffs | native (loaded by modalias) |
 | linux-surface `patches/6.18/0005-ipts.patch`, **drivers/hid part only**: `git apply --include='drivers/hid/*' 0005-ipts.patch` (not included here; GPL-2.0, md5 `5af0a1a8bbfb9d7038a43674508e5938`) | IPTS touch/pen driver `drivers/hid/ipts` + its Kconfig/Makefile hooks ([patches/0004](patches/) records the hooks; do not apply it as well) | native |
 | [../native/power/patches/0001-0003](../native/power/patches/) | `surface_battery scope_device`, `test_power charge_full/temp`, `surface_dtx` latch event fix | native (`test_power` also VM) |
 | [../native/sensors/patches/0001-0002](../native/sensors/patches/) | HID sensors / APDS-9960 registered as `cros-ec-accel`/`-gyro`/`-light`, the form lapis's IIO sensors HAL accepts | native (build #13) |
@@ -92,6 +94,27 @@ is byte-for-byte unchanged (review notes and the acceptance table in [K15.md](K1
 Build script [scripts/kbuild15_native.sh](scripts/kbuild15_native.sh); acceptance K-01..K-14
 `patches/k15/tools/k15_accept.sh`; state-handling test `patches/k15/tools/test_kbuild15_state.sh`. The KAT
 (`tools/vnni_kat.c`, the static test binary) and its host self-check are described in [K15.md](K15.md).
+
+## Build #16 (k16): the escaped task name and the SD-card reader modules
+
+Native images (and the VM) run **build #16**: build #15 plus two patches applied on top of `k15-nouveau` (review
+notes and the acceptance table in [K16.md](K16.md)).
+
+* `0112` **x86/traps** (also published as [patches/0006](patches/)): the task name in the `gb_vnni` summary and in the
+  rate-limited kmsg line goes through `string_escape_mem()`. Printable ASCII and the blank pass unchanged except `\`
+  and `=`; every other byte becomes `\xHH`. One bucket is always one line, and a normal name prints exactly as on k15.
+* `0113` **gki_defconfig, BUILD.bazel**: the Realtek card-reader drivers `rtsx_usb` + `rtsx_usb_sdmmc` (USB vendor
+  class, `0bda:0129/0139/0140`) and `rtsx_pci` + `rtsx_pci_sdmmc` (PCIe) as modules. A mass-storage-class reader needs
+  nothing new (`usb-storage` and `uas` are built in). The native image loads them by modalias only: `stage_kernel.py`
+  writes a `modules.alias` and a `modules.dep` for exactly these four into `/odm/lib/modules`, which lapis's ueventd
+  (`modalias_handling enabled`) reads before `/vendor/lib/modules`.
+
+The KMI symbol list is unchanged and every k15 export keeps its CRC; vmlinux additionally exports the core symbols
+these drivers need (`devm_mmc_alloc_host`, `mmc_add_host`, `mmc_remove_host`, `pci_intx`, `usb_sg_cancel`, `usb_sg_init`, `usb_sg_wait`). `.config` = k15's + the five card-reader lines
+([config/k16_card_readers.fragment](config/k16_card_readers.fragment), the k15 -> k16 `.config` difference as a
+Kconfig fragment). Build script
+[scripts/kbuild16_native.sh](scripts/kbuild16_native.sh); acceptance K-01..K-18 `patches/k16/tools/k16_accept.sh`;
+state-handling test `patches/k16/tools/test_kbuild16_state.sh`.
 
 ## Build
 

@@ -28,7 +28,8 @@
   (each refusal is exit 2, nothing written): the export GUIDs are the installed set's; the active slot decoded from the
   installed vbmeta_a/b GPT attributes (bit for bit as gb_slotsync) is unambiguous and equals the export's slot; the
   installed boot/init_boot/vendor_boot/vbmeta of that slot are byte-identical to the export (gbdisk verify, read-only:
-  a slot updated on the device is refused); the installed loader.conf default is gb-<slot>. Before the write the whole
+  a slot updated on the device is refused); the installed loader.conf default is gb-<slot>.conf (or the pre-wave-8
+  gb-<slot>). Before the write the whole
   installed EFI-SYSTEM is saved raw into the run folder (esp-before-<stamp>.img + sha256, the rollback image) and
   gblog\, gbinstall\, gb\gb.cfg and gb\overlay\ are copied out as files (gblog-preserved-<stamp>\). -NoEspBackup
   goes on when that raw save fails (an unreadable ESP). Idea: the gbOS86 update flow (gbos86.com/docs/updating,
@@ -346,12 +347,14 @@ if ($UpdateEspOnly -or $RepairBootEntry) {
                 if ($info.gb_cfg -or $info.gb_overlay) { Write-Warn2 "the update removes the bring-up files gb\gb.cfg / gb\overlay\ from the ESP; the copies are in $pres (put them back from Windows if you still need them)" }
                 $defs = @($info.loader_defaults)
                 if ($info.loader_conf) {
-                    $bad = @($defs | Where-Object { $_ -ne "gb-$slot" })
+                    # (wave 8, SLOT-DEFAULT) 'gb-<slot>.conf' is the id systemd-boot 262.1 matches; 'gb-<slot>' is what
+                    # every ESP written before wave 8 carries (the export writes the .conf form either way)
+                    $bad = @($defs | Where-Object { $_ -cne "gb-$slot.conf" -and $_ -cne "gb-$slot" })
                     if ($defs.Count -eq 0 -or $bad.Count) {
-                        Write-Bad ("the installed loader.conf default is '{0}', not gb-{1}: the ESP is set to boot another entry - refusing (the raw backup and copies stay in the run folder)" -f ($defs -join "', '"), $slot)
+                        Write-Bad ("the installed loader.conf default is '{0}', not gb-{1}.conf: the ESP is set to boot another entry - refusing (the raw backup and copies stay in the run folder)" -f ($defs -join "', '"), $slot)
                         exit 2
                     }
-                    Write-Ok "installed loader.conf default gb-$slot"
+                    Write-Ok "installed loader.conf default $($defs -join ', ') (slot $slot)"
                 }
             }
 

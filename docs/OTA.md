@@ -30,14 +30,25 @@ Here nothing does: systemd-boot just starts its default entry, and our initrd em
    `build_esp.slot_stamp()`) skips the rebuild when nothing changed.
 5. Writes `loader/entries/gb-<x>.conf` from the booted slot's entry (same kernel and options, new initrd and title)
    and, on native ESPs, `gb-<x>-nvtest.conf` from the booted slot's `[NVIDIA test]` entry, then sets
-   `default gb-<x>` in `loader/loader.conf`. The old slot's entries stay in the menu as a fallback while they still
+   `default gb-<x>.conf` in `loader/loader.conf`. systemd-boot matches that line against the entry's file name,
+   `.conf` included. Images before wave 8 wrote `default gb-<x>`, which matched no entry, so the loader started
+   `gb-b.conf` whenever it existed and an update into slot A was never started; the first boot of a wave-8 image
+   rewrites such a line once, for the slot that booted. The old slot's entries stay in the menu as a fallback while
+   they still
    match that slot. A rebuild first removes the slot's older entries and stamp, so an interrupted rebuild leaves no
    entry that would boot the slot's new system with its old ramdisk. On later boots (no update pending) the other
    slot's entries are checked once per boot and whenever its GPT bootable state changes: they are removed while an
    update is being written into that slot (it is marked unbootable) or when its initrd no longer matches its
    `init_boot`/`vendor_boot` (the stamp). The next update into that slot writes them again.
 6. Otherwise it keeps the default on the slot that actually booted, so after a failed new slot (you pick the old one
-   in the menu) the default falls back.
+   in the menu) the default falls back, and a slot you pick by hand stays the default for the next starts (since
+   wave 8; before, the next unattended start was slot B again). Pick the older slot only while the newer build has
+   not reached the lock screen: once you signed in on it, Android may have upgraded `/data` and the keys behind
+   your lock-screen PIN, and going back is a downgrade that can refuse your PIN (inferred, not measured); update
+   the ESP from the host instead. A `preferred` line in `loader.conf` (nothing writes
+   one; it would override the default) is removed at the same time. Do not press `d` or `D` in the boot menu: they
+   store an entry in the firmware (`d`: the `LoaderEntryPreferred` EFI variable, `D`: `LoaderEntryDefault`) that
+   overrides `loader.conf` and that Android cannot see or clear. Pressing `d` again on that entry removes either one.
 
 ### Kernel check before the switch
 
@@ -49,7 +60,8 @@ modules for a build are made for the GKI in that build's `boot_<x>`, while this 
 * **Same KMI** (also when the GKI sublevel or build number changed, as long as the KMI is the same): switch as
   above. The comparison is logged once.
 * **Different KMI, or a version that cannot be read:** **HOLD.** The new slot's initrd and its `(slot X)` entries are
-  still written, so it is in the boot menu and can be picked once by hand, but `loader.conf` keeps the old default.
+  still written, so it is in the boot menu and can be picked once by hand, but `loader.conf` keeps the old default
+  (`default gb-<cur>.conf`, written before the held slot's entries).
   kmsg gets one line per (slot, release), `gb_slotsync: HOLD slot <x>: KMI <new> != running <ours>; default stays
   gb-<cur>`, again once on each later boot while the hold is in effect (so the `gblog\` summary shows it), and the
   notification **"System update held"** ("Kernel mismatch: ...") appears (natively, through `gb_notify`) once the
@@ -87,7 +99,7 @@ and checks it at every boot:
     usage; a refused user or style prints `Error occurred`). Since wave 7 the native notice path (gb_notify) reads
     that output and tries once more without the missing option: for all users without the text style, for the
     login screen only when a future build has no `-u` at all (logged), or once per signed-in user when `all` is
-    refused. The VM build's direct post (`gb_otagate_post`) does not have this fallback yet. From wave 6
+    refused. Since wave 8 the VM build's direct post (`gb_otagate_post`) does the same. From wave 6
     the kernel log also gets, after the notification, one line per bind mount of the image
     (`gb_otagate: stock <path> <sha256> ours <sha256>`): the Google file's sha256 where nothing of ours covers it on
     that boot (for example the stock `libz.so` when the libz patch was skipped), otherwise `hidden-by-our-bind` or
@@ -96,7 +108,9 @@ and checks it at every boot:
     From wave 7 the notice also counts: the image keeps a small record in `/data/vendor/gb/ota_unvalidated` (the two
     build fingerprints, the boot id, the count), and from the third boot of the same unvalidated build the notice
     reads **"System update still not validated"**, "Unvalidated boot N of build ... Still paused: VNNI libz patch.
-    Update the ESP from the host, or boot the previous slot." The kernel log gets `gb_otagate: boot count: N
+    Update the ESP from the host, or boot the previous slot." (Boot the previous slot only if this build never
+    reached the lock screen; after a sign-in on it, update the ESP from the host: see below.) The kernel log gets
+    `gb_otagate: boot count: N
     unvalidated boot(s) of this build pair`. Without a boot id or a usable record the plain notice is shown; nothing
     changes on a validated build.
 * **The SELinux list is OTA-robust.** Every `(typepermissive T)` line of
@@ -115,7 +129,11 @@ and checks it at every boot:
 tested on it. Most things are expected to work. To validate it, rebuild the ESP on the host from a `lapis.bin` that
 has the new build in its boot slot: in the VM (VM off) `python -I vnni_prepare.py` (optional; patches the new build's
 libz), then `GB_WRITE_LAPIS=1 python -I build_esp.py`; for a dual-boot install, a new export and
-`install_dualboot.ps1 -UpdateEspOnly`. To go back instead, pick the previous slot's entry in the boot menu. The
+`install_dualboot.ps1 -UpdateEspOnly`. To go back instead, pick the previous slot's entry in the boot menu, but only
+while the new build has not reached the lock screen: since wave 8 that pick stays the default, and after a sign-in
+on the new build going back is a downgrade over `/data` whose upgraded keys can make the lock screen refuse your
+PIN (inferred, not measured). The same holds for an ESP backup taken before the update: in the VM, `gb_vmbackup.py
+restore --esp-only` refuses a backup of the other slot (wave 8). The
 louder "still not validated" notice (from the third such boot) asks for the same thing. The image does not fall back
 to the previous slot by itself when a new build fails to boot: that needs systemd-boot boot counting in `gb_slotsync`
 (planned; see [native/ota-gating/DESIGN.md](../native/ota-gating/DESIGN.md) section 8, F5).
@@ -177,3 +195,8 @@ complete and no firmware is touched.
 * Observed in the VM, once: CL3B.260622.271 -> .276 installed by OTA, and the VM then booted .276 from slot B. This
   was confirmed afterwards from the slot state and the build number; the reboot into the new slot was not watched
   step by step. Untested on hardware.
+* Wave 8, on a throwaway VMware VM: with the GPT set as an update into slot A leaves it and the update recorded as
+  completed in that boot, `gb_slotsync` logged the kernel check, built `initrd-a.img`, wrote `gb-a.conf` and
+  `default gb-a.conf`, and the next power-on started slot A (13 of 13 kernel starts). That VM's slot A held an older
+  system, so dm-verity then refused it and the start repeated: the image does not fall back to slot B by itself
+  yet (pick "(slot B)" in the boot menu; that pick stays the default).

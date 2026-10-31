@@ -175,6 +175,46 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     G1-G4 and T8 (378 checks, 0 failed). The long-running VM now runs the wave 7 VM build (after a verified backup of
     its boot partition; its lock-screen PIN path is unchanged). On the native image the settings and notice changes act
     after Android has started, which the native tree never reaches in VMware: checklist item 28.
+* **Wave 8, 2026-10-31 (kernel build #16, updates into slot A, your own settings kept; nothing has run on the
+  hardware yet):**
+  * Kernel build #16 ([kernel/K16.md](../kernel/K16.md)) in both trees: build #15 plus two patches. The VNNI
+    emulator's counter prints task names escaped, so a program can no longer add lines to the boot-log summary,
+    and the Realtek SD-card reader drivers (USB vendor class and PCIe) are built and loaded by modalias in the
+    native image, so the base's reader works whichever type it is (row 34, item 6). The KMI symbol list is
+    unchanged; lapis's vendor modules load as before. The emulator's known-answer test passed again on build #16
+    (9,235 cases).
+  * Updates into slot A now start ([OTA.md](OTA.md#gb_slotsync)). systemd-boot matches the `loader.conf` default
+    against the entry's file name including `.conf`; the line `default gb-<x>` written so far matched no entry, so
+    the loader always started slot B's entry. The images, `gb_slotsync` (it rewrites an older ESP's line once),
+    `verify_image` (check V33) and the dual-boot `-UpdateEspOnly` check now use `default gb-<x>.conf`; a slot you
+    pick in the boot menu stays the default (pick the older slot only while the newer build has not reached the
+    lock screen).
+  * Your own settings stay. `gb_ui.sh` used to put back its display density and the stock launcher at every boot,
+    and its one-time values (the VM's screen timeout, the native Auto-rotate default) replaced whatever your user
+    had. Now the density changes only while it is still the value it set itself (it follows a display change, never
+    your Display size), the launcher is set up once (a launcher you pick stays), and a one-time value is written
+    only when nobody chose the current one (`dumpsys settings` shows who wrote it: the system's default and our own
+    values are replaced, a value from Settings, the quick settings, an app or `adb` is kept and logged) and it did
+    not change since your first sign-in (a toggle such as Auto-rotate is written by the system for you). Tested in
+    VMware on a fresh first boot, a second user whose screen timeout was changed right after the first sign-in, and
+    a warm boot after a Display size change. `verify_image.py` now also checks the image's `gb_ui.sh` (V12).
+  * The VM build's update notice no longer depends on `cmd notification post`'s exit status: like `gb_notify`, its
+    direct post reads the output and falls back once (without the text style, without `-u` for the login screen
+    only, or once per signed-in user), logging what happened.
+  * Smaller items: item 10's one-time Auto-rotate flag is also set when the overlay applied; `build_esp.py` writes
+    the VM's `lapis.bin` only with `GB_EXPECT_ESP_SHA256` = the sha256 of the preview that was checked
+    ([VMWARE.md](VMWARE.md)); the VMware ESP rollback (`gb_vmbackup.py restore --esp-only`) refuses a backup of
+    the other A/B slot, because after a Google update switched the VM's slot every older ESP backup is the wrong
+    rollback ([GATEKEEPER.md](GATEKEEPER.md#upgrading-an-existing-vm)).
+  * Tested in VMware: a rehearsal of the VM build on kernel build #16 (a fresh first boot, 42 of 42 checks; a forced
+    unvalidated update, 25 of 25, with the notice in user 10's panel and your own Display size and screen timeout
+    kept; the emulator's known-answer test and a hostile-task-name test, 15 of 15; a validated boot, 17 of 17; a
+    switch to slot A, 11 of 11: `gb_slotsync` wrote `default gb-a.conf` and the next start ran slot A), VM-1 on the
+    rebuilt USB image (every wave 2, 3, 5, 6, 7 and 8 check that VMware can show; the hardware-test analyser 17
+    PASS, 0 FAIL, 23 UNKNOWN), and on the installer ISO T0, T1a/T1b, the dual-boot groups G1-G4 and T8 (378 checks,
+    0 failed). The long-running VM now runs the wave 8 VM build with kernel build #16 (after a verified backup of
+    its boot partition; its lock-screen PIN path is unchanged). The SD reader's type and its loading, the native
+    `gb_ui.sh` branch and the rotation flag can only be checked on the laptop: items 6, 10, 24 and 28.
 
 ## 1. Platform, CPU, firmware interfaces
 
@@ -233,7 +273,7 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 | 31 | PCH xHCI 34ED + base hubs 045E:0C12/0C13 → 0C14/0C15 | xhci-pci, hub (built in) | Expected | Port map from ACPI `_UPC`/`_PLD` [V]: HS01/SS01 = proprietary visible port (Surface Connect); HS02/SS02 = base hub → PRT1 USB-C, PRT2 = second hub → PRT2/PRT3 the two USB-A ports, PRT1 internal/non-connectable; HS10 = Bluetooth. Detaching the base removes all base ports. |
 | 32 | TCSS xHCI 8A13 (00:0d.0) | xhci-pci (built in) | N/A | Nothing attached. TCSS DMA and Thunderbolt root ports are disabled [V, PnP + SSDT `_STA`]. |
 | 33 | USB-C / PD (base) | USB data: base hub. **UCSI:** ACPI `\_SB.UBTC` (USBC000/PNP0CA0) exists, but `_STA` returns 0 unless NVS `USTC==1`, and Windows does not enumerate it [V], so lapis `ucsi_acpi` never binds. Windows uses UCSI over SAM HID (row 20) | Partial | Data and charging are expected to work (the EC runs PD) [I]. Android gets no `/sys/class/typec` port, so there is no PD/role/partner information and no data-role switching (lapis USB HAL shows nothing). Writing a SAM-HID UCSI transport would mean reverse-engineering an undocumented protocol on the real device. Not feasible blind. |
-| 34 | SD card reader (base) | usb-storage / uas (built in), vfat/exFAT (built in) | Ready [I] / Partial | There is no PCI SD host on the SB3, and on the audited unit Windows had never enumerated the reader, so it probably appears only with a card inserted, behind the base hub [I]. vold mounts it as a "USB" volume on internal installs. **On USB-stick boots** gbinit deletes the `voldmanaged=usb` fstab line (to protect the boot stick) [V, build_esp.py], so SD cards and USB sticks are not mounted then. If it turns out to be a Realtek vendor-class reader (0BDA:0129/0139/0179), enable MISC_RTSX_USB + MMC_REALTEK_USB in a later build. |
+| 34 | SD card reader (base) | usb-storage / uas (built in), vfat/exFAT (built in) | Ready [I] / Partial | There is no PCI SD host on the SB3, and on the audited unit Windows had never enumerated the reader, so it probably appears only with a card inserted, behind the base hub [I]. vold mounts it as a "USB" volume on internal installs. **On USB-stick boots** gbinit deletes the `voldmanaged=usb` fstab line (to protect the boot stick) [V, build_esp.py], so SD cards and USB sticks are not mounted then. Since kernel build #16 a Realtek vendor-class reader (0BDA:0129/0139/0140, the ids in the driver's table) or a Realtek PCIe reader is covered too: `rtsx_usb`/`rtsx_usb_sdmmc` and `rtsx_pci`/`rtsx_pci_sdmmc` are in the native image and lapis's ueventd loads them by modalias when the reader appears [V: VMware load test; the reader type itself is still unknown]. |
 | 35 | Surface Connect + SurfaceDock 1/2 (USB, Ethernet, DP, audio) | Ethernet: `r8152` (in modules.load; handles 045E:07AB/07C6/0927/0C5E [V, r8152.c]); DP: i915; dock audio: SND_USB_AUDIO (built in) | Ready [I] + **New here** | `firmware/rtl_nic/rtl815[36]*.fw`: 7 files from linux-firmware, listed by sha256 in `native/hw-gap-audit/tree/firmware/rtl_nic.sha256` (you fetch them; not in this repository). r8152 works without them but loads these PHY patches when present. lapis declares `android.hardware.ethernet` [V]. |
 | 36 | USB NIC / serial dongles | r8152, ax88179_178a, cdc_ether, cdc_ncm, cdc-acm (gbinit) | Ready | – |
 
@@ -281,7 +321,7 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 3. RAPL: dmesg should contain `gb_hw: rapl-snapshot: firmware MSR_PKG_POWER_LIMIT pl1_uw=... locked=...` and `gb_hw: rapl: mode=fw PL1/PL2 uW 25000000/55000000 -> <fw values>`. If locked=1, lapis's writes failed too, which is fine.
 4. Backlight: `gb_hw: backlight: intel_backlight max=...`. Brightness slider and Fn brightness keys both change the panel.
 5. USB-C: plug in a USB-C hub or monitor. Check that data and charging work and that DP shows a picture. `/sys/class/typec` is expected to be empty.
-6. SD card: insert a card **while booted from the internal install**, then note the reader's VID:PID (`cat /sys/bus/usb/devices/*/idVendor /sys/bus/usb/devices/*/idProduct`; it is also visible in Windows Device Manager once a card is inserted there).
+6. SD card: insert a card **while booted from the internal install**, then note the reader's VID:PID (`cat /sys/bus/usb/devices/*/idVendor /sys/bus/usb/devices/*/idProduct`; it is also visible in Windows Device Manager once a card is inserted there). With kernel build #16: a Realtek `0bda:0129`/`0139`/`0140` reader must show `rtsx_usb` and `rtsx_usb_sdmmc` in `lsmod` and a `/dev/block/mmcblk0`; any other reader must be bound by `usb-storage` (`ls /sys/bus/usb/drivers/usb-storage/`) and give a `/dev/block/sd*`. Either way vold should offer the card. If neither happens, keep `dmesg | grep -i -E 'rtsx|mmc|usb-storage|sd '` and the VID:PID. If a boot hangs once the reader appears, keep the four drivers off for one boot: press `e` at the boot menu, press End and type ` module_blacklist=tpm,tpm_tis,tpm_tis_core,tpm_tis_spi,tpm_tis_i2c_cr50,spi_intel_pci,spi_intel,spi_nor,mtd,gsmi,rtsx_usb,rtsx_usb_sdmmc,rtsx_pci,rtsx_pci_sdmmc` (the kernel keeps only the last `module_blacklist=`, so the line must repeat the entry's own list; `module_blacklist=rtsx_usb` alone would drop the TPM, SPI-flash and GSMI protection for that boot).
 7. Dock: SurfaceDock Ethernet (r8152 firmware lines in dmesg), external DP and dock audio.
 8. Pen: pair the Surface Pen in Android Bluetooth settings. A top-button click should open the notes app; double-click takes a screenshot.
 9. Cameras: the boot-log summary shows `vendor.camera-provider-2-7-legacy-wrapper` `running` with `HAL load failures: 0`; `dmesg | grep -i ipu` shows firmware `intel/ipu/ipu4p_fw.bin` loaded and ISYS registered; `/odm/bin/lcam-probe -l` lists the front (`ov5693`) and rear (`ov8865`) sensors without `CANNOT LINK EXECUTABLE`; then test the Camera app (front and rear).
@@ -298,7 +338,9 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     `user=` field says which user).
     At the first boot the log also shows how Auto-rotate got its default (wave 7):
     `GB_SENSORS: auto-rotate default from GbSb3SettingsOverlay (enabled): no first-boot write` is expected (the
-    overlay applied, and nothing writes a rotation setting); `GB_SENSORS: auto-rotate enabled (first boot)` means the
+    overlay applied, and nothing writes a rotation setting; since wave 8 that boot also sets the one-time flag
+    `persist.gb.sensors.rotinit=1`, so a later boot that does not see the overlay enabled writes nothing either);
+    `GB_SENSORS: auto-rotate enabled (first boot)` means the
     overlay is not applied (check `cmd overlay list --user 0 | grep gb_sb3`), and the old one-time write ran as a
     fallback.
 11. Suspend: lid close → s2idle → lid open wakes. Power button sleeps and wakes (also with the clipboard detached, once `gb_hw.sh buttons` bound `MSHW0040:00`: item 25). Base keyboard keys are **not** expected to wake (`surface_aggregator` leaves wake off by default). After a sleep, check the battery drop, `/sys/power/suspend_stats` and `lpi_residency_us system=` on the `gb_hw: diag: mem_sleep` line (growing > 0 confirms S0ix residency), and check that the dGPU is in D3cold (`gb_hw: diag: dGPU ... power_state=D3cold`).
@@ -338,7 +380,9 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     `hal=running`; `linker:` shows `CANNOT LINK lines: 0 logcat, 0 kernel`.
 24. (Wave 3) The rest of the summary as in [FLASHING.md, First-boot checklist](FLASHING.md#first-boot-checklist):
     fs-verity present, apgetty off, the `-- gb_vnni` counter (`irqon` equals `emulated`), no HWUI abort lines, no
-    `gb_slotsync HOLD:` line.
+    `gb_slotsync HOLD:` line. (Wave 8) On the stick, `loader\loader.conf` starts with `default gb-b.conf`; in the
+    boot menu the `(slot B)` entry is highlighted; `ro.boot.slot_suffix` in `== getprop` is `_b`. Every line of
+    the `-- gb_vnni` block is one `comm=... rip=... count=...` record (kernel build #16 escapes the task names).
 25. (Wave 5, row 23) Power button and volume keys: the summary's `buttons:` line (and `gb_hw: buttons:` in `dmesg`, `[vendor.gb.buttons]` in `== getprop`) shows `MSHW0040:00` bound to `soc_button_array` with `2 gpio-keys input(s)`. A short Power press turns the screen off and wakes it again (including with the clipboard detached), and the volume rocker changes the volume.
 26. (Wave 6, row 17) 15" Surface Book 3 only: `vendor.gb.nouveau.result=refused:model`, one `gb_nouveau: guard:`
     line naming `TU116` or `TU106` per gb_nouveau run (at most two per boot, plus one per base reattach), the dGPU
@@ -354,7 +398,8 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     is `1` and the boot log has `GB_SENSORS: user 10: auto-rotate already on` (the Auto-rotate default came from
     our settings overlay) or `... auto-rotate enabled at its first unlock` (it did not); `GB_UI user=10` shows
     density 320. Turn Auto-rotate off, reboot, sign in: it stays off. Turn the Graphics app's notifications off,
-    reboot: they stay off.
+    reboot: they stay off. (Wave 8) Change Display size in Settings, reboot, sign in: it stays, and the boot log's
+    `GB_UI user=10` line says `the person's own Display size kept`.
 
 ## Readiness audit (wave 5): what the image proves and what needs the laptop
 
