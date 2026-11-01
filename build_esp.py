@@ -754,6 +754,10 @@ GB_SLEEPER = b"#!/system/bin/sh\nwhile :; do /system/bin/sleep 3600; done\n"
 # other hardware (a VMware VM, a Surface Book 3); in the VM it fails, and its non-zero exit aborts every system update
 # ("Couldn't update - Installation problem"). Bound over the updater: skip and succeed.
 # Native only: refuse (exit 1) for flashing/EC tools; fwupd's daemon idles so init sees a healthy service.
+# (W9 hw-native1) Every lapis vendor binary that reaches libflashrom is a refusal stub natively: flashrom (lapis's vpd
+# execs it in the permissive firmware_tool domain at every boot), futility, crossystem (its own stub), and elogtool
+# and cbfstool, which link libvboot_host -> libflashrom in-process (snapshot_collector runs elogtool for its event-log
+# reports). cgpt also links libflashrom, but only for a GPT on NOR flash (MTD), which k16 cannot provide (no MTD).
 GB_REFUSE = (b"#!/system/bin/sh\n"
              b"echo \"gb: $0 is disabled on this hardware (protects the Surface firmware and TPM)\" >&2\n"
              b"exit 1\n")
@@ -828,6 +832,10 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"# It polls the foreground user (am get-current-user) every 2 s for 10 min, then every 10 s, for the whole boot, so a\n"
             b"# late sign-in and a user created later are covered. At start, the markers and records of users that no longer exist\n"
             b"# are removed (pm list users must answer and list user 0), so a reused user id starts fresh.\n"
+            b"# (Wave 9, BACKLOG HS-O4/HS-O11) It publishes the foreground full user in vendor.gb.ui.fg, set at every change:\n"
+            b"# the user's id once it is in the foreground and unlocked (a user set up above, or one seen unlocked again), \"none\"\n"
+            b"# otherwise (the login screen, a user still starting). init starts gb_notify on it (a notice held while nobody was\n"
+            b"# signed in is posted for that user) and, natively, GbGpu's per-user setup (gb_gpu_ui_user). No other property.\n"
             b"# Test hooks (never set by init): GB_ROOT (prefix for /odm and /data), GB_TEST_PATH (prepended to PATH), GB_UI_LOG=-\n"
             b"# (log to stdout instead of /dev/kmsg), GB_UI_MAXPOLL (stop after that many polls; default: never stop).\n"
             b"[ \"${GB_UI_LOG:-}\" = - ] || exec > /dev/kmsg 2>&1\n"
@@ -1047,17 +1055,20 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"cleanup\n"
             b"SEEN=\n"
             b"PEND=\n"
+            b"FGP=\n"
             b"Z=0\n"
             b"n=0\n"
             b"while :; do\n"
             b"  c=$(timeout 20 am get-current-user 2> /dev/null)\n"
             b"  case $c in '' | *[!0-9]*) c= ;; esac\n"
             b"  [ ${#c} -le 5 ] || c=\n"
+            b"  JUST=\n"
             b"  if [ -n \"$c\" ] && [ \"$c\" != 0 ]; then\n"
             b"    case \" $SEEN \" in\n"
             b"      *\" $c \"*) ;;\n"
             b"      *)\n"
             b"        if unlocked \"$c\"; then\n"
+            b"          JUST=$c\n"
             b"          SEEN=\"$SEEN $c\"\n"
             b"          user_ui \"$c\"\n"
             b"          show \"$c\"\n"
@@ -1071,6 +1082,19 @@ GB_UI_SH = (b"#!/system/bin/sh\n"
             b"    Z=1\n"
             b"    dens 0\n"
             b"    show 0\n"
+            b"  fi\n"
+            b"  # (wave 9) vendor.gb.ui.fg: the foreground user once unlocked (just set up; already published; or seen again and\n"
+            b"  # unlocked: one am call per poll only while a known user is back in front but not published yet), else none\n"
+            b"  _f=none\n"
+            b"  if [ -n \"$c\" ] && [ \"$c\" != 0 ]; then\n"
+            b"    case \" $SEEN \" in\n"
+            b"      *\" $c \"*) if [ \"$c\" = \"$JUST\" ] || [ \"$c\" = \"$FGP\" ] || unlocked \"$c\"; then _f=$c; fi ;;\n"
+            b"    esac\n"
+            b"  fi\n"
+            b"  if [ \"$_f\" != \"$FGP\" ]; then\n"
+            b"    FGP=$_f\n"
+            b"    if setprop vendor.gb.ui.fg \"$_f\" 2> /dev/null; then echo \"GB_UI foreground: $_f\"\n"
+            b"    else echo \"GB_UI foreground: $_f (setprop vendor.gb.ui.fg failed)\"; fi\n"
             b"  fi\n"
             b"  _left=\n"
             b"  for _p in $PEND; do                       # <user>:<poll of its first unlock>:<CAP>\n"
@@ -1688,6 +1712,41 @@ GB_SLOTSYNC_RC = (b"\n"
 GB_RC += GB_SLOTSYNC_RC
 print(f"slot follower (gb_slotsync): {'ON' if SLOTSYNC_BIN else 'off'}", flush=True)
 
+# (Wave 9, BACKLOG HS-O7 + HS-O4) The notification queue in the VM tree too (INTERFACES 12.1/12.1a): before, gb_slotsync's
+# "System update held" reached only kmsg in the VM (no queue, no gb_notify) and gb_otagate_post posted its notice for all
+# users. Now the VM runs the native component's own gb_notify.sh (the same file, packed as /odm/vup/bin/gb_notify.sh from
+# inject\native\components\nouveau.json), with the native service and queue: gb_slotsync's HOLD notice is queued as
+# natively, gb_otagate's root service queues its notice (its qok() test finds gb_notify.sh and the queue) and
+# gb_otagate_post stands down; gb_notify posts every notice for the person's foreground full user and holds it while
+# nobody is signed in (vendor.gb.ui.fg, published by gb_ui, starts it again). VM-only block: natively the component's
+# own rc defines the service. Not a PIN-path file or rc line (no gatekeeper/keymint word).
+def _component_file(name, dest):
+    with open(os.path.join(HERE, "inject", "native", "components", name + ".json"), encoding="utf-8") as _f:
+        _m = __import__("json").load(_f)
+    _src = [e["src"] for e in _m.get("files", []) if e.get("dest") == dest]
+    assert len(_src) == 1, f"{name}.json: exactly one file with dest {dest}"
+    with open(_src[0], "rb") as _f:
+        return _f.read()
+GB_NOTIFY_VM = _component_file("nouveau", "vup/bin/gb_notify.sh")
+GB_NOTIFY_VM_RC = (b"\n"
+                   b"service gb_notify /system/bin/sh /vendor/bin/gb_notify.sh\n"
+                   b"    user shell\n"
+                   b"    group shell\n"
+                   b"    seclabel u:r:shell:s0\n"
+                   b"    oneshot\n"
+                   b"    disabled\n"
+                   b"\n"
+                   b"on post-fs-data\n"
+                   b"    mkdir /data/vendor/gb 0751 root shell\n"
+                   b"    mkdir /data/vendor/gb/notify 0770 root shell\n"
+                   b"\n"
+                   b"on property:vendor.gb.notify=*\n"
+                   b"    start gb_notify\n"
+                   b"\n"
+                   b"on property:vendor.gb.ui.fg=*\n"
+                   b"    start gb_notify\n")
+GB_RC += GB_NOTIFY_VM_RC
+
 # ---------------- OTA gate, both trees (wave 5b) ----------------
 # After a Google A/B OTA, gb_slotsync boots the new slot with THIS initrd's /odm tree (it reuses /gb/inject.gz), so every
 # injection built and tested for one build also meets the next one. Design, the classification and its evidence:
@@ -1736,6 +1795,7 @@ OTA_CLASSES = (
     ("vup/bin/fwupd-binder", "always", "stub"), ("vup/bin/fwupd_blocking_update", "always", "stub"),
     ("vup/bin/fwupdmgr", "always", "stub"), ("vup/bin/flashrom", "always", "stub"), ("vup/bin/futility", "always", "stub"),
     ("vup/bin/ectool", "always", "stub"), ("vup/bin/init.adbd-killer.sh", "always", "stub"),
+    ("vup/bin/elogtool", "always", "stub"), ("vup/bin/cbfstool", "always", "stub"),       # (W9 hw-native1) libflashrom
     ("vup/bin/android-desktop-install", "always", "stub"),
     ("empty_vintf.xml", "always", "mask"), ("gb_noop.sh", "always", "stub"), ("gb_sleeper.sh", "always", "stub"),
     ("gb_fw_stub.sh", "always", "stub"),
@@ -1858,6 +1918,9 @@ assert GBINIT.count(OTA_GBINIT_TOKENS) == 1 and GBINIT.count(OTA_GBINIT_UNVALIDA
 # gb_notify ships and its queue exists (native), queues the message like every other producer; gb_otagate_post (user
 # shell, the identity gb_notify posts with; INTERFACES D6: posting as uid 0 is unverified) posts it directly everywhere
 # else (the VM tree has no gb_notify). Notifications with the same tag replace each other, so a double post is one.
+# (Wave 9, HS-O7) Since wave 9 the VM tree has gb_notify and its queue too (GB_NOTIFY_VM_RC), so in both trees the root
+# service queues the notice and gb_notify posts it for the person's foreground user (INTERFACES 12.1a, HS-O4); the
+# direct post below (still -u all) only runs in a tree without gb_notify. The script's bytes are unchanged.
 # (Wave 6, notify) lapis is in headless system user mode: a shell post without a user lands in user 0 (the login
 # screen's headless "System User") and SystemUI hides it from the person's user 10 (forced OTA-gate boot: sysui
 # NotCurrentUserFilter). Both paths now post ONE record for UserHandle.ALL (`cmd notification post -u all`, as
@@ -1879,7 +1942,7 @@ assert len(OTA_TITLE) <= 40 and len(OTA_TEXT.replace(b"$B", b"x" * 24).replace(b
 OTA_LOUD_AFTER = b"3"
 OTA_TITLE_LOUD = b"System update still not validated"
 OTA_TEXT_LOUD = (b"Unvalidated boot $N of build $B (setup made for $V). Still paused: " + ", ".join(OTA_SKIP_LABELS).encode()
-                 + b". Update the ESP from the host, or boot the previous slot.")
+                 + b". Update the ESP from the host. Previous slot: only before a sign-in.")
 assert len(OTA_TITLE_LOUD) <= 40 and len(OTA_TEXT_LOUD.replace(b"$N", b"9" * 6).replace(b"$B", b"x" * 24)
                                           .replace(b"$V", b"x" * 24)) <= 200 \
     and all(32 <= c <= 126 for c in OTA_TITLE_LOUD + OTA_TEXT_LOUD) and OTA_LOUD_AFTER.isdigit(), \
@@ -2107,11 +2170,12 @@ GK_BIN_DEST = "vup/bin/hw/android.hardware.gatekeeper-service.gb"
 GK_VINTF_DEST = "etc/vintf/manifest/android.hardware.gatekeeper-service.gb.xml"
 GK_VINTF_SHA256 = "48cd680b721996e57c4b93acce4d842d9f14e0cd3dbd9cda75e1fe3b3216b77b"   # the reviewed fragment (GK-6)
 GK_MIN_VERSION = (0, 2, 0)                                # W4-GK-1 (must before a real PIN), W4-GK-2, W4-GK-3
-# (W6 prep, SA-6) every accepted build after 0.2.0 must have passed the frozen on-disk vectors (gatekeeper\tests\
+# (W6 prep, SA-6) every accepted build must have passed the frozen on-disk vectors (gatekeeper\tests\
 # test_frozen_v1.cpp: the gk_key.v1 files + handles 0.2.0 enrolled for the PIN "1234" still verify): ACCEPTANCE.txt
-# "host: GK_FROZEN_V1: PASS". 0.2.0 itself predates the test; it passed it on its own sources (w6prep\safety-misc SA-6).
-GK_FROZEN_PREDATES = ("505b404d0606bf80bcb41ff8a66a80c962934e3791d3b8db13645608da143d51",)
-# (W7, safety audit W6-S1) ... and not on the host only: a build after 0.2.0 needs all three frozen-vector results in
+# "host: GK_FROZEN_V1: PASS". (W9, BACKLOG GK_FROZEN_PREDATES) 0.2.0 too: its ACCEPTANCE.txt is the record of the
+# patched build.sh re-run on the builder from the same sources (w9prep\tooling-lows, byte-identical binary 505b404d),
+# so no binary is exempt any more.
+# (W7, safety audit W6-S1) ... and not on the host only: every build needs all three frozen-vector results in
 # ACCEPTANCE.txt, the host run, the independent Python reference over the same vectors (frozen_check.py) and the
 # Android build run on lapis's own bionic (the code that runs on the device). build.sh skips the Android run without
 # LAPIS_RT/LAPIS_SYSLIB and then writes 'android-on-lapis-bionic: NOT RUN', which does not match.
@@ -2184,7 +2248,7 @@ def _gatekeeper_inputs(manifest=GK_MANIFEST):
     assert f"sha256: {_hl.sha256(gbin).hexdigest()}  {os.path.basename(bsrc)}" in acc.splitlines(), \
         "gatekeeper ACCEPTANCE.txt does not name this binary's sha256"
     frozen_miss = [ln for ln in GK_FROZEN_LINES if not re.search("^" + re.escape(ln), acc, re.M)]
-    assert _hl.sha256(gbin).hexdigest() in GK_FROZEN_PREDATES or not frozen_miss, \
+    assert not frozen_miss, \
         f"gatekeeper ACCEPTANCE.txt lacks {frozen_miss} (SA-6, W6-S1: enrolled PINs must keep verifying, on the host " \
         f"and with the Android build on lapis's bionic)"
     interp, needed = _elf_dynamic(gbin)
@@ -2608,7 +2672,7 @@ summary() {
   echo '-- serial bus devices'; ls -l "$r/sys/bus/serial/devices" 2>&1; ls "$r/sys/bus/serdev/devices" 2>/dev/null
   echo "inputs (Surface Aggregator HID, bus 0019): $(awk '/^I:/ { b = ($2 == "Bus=0019") } /^N:/ && b { sub(/^N: Name=/, ""); printf "%s; ", $0 }' "$r/proc/bus/input/devices" 2>/dev/null)"
   # (wave 5, A-L1) -517 = a probe deferred and retried later, not an error: on the SB3 surface_hotplug's first probe
-  # (in gbinit, before lapis's pinctrl-icelake) logs it; the Surface Aggregator's deferral is silent
+  # (in gbinit, before lapis's pinctrl-icelake) logs it; the Surface Aggregator does not defer on k16 (sam: below)
   echo "deferred probes (-517, retried later; expected on the SB3): $(grep -c -E -- '-517([^0-9]|$)|EPROBE_DEFER' "$K") line(s): $(grep -E -- '-517([^0-9]|$)|EPROBE_DEFER' "$K" | sed -e 's/^[^]]*\] //' -e 's/: .*//' | sort -u | head -n 6 | tr '\n' ';')"
   # (wave 5, A-H1) power button and volume keys: soc_button_array on MSHW0040 needs lapis's INT3455 pinctrl, which
   # ueventd loads after gbinit, and gb_hw binds it again at boot. Two gpio-keys inputs = power + volume work
@@ -2616,6 +2680,23 @@ summary() {
   if [ -e "$d" ]; then x=$(readlink "$d/driver" 2>/dev/null); if [ -n "$x" ]; then x="bound to ${x##*/}"; else x='NOT bound'; fi; fi
   if [ -e "$r/sys/bus/platform/drivers/icelake-pinctrl/INT3455:00" ]; then b=bound; else b='not bound'; fi
   echo "buttons: MSHW0040 $x; INT3455 pinctrl $b; gpio-keys inputs: $(nmatch -F 'N: Name="gpio-keys"' "$r/proc/bus/input/devices"); $(grep -F 'gb_hw: buttons:' "$K" | tail -n 1 | sed 's/^[^]]*\] //')"
+  # (wave 9 hw-native1) the Surface Aggregator: on k16 its first-stage probe does not defer on the missing INT3455 GPIO
+  # controller, it fails with -EINVAL ("failed to setup IRQ", the line counted above), and gb_hw binds it again at boot.
+  # Its serial device(s) and driver, the client devices (base keyboard/touchpad, BAT1/BAT2/ADP1, DTX) and gb_hw's line
+  sx=; for sd in "$r"/sys/bus/serial/devices/*; do
+    case "$(cat "$sd/modalias" 2>/dev/null)" in acpi:MSHW0084:*) sl=$(readlink "$sd/driver" 2>/dev/null); sl=${sl##*/}; sx="$sx ${sd##*/}=${sl:-none}";; esac
+  done
+  ss=; for sn in BAT1 BAT2 ADP1; do [ -e "$r/sys/class/power_supply/$sn" ] && ss="$ss$sn "; done
+  if [ -e "$r/sys/class/misc/surface_dtx" ]; then sl=present; else sl=absent; fi
+  echo "sam: MSHW0084${sx:- none}; keyboard $(nmatch -F 'N: Name="Microsoft Surface 045E:09AE Keyboard"' "$r/proc/bus/input/devices"), touchpad $(nmatch -F 'N: Name="Microsoft Surface 045E:09AF Touchpad"' "$r/proc/bus/input/devices"); supplies: ${ss:-none }; dtx $sl; vendor.gb.sam=$(getprop vendor.gb.sam); $(grep -F 'gb_hw: sam: ' "$K" | tail -n 1 | sed 's/^[^]]*\] //' | cut -c1-400)"
+  # (wave 9 hw-native1) the Integrated Sensor Hub (accelerometer): lapis's coldboot probe can time out on the ISH
+  # firmware (boot 3 of the first native boot); gb_hw resets and binds it again at early-boot
+  sx=; for sd in "$r"/sys/bus/pci/devices/*; do
+    [ "$(cat "$sd/vendor" 2>/dev/null):$(cat "$sd/device" 2>/dev/null)" = 0x8086:0x34fc ] || continue
+    sl=$(readlink "$sd/driver" 2>/dev/null); sl=${sl##*/}; sx="${sd##*/} driver=${sl:-none}"
+  done
+  sn=0; for sd in "$r"/sys/bus/iio/devices/*/name; do case "$(cat "$sd" 2>/dev/null)" in cros-ec-accel|accel_3d*) sn=$((sn+1));; esac; done
+  echo "ish: ${sx:-no 8086:34fc}; accelerometers: $sn; vendor.gb.ish=$(getprop vendor.gb.ish); $(grep -E 'intel_ish_ipc [^ ]*: (HBM haven|ISHTP: Protocol init failed|ISH: hw start failed)|gb_hw: ish: ' "$K" | tail -n 2 | sed 's/^[^]]*\] //' | tr '\n' ' ' | cut -c1-400)"
   # (wave 5, A-M1) posture: lapis's device-state policy disables built-in input in CLOSED; on the kernel side lapis's
   # touchpad-inhibitor and gb_power's studio mode set /sys/class/input/*/inhibited. Internal device names only
   x=$(timeout 5 dumpsys device_state 2>/dev/null | sed -n -E "s/^ *(mCommittedState|mBaseState|mOverrideState)=.*name='([^']*)'.*/\1=\2/p; s/^ *(mCommittedState|mBaseState|mOverrideState)=Optional\.empty.*/\1=none/p" | tr '\n' ' ')
@@ -3061,6 +3142,7 @@ if EGLPROBE is not None:
     _entries.append(('gbstage/gb_eglprobe.sh', 0o100755, EGLPROBE_SH))
 if SLOTSYNC_BIN:
     _entries.append(('gbstage/vup/bin/gb_slotsync', 0o100755, SLOTSYNC_BIN))
+_entries.append(('gbstage/vup/bin/gb_notify.sh', 0o100755, GB_NOTIFY_VM))     # (wave 9, HS-O7) the VM's queue
 if _BATT_MODS[0] == "test_power.ko":
     _entries.append(('gbstage/gb_battunbind.sh', 0o100755, GB_BATTUNBIND_SH))
 _entries.append(('gbstage/gb_zram.sh', 0o100755, GB_ZRAM_SH))     # (W4 rehearsal) the zram load-race fallback
@@ -3265,6 +3347,7 @@ for _p, _d, _m in [
         ("vup/bin/fwupd_blocking_update", b"#!/system/bin/sh\nexit 0\n", 0o100755),
         ("vup/bin/fwupdmgr", GB_REFUSE, 0o100755), ("vup/bin/flashrom", GB_REFUSE, 0o100755),
         ("vup/bin/futility", GB_REFUSE, 0o100755), ("vup/bin/ectool", GB_REFUSE, 0o100755),
+        ("vup/bin/elogtool", GB_REFUSE, 0o100755), ("vup/bin/cbfstool", GB_REFUSE, 0o100755),
         ("vup/bin/hw/vendor.google.desktop.futility-executor", GB_REFUSE, 0o100755),
         ("vup/bin/init.adbd-killer.sh", b"#!/system/bin/sh\nexit 0\n", 0o100755),
         ("vup/bin/android-desktop-install", GB_REFUSE, 0o100755)] + (
@@ -3290,7 +3373,10 @@ DGPU_TEXTS = [("firmware/nvidia/WHENCE.tu117", os.path.join(NK, "firmware", "WHE
               ("firmware/nvidia/LICENCE.nvidia", os.path.join(NK, "firmware", "LICENCE.nvidia"))]
 DGPU_CACHE = os.path.join(HERE, "cache", "dgpu")
 DGPU_STAGE = "/build/native/dgpu/payload-stage"                  # builder scratch (/build, never /)
-DGPU_MIN_FREE = 6 * 10**9                                         # builder / and /build must keep this much free
+# (W9, BACKLOG W8-dgpu-floor) checked only on a cache miss, i.e. when a payload is really built: after its staging
+# (5 x the tree, all on /build) /build keeps the project floor of 1 GB + 1 GB margin and / (which the build does not
+# write) its 4 GB floor + 1 GB, the margins of the area-test runner (was a flat 6 GB on both: /build has had ~4.2 GB)
+DGPU_KEEP_BUILD, DGPU_KEEP_ROOT = 2 * 10**9, 5 * 10**9
 SIG_TRAILER = b"~Module signature appended~\n"
 _sha = lambda b: _hl.sha256(b).hexdigest()
 
@@ -3393,16 +3479,22 @@ def dgpu_payload():
         print(f"dgpu payload: cache entry {cdir} does not verify, rebuilding", flush=True)
     total = sum(len(v) for v in files.values())
     print(f"dgpu payload: cache miss (key {key[:16]}): {len(files)} files, {total:,} B -> builder", flush=True)
-    # builder space (never below 6 GB on / or /build) and etiquette (INTERFACES 1.4: warn, do not block, on load)
+    # builder space (DGPU_KEEP_*: only here, on a cache miss) and etiquette (INTERFACES 1.4: warn, do not block, on load)
     rc, out, err = _builder("df -B1 --output=avail / /build | tail -n 2; cut -d' ' -f1 /proc/loadavg; "
                             "pgrep -fa '[/]var/tmp/gbiso/[0-9]' | wc -l")
     assert rc == 0, f"builder preflight failed: {err.strip()}"
     v = out.decode().split()
     root_free, build_free, load1, iso_jobs = int(v[0]), int(v[1]), float(v[2]), int(v[3])
     need = 5 * total + 64 * 2**20          # tree + tool copy + image + two extractions, all on /build
-    if root_free < DGPU_MIN_FREE or build_free - need < DGPU_MIN_FREE:
-        raise RuntimeError(f"builder free space too low for the payload build: / {root_free:,} B, /build {build_free:,} B "
-                           f"(needs {need:,} B and must keep {DGPU_MIN_FREE:,} B)")
+    if root_free < DGPU_KEEP_ROOT or build_free - need < DGPU_KEEP_BUILD:
+        raise RuntimeError(
+            f"dgpu payload: the payload inputs changed (cache miss {key[:16]}), so the payload must be built once on the "
+            f"builder, and it has too little space: /build {build_free / 1e9:.2f} GB free, the build stages "
+            f"{need / 1e9:.2f} GB there and must leave {DGPU_KEEP_BUILD / 1e9:.0f} GB (the 1 GB floor + 1 GB); / "
+            f"{root_free / 1e9:.2f} GB free, must keep {DGPU_KEEP_ROOT / 1e9:.0f} GB (the 4 GB floor + 1 GB). Nothing "
+            f"was staged. Free space on the builder (the user decides what goes; never /build/dist*; candidates: the "
+            f"superseded builder folders in HANDOFF section 3), or, if the inputs are unchanged and only the cache is "
+            f"gone, put the cache folder {cdir} back; then run again.")
     if iso_jobs or load1 >= 2:
         print(f"dgpu payload: WARNING builder busy (load {load1}, ISO jobs {iso_jobs}); continuing at nice 19 / idle I/O",
               flush=True)
@@ -3664,6 +3756,11 @@ def _check_vm(ents, label="VM tree"):
     _check_gatekeeper(ents, "gbstage", label)
     _check_vnni(ents, "gbstage", label)                 # W5: the fingerprint-gated libz patch
     _check_otagate(ents, "gbstage", label)              # W5b: the OTA gate
+    # (wave 9, HS-O7) the queue: the component's gb_notify.sh, one gb_notify service, the queue dirs and both triggers
+    md = {p: (m, x) for p, m, x in ents}
+    assert md.get("gbstage/vup/bin/gb_notify.sh") == (0o100755, GB_NOTIFY_VM), f"{label}: /odm/vup/bin/gb_notify.sh"
+    assert rc.count(GB_NOTIFY_VM_RC) == 1 and rc.count(b"service gb_notify ") == 1, f"{label}: the gb_notify rc block"
+    _check_c6(ents, "gbstage", label)                   # (wave 9, C-6)
 
 def _check_native(ents, label="native tree"):
     _check_common(ents, label)
@@ -3722,6 +3819,7 @@ def _check_native(ents, label="native tree"):
     _check_gatekeeper(ents, "gbnative", label)          # W4: the software Gatekeeper (component gatekeeper)
     _check_vnni(ents, "gbnative", label)                # W5: the fingerprint-gated libz patch
     _check_otagate(ents, "gbnative", label)             # W5b: the OTA gate
+    _check_c6(ents, "gbnative", label)                  # (wave 9, C-6)
 
 def _gfx_build_id(ents, payload):
     """/odm/etc/gb/gfx_build_id (INTERFACES 5.3, 25.1): one line from the bytes that go into this tree."""
@@ -3737,6 +3835,53 @@ def _gfx_build_id(ents, payload):
     line = f"apk={_sha(apk)} icd={_sha(icd)} nvk={_sha(z.read(info))} probe={_sha(probe)} pay={pay}\n"
     assert re.fullmatch(r"apk=[0-9a-f]{64} icd=[0-9a-f]{64} nvk=[0-9a-f]{64} probe=[0-9a-f]{64} pay=[0-9a-f]{64}\n", line)
     return line.encode()
+
+# (Wave 9, BACKLOG C-6, readiness C-6) Our files that HALs read sit on the /odm tmpfs, so they carried the label tmpfs
+# (VM-1: hal_audio_default reading /vendor/etc/data/hal_configs/audio_default.xml and hal_camera_default reading
+# /odm/lib64/hw/camera.sb3.so, both "tcontext=u:object_r:tmpfs:s0 permissive=1"). Harmless while the OTA gate keeps
+# those domains permissive (OTA_REQUIRED_PERMISSIVE and the cil), wrong the day one of them enforces. Each tree's gb.rc
+# now restores the labels the running build's own file_contexts give these paths: one early-init restorecon line,
+# right after the overlay mount and the fstab/se_manifest binds, over every regular file our overlay upper layer has
+# below /vendor/etc (vup/etc/*: audio configs, permissions, input lists) and every file below /odm/lib64/hw (the camera
+# HAL). No odm file_contexts of ours: the labels come from the build (OTA-robust: nothing names a type, so a renamed
+# type cannot break a compile, unlike a cil statement; a path a later build does not list falls back to its own
+# default). Paths that name a PIN-path word (gatekeeper, keymint, ...) or a VINTF fragment are never listed, so the
+# PIN path (verify_image pin_path: rc lines with those words) is unchanged by construction. A missing path (e.g. a
+# file the OTA gate removed) only logs an init error. Generated from the tree here and checked by _check_c6.
+C6_ANCHOR = b"    restorecon /system_ext/etc/vintf/manifest.xml\n"
+_C6_SKIP = re.compile(r"gatekeeper|keymint|keymaster|keystore|weaver|secretkeeper|trusty|gbkm|empty_vintf|/vintf/", re.I)
+def _c6_paths(ents, tree):
+    """The runtime paths whose labels the tree's gb.rc restores (C-6): sorted, regular files only."""
+    out = []
+    for p, m, x in ents:
+        if x is None or (m & 0o170000) != 0o100000 or _C6_SKIP.search(p):
+            continue
+        if p.startswith(tree + "/vup/etc/"):
+            out.append("/vendor/etc/" + p[len(tree + "/vup/etc/"):])
+        elif p.startswith(tree + "/lib64/hw/"):
+            out.append("/odm/lib64/hw/" + p[len(tree + "/lib64/hw/"):])
+    assert all(re.fullmatch(r"/[A-Za-z0-9._/+-]+", q) for q in out), "C-6: a path init cannot take as one word"
+    return sorted(out)
+def _c6_line(ents, tree):
+    q = _c6_paths(ents, tree)
+    return (b"    restorecon " + " ".join(q).encode() + b"\n") if q else b""
+def _with_c6(ents):
+    """Insert each tree's restorecon line (C-6) into its gb.rc, after C6_ANCHOR (once per tree)."""
+    out = []
+    for p, m, x in ents:
+        for tree in ("gbstage", "gbnative"):
+            if p == tree + "/etc/init/gb.rc":
+                assert x.count(C6_ANCHOR) == 1, f"{tree} gb.rc: the C-6 anchor"
+                x = x.replace(C6_ANCHOR, C6_ANCHOR + _c6_line(ents, tree), 1)
+        out.append((p, m, x))
+    return out
+def _check_c6(ents, tree, label):
+    rc = {p: x for p, m, x in ents}[tree + "/etc/init/gb.rc"]
+    line = _c6_line(ents, tree)
+    assert line and rc.count(C6_ANCHOR + line) == 1 and b" /vendor/etc/data/hal_configs/audio_default.xml" in line, \
+        f"{label}: the C-6 restorecon line must follow the overlay binds once and list exactly the tree's files"
+    assert not _C6_SKIP.search(line.decode()), f"{label}: the C-6 line must not touch the PIN path"
+_entries = _with_c6(_entries)
 
 # One initrd per target: the VM boot carries only /gbstage, native boots only /gbnative (the Surface firmware the VM
 # never needs). gbinit falls back to /gbstage if /gbnative is missing.
@@ -4010,7 +4155,13 @@ CMDLINE = ("rdinit=/gbinit root=/dev/ram0 kvm-intel.pkvm=0 kvm.enable_virt_at_lo
 
 # Per-target command line: hardware mode for gbinit + the disk that holds this install's Android partitions.
 VM_BOOT_DEVICES = "pci0000:00/0000:00:15.2"            # VMware virtual NVMe
-CMDLINE_VM = CMDLINE + " gb.hw=vm androidboot.boot_devices=" + VM_BOOT_DEVICES
+# (Wave 9, BACKLOG I-W8-1, safety audit W8) efi_pstore off in VMware too, as natively (build_usb.native_cmdline): a
+# panicking VM boot would otherwise write its dmesg into the VM's NVRAM file (lapis-boot.nvram). The panic still goes to
+# the serial console (console=ttyS0, ignore_loglevel) and serial0.log; only the EFI variable copy is dropped. Every
+# VMware entry carries it: the user VM's own (CMDLINE_VM, written with its next ESP update), build_usb --vm-test and
+# the GB_NATIVE_TEST one-off. CMDLINE (shared with build_usb.native_cmdline) is unchanged, so no native entry changes.
+VM_PSTORE = "efi_pstore.pstore_disable=1"
+CMDLINE_VM = CMDLINE + " " + VM_PSTORE + " gb.hw=vm androidboot.boot_devices=" + VM_BOOT_DEVICES
 
 def slot_files(cmdline, inject_cpio, title, default=None, timeout=3, native=False):
     """ESP files for systemd-boot: entry gb-<slot> + initrd-<slot>.img for the boot slot (the default; (wave 8,
@@ -4183,7 +4334,7 @@ if __name__ == "__main__":       # build_usb.py imports this module for the shar
         # reach a desktop): checks gbinit module loading against lapis's vendor modules, the late pass, the native rc
         # and services, via serial0.log (console kept). gb_slotsync makes gb-<slot>.conf the default if it gets that far;
         # a normal rebuild drops this entry.
-        ntest = (f"{CMDLINE} gb.hw=native androidboot.boot_devices={VM_BOOT_DEVICES} "
+        ntest = (f"{CMDLINE} {VM_PSTORE} gb.hw=native androidboot.boot_devices={VM_BOOT_DEVICES} "
                  f"firmware_class.path=/odm/firmware,/vendor/firmware snd_intel_dspcfg.dsp_driver=3")
         # the native initrd (Surface firmware, camera stack, nouveau) no longer fits next to the VM entry in the
         # 192 MiB VM ESP: this one-off ESP holds only the test entry (the next normal build restores the VM entry)

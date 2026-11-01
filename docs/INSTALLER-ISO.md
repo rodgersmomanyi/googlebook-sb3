@@ -22,7 +22,11 @@ Every destructive step asks you to type a confirmation. The installer refuses di
 [The installer menu](#the-installer-menu)).
 
 **Status.** Tested in VMware only, never on the real Surface Book 3. Rufus and Ventoy themselves were never run;
-equivalent stick layouts were tested in VMware. The last ISO built and tested is the wave 8 build (2026-10-31):
+equivalent stick layouts were tested in VMware. **Wave 9 has no ISO yet:** the wave 8 ISO below installs the wave 8
+system with both options 1 and 2, without the wave 9 fixes (among them the keyboard base fix from the first native
+boot); for wave 9 flash the USB image with Rufus in DD mode, or use the wave 9 dual-boot export with
+`install_dualboot.ps1`. Its rebuild needs more free disk space on the build host. The last ISO built and tested is
+the wave 8 build (2026-10-31):
 kernel build #16 (since wave 8; build #15 before), the native tree with the wave 3 fixes (the keyboard base's `8250.nr_uarts=4` among them, see
 [Boot entries](#boot-entries-and-the-nvidia-payload)), the wave 4/5 software Gatekeeper, the VNNI libz patch, the OTA
 gate, the wave 5 readiness fixes, the wave 6, wave 7 and wave 8 changes (README, CHANGELOG; wave 8: the loader's

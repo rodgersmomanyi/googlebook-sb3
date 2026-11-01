@@ -40,7 +40,8 @@ def main():
                 cur = services.setdefault(m.group(1), {"exec": m.group(2), "opts": []})
             else:
                 trig = line
-                check(line in ("on property:sys.boot_completed=1", "on post-fs-data"), "trigger: " + line)
+                check(line in ("on property:sys.boot_completed=1", "on post-fs-data",
+                               "on property:vendor.gb.ui.fg=*"), "trigger: " + line)   # (wave 9, HS-O11)
             continue
         if cur is not None:
             cur["opts"].append(line.strip())
@@ -53,7 +54,7 @@ def main():
             if m:
                 starts.append(m.group(1))
     check(mkdirs == want_mkdirs, "post-fs-data creates the /data/vendor/gb chain (0751 root:shell) and ui/ (0700 shell)")
-    check(list(services) == ["gb_gpu_ui_setup"], "one service gb_gpu_ui_setup")
+    check(list(services) == ["gb_gpu_ui_setup", "gb_gpu_ui_user"], "two services: gb_gpu_ui_setup, (wave 9) gb_gpu_ui_user")
     for n, s in services.items():
         o = s["opts"]
         check(s["exec"] == "/system/bin/sh", "%s runs through /system/bin/sh" % n)
@@ -61,7 +62,7 @@ def main():
         check("group shell" in o, "%s: group shell" % n)
         check("seclabel u:r:shell:s0" in o, "%s: seclabel u:r:shell:s0" % n)
         check("oneshot" in o and "disabled" in o, "%s: oneshot + disabled" % n)
-    check(starts == ["gb_gpu_ui_setup"] and all(x in services for x in starts), "start names a defined service")
+    check(starts == ["gb_gpu_ui_setup", "gb_gpu_ui_user"] and all(x in services for x in starts), "start names a defined service")
     if len(sys.argv) == 3:
         spec = open(sys.argv[2], encoding="utf-8").read()
         m = re.search(r"### 15\.4 `gb_gpu_ui\.rc`.*?\n```\n(.*?)```", spec, re.S)

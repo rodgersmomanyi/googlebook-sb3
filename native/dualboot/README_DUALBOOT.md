@@ -215,7 +215,9 @@ installer refuses.
 3. **Loader default.** When the installed ESP is readable, its `loader\loader.conf` default must name slot `<s>`:
    `gb-<s>.conf` (since wave 8: systemd-boot 262.1 matches the entry id including `.conf`) or `gb-<s>` (an ESP
    written before wave 8; that line matched no entry, so the loader started `gb-b.conf` whenever it existed). The
-   update writes `default gb-<s>.conf`.
+   default lines are read as systemd-boot reads them (since wave 9: blanks around a line ignored, one pair of quotes
+   removed, `default` in lower case only), so an indented `default` line counts too; every one must name slot `<s>`.
+   The update writes `default gb-<s>.conf`.
 4. **Lock-screen PIN path (wave 7).** The installed ESP (its raw save with `-Apply`) and the export's ESP must boot
    the same PIN path: Gatekeeper binary, VINTF fragment and service, KeyMint service and its library graft, the
    Trusty/Weaver masks, the fstab and the PIN SELinux types (`tools\pin_path_check.py` with

@@ -17,6 +17,20 @@
 #                style is missing; without -u when -u is missing: the shell's own user 0, i.e. the login screen only,
 #                logged); "unrecognized notification style" = for all users without -S bigtext; "Bad user" = one
 #                post per running full user (-u <id>); any other error is logged. At most 1 + 8 posts per notice.
+#                (wave 9, BACKLOG HS-O4) -u all is replaced: a UserHandle.ALL record was shown to every full user (a
+#                guest too) and one dismissal removed it for all of them, but a notice is a matter for the person in
+#                front of the screen. A notice is now posted ONCE, for the FOREGROUND FULL user (am get-current-user, a
+#                running FULL user in pm list users, am get-started-user-state RUNNING_UNLOCKED; (review) as in gb_ui's
+#                unlocked(), only a known not-ready state holds: an answer without a known state counts as unlocked,
+#                so a future build's other wording cannot hold a notice that gb_ui's vendor.gb.ui.fg asked to post):
+#                cmd notification post -u <that user> -S bigtext. Nothing is ever posted for the headless system user 0
+#                or for all users. While no full user is in the foreground (the login screen before the sign-in, a user
+#                that is still starting or locked) the notice is HELD: $Q/held/<tag> (the newest per tag, 0600, with
+#                this boot's id), and posted for the first full user that comes to the foreground in this boot: gb_ui
+#                publishes that user in vendor.gb.ui.fg once it is RUNNING_UNLOCKED ("none" otherwise), and init starts
+#                gb_notify at every change (gb_nouveau.rc; the VM tree's gb.rc too). A held notice of another boot is
+#                dropped (logged). The O5 fallbacks below are kept with -u <user> in place of -u all; "Bad user" (the
+#                user went away between the check and the post) holds the notice.
 #   broadcast -> one explicit broadcast per RUNNING FULL user (pm list users: flag FULL 0x400 and "running"), never the
 #                headless system user; a user that starts later (the sign-in) refreshes itself: GbGpu's UserReceiver
 #                runs the same refresh at that user's BOOT_COMPLETED. If pm list users fails: --user current.
@@ -51,6 +65,7 @@ umask 007
 
 GB=$R/data/vendor/gb
 Q=$GB/notify
+H=$Q/held                                # (wave 9, HS-O4) notices waiting for a full user in the foreground
 DONE=,
 LIST=
 
@@ -110,14 +125,56 @@ po_log() {                               # PO for a log line: printable ASCII, o
   printf '%s' "$PO" | tr -c ' -~' ' ' | cut -c1-120
 }
 
+fg_user() {                              # -> FG: the foreground FULL user once it is unlocked; 1 = none, WHY = the reason
+  FG=
+  WHY=
+  _c=$(timeout 20 am get-current-user 2> /dev/null)
+  case $_c in '' | *[!0-9]*) WHY="am get-current-user failed"; return 1 ;; esac
+  if [ ${#_c} -gt 4 ]; then WHY="am get-current-user failed"; return 1; fi
+  if ! full_users; then WHY="pm list users failed"; return 1; fi
+  case " $USERS " in
+    *" $_c "*) ;;
+    *) WHY="no full user in the foreground (user $_c)"; return 1 ;;   # the headless user 0's login screen, a profile
+  esac
+  _st=$(timeout 20 am get-started-user-state "$_c" 2>&1)
+  case $_st in                           # (review) the same rule as gb_ui's unlocked(), which publishes vendor.gb.ui.fg
+    *RUNNING_UNLOCKED*) FG=$_c; return 0 ;;
+    *BOOTING* | *RUNNING_LOCKED* | *RUNNING_UNLOCKING* | *STOPPING* | *SHUTDOWN* | *'not started'*) ;;
+    *) FG=$_c; return 0 ;;               # an answer without a known state counts as unlocked (gb_ui did so too)
+  esac
+  WHY="user $_c is not unlocked yet ($(printf '%s' "$_st" | tr -cd 'A-Z_' | cut -c1-24))"
+  return 1
+}
+
+boot_id() {                              # -> BID: this boot's id (a held notice of another boot is stale)
+  BID=$(head -c 64 "$R/proc/sys/kernel/random/boot_id" 2> /dev/null | tr -cd '0-9a-f-')
+}
+
+hold_notice() {                          # $1 tag, $2 title, $3 text, $4 message name, $5 why: $H/<tag>, the newest wins
+  boot_id
+  if [ -L "$H" ] || { [ -e "$H" ] && [ ! -d "$H" ]; }; then logn "cannot hold $4 ($5; $H is not a directory): dropped"; return 0; fi
+  [ -d "$H" ] || mkdir -m 0700 "$H" 2> /dev/null
+  rm -f "$H/$1.tmp" 2> /dev/null
+  if (umask 077; set -C; printf 'boot=%s\ntag=%s\ntitle=%s\ntext=%s\n' "$BID" "$1" "$2" "$3" > "$H/$1.tmp") 2> /dev/null &&
+    mv -f "$H/$1.tmp" "$H/$1" 2> /dev/null; then
+    logn "$4 held until a full user is in the foreground ($5)"
+  else
+    rm -f "$H/$1.tmp" 2> /dev/null
+    logn "cannot hold $4 ($5): dropped"
+  fi
+  return 0
+}
+
 post_notice() {                          # $1 tag, $2 title, $3 text, $4 message file name (for the log)
-  cmd_post -u all -S bigtext -t "$2" "$1" "$3" && return 0
+  if ! fg_user; then hold_notice "$1" "$2" "$3" "$4" "$WHY"; return 0; fi
+  rm -f "$H/$1" 2> /dev/null             # an older held notice of this tag is superseded
+  cmd_post -u "$FG" -S bigtext -t "$2" "$1" "$3" && return 0
   case $PO in
     *'usage: cmd notification post'*)     # the usage lists the options this build has
       case $PO in *bigtext*) _bt=1 ;; *) _bt=0 ;; esac
       case $PO in
         *'-u|--user'*)
-          if [ $_bt = 0 ] && cmd_post -u all -t "$2" "$1" "$3"; then
+          if [ $_bt = 0 ] && cmd_post -u "$FG" -t "$2" "$1" "$3"; then
             logn "$4 posted without -S bigtext (this build's cmd notification post has no bigtext style)"
             return 0
           fi
@@ -131,21 +188,51 @@ post_notice() {                          # $1 tag, $2 title, $3 text, $4 message
       esac
       ;;
     *'notification style'*)               # this build has no bigtext style
-      if cmd_post -u all -t "$2" "$1" "$3"; then
+      if cmd_post -u "$FG" -t "$2" "$1" "$3"; then
         logn "$4 posted without -S bigtext (this build's cmd notification post has no bigtext style)"
         return 0
       fi
       ;;
-    *'Bad user'*)                         # -u all refused: one post per running full user
-      if full_users && [ -n "$USERS" ]; then
-        _np=0
-        for _u in $USERS; do cmd_post -u "$_u" -S bigtext -t "$2" "$1" "$3" && _np=$((_np + 1)); done
-        logn "cmd notification post -u all refused for $4: posted per running full user ($_np of$USERS)"
-        return 0
-      fi
+    *'Bad user'*)                         # the foreground user went away between the check and the post
+      hold_notice "$1" "$2" "$3" "$4" "user $FG refused: $(po_log)"
+      return 0
       ;;
   esac
   logn "cmd notification post failed for $4 ($(po_log))"
+  return 0
+}
+
+flush_held() {                           # post the held notices once a full user is in the foreground (this boot's only)
+  { [ -d "$H" ] && [ ! -L "$H" ]; } || return 0
+  _hl=
+  set +f
+  for _h in "$H"/*; do [ -f "$_h" ] && [ ! -L "$_h" ] && _hl="$_hl ${_h##*/}"; done
+  set -f
+  [ -n "$_hl" ] || return 0
+  boot_id
+  _fg=0
+  fg_user && _fg=1
+  for _h in $_hl; do
+    case $_h in gb_dgpu | gb_dtx | gb_dgpu_test | gb_gfx | gb_update) ;; *) rm -f "$H/$_h"; continue ;; esac
+    _hb=''; _ht=''; _hti=''; _htx=''
+    _hsz=$(($(wc -c < "$H/$_h" 2> /dev/null) + 0))
+    if [ "$_hsz" -le 4096 ]; then
+      while IFS= read -r _l || [ -n "$_l" ]; do
+        _v=${_l#*=}
+        [ ${#_v} -le 240 ] || continue
+        case $_l in boot=*) _hb=$_v ;; tag=*) _ht=$_v ;; title=*) _hti=$_v ;; text=*) _htx=$_v ;; esac
+      done < "$H/$_h"
+    fi
+    if [ -z "$BID" ] || [ "$_hb" != "$BID" ]; then
+      rm -f "$H/$_h"; logn "held $_h of another boot dropped"; continue
+    fi
+    if [ "$_ht" != "$_h" ] || ! printable "$_hti" 40 || ! printable "$_htx" 200; then
+      rm -f "$H/$_h"; logn "held $_h is malformed: dropped"; continue
+    fi
+    [ $_fg = 1 ] || continue
+    logn "held $_h posted for user $FG"
+    post_notice "$_h" "$_hti" "$_htx" "held $_h"
+  done
   return 0
 }
 
@@ -292,6 +379,7 @@ handle() {                               # $1 = message file
 }
 
 [ -d "$Q" ] || exit 0
+flush_held                               # (wave 9) e.g. started by vendor.gb.ui.fg: a full user came to the foreground
 idle=0
 pass=0
 while [ $pass -lt 100 ]; do              # bounded; init restarts us on the next vendor.gb.notify change anyway
@@ -314,7 +402,7 @@ while [ $pass -lt 100 ]; do              # bounded; init restarts us on the next
     rm -f "$Q/$f" 2>/dev/null || logn "cannot delete $f"
   done
   if [ $new = 0 ]; then
-    [ $idle = 1 ] && break
+    [ $idle = 1 ] && { flush_held; break; }   # (wave 9) a foreground change while this run was busy
     idle=1                               # one more look after 1 s: a producer may have raced our last scan
     sleep 1
   else

@@ -1,8 +1,45 @@
 # Changelog
 
 What each wave changed, newest first. Details per device: [docs/DEVICE-STATUS.md](docs/DEVICE-STATUS.md) ("Changes
-since the audit"). Nothing has run on the Surface Book 3 itself yet: every result below is from VMware VMs, QEMU, the
+since the audit"). The first native boot on the Surface Book 3 happened on 2026-10-31 (the wave 8 image; results
+per item in DEVICE-STATUS, "First real-hardware results"); every other result below is from VMware VMs, QEMU, the
 Linux build machine or disk-image files.
+
+## Wave 9 (2026-10-31/11-01): the first native boot's fixes, notices for the user in front, the last hardware-independent items
+
+* **The first native boot** (the wave 8 image, three starts on the Surface Book 3 13.5"; analyser 29 PASS, 10 FAIL,
+  2 UNKNOWN): Android started in 42.8 s; the display, touch and pen, Wi-Fi, Bluetooth, the sound card, the buttons,
+  the NVIDIA power saving, the lock-screen service, the VNNI patch and the update check worked. The keyboard base,
+  touchpad, batteries, charger and detach did not: on kernel build #16 the Surface Aggregator's first probe runs
+  before lapis's GPIO driver is ready and fails for good (`failed to setup IRQ`, an upstream regression since 6.12).
+* **Fixes in the image (untested on the laptop):** `gb_hw.sh sam` (service `gb_hw_sam`) binds the Surface Aggregator
+  again once the GPIO controller is bound and waits for its devices (`vendor.gb.sam`, a `sam:` line in the boot-log
+  summary); `gb_hw.sh ish` (service `gb_hw_ish`) resets and binds the sensor hub once when its firmware did not start
+  (`vendor.gb.ish`, an `ish:` line); the unused IR camera driver (`ov7251`, whose probe always failed) is staged but no
+  longer loaded; `elogtool` and `cbfstool` are refusal stubs like flashrom; the analyser names these causes, ignores
+  the harmless `powertool set-soc-slider` exit and skips a stale previous-boot kernel log. A kernel fix for the probe
+  (patch 0114) is prepared for the next kernel build; there is no kernel change in wave 9.
+* **Notices** go to the user in front of the screen and wait for the sign-in; the VM build shows "System update held"
+  too; GbGpu: tile set up at any sign-in, a real app icon, "Can't detach yet" for the user in front; the louder
+  "still not validated" notice says "Previous slot: only before a sign-in". `gb_slotsync` reads `loader.conf` lines
+  the way systemd-boot does (a line also ends at a lone CR; exactly one `default` line is kept);
+  `efi_pstore.pstore_disable=1` in the VM entry; HAL file labels restored. Test-only: the TU117 cases of the nouveau
+  suite also assert that no "model gate" line is logged.
+* Tooling (no image change): `verify_image.py` reads the NVIDIA payload's own files (an EROFS/LZ4 reader) and
+  compares every one with its input, and checks the packed `modules.alias`/`.dep` (V4b); TB-3 judges the wave-8
+  build and the kept wave-6/7 fallback images from a record of what they pack (`tests/w2b/prev_images.json`,
+  `--image`), so their expected failures follow later source changes by themselves; the shipped
+  Gatekeeper 0.2.0 now has the frozen-vector acceptance record (rebuilt byte for byte) and is no longer exempt;
+  `build_esp.py`'s builder floor for an NVIDIA payload rebuild is the project's 1 GB/4 GB rule + margin, with an
+  actionable message; the dual-boot `-UpdateEspOnly` reads `loader.conf` default lines as systemd-boot does.
+* Tested in VMware: a rehearsal of the VM build (a fresh first boot 51 of 51; a forced unvalidated update 40 of 40:
+  the notice held at the login screen, then exactly one for the signed-in user; a validated boot 23 of 23; a held
+  update 36 of 36 with the notice in user 10's panel), VM-1 on the wave 9 USB image `e0825ee1…` (every wave 2-9
+  check VMware can show; two checks judged after a project decision: 2 more short instruction emulations by init in
+  the new label-restoring step, accepted, and a key-store result line outside that boot's log window; the analyser
+  17 PASS, 0 FAIL, 24 UNKNOWN), the host suites and every area test. **Not done in wave 9:** the installer ISO is not
+  rebuilt (it still installs the wave 8 system; the build needs more free disk space on the host), and the
+  long-running VM keeps the wave 8 boot partition until the host has room for its check boot.
 
 ## Wave 8 (2026-10-31): kernel build #16, updates into slot A, your own settings kept
 

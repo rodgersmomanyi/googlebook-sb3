@@ -5,8 +5,10 @@
 # every FULL user and for the signed-in user, (wave 7, headless-settings, notify O10) once per user ever (marker
 # granted.<u>), never for the headless system user 0; `add-tile` only while a FULL user is in the foreground and only
 # once ever per user (a user removal is respected; the pre-wave-6 marker is ignored); (wave 7) the markers of removed
-# user ids are removed; (wave 7, O14) at most 16 users; plus the guard and failure paths. Prints "N checks, M failures";
-# exit 1 on a failure.
+# user ids are removed; (wave 7, O14) at most 16 users; plus the guard and failure paths. (Wave 9, BACKLOG HS-O11) the
+# boot run grants every full user and does not wait; the person's grant and tile come from `gb_gpu_ui_setup.sh user`,
+# run at each change of vendor.gb.ui.fg (gb_ui; a getprop shim here), at any time in the boot. Prints
+# "N checks, M failures"; exit 1 on a failure.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT=${1:-$HERE/../gb_gpu_ui_setup.sh}
@@ -74,6 +76,17 @@ if [ "$1" = statusbar ] && [ "$2" = add-tile ]; then
 fi
 exit 1
 EOF
+# (wave 9) getprop vendor.gb.ui.fg: pops the first line of ctl/fg (the last line stays; default none)
+cat > "$W/shims/getprop" << 'EOF'
+#!/bin/sh
+PATH=/usr/bin:/bin
+echo "getprop $*" >> "$GB_CALLS"
+[ "$1" = vendor.gb.ui.fg ] || exit 0
+[ -f "$GB_CTL/fg" ] || { echo none; exit 0; }
+l=$(head -n 1 "$GB_CTL/fg")
+if [ "$(wc -l < "$GB_CTL/fg")" -gt 1 ]; then sed -i 1d "$GB_CTL/fg"; fi
+echo "$l"
+EOF
 cat > "$W/shims/log" << 'EOF'
 #!/bin/sh
 echo "log $*" >> "$GB_LOG"
@@ -87,10 +100,12 @@ cat > "$W/shims/timeout" << 'EOF'
 shift
 exec "$@"
 EOF
-for f in pm am cmd log sleep timeout; do chmod +x "$W/shims/$f"; done
+for f in pm am cmd getprop log sleep timeout; do chmod +x "$W/shims/$f"; done
 # The script resets PATH to <shims>:/system/bin:/vendor/bin (toybox on the device); give it the host's cat.
 ln -sf "$(command -v cat)" "$W/shims/cat"
 ln -sf "$(command -v rm)" "$W/shims/rm"
+for a in tr cut; do ln -sf "$(command -v $a)" "$W/shims/$a"; done
+ln -sf /usr/bin/printf "$W/shims/printf"   # a builtin in dash, an applet (toybox) on the device, not built into mksh
 
 TAB=$(printf '\t')
 HSUM="${TAB}UserInfo{0:System User:811} running
@@ -104,6 +119,7 @@ fresh() { # a new device: native, APK present, /data/vendor/gb/ui present (rc), 
   printf '%s\n' "$HSUM" > "$GB_CTL/users"
   printf '0\n0\n10\n' > "$GB_CTL/cur" # the person signs in after two checks
   WAITN=180
+  rm -f "$GB_CTL/fg"
 }
 boot() {
   : > "$GB_CALLS"
@@ -111,98 +127,133 @@ boot() {
   GB_ROOT=$W/root GB_TEST_PATH=$W/shims GB_UI_WAIT_CHECKS=$WAITN "$SHELL_UNDER_TEST" "$SCRIPT"
   RC=$?
 }
+fg_event() { # (wave 9) gb_ui published $1 (one or more lines: the values getprop returns in turn); the user run
+  printf '%s\n' "$@" > "$GB_CTL/fg"
+  : > "$GB_CALLS"
+  : > "$GB_LOG"
+  GB_ROOT=$W/root GB_TEST_PATH=$W/shims "$SHELL_UNDER_TEST" "$SCRIPT" user
+  RC=$?
+}
 UI=$W/root/data/vendor/gb/ui
 G10="pm grant --user 10 gb.sb3.gpu android.permission.POST_NOTIFICATIONS"
 G0="pm grant --user 0 "
 ADD="cmd statusbar add-tile gb.sb3.gpu/.GpuTileService"
 
-echo "== first boot, headless system user mode: the person (user 10) signs in after 20 s"
+echo "== first boot, headless system user mode: the boot run grants, the sign-in event adds the tile (wave 9)"
 fresh
 boot
-is 0 "$RC" "exit 0"
-is 1 "$(count "$G10")" "user 10 granted once (before the sign-in; the marker stops the second grant)"
+is 0 "$RC" "boot run: exit 0"
+is 1 "$(count "$G10")" "boot run: user 10 granted once"
 ok "$([ -f "$UI/granted.10" ]; echo $?)" "marker granted.10 created"
 is 644 "$(stat -c %a "$UI/granted.10" 2> /dev/null)" "marker granted.10 mode 0644"
 is 0 "$(count "$G0")" "never a grant for the headless system user 0"
 is 0 "$(count "pm grant gb.sb3.gpu")" "no grant without --user (it would reach user 0 only)"
-is 1 "$(count "$ADD @10")" "add-tile once, while user 10 is in the foreground"
+is 0 "$(count "$ADD")" "boot run: no add-tile (wave 9: no wait for the sign-in)"
+is 0 "$(count "sleep 10")" "boot run: no 10 s waits"
+is 0 "$(count "am get-current-user")" "boot run: no foreground look (user 0 is not a full user here)"
+printf '10\n' > "$GB_CTL/cur"
+fg_event 10
+is 0 "$RC" "event 10: exit 0"
+is 0 "$(count "$G10")" "event 10: no second grant (marker)"
+is 1 "$(count "$ADD @10")" "event 10: add-tile once, while user 10 is in the foreground"
 is 1 "$(count "$ADD")" "add-tile exactly once"
-is 2 "$(count "sleep 10")" "two 10 s waits for the sign-in"
 ok "$([ -f "$UI/tile_added.10" ]; echo $?)" "marker tile_added.10 created"
 is 644 "$(stat -c %a "$UI/tile_added.10" 2> /dev/null)" "marker mode 0644"
 ok "$([ ! -e "$UI/tile_added.0" ] && [ ! -e "$UI/tile_added" ]; echo $?)" "no marker for user 0, no legacy marker"
+fg_event 10
+is 0 "$(count "$ADD")" "the same event again: nothing (marker)"
 
 echo "== second boot (the user may have removed the tile since)"
 printf '0\n10\n' > "$GB_CTL/cur"
 boot
 is 0 "$RC" "exit 0"
 is 0 "$(count "$G10")" "user 10 not granted again (the person may have turned GbGpu's notifications off)"
+printf '10\n' > "$GB_CTL/cur"
+fg_event 10
 is 0 "$(count "$ADD")" "add-tile not repeated for user 10"
+is 0 "$(count "$G10")" "event: no grant either"
 
 echo "== pre-wave-6 marker (the tile went to user 0's list): ignored and kept"
 fresh
 : > "$UI/tile_added"
-boot
+printf '10\n' > "$GB_CTL/cur"
+fg_event 10
 is 1 "$(count "$ADD @10")" "add-tile for user 10 despite the legacy marker"
 ok "$([ -f "$UI/tile_added" ] && [ -f "$UI/tile_added.10" ]; echo $?)" "legacy marker kept, tile_added.10 created"
 
-echo "== nobody signs in this boot (bounded wait)"
+echo "== nobody signs in this boot (wave 9: no wait at all; gb_ui publishes none)"
 fresh
 printf '0\n' > "$GB_CTL/cur"
-WAITN=5
 boot
 is 0 "$RC" "exit 0"
-is 5 "$(count "am get-current-user")" "5 foreground checks (GB_UI_WAIT_CHECKS)"
 is 1 "$(count "$G10")" "user 10 granted once (before the sign-in)"
-is 0 "$(count "$ADD")" "no add-tile while the login screen (user 0) is in the foreground"
-ok "$(grep -q 'no full user in the foreground after 5 checks' "$GB_LOG"; echo $?)" "logged"
+is 0 "$(count "$ADD")" "no add-tile"
+fg_event none
+is 0 "$RC" "event none: exit 0"
+is 000 "$(count "pm ")$(count "cmd ")$(count "am ")" "event none: no pm/cmd/am call"
+ok "$(grep -q "foreground 'none': no full user to set up" "$GB_LOG"; echo $?)" "event none: logged"
+for bad in '' 1x 123456 -1 '10 x'; do
+  fg_event "$bad"
+  is 00 "$(count "pm grant")$(count "cmd ")" "event '$bad': nothing done"
+done
 
-echo "== a user created during this boot (11) signs in"
+echo "== a user created during this boot (11) signs in, at any time (wave 9: no 30-minute limit)"
 fresh
-printf '%s\n' "$HSUM" "${TAB}UserInfo{11:Guest:412} running" > "$GB_CTL/users11"
-printf '0\n11 users11\n' > "$GB_CTL/cur"
 boot
+printf '%s\n' "$HSUM" "${TAB}UserInfo{11:Guest:412} running" > "$GB_CTL/users"
+printf '11\n' > "$GB_CTL/cur"
+fg_event 11
 is 0 "$RC" "exit 0"
-is 1 "$(count "pm grant --user 11 ")" "user 11 granted after the sign-in"
+is 1 "$(count "pm grant --user 11 ")" "user 11 granted at its event"
 ok "$([ -f "$UI/granted.10" ] && [ -f "$UI/granted.11" ]; echo $?)" "markers granted.10 and granted.11"
 is 1 "$(count "$ADD @11")" "add-tile for user 11"
 ok "$([ -f "$UI/tile_added.11" ]; echo $?)" "marker tile_added.11"
-is 3 "$(count "pm list users")" "the list is read again only when the foreground user changes to an unknown one"
+
+echo "== the foreground changes while the user run is busy: the newer value is handled before it ends"
+fresh
+boot
+printf '%s\n' "$HSUM" "${TAB}UserInfo{11:B:412} running" > "$GB_CTL/users"
+printf '10\n11\n' > "$GB_CTL/cur"
+fg_event 10 11
+is 0 "$RC" "exit 0"
+is "1/1" "$(count "$ADD @10")/$(count "$ADD @11")" "add-tile for 10, then for 11, in one run"
+is 3 "$(count "getprop vendor.gb.ui.fg")" "vendor.gb.ui.fg read 3 times (10, 11, 11 = unchanged: end)"
 
 echo "== the user leaves the foreground before add-tile"
 fresh
-printf '0\n10\n0\n' > "$GB_CTL/cur"
-boot
+printf '0\n' > "$GB_CTL/cur"
+fg_event 10
 is 0 "$RC" "exit 0"
 is 0 "$(count "$ADD")" "no add-tile (it would go to another user's tiles)"
 ok "$([ ! -e "$UI/tile_added.10" ]; echo $?)" "no marker"
+ok "$(grep -q 'user 10 left the foreground' "$GB_LOG"; echo $?)" "logged"
 
-echo "== add-tile fails, then succeeds on the next boot"
+echo "== add-tile fails, then succeeds at the next event"
 fresh
 printf '10\n' > "$GB_CTL/cur"
 : > "$GB_CTL/addtile_fail"
-boot
+fg_event 10
 is 1 "$RC" "exit 1 when add-tile keeps failing"
 is 3 "$(count "$ADD")" "add-tile tried 3 times"
 is 2 "$(count "sleep 10")" "10 s between tries"
 ok "$([ ! -e "$UI/tile_added.10" ]; echo $?)" "no marker after a failure"
 rm -f "$GB_CTL/addtile_fail"
-boot
-is 0 "$RC" "next boot: exit 0"
-is 1 "$(count "$ADD")" "next boot: add-tile once"
-ok "$([ -f "$UI/tile_added.10" ]; echo $?)" "next boot: marker created"
+fg_event 10
+is 0 "$RC" "next event: exit 0"
+is 1 "$(count "$ADD")" "next event: add-tile once"
+ok "$([ -f "$UI/tile_added.10" ]; echo $?)" "next event: marker created"
 
 echo "== pm grant fails"
 fresh
 : > "$GB_CTL/grant_fail"
 boot
+printf '10\n' > "$GB_CTL/cur"
+fg_event 10
 is 0 "$RC" "grant failure ignored"
 is 1 "$(count "$ADD")" "add-tile still done"
 ok "$([ ! -e "$UI/granted.10" ]; echo $?)" "no granted marker after a failed grant"
 rm -f "$GB_CTL/grant_fail"
-printf '0
-10
-' > "$GB_CTL/cur"
+printf '0\n' > "$GB_CTL/cur"
 boot
 is 1 "$(count "$G10")" "next boot: the grant is tried again (once) and recorded"
 ok "$([ -f "$UI/granted.10" ]; echo $?)" "next boot: marker granted.10"
@@ -210,13 +261,25 @@ ok "$([ -f "$UI/granted.10" ]; echo $?)" "next boot: marker granted.10"
 echo "== pm list users fails"
 fresh
 : > "$GB_CTL/list_fail"
-WAITN=3
 boot
 is 0 "$RC" "exit 0"
 is 0 "$(count "pm grant")" "no grant without a user list"
-is 0 "$(count "$ADD")" "no add-tile (the foreground user cannot be shown to be a full user)"
+printf '10\n' > "$GB_CTL/cur"
+fg_event 10
+is 0 "$RC" "event: exit 0"
+is 00 "$(count "pm grant")$(count "$ADD")" "event: no grant, no add-tile (the user cannot be shown to be a full user)"
+ok "$(grep -q 'pm list users failed: nothing done' "$GB_LOG"; echo $?)" "event: logged"
 
-echo "== not headless (user 0 is a FULL user)"
+echo "== a profile or an unknown user published (never by gb_ui; defence): nothing"
+fresh
+printf '%s\n' "$HSUM" "${TAB}UserInfo{13:Work:1030} running" > "$GB_CTL/users"
+printf '13\n' > "$GB_CTL/cur"
+fg_event 13
+is 00 "$(count "pm grant")$(count "$ADD")" "a work profile (1030): no grant, no add-tile"
+fg_event 42
+is 00 "$(count "pm grant")$(count "$ADD")" "an unknown user: no grant, no add-tile"
+
+echo "== not headless (user 0 is a FULL user): the boot run sets user 0 up (gb_ui never publishes user 0)"
 fresh
 printf '\tUserInfo{0:Owner:c13} running\n' > "$GB_CTL/users"
 printf '0\n' > "$GB_CTL/cur"
@@ -282,6 +345,8 @@ is 0 "$RC" "exit 0"
 is 0 "$(count "pm ")" "no pm call"
 is 0 "$(count "cmd ")" "no cmd call"
 is 0 "$(count "am ")" "no am call"
+fg_event 10
+is 000 "$(count "pm ")$(count "cmd ")$(count "am ")" "event on the VM tree: no pm/cmd/am call"
 
 echo "== APK absent"
 fresh
@@ -289,13 +354,18 @@ rm -f "$W/root/odm/app/GbGpu/GbGpu.apk"
 boot
 is 0 "$RC" "exit 0"
 is 000 "$(count "pm ")$(count "cmd ")$(count "am ")" "no pm/cmd/am call"
+fg_event 10
+is 000 "$(count "pm ")$(count "cmd ")$(count "am ")" "event: no pm/cmd/am call"
 
 echo "== /data/vendor/gb/ui missing"
 fresh
 rm -rf "$W/root/data/vendor/gb/ui"
 boot
 is 0 "$RC" "exit 0"
-is 2 "$(count "$G10")" "pm grant done (before and after the sign-in: it cannot be recorded)"
+is 1 "$(count "$G10")" "boot run: pm grant done (it cannot be recorded)"
+printf '10\n' > "$GB_CTL/cur"
+fg_event 10
+is 1 "$(count "$G10")" "event: pm grant done again (nothing recorded it)"
 is 0 "$(count "$ADD")" "no add-tile without the marker directory (it could not be recorded)"
 ok "$(grep -q 'is missing: not recorded' "$GB_LOG"; echo $?)" "unrecorded grant logged"
 
@@ -307,6 +377,10 @@ is 1 "$RC" "exit 1"
 is 12 "$(count "pm path gb.sb3.gpu")" "waited 12 x 5 s for PackageManager"
 is 0 "$(count "pm grant")" "no grant"
 is 0 "$(count "$ADD")" "no add-tile"
+fg_event 10
+is 1 "$RC" "event: exit 1"
+is 12 "$(count "pm path gb.sb3.gpu")" "event: waited 12 x 5 s for PackageManager too"
+is 0 "$(count "$ADD")" "event: no add-tile"
 
 echo "== static: never needs root"
 for bad in '\bsu\b' 'setprop' 'insmod' '> */sys/' 'chown' 'mount '; do

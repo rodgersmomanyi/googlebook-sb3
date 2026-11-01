@@ -52,7 +52,10 @@ section per item and a table of the checklist steps that only a person at the la
   cut inside a list does not hide an older snapshot's whole one. The summary's raw kernel lines (wave 5: the iwlwifi,
   Bluetooth and IPU lines after `wifi:`, `bluetooth:`, `camera:`) count as kernel log, so those items are still
   judged when the full `== dmesg` is cut off or has wrapped.
-  `== dmesg-live.prev (tail)` belongs to the previous boot and is never used as evidence.
+  `== dmesg-live.prev (tail)` belongs to the previous boot and is never used as evidence. (Wave 9) Neither is an
+  early snapshot's `== dmesg-live (tail)` that still holds the previous boot (its kernel times run past the
+  snapshot's own `== dmesg`): it is skipped (the first native boot's "accelerometer present at ~20 s" came from such
+  a stale copy).
 * **HW / SW.** HW items need the Surface Book 3 hardware. They are judged only when `== dmi` says `Surface Book 3`
   (or when there is no dmi section). On VMware or another machine they are **UNKNOWN** and still show what was
   found. Exceptions, because they fail the same way on the laptop:
@@ -79,8 +82,8 @@ section per item and a table of the checklist steps that only a person at the la
 | 1 | kernel | header, K16.md | `Linux version` / report `uname_r=` is the k16 release (or `--expect-kernel`) | another release (k15 and k14 are named) |
 | 2 | cmdline | rows 9-12, 39, 47; cl. 19 | `8250.nr_uarts>=1`, `gb.hw=native`, `snd_intel_dspcfg.dsp_driver=3`, `reboot=pci`, `module_blacklist` with tpm + spi_intel_pci, `efi_pstore.pstore_disable=1` | any of them missing (notes: `gb.nouveau=0`, `gb.vnni=0`, `gb.overlay=1`) |
 | 3 | gbinit | modules.load | no `FAILED x.ko` (off the laptop: only `No such device`, e.g. surface_gpe's DMI check) | any other insmod failure |
-| 4 | serial8250 | row 12; cl. 19 | `Serial: 8250/16550 driver, N ports` (N>=1), no `dw-apb-uart ... -22`; on the laptop also an MMIO UART in `/proc/tty/driver/serial` | `-22`, a serial IRQ failure (not a `-517` deferral), or no banner although the log starts at 0 s |
-| 5 | ssam | rows 12, 18, 42; cl. 19 | `serial surface_serial_hub bound: <dev>` or `SAM firmware version`, no SAM errors (`-517` lines are deferrals) | bound `none` (cause hints: no `8250.nr_uarts`, `-22`, module) |
+| 4 | serial8250 | row 12; cl. 19 | `Serial: 8250/16550 driver, N ports` (N>=1), no `dw-apb-uart ... -22`; on the laptop also an MMIO UART in `/proc/tty/driver/serial` | `-22`, a serial IRQ failure (not a `-517` deferral), or no banner although the log starts at 0 s. (Wave 9) `surface_serial_hub`'s own `failed to setup IRQ` is the SAM's, judged by item `ssam`, not here |
+| 5 | ssam | rows 12, 18, 42; cl. 19 | `serial surface_serial_hub bound: <dev>` or `SAM firmware version`, no SAM errors (`-517` lines are deferrals); (wave 9) also with the first-stage `error -EINVAL: failed to setup IRQ` / `-22` lines when the device is bound at the end (noted, with gb_hw's `sam:` result) | bound `none`, even with a firmware line (cause hints: no `8250.nr_uarts`, `-22`, module; (wave 9) the first-stage `-EINVAL` and `gb_hw sam: <state>`, or `no gb_hw sam re-bind: an image before wave 9`) |
 | 6 | ssam_registry | rows 18, 19, 25, 42 | registry + hub loaded and at least one SAM client (045E HID inputs, BAT1/BAT2/ADP1, DTX) | module missing, or no client |
 | 7 | keyboard | row 18; cl. 1 | `Microsoft Surface 045E:09AE Keyboard` present, not GAMEPAD in `dumpsys input` | absent with the base attached, or classified GAMEPAD (Fn BTN_0) |
 | 8 | touchpad | row 19; cl. 2, 20 | `Microsoft Surface 045E:09AF Touchpad` present | absent with the base attached |
@@ -97,33 +100,39 @@ section per item and a table of the checklist steps that only a person at the la
 | 19 | bluetooth | row 38; cl. 23 | `Firmware loaded in` / `Device booted in` / `Firmware revision`; evidence also the summary's `bluetooth:` line | `.sfi` not found (named), firmware errors, no hci0 |
 | 20 | audio_card | rows 39-41; cl. 22 | ALSA card id `sofhdadsp` (`/proc/asound/cards`, summary, audio-b* file); with `snd_intel_dspcfg.dsp_driver=1` (summary `audio dsp_driver=1` or the command line) the legacy HDA card id `PCH` (wave 5, C-4) | no such card (hints: SOF waits for i915; the one-boot legacy fallback `dsp_driver=1`) |
 | 21 | audio_dras | row 39; cl. 22 | DRAS `primary_soundcard_name: Some("sofhdadsp")` (`Some("PCH")` with `dsp_driver=1`) | another name; on the laptop also 4+ DRAS starts with the card present |
-| 22 | sensors | rows 27-28; cl. 10 | `GB_SENSORS: waited ... missing: none` or IIO names cros-ec-accel + cros-ec-light | missing devices, `no ISH` |
-| 23 | cameras | row 29; cl. 9 | 00:05.0 8086:8A19 bound to intel-ipu6, no firmware error, sensors found / `Connected N cameras` | **on any machine** the camera HAL does not load (logcat `Could not load /odm/lib64/hw/camera.sb3.so ...`, e.g. `cannot find "n34_0_Box_C" from verneed[0]`: wave 5, C-1); on the laptop: 00:05.0 missing from a whole `== pci` list or not intel-ipu6, `intel/ipu/ipu4p_fw.bin` failed, no sensor (with the boot's kernel log; else UNKNOWN), sensor errors |
-| 24 | dgpu_power | rows 17, 46; cl. 11, 14, 17 | the 10de VGA function `state=D3cold` (in any snapshot) | D0 while idle, `runtime=error`, no dGPU with the base attached |
-| 25 | nouveau | row 17; cl. 14, 17 | Auto/NVIDIA: nouveau bound and `vendor.gb.nouveau.result=clean/healthy`; Intel only: no driver | `unhealthy:*`, `insmod-failed:*`, `bind-failed`, `crashloop`, `refused:*`, a driver in Intel mode. Exception (wave 5, B-4): `refused:model` with a driverless dGPU whose id is not a TU117 (`0x1f80`-`0x1fff`), i.e. a 15-inch SB3, is UNKNOWN by design (dgpu_power must still show D3cold); on a TU117 it stays FAIL (a gate bug) |
-| 26 | dgpu_report | row 17; cl. 14, 18 | `== gb_dgpu_report report n=` present (notes: payload state, other reports) | missing after 120 s, firmware mismatch, payload mounted but files missing |
-| 27 | gfx_switching | row 17; cl. 15 | `ro.gfx.driver.0=gb.sb3.gfxdriver`, vulkan intel, egl angle, gb_power api 1 + running + `get-mode` ok, `gfx_active` set, 0 HWUI queueCount aborts | any of them wrong |
-| 28 | gatekeeper | wave 4 | `gb_gatekeeper: registered ...IGatekeeper/default` | never registered, 3+ exits, `Could not find Gatekeeper device` |
-| 29 | zram | fstab / mmd | `Adding ...k swap on /dev/block/zram0` / summary `swaps:` | zram/swapon errors, or none after boot completed (mmd starts it after completion) |
-| 30 | vnni | cl. 24, K15.md, K16.md | `-- gb_vnni`: `irqon == emulated` (notes: counts per snapshot, top comms, adler32 RIPs; k16 prints `comm=` escaped, `\xHH` for control bytes) | not equal; k15/k16 without the node |
-| 31 | libz_bind | wave 5, vnni-perf | `processing action (ro.{system,vendor}.build.fingerprint=... && early-init) from (/odm/...)`, no failure | a `/odm/vnni` / libz.so command failed or the trigger was rejected (`gb.vnni=0` = UNKNOWN); wave 6: the gbvnni read-only remount (`mount tmpfs gbvnni /odm/vnni remount ro`, ungated) failing with "No such file or directory" only means no `/odm/vnni` this boot (OTA gate, gbinit fallback) and is a note; any other error of it after the binds ran is a FAIL (the patched libz stays writable). (Wave 7) lapis 276's init does not log that ENOENT (AOSP init reports a builtin's ENOENT only at its DEBUG log level), so such a boot shows no tail line and no note; on a forced OTA-gate test boot the gated binds' `remount bind ro` fail with EINVAL instead (a FAIL, as in wave 5) |
-| 32 | fsverity | cl. 24 | summary `ext4 feature present` (or `Enabling ext4 verity on .../userdata`) | absent, `FS_STAT_ENABLE_VERITY_FAILED`, tune2fs failure |
-| 33 | apgetty | cl. 24 | `desktop.apgetty.enable` not 1 and the service not running | on |
-| 34 | slotsync | cl. 24, OTA.md | no `gb_slotsync: HOLD slot` | a HOLD |
-| 35 | esp_bringup | cl. 24, FLASHING 8 | `absent (gb.overlay=1 not set)`, or applied with rc=0 (refused single settings noted) | `refused, nothing applied`, a rewrite/overlay FAILED, rc != 0 |
-| 36 | firmware | cl. 23 | no required `Direct firmware load ... failed` (optional: i915 GuC/HuC, regulatory.db, iwl-debug-yoyo, .pnvm, rtl_nic, BT .ddc, iwlwifi `.ucode` API fallbacks unless iwlwifi logged `no suitable firmware found`) | any required file missing (named) |
-| 37 | crashes | all | no tombstone, fatal signal, Java fatal, ANR, 3+ abnormal init-service exits, kernel BUG/Oops/WARNING/panic | any; off the laptop, crashes of services that need the missing hardware (SurfaceFlinger, allocator, camera, audio, ...) are UNKNOWN, but kernel warnings always FAIL (a camera provider that exits because its HAL does not load gets a note pointing at `cameras`, C-1) |
-| 38 | selinux | all | no enforced (`permissive=0`) denial touching our components (counts and top denials as notes) | an enforced denial of gb_*, /odm, iptsd, vnni, gatekeeper, nouveau, dgpu, gfxdriver, sb3, surface, vendor_init contexts |
-| 39 | boot_time | all | `processing action (sys.boot_completed=1)` (time given; slow above 120 s) | not completed by a snapshot at >= 180 s (VMware: UNKNOWN, the native tree never completes there) |
+| 22 | sensors | rows 27-28; cl. 10 | `GB_SENSORS: waited ... missing: none` or IIO names cros-ec-accel + cros-ec-light | missing devices, `no ISH`; (wave 9) a missing accelerometer names the ISH coldboot failure (`HBM haven't started`, `ISHTP: Protocol init failed`) and `gb_hw ish: <state>` |
+| 23 | rotation | row 27; cl. 10 | (wave 9) every `GB_SENSORS: rotation: <trigger>: ... => <verdict>` line of gb_sensors' `rot_report` (one at boot_completed, one per posture change, at most 3 per start) has an `ok:` verdict (`ok: laptop posture, rotation locked`, `ok: tablet posture, auto-rotate on|off ...`: the verdicts are computed on the device by `rot_verdict`, DEVICE-STATUS item 10); `info:` lines and a `; note: DTX mode X disagrees with the device state Y` (checklist 25, A-M1) are noted | any `MISMATCH:` (Android's posture policy did not follow the hardware; one detach/attach or the Auto-rotate tile corrects a missed boot-time state, rotation-al3 R1; a later ok line is named) or `WARN: config_supportAutoRotation is off` (the sensors overlay did not apply); UNKNOWN without a rotation line (Android not up within the log window, an image before wave 6) or with only `info:` verdicts |
+| 24 | cameras | row 29; cl. 9 | 00:05.0 8086:8A19 bound to intel-ipu6, no firmware error, sensors found / `Connected N cameras` | **on any machine** the camera HAL does not load (logcat `Could not load /odm/lib64/hw/camera.sb3.so ...`, e.g. `cannot find "n34_0_Box_C" from verneed[0]`: wave 5, C-1); on the laptop: 00:05.0 missing from a whole `== pci` list or not intel-ipu6, `intel/ipu/ipu4p_fw.bin` failed, no sensor (with the boot's kernel log; else UNKNOWN), sensor errors (the FAIL names the driver(s), e.g. the rear focus motor `dw9719`; (wave 9) `ov7251` errors are only a note: the IR camera's driver is staged but not loaded) |
+| 25 | dgpu_power | rows 17, 46; cl. 11, 14, 17 | the 10de VGA function `state=D3cold` (in any snapshot) | D0 while idle, `runtime=error`, no dGPU with the base attached |
+| 26 | nouveau | row 17; cl. 14, 17 | Auto/NVIDIA: nouveau bound and `vendor.gb.nouveau.result=clean/healthy`; Intel only: no driver | `unhealthy:*`, `insmod-failed:*`, `bind-failed`, `crashloop`, `refused:*`, a driver in Intel mode. Exception (wave 5, B-4): `refused:model` with a driverless dGPU whose id is not a TU117 (`0x1f80`-`0x1fff`), i.e. a 15-inch SB3, is UNKNOWN by design (dgpu_power must still show D3cold); on a TU117 it stays FAIL (a gate bug) |
+| 27 | dgpu_report | row 17; cl. 14, 18 | `== gb_dgpu_report report n=` present (notes: payload state, other reports) | missing after 120 s, firmware mismatch, payload mounted but files missing |
+| 28 | gfx_switching | row 17; cl. 15 | `ro.gfx.driver.0=gb.sb3.gfxdriver`, vulkan intel, egl angle, gb_power api 1 + running + `get-mode` ok, `gfx_active` set, 0 HWUI queueCount aborts | any of them wrong |
+| 29 | gatekeeper | wave 4 | `gb_gatekeeper: registered ...IGatekeeper/default` | never registered, 3+ exits, `Could not find Gatekeeper device` |
+| 30 | zram | fstab / mmd | `Adding ...k swap on /dev/block/zram0` / summary `swaps:` | zram/swapon errors, or none after boot completed (mmd starts it after completion) |
+| 31 | vnni | cl. 24, K15.md, K16.md | `-- gb_vnni`: `irqon == emulated` (notes: counts per snapshot, top comms, adler32 RIPs; k16 prints `comm=` escaped, `\xHH` for control bytes) | not equal; k15/k16 without the node |
+| 32 | libz_bind | wave 5, vnni-perf | `processing action (ro.{system,vendor}.build.fingerprint=... && early-init) from (/odm/...)`, no failure | a `/odm/vnni` / libz.so command failed or the trigger was rejected (`gb.vnni=0` = UNKNOWN); wave 6: the gbvnni read-only remount (`mount tmpfs gbvnni /odm/vnni remount ro`, ungated) failing with "No such file or directory" only means no `/odm/vnni` this boot (OTA gate, gbinit fallback) and is a note; any other error of it after the binds ran is a FAIL (the patched libz stays writable). (Wave 7) lapis 276's init does not log that ENOENT (AOSP init reports a builtin's ENOENT only at its DEBUG log level), so such a boot shows no tail line and no note; on a forced OTA-gate test boot the gated binds' `remount bind ro` fail with EINVAL instead (a FAIL, as in wave 5) |
+| 33 | fsverity | cl. 24 | summary `ext4 feature present` (or `Enabling ext4 verity on .../userdata`) | absent, `FS_STAT_ENABLE_VERITY_FAILED`, tune2fs failure |
+| 34 | apgetty | cl. 24 | `desktop.apgetty.enable` not 1 and the service not running | on |
+| 35 | slotsync | cl. 24, OTA.md | no `gb_slotsync: HOLD slot` | a HOLD |
+| 36 | esp_bringup | cl. 24, FLASHING 8 | `absent (gb.overlay=1 not set)`, or applied with rc=0 (refused single settings noted) | `refused, nothing applied`, a rewrite/overlay FAILED, rc != 0 |
+| 37 | firmware | cl. 23 | no required `Direct firmware load ... failed` (optional: i915 GuC/HuC, regulatory.db, iwl-debug-yoyo, .pnvm, rtl_nic, BT .ddc, iwlwifi `.ucode` API fallbacks unless iwlwifi logged `no suitable firmware found`) | any required file missing (named) |
+| 38 | crashes | all | no tombstone, fatal signal, Java fatal, ANR, 3+ abnormal init-service exits, kernel BUG/Oops/WARNING/panic | any; off the laptop, crashes of services that need the missing hardware (SurfaceFlinger, allocator, camera, audio, ...) are UNKNOWN, but kernel warnings always FAIL (a camera provider that exits because its HAL does not load gets a note pointing at `cameras`, C-1); (wave 9) lapis's `powertool set-soc-slider` exits are not counted when logcat has `Setting SocSlider is not supported` (Ice Lake has no SoC slider; it writes nothing) |
+| 39 | selinux | all | no enforced (`permissive=0`) denial touching our components (counts and top denials as notes) | an enforced denial of gb_*, /odm, iptsd, vnni, gatekeeper, nouveau, dgpu, gfxdriver, sb3, surface, vendor_init contexts |
+| 40 | boot_time | all | `processing action (sys.boot_completed=1)` (time given; slow above 120 s) | not completed by a snapshot at >= 180 s (VMware: UNKNOWN, the native tree never completes there) |
 
 Steps that are not visible in the log are listed at the end of TRIAGE.md: checklist 5, 6, 7, 8, 12, 13, 15, 16, 18
 and 20, plus the interactive parts of 1 and 2.
 
-**What is inferred.** Nothing has run on the laptop yet. The hardware patterns come from the kernel drivers'
-messages and our own scripts and daemons, and none of them has been seen from this machine: i915 DMC, iwlwifi,
-btintel, SOF, ipu-bridge/IPU4P, `SAM firmware version`, `PM: suspend entry/exit`, gb_power, gb_hw, gb_iptsd,
-gb_sensors, gb_gatekeeper, gbbringup and the init `processing action` format. Expect to adjust a few patterns after
-the first real `gblog\`. The tests pin the current behavior, so any change shows up there. The wave-5 summary lines
+**What is inferred.** The hardware patterns come from the kernel drivers' messages and our own scripts and
+daemons: i915 DMC, iwlwifi, btintel, SOF, ipu-bridge/IPU4P, `SAM firmware version`, `PM: suspend entry/exit`,
+gb_power, gb_hw, gb_iptsd, gb_sensors, gb_gatekeeper, gbbringup and the init `processing action` format. (Wave 9)
+The first native boot (2026-10-31, the wave 8 image, three starts) matched most of them on real logs: i915 DMC,
+iwlwifi, btintel, SOF, `SAM firmware version`, gb_hw's buttons and RAPL lines, gb_sensors' rotation lines,
+gb_gatekeeper and the init `processing action` format. It disproved four judgements, which wave 9 corrected: the
+SAM's first-stage `failed to setup IRQ` (item `ssam`, no longer counted under `serial8250`), the ISH coldboot
+failure (`sensors`), a stale previous-boot `dmesg-live` copy (skipped) and lapis's harmless `powertool` exit
+(`crashes`). Patterns of hardware that boot did not exercise (suspend, camera streaming, the SD reader, the SAM
+devices themselves) are still inferred. The tests pin the current behavior, so any change shows up there. The wave-5 summary lines
 were checked against the real VM-1 logs replayed through the new `GB_BOOTLOG_SH` (fixprep bootlog), not yet against a
 boot of a wave-5 image; gb_hw's `buttons`/`posture` lines come from platform's fake-sysfs harness. (review 2026-10-29)
 `make_fixtures.py` writes the whole `cd94022f` summary (every wave-5 line, derived from the scenario's own logs and
@@ -149,6 +158,8 @@ so no `-- ` block can swallow them. All wave-3 lines keep their text and order. 
 | `bluetooth: hci0 \| hal=..` | C-3 | evidence of `bluetooth` |
 | `camera: provider=.., exits seen: N, HAL load failures: N \| lcam-probe link: ok` | C-3, C-1 | `cameras` FAILs on any machine when N > 0 in any snapshot (review 2026-10-29), like the logcat line itself; an `lcam-probe link: FAILED: CANNOT LINK ...` is noted (below) |
 | `linker: CANNOT LINK lines: N logcat, N kernel; dlopen failed lines outside /data: N` + `-- linker failures` | C-3 | key and block only (read it when a service crash-loops) |
+| (wave 9) `sam: MSHW0084 serial0-0=surface_serial_hub; keyboard 1, touchpad 1; supplies: BAT1 BAT2 ADP1 ; dtx present; vendor.gb.sam=bound binds=1 ...; <gb_hw's last sam line>` | hw-native1 (SAM re-bind) | evidence of `ssam`; a `vendor.gb.sam=FAILED ...` value names the GPIO controller state and the kernel's reason |
+| (wave 9) `ish: driver=intel_ish_ipc; accelerometers: 1; vendor.gb.ish=already accel=1; <gb_hw's last ish line>` | hw-native1 (ISH re-probe) | evidence of `sensors`; `rebound reset=ok accel=1` = repaired by the re-probe, `FAILED` = the firmware did not answer |
 
 The collector (`Get-GooglebookLogs.ps1`) leaves the whole summary block unchanged in the redacted share zip: on the
 replayed VM-1 boot all 12 lines survive and the analyzer gives the same 39 statuses on the private and the shared

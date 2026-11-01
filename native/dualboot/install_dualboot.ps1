@@ -315,7 +315,7 @@ if ($UpdateEspOnly -or $RepairBootEntry) {
                         $lc = "$($L):\loader\loader.conf"
                         if (Test-Path -LiteralPath $lc) {
                             $info.loader_conf = $true
-                            $info.loader_defaults = @(Get-Content -LiteralPath $lc | ForEach-Object { if ($_ -match '^default(?:[ \t]+(.*?))?[ \t\r]*$') { [string]$Matches[1] } })
+                            $info.loader_defaults = @(Get-Content -LiteralPath $lc | ForEach-Object { if ($_ -cmatch '^[ \t]*default(?:[ \t]+(.*?))?[ \t\r]*$') { $v = [string]$Matches[1]; if ($v.Length -ge 2 -and $v[0] -eq $v[-1] -and ('"', "'") -contains [string]$v[0]) { $v = $v.Substring(1, $v.Length - 2) }; $v } })   # (wave 9, SD lows) as esp_extract.py and systemd-boot: blanks around a line dropped, one pair of quotes, the key case-sensitive
                         }
                         $sums = New-Object System.Collections.ArrayList
                         foreach ($rel in @('gblog', 'gbinstall', 'gb\overlay', 'gb\gb.cfg')) {

@@ -70,6 +70,24 @@ TOP = [
 TOP_INDEX = {name: i for i, (name, _) in enumerate(TOP)}
 # Sections whose kernel/logcat lines belong to an EARLIER boot: never evidence for this one.
 PREV_BOOT_SECTIONS = {"dmesg_live_prev"}
+# (wave 9 hw-native1) gb_nouveau's live kernel log (/data/vendor/gb/report/dmesg-live.txt) is rotated into .prev only
+# some time after boot_completed: an early snapshot's "== dmesg-live (tail)" can still be the PREVIOUS boot's log (first
+# native boot, boot 3 at t40: lines up to 486 s, the shutdown of boot 2, in a snapshot taken at 48 s, so boot 2's
+# GB_SENSORS line looked like boot 3's). Such a section is skipped when it has a kernel timestamp past the newest one of
+# the same snapshot's "== dmesg" dump, which is taken after it (+ LIVE_SLACK_S; without that dump: the snapshot's uptime
+# + LIVE_NODMESG_S, as the snapshot takes up to ~5 s between its uptime line and the live log): a log of this boot cannot
+# be ahead of the kernel that wrote the snapshot.
+LIVE_SECTIONS = {"dmesg_live"}
+LIVE_SLACK_S = 2.0
+LIVE_NODMESG_S = 60.0
+
+
+def live_limit(sn):
+    """(wave 9 hw-native1) The newest kernel timestamp a dmesg-live section of THIS boot can have in snapshot sn."""
+    ts = [float(m.group(1)) for _ln, s in sn.lines("dmesg") for m in [KTS_RE.match(s)] if m]
+    if ts:
+        return max(ts) + LIVE_SLACK_S
+    return sn.uptime + LIVE_NODMESG_S if sn.uptime is not None else None
 
 SUMMARY_KEYS = ("serial 8250:", "serial errors:", "serial surface_serial_hub bound:", "inputs (Surface Aggregator HID",
                 "audio cards:", "audio DRAS:", "firmware i915 DMC:", "swaps:", "pci functions without a driver:",
@@ -79,7 +97,9 @@ SUMMARY_KEYS = ("serial 8250:", "serial errors:", "serial surface_serial_hub bou
                 "kernel log:", "deferred probes", "buttons:", "posture:", "posture override:", "audio dsp_driver=",
                 "i915 PSR/underrun lines:", "wifi:", "bluetooth:", "camera:", "linker:",
                 # (wave 6, OTA gate F2) gbinit's verdict from /odm/etc/gb/ota_state
-                "ota gate:")
+                "ota gate:",
+                # (wave 9 hw-native1) the Surface Aggregator after gb_hw's re-bind, the Integrated Sensor Hub
+                "sam: MSHW0084", "ish: ")
 # (wave 5, native-readiness A-L1) -517 = -EPROBE_DEFER: a probe deferred and retried later, never an error by itself
 # (on the SB3 surface_hotplug's first probe, before lapis's pinctrl-icelake, logs "failed to set up IRQ 0: -517")
 DEFERRED_RE = re.compile(r"-517(?!\d)|EPROBE_DEFER")
@@ -264,10 +284,17 @@ class Boot:
                     seen_l.add(s)
                     self.logcat.append(Ev(f, ln, s))
 
+        self.stale_live = []        # (wave 9 hw-native1) [(file, newest timestamp, uptime)]: an earlier boot's dmesg-live
         for sn in self.snaps:
             for name, body in sn.sec.items():
                 if name in PREV_BOOT_SECTIONS:
                     continue
+                if name in LIVE_SECTIONS:
+                    ts = [float(m.group(1)) for _ln, s in body for m in [KTS_RE.match(s)] if m]
+                    lim = live_limit(sn)
+                    if ts and lim is not None and max(ts) > lim:
+                        self.stale_live.append((sn.name, max(ts), lim))
+                        continue
                 for ln, s in body:
                     take(sn.name, ln, s)
             for _hdr, body in sn.reports:
@@ -781,8 +808,10 @@ def c_serial(a, it):
             m = re.search(r"dw-apb-uart -22: (\d+)", e.text)
             if m and int(m.group(1)) > 0:
                 sum_err.append(e)
+    # (wave 9 hw-native1) not the Surface Aggregator's own "surface_serial_hub serialN-M: ... failed to setup IRQ" (its
+    # wakeup GPIO, judged by the ssam item): the 8250 port itself is fine then
     irq = [x for x in not_deferred(b.dm(r"failed to setup IRQ")) if re.search(r"serial|uart|8250|ttyS", x[0].text,
-                                                                         re.I)]
+                                                                         re.I) and "surface_serial_hub" not in x[0].text]
     it.add(banner[:1] or sum_banner[:1]).add(err22).add(sum_err).add(irq)
     ports = []
     for sn in reversed(b.summary_snaps()):
@@ -830,19 +859,48 @@ def c_ssam(a, it):
     fw = b.dm(r"(surface_serial_hub|surface_aggregator|ssam)\S*.*SAM firmware version")
     errs = [x for x in not_deferred(b.dm(r"(surface_serial_hub|surface_aggregator|ssam)\S*\s.*\b(fail(ed)?|error|"
                                          r"timed? ?out)\b", re.I)) if "avc:" not in x[0].text]
+    # (wave 9 hw-native1) k16's first-stage probe fails before lapis's pinctrl-icelake registers INT3455 (the SAM wakeup
+    # GPIO): "error -EINVAL: failed to setup IRQ" + the driver core's "-22"; gb_hw 'sam' binds it again at boot
+    # ('gb_hw: sam:' line, vendor.gb.sam, the summary's 'sam: MSHW0084' line). Those two lines are that known first
+    # failure, not an error of the running Surface Aggregator.
+    first = [x for x in errs if re.search(r"surface_serial_hub \S+: (error -EINVAL: failed to setup IRQ|probe with driver "
+                                          r"surface_serial_hub failed with error -22)", x[0].text)]
+    other = [x for x in errs if x not in first]
+    gbs = b.dm(r"gb_hw: sam: (.*)$")
+    vsam, vev = b.prop("vendor.gb.sam")
+    ssum = b.newest_sline("sam: MSHW0084")
     loaded, mev = a.mod_loaded("surface_aggregator")
-    it.add([bound] if bound else []).add(fw[:2]).add(errs[:4]).add(mev[:1])
+    it.add([bound] if bound else []).add(fw[:2]).add(first[:2]).add(other[:4]).add(mev[:1]).add(gbs[-1:]) \
+        .add([vev] if vev else []).add([ssum] if ssum else [])
     val = bound.text.split("bound:", 1)[1].strip() if bound else None
     if not a.judge_hw:
         if a.module_precondition(it, ["surface_aggregator"]):
             return
         return a.not_here(it, f"surface_aggregator {'loaded' if loaded else 'not loaded'}, "
-                              f"surface_serial_hub bound: {val if val is not None else '?'}")
-    if (val and val != "none") or fw:
-        if errs:
+                              f"surface_serial_hub bound: {val if val is not None else '?'}"
+                              + (f", gb_hw sam: {vsam}" if vsam else ""))
+    gbsam = f"gb_hw sam: {vsam}" if vsam else (f"gb_hw: sam: {gbs[-1][1].group(1)[:160]}" if gbs else "")
+    if first:
+        it.note("the first-stage probe failed with -EINVAL ('failed to setup IRQ'): k16's ssam_irq_setup() does not "
+                "defer while lapis's pinctrl-icelake has not registered INT3455 yet (kernel patch 0114, backlog); "
+                + ("gb_hw re-binds it at boot" if (vsam or gbs) else
+                   "no gb_hw sam result: an image before wave 9 has no re-bind"))
+    # (wave 9 hw-native1) "serial surface_serial_hub bound: none" is not bound, even with a SAM firmware line (the first
+    # native boot: the firmware version is read before the IRQ setup fails)
+    if val != "none" and (val or fw):
+        if other:
             return it.set(FAIL, "bound, but the Surface Aggregator logged errors")
-        return it.set(PASS, f"surface_serial_hub bound: {val or '(SAM firmware version logged)'}")
+        if first and val is None and not gbs and not vsam:
+            return it.set(FAIL, "the first-stage probe failed with -EINVAL ('failed to setup IRQ') and no summary line "
+                                "says it was bound later")
+        return it.set(PASS, f"surface_serial_hub bound: {val or '(SAM firmware version logged)'}"
+                      + (f"; {gbsam}" if gbsam else ""))
     hint = []
+    if first:
+        hint.append("its first-stage probe failed with -EINVAL, 'failed to setup IRQ'; "
+                    + (gbsam if gbsam else "no gb_hw sam re-bind: an image before wave 9"))
+    elif gbsam:
+        hint.append(gbsam)
     if not a.token("8250.nr_uarts"):
         hint.append("8250.nr_uarts is missing from the command line")
         it.add([a.cmdline_ev] if a.cmdline_ev else [])
@@ -1501,13 +1559,33 @@ def c_sensors(a, it):
                 names.append((m.group(2).strip(), sn.ev(ln, s)))
     wait = a.b.dm(r"GB_SENSORS: waited (\d+) ms for:(.*?); iio:(.*?)\s*missing:\s*(.*)$")
     noish = a.b.dm(r"GB_SENSORS: no ISH")
-    it.add([e for _n, e in names][:6]).add(wait[:1]).add(noish[:1])
+    # (wave 9 hw-native1) the Integrated Sensor Hub's coldboot probe can time out on its firmware (first native boot,
+    # boot 3): then no HID sensor hub and no accelerometer exist; gb_hw 'ish' resets and re-binds it at early-boot
+    ishf = a.b.dm(r"intel_ish_ipc \S+: (waiting for ishtp start failed|HBM haven't started|ISHTP: Protocol init failed|"
+                  r"ISH: hw start failed)")
+    gbi = a.b.dm(r"gb_hw: ish: (.*)$")
+    vish, iev = a.b.prop("vendor.gb.ish")
+    it.add([e for _n, e in names][:6]).add(wait[-1:]).add(noish[:1]).add(ishf[-2:]).add(gbi[-1:]) \
+        .add([iev] if iev else [])
+    for f, newest, lim in getattr(a.b, "stale_live", []):
+        it.note(f"{f}: its dmesg-live section is an earlier boot's (kernel time {newest:.0f} s, past this snapshot's "
+                f"{lim:.0f} s): not used")
     if not a.judge_hw:
         return a.not_here(it, "gb_sensors found no ISH (8086:34fc) / MSHW0184" if noish else "")
+    ish_why = ""
+    if ishf:
+        ish_why = ("; the Integrated Sensor Hub did not start at coldboot (intel_ish_ipc: the ISH firmware did not answer"
+                   ", ISHTP protocol init failed)"
+                   + (f"; gb_hw ish: {vish}" if vish else "; no gb_hw ish re-probe: an image before wave 9"))
+    elif vish:
+        it.note(f"gb_hw ish: {vish}")
     if wait:
         miss = wait[-1][1].group(4).strip()
         if miss and miss != "none":
-            return it.set(FAIL, f"missing IIO devices after the wait: {miss}")
+            return it.set(FAIL, f"missing IIO devices after the wait: {miss}" + (ish_why if "accel" in miss else ""))
+        if ishf:
+            it.note("the ISH's coldboot probe failed, but the accelerometer was there before the sensors HAL started"
+                    + (f" (gb_hw ish: {vish})" if vish else ""))
         return it.set(PASS, f"IIO devices registered: {wait[-1][1].group(3).strip()}")
     if noish:
         return it.set(FAIL, "gb_sensors found no ISH (8086:34fc) and no MSHW0184")
@@ -1516,8 +1594,51 @@ def c_sensors(a, it):
     if need <= have:
         return it.set(PASS, f"IIO devices: {', '.join(sorted(have))}")
     if names:
-        return it.set(FAIL, f"missing {', '.join(sorted(need - have))} (have {', '.join(sorted(have))})")
-    it.set(FAIL, "no IIO sensor device")
+        return it.set(FAIL, f"missing {', '.join(sorted(need - have))} (have {', '.join(sorted(have))})"
+                      + (ish_why if "cros-ec-accel" not in have else ""))
+    it.set(FAIL, "no IIO sensor device" + ish_why)
+
+
+# (wave 9, BACKLOG 13.3 "rotation analyser", relabel B.4) gb_sensors.sh rot_report writes one read-only kmsg line per
+# posture change (at most 3 per start; the 'diag' one at boot_completed): 'GB_SENSORS: rotation: <trigger>:
+# device_state=.. dtx=.. ... => <verdict>', the verdict computed ON THE DEVICE by rot_verdict (C:\GB-build\native\
+# sensors\gb_sensors.sh): 'ok: ...', 'MISMATCH: ...', 'WARN: config_supportAutoRotation is off ...', 'info: ...', plus
+# '; note: DTX mode X disagrees with the device state Y'. The expected verdicts per posture are DEVICE-STATUS item 10.
+ROT_RE = r"GB_SENSORS: rotation: ([^:]+): (.*?) => (.*)$"
+
+
+@check("rotation", "Rotation per posture (GB_SENSORS: rotation: verdicts)", "row 27; checklist 10", "HW")
+def c_rotation(a, it):
+    rows = a.b.dm(ROT_RE)
+    it.add(rows[:6])
+    if not a.judge_hw:
+        return a.not_here(it, f"{len(rows)} 'GB_SENSORS: rotation:' line(s)" if rows else "")
+    if not rows:
+        return it.set(UNKNOWN, "no 'GB_SENSORS: rotation:' line (gb_sensors writes one at boot_completed and one per "
+                               "posture change: Android was not up within the log window, or an image before wave 6)")
+    bad, ok, info = [], [], []
+    for i, (e, m) in enumerate(rows):            # kernel-log order (Boot.dmesg: snapshots in time order, each line once)
+        verdict, _, note = m.group(3).strip().partition("; note: ")
+        if note:
+            it.note(f"{m.group(1)}: {note} (the lid switch or SW_TABLET_MODE: checklist 25, A-M1)")
+        (bad if verdict.startswith(("MISMATCH:", "WARN:")) else ok if verdict.startswith("ok:") else info).append(
+            (i, m.group(1), verdict))
+    for _i, trig, verdict in info[:2]:
+        it.note(f"{trig}: {verdict}")
+    if bad:
+        i0, trig, verdict = bad[0]
+        rem = ""
+        if verdict.startswith("MISMATCH:"):
+            rem = ("; Android's posture policy did not follow the hardware: one detach/attach of the clipboard or the "
+                   "Auto-rotate tile corrects a missed boot-time state (rotation-al3 R1)")
+            if any(i2 > i0 for i2, _t2, _v2 in ok):
+                rem += "; a later line is ok"
+        elif verdict.startswith("WARN:"):
+            rem = "; the sensors overlay did not apply (cmd overlay list | grep gb_sb3)"
+        return it.set(FAIL, f"{len(bad)} of {len(rows)} rotation line(s) not ok; {trig}: {verdict}{rem}")
+    if ok:
+        return it.set(PASS, "; ".join(sorted({v for _i, _t, v in ok})) + f" ({len(ok)} line(s))")
+    it.set(UNKNOWN, f"only info verdicts ({info[0][1]}: {info[0][2]})")
 
 
 @check("cameras", "Cameras: IPU4P firmware loaded, sensors probed", "row 29; checklist 9", "HW")
@@ -1531,7 +1652,15 @@ def c_cameras(a, it):
     conn = a.b.dm(r"Connected (\d+) cameras?")
     serr = a.b.dm(r"\b(ov5693|ov8865|ov7251|dw9719)\b.*\b(fail(ed)?|error|mismatch|timeout)\b|"
                   r"\b(ov5693|ov8865|ov7251|dw9719)\b.*: probe .* failed with error", re.I)
-    it.add([dev[3]] if dev else []).add(hw[:1]).add(fwbad[:3]).add(found[:3]).add(conn[:1]).add(serr[:4])
+    # (wave 9 hw-native1) the IR camera OV7251 (INT347E) is not exposed by the camera HAL (camera_hal.yaml) and its probe
+    # always failed on the Surface Book 3 (-121); images from wave 9 on no longer load it: a note, never a FAIL
+    serr_ir = [x for x in serr if re.search(r"\bov7251\b", x[0].text, re.I)]
+    serr = [x for x in serr if x not in serr_ir]
+    it.add([dev[3]] if dev else []).add(hw[:1]).add(fwbad[:3]).add(found[:3]).add(conn[:1]).add(serr[:4]) \
+        .add(serr_ir[:1])
+    if serr_ir:
+        it.note("the IR camera ov7251 (INT347E) logged errors: not used by Android (the camera HAL exposes only the "
+                "front and rear cameras); images from wave 9 on do not load it")
     # (W5, C-1) the HAL must load on any machine: a dlopen failure is software, so it FAILs in VMware too (it hid
     # behind "no hardware" in every native VM smoke before wave 5)
     hal = a.b.lc(r"Could not load (/odm/lib64/hw/camera\.sb3\.so|camera HAL module)")
@@ -1570,7 +1699,8 @@ def c_cameras(a, it):
     if not found and not conn and a.b.klog_from_zero:     # (review 2026-10-29) only with the boot's kernel log
         bad.append("ipu-bridge found no camera sensor")
     if serr:
-        bad.append("a sensor driver logged errors")
+        bad.append("a sensor driver logged errors (" + ", ".join(sorted({re.search(
+            r"\b(ov5693|ov8865|dw9719)\b", x[0].text, re.I).group(1).lower() for x in serr})) + ")")
     if bad:
         return it.set(FAIL, "; ".join(bad))
     if not found and not conn:
@@ -2089,7 +2219,16 @@ HW_DEPENDENT_PROC = re.compile(r"surfaceflinger|allocator|composer|camera|dras|a
 
 @check("crashes", "Crashes: tombstones, fatal signals, crash loops, kernel oops/WARN", "all rows", "SW")
 def c_crashes(a, it):
-    procs = a.crash_procs
+    procs = dict(a.crash_procs)
+    # (wave 9 hw-native1) lapis's /vendor/etc/init/powertool.rc runs 'powertool set-soc-slider <value>' (exec_background)
+    # on every vendor.powerhal.socslider change (the power HAL's powerhint.json SocSlider node). Ice Lake has no
+    # processor_thermal_soc_slider, so powertool logs "Setting SocSlider is not supported" and exits 1 before it writes
+    # anything: expected on the Surface Book 3, not a crash (only with that logcat line as proof)
+    if a.b.lc(r"powertool\s*:\s+Setting SocSlider is not supported"):
+        for p in [p for p in procs if "/vendor/bin/powertool set-soc-slider" in p]:
+            it.note(f"{p}: expected on the Surface Book 3 (powertool: 'Setting SocSlider is not supported': Ice Lake "
+                    "has no SoC slider; nothing is written), not counted")
+            del procs[p]
     for e, _m in a.kernel_issues[:4]:
         it.add([e])
     for p, evs in procs.items():

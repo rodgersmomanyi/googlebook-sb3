@@ -18,6 +18,8 @@ The full design, integration record and test results: [dgpu/w4/GATEKEEPER.md](..
 Build on the builder (NDK r27c at `$NDK`, default `/build/ndk`; BoringSSL is cloned from AOSP and pinned):
 `sh build.sh` writes `out/android/android.hardware.gatekeeper-service.gb`, `out/android/SHA256SUMS` and
 `out/ACCEPTANCE.txt`. `build_esp.py` refuses a binary whose sha256 is not in `SHA256SUMS` and `ACCEPTANCE.txt`
-(version 0.2.0 or later) or that needs a library other than `libbinder_ndk libc libdl liblog libm`. Our build of
+(version 0.2.0 or later, with the three frozen-vector results `host: GK_FROZEN_V1: PASS`, `host: GK_FROZEN_REF:
+PASS` and `android-on-lapis-bionic: GK_FROZEN_V1: PASS`) or that needs a library other than `libbinder_ndk libc
+libdl liblog libm`. Our build of
 0.2.0 is `505b404d0606bf80bcb41ff8a66a80c962934e3791d3b8db13645608da143d51` (reproduced byte for byte from empty
 output directories on the builder). **The binary and `out/` are never committed.**

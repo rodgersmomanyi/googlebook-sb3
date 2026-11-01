@@ -23,10 +23,18 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
       gb.gfxdriver= anywhere; every androidboot.boot_part_uuid= names the super GUID; --boot: a native default entry
       has gb.boot=<boot> (VM entries have no gb.boot=)
   V3  gb/inject.gz gunzips and is the first segment of initrd-<slot>.img; the cpio parses; no duplicate path
-  V4  krel from the bzImage setup header; every .ko (cpio, and the payload's from inject\\native\\modules) has that
-      vermagic and a module signature whose signer is a certificate built into vmlinuz; --krel FILE matches
+  V4  krel from the bzImage setup header; every .ko (cpio, and (W9, image audit IA8-1) the payload's own lib/modules
+      files, read out of the erofs) has that vermagic and a module signature whose signer is a certificate built into
+      vmlinuz; --krel FILE matches
+  V4b (W9, kernel-k16 L-1) native: gbnative/lib/modules/modules.alias and modules.dep (0644) are byte-identical to the
+      staged inject\\native\\modules copies (both or neither, as staged) and consistent (build_esp _modalias_set: only
+      packed .ko files that no modules.load* names, dependencies in order or lapis /vendor/lib/modules ones); VM kinds:
+      neither file
   V5  none of the 5 opt-in modules in a native modules.load*, none of their .ko in the native cpio
-  V6  no backup/superseded file names in the cpio        V7  native: the dGPU payload (INTERFACES 6.1/6.2)
+  V6  no backup/superseded file names in the cpio        V7  native: the dGPU payload (INTERFACES 6.1/6.2); (W9, IA8-1)
+      every payload file's bytes (decoded: plain, inline or LZ4 erofs extents) == its host input (the staged modules,
+      the firmware pins, the component payload sources, modules.dgpu, VERSION) and MANIFEST.sha256 lists exactly the
+      other files with their sha256
   V8  native gb.rc content (15.1-v12 and the other component rules)   V8b every /odm and gb_* service binary is packed
   V9  native build.prop: exactly one ro.gfx.driver.0 (none with --no-gfxdriver), no forbidden graphics props; VM
       build.prop: no ro.gfx.driver. (vmtest-gfx: exactly the one line)   V10 no priv-app
@@ -92,7 +100,7 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
 Read-only: images, lapis.bin and the host inputs are opened "rb"; only --extract writes (into OUTDIR).
 Exit 0 and last line "RESULT: OK"; exit 1 and "RESULT: <n> problem(s)" with one "PROBLEM: V<n> ..." line each;
 exit 2 = usage. Module API (build_iso.py imports this file by path): esp_of_disk, fat_files, fat_parse, cpio_entries,
-gunzip_padded, native_tree, erofs_listing, kernel_release, compare_export.
+gunzip_padded, native_tree, erofs_listing, kernel_release, compare_export; (W9) erofs_read.
 VP (W6 prep, SA-7) --expect-pin-path ESP (an ESP image or a disk image; before a user-VM write: the ESP now in
     lapis.bin): the PIN path of the verified ESP's booted tree (pin_path: the Gatekeeper binary, fragment and rc
     service, the KeyMint service and its vup/lib64 NEEDED closure, the Trusty/Weaver masks and gbinit whiteouts, the
@@ -642,6 +650,140 @@ def erofs_listing(img):
     return sorted(lines, key=lambda x: x[5])
 
 
+_EROFS_MEMO = []                                  # [(image object, files)]: T3/T4 build many Ctx over one payload
+
+
+def erofs_read(img):
+    """(W9, image audit IA8-1) {path: bytes} of every regular file of an EROFS image, the way the kernel reads it:
+    FLAT_PLAIN / FLAT_INLINE files and LZ4 compressed ones (COMPRESSED_FULL or _COMPACT index, 4 KiB lclusters,
+    one-block pclusters with 0padding, uncompressed pclusters plain or interlaced): what make_dgpu_payload.sh's
+    mkfs.erofs -zlz4hc,12 writes. Anything else (big pclusters, tail packing, fragments, dedupe, another algorithm,
+    another block size) raises ValueError, as does any extent that does not decode to exactly its length."""
+    for o, res in _EROFS_MEMO:
+        if o is img:
+            return res
+    BS = 4096
+
+    def rd(off, ln):
+        if off < 0 or off + ln > len(img):
+            raise ValueError("erofs: read past the end of the image")
+        return img[off:off + ln]
+
+    sb = rd(1024, 128)
+    if struct.unpack_from("<I", sb, 0)[0] != 0xE0F5E1E2:
+        raise ValueError("not an EROFS image (magic)")
+    if sb[12] != 12 or sb[90] != 0:
+        raise ValueError(f"erofs: block size 2^{sb[12]} / directory blocks 2^{12 + sb[90]} unsupported")
+    root_nid, meta = struct.unpack_from("<H", sb, 14)[0], struct.unpack_from("<I", sb, 40)[0]
+    incompat = struct.unpack_from("<I", sb, 80)[0]
+    if incompat & ~1:
+        raise ValueError(f"erofs: incompatible features {incompat:#x} unsupported (only 0padding)")
+
+    def inode(nid):
+        off = meta * BS + nid * 32
+        h = rd(off, 64)
+        fmt, xic, mode = struct.unpack_from("<HHH", h, 0)
+        size = struct.unpack_from("<Q" if fmt & 1 else "<I", h, 8)[0]
+        isz = 64 if fmt & 1 else 32
+        return dict(off=off, mode=mode, size=size, layout=(fmt >> 1) & 7, u=struct.unpack_from("<I", h, 16)[0],
+                    end=off + isz + (0 if xic == 0 else 12 + (xic - 1) * 4))
+
+    def flat(ino):
+        size, nfull = ino["size"], ino["size"] // BS
+        if ino["layout"] == 0:
+            return rd(ino["u"] * BS, size)
+        if ino["layout"] != 2:
+            raise ValueError(f"erofs: layout {ino['layout']} where a flat one is needed")
+        d = rd(ino["u"] * BS, nfull * BS) if nfull else b""
+        return d + rd(ino["end"], size - nfull * BS) if size - nfull * BS else d
+
+    def compressed(ino):
+        size, lay = ino["size"], ino["layout"]
+        hpos = (ino["end"] + 7) & ~7
+        advise, algs, cbits = struct.unpack_from("<HBB", rd(hpos, 8), 4)
+        if not incompat & 1 or cbits or advise & ~0x11 or algs:
+            raise ValueError(f"erofs: compressed inode (0padding {incompat & 1}, h_advise {advise:#x}, algorithms "
+                             f"{algs:#x}, clusterbits {cbits:#x}) unsupported: LZ4, 4 KiB lclusters, no big pclusters")
+        nl = (size + BS - 1) // BS
+        heads = []                                  # (logical start, type, pblk) of every HEAD / PLAIN lcluster
+        if lay == 1:                                # COMPRESSED_FULL: 8-byte z_erofs_lcluster_index records
+            for i in range(nl):
+                adv, cofs, u = struct.unpack_from("<HHI", rd(hpos + 16 + 8 * i, 8), 0)
+                if adv & 3 != 2:
+                    if cofs >= BS:
+                        raise ValueError(f"erofs: lcluster {i}: clusterofs {cofs}")
+                    heads.append((i * BS + cofs, adv & 3, u))
+        else:                                       # COMPRESSED_COMPACT (zmap.c z_erofs_load_compact_lcluster)
+            ebase = hpos + 8
+            init4 = ((32 - ebase % 32) // 4) & 7
+            n2 = (nl - init4) // 16 * 16 if advise & 1 and init4 < nl else 0
+            n4 = min(init4, nl)
+            pos, i = ebase, 0
+            for vcnt, ab, cnt in ((2, 4, n4), (16, 2, n2), (2, 4, nl - n4 - n2)):
+                for _ in range(0, cnt, vcnt):
+                    blob = rd(pos, vcnt * ab)
+                    enc, base, nh = (vcnt * ab - 4) * 8 // vcnt, struct.unpack_from("<I", blob, vcnt * ab - 4)[0], 0
+                    for k in range(vcnt):
+                        v = int.from_bytes(blob[enc * k // 8:enc * k // 8 + 4], "little") >> (enc * k % 8)
+                        t, lo = (v >> 12) & 3, v & 0xFFF
+                        if i < nl and t != 2:
+                            heads.append((i * BS + lo, t, base + 1 + nh))   # pblk = base + 1 + HEADs before it
+                            nh += 1
+                        elif i < nl and lo & 0x800 and k + 1 < vcnt:
+                            raise ValueError("erofs: big pcluster (CBLKCNT) unsupported")
+                        i += 1
+                    pos += vcnt * ab
+        out = bytearray()
+        for k, (la, t, pblk) in enumerate(heads):
+            if la >= size:                          # mkfs.erofs's final PLAIN index: where the last extent ends
+                break
+            llen = min(heads[k + 1][0] if k + 1 < len(heads) else size, size) - la
+            if la != len(out) or llen <= 0:
+                raise ValueError(f"erofs: extent at {la} (type {t}, {llen} B) does not follow at {len(out)}")
+            blk = rd(pblk * BS, BS)
+            if t == 0:                              # an uncompressed pcluster
+                if llen > BS:
+                    raise ValueError(f"erofs: uncompressed extent at {la} longer than its block")
+                s = la % BS if advise & 0x10 else 0     # interlaced: the data starts at its own offset in the block
+                cur = min(BS - s, llen)
+                out += blk[s:s + cur] + blk[:llen - cur]
+                continue
+            m = 0
+            while m < BS and blk[m] == 0:            # 0padding: the LZ4 stream ends at the end of the pcluster
+                m += 1
+            dec = lz4_block(blk[m:])
+            if len(dec) != llen:
+                raise ValueError(f"erofs: the LZ4 extent at {la} decodes to {len(dec)} B, not {llen}")
+            out += dec
+        if len(out) != size:
+            raise ValueError(f"erofs: a compressed file decodes to {len(out)} B, not {size}")
+        return bytes(out)
+
+    files = {}
+
+    def walk(ino, path, depth):
+        if depth > 32:
+            raise ValueError("erofs: directory tree too deep")
+        d = flat(ino)
+        for bo in range(0, len(d), BS):
+            blk = d[bo:bo + BS]
+            n = struct.unpack_from("<H", blk, 8)[0] // 12
+            ents = [struct.unpack_from("<QHBB", blk, i * 12) for i in range(n)]
+            for i, (nid, no, ft, _) in enumerate(ents):
+                name = blk[no:ents[i + 1][1] if i + 1 < n else len(blk)].split(b"\0")[0].decode("utf-8", "replace")
+                if name in (".", ".."):
+                    continue
+                ci, p = inode(nid), path + "/" + name if path else name
+                if ft == 2:
+                    walk(ci, p, depth + 1)
+                elif ft == 1:
+                    files[p] = compressed(ci) if ci["layout"] in (1, 3) else flat(ci)
+
+    walk(inode(root_nid), "", 0)
+    _EROFS_MEMO[:] = _EROFS_MEMO[-1:] + [(img, files)]
+    return files
+
+
 # ------------------------------------------------------------------------------------------------------------ kernel
 
 def kernel_release(bz):
@@ -1058,11 +1200,11 @@ def loader_match_problems(files, slot, expect_slot=None):
 
 class Ctx:
     """Everything the ESP checks look at, parsed once. files: {ESP path: bytes}; info: fat_parse info (None in unit
-    tests that build files directly); cpio / listing: parsed from files unless given."""
+    tests that build files directly); cpio / listing / payload: parsed from files unless given."""
 
     def __init__(self, files, info=None, kind="auto", super_guid=None, boot=None, part_size=None, krel_file=None,
                  no_gfxdriver=False, compare=None, cpio=None, listing=None, bringup_test=False, esp_size=None,
-                 expect_inject=None, expect_slot=None):
+                 expect_inject=None, expect_slot=None, payload=None):
         self.files, self.info, self.boot, self.part_size = files, info, boot, part_size
         self.bringup_test = bringup_test                 # the R-12b test ESP (build_usb.py --bringup-test)
         self.esp_size = esp_size or ESP_SIZE             # (W4) --esp-size: the user VM's lapis ESP is 192 MiB
@@ -1105,6 +1247,20 @@ class Ctx:
                 except (ValueError, struct.error) as e:
                     self.listing_error = str(e)
         self.listing = listing
+        self._payload, self.payload_error = payload, None    # (W9, IA8-1) read on first use (V4, V7)
+
+    def payload_files(self):
+        """(W9, image audit IA8-1) {path: bytes} of the dGPU payload's regular files (the one gb/dgpu-*.erofs, decoded
+        once), or None with payload_error saying why."""
+        if self._payload is None and self.payload_error is None:
+            er = [k for k in self.files if k.startswith("gb/dgpu-") and k.endswith(".erofs")]
+            try:
+                if len(er) != 1:
+                    raise ValueError(f"{len(er)} gb/dgpu-*.erofs files on the ESP")
+                self._payload = erofs_read(self.files[er[0]])
+            except (ValueError, struct.error, IndexError) as e:
+                self.payload_error = str(e)
+        return self._payload
 
     def data(self, path):
         e = self.tree.get(path)
@@ -1420,17 +1576,12 @@ def v4(c):
         p.append("no X.509 certificate found in the decompressed vmlinuz")
         certs = None
     mods, bad = [(path, data) for path, mode, data in c.cpio if path.endswith(".ko") and is_reg(mode)], []
-    for t, _, _, _, size, path in c.listing or []:
-        if t == "f" and path.startswith("lib/modules/") and path.endswith(".ko"):
-            hp = os.path.join(HOST["modules"], path.rsplit("/", 1)[-1])
-            try:
-                d = rd_host(hp)
-            except OSError:
-                bad.append(f"payload {path}: no staged copy {hp}")
-                continue
-            if len(d) != size:
-                bad.append(f"payload {path}: size {size} != the staged module's {len(d)}")
-            mods.append(("payload " + path, d))
+    if c.listing is not None:                   # (W9, IA8-1) the payload's own module bytes, not the staged copies
+        pf = c.payload_files()
+        if pf is None:
+            bad.append(f"payload modules unreadable: {c.payload_error}")
+        mods += [("payload " + k, v) for k, v in sorted((pf or {}).items())
+                 if k.startswith("lib/modules/") and k.endswith(".ko")]
     lapis, tails = [], set()
     for name, data in mods:
         if lapis_module(name, data):
@@ -1450,6 +1601,61 @@ def v4(c):
     c.notes.append(("V4", f"krel {c.krel}; {len(mods) - len(lapis)} kernel modules checked (vermagic, signature, "
                           f"signer among {len(certs or ())} certificate ids in vmlinuz); {len(lapis)} lapis vendor "
                           f"module copies checked by their modversions vermagic only"))
+    return p
+
+
+MODALIAS_FILES = ("modules.alias", "modules.dep")
+
+
+def v4b(c):
+    """(W9, kernel-k16 L-1) the packed ueventd module index == the staged copies and consistent (_modalias_set)"""
+    p, tr = [], "gbnative" if c.kind == "native" else "gbstage"
+    have = {n: c.tree.get(f"{tr}/lib/modules/{n}") for n in MODALIAS_FILES}
+    if c.kind != "native":
+        return [f"{tr}/lib/modules/{n} in a VM tree (no modalias set there)" for n, e in have.items() if e]
+    for n, e in have.items():
+        try:
+            want = rd_host(os.path.join(HOST["modules"], n))
+        except FileNotFoundError:
+            want = None
+        except OSError as x:
+            p.append(f"staged {n}: {x}")
+            continue
+        if want is None and e:
+            p.append(f"gbnative/lib/modules/{n} packed, but inject\\native\\modules has none")
+        elif want is not None and (not e or not is_reg(e[0]) or e[0] & 0o7777 != 0o644 or e[1] != want):
+            p.append(f"gbnative/lib/modules/{n} missing, not 0644 or not the staged copy")
+    if bool(have["modules.alias"]) != bool(have["modules.dep"]):
+        p.append("modules.alias and modules.dep go together (only one is packed)")
+    if p or not any(have.values()):
+        return p
+    mods = {k[len("gbnative/lib/modules/"):]: v for k, v in c.tree.items()
+            if k.startswith("gbnative/lib/modules/") and k.count("/") == 3 and is_reg(v[0])}
+    lines = lambda n: [ln for ln in (mods[n][1] or b"").decode("ascii", "replace").split("\n")
+                       if ln and not ln.startswith("#")]
+    loaded = {ln.split()[0] for n in ("modules.load", "modules.load.late") if n in mods for ln in lines(n)}
+    aliased, deps = set(), {}
+    for ln in lines("modules.alias"):
+        w = ln.split(" ")
+        if len(w) != 3 or w[0] != "alias" or not w[1] or not w[2]:
+            p.append(f"modules.alias: bad line {ln[:60]!r}")
+        else:
+            aliased.add(w[2])
+    for ln in lines("modules.dep"):
+        w = ln.split(" ")
+        f = w[0][len("/odm/lib/modules/"):-1] if w[0].startswith("/odm/lib/modules/") and w[0].endswith(".ko:") else None
+        if f is None or f not in mods or f in loaded:
+            p.append(f"modules.dep: {w[0][:60]!r} is not a packed module outside the load lists")
+            continue
+        late = [d for d in w[1:] if not ((d.startswith("/odm/lib/modules/") and d[17:] in deps) or
+                                         (d.startswith("/vendor/lib/modules/") and d.endswith(".ko") and "/" not in d[20:]))]
+        if late:
+            p.append(f"modules.dep: {f} depends on {late[:2]} (not an earlier packed module or a lapis vendor module)")
+        deps[f] = w[1:]
+    if aliased != {f[:-3].replace("-", "_") for f in deps}:
+        p.append(f"modules.alias names {sorted(aliased)[:6]}, modules.dep {sorted(deps)[:6]}")
+    c.notes.append(("V4b", f"{len(deps)} modalias module(s), {len(lines('modules.alias'))} alias line(s) == the staged "
+                           f"copies"))
     return p
 
 
@@ -1504,6 +1710,47 @@ def payload_expected(krel):
     return want
 
 
+_SHA_MEMO = {}                                  # (W9) T3/T4 run V7 many times: each host input hashed once per state
+_PSHA_MEMO = []                                 # [(payload dict, {path: sha256})]; payload dicts are never modified
+
+
+def _payload_sha(pf):
+    for o, r in _PSHA_MEMO:
+        if o is pf:
+            return r
+    r = {k: sha256(v) for k, v in pf.items()}
+    _PSHA_MEMO[:] = _PSHA_MEMO[-1:] + [(pf, r)]
+    return r
+
+
+def payload_input_sha(krel):
+    """(W9, image audit IA8-1) {path: sha256 hex, or None if the host input is unreadable} of every payload file but
+    MANIFEST.sha256: the inputs build_esp's _payload_inputs packs (the firmware by its firmware_staged_sha256.txt pin)."""
+    def h(p):
+        try:
+            st = os.stat(p)
+            key = (os.path.abspath(p), st.st_size, st.st_mtime_ns)
+            if key not in _SHA_MEMO:
+                _SHA_MEMO[key] = sha256(rd_host(p))
+            return _SHA_MEMO[key]
+        except OSError:
+            return None
+    want = {"VERSION": sha256(f"gb-dgpu-payload 1\nkrel {krel}\n".encode()),
+            "firmware/nvidia/LICENCE.nvidia": h(os.path.join(HOST["nk_fw"], "LICENCE.nvidia")),
+            "firmware/nvidia/WHENCE.tu117": h(os.path.join(HOST["nk_fw"], "WHENCE.tu117")),
+            "lib/modules/modules.dgpu": sha256(MODULES_DGPU)}
+    for ln in rd_host(HOST["fw_sha"]).decode("utf-8").splitlines():
+        w = ln.split()
+        if len(w) == 2:
+            want["firmware/" + w[1].lstrip("*")] = w[0].lower()
+    for m in OPTIN_FILES:
+        want["lib/modules/" + m] = h(os.path.join(HOST["modules"], m))
+    for _, man in manifests(False):
+        for e in man.get("payload", []):
+            want[e["dest"]] = h(e["src"])
+    return want
+
+
 def v7(c):
     dg = sorted(k for k in c.files if k.startswith("gb/dgpu-"))
     if c.kind != "native":
@@ -1553,6 +1800,25 @@ def v7(c):
     badsize = [k for k, s in want.items() if k in have_f and s is not None and have_f[k][4] != s]
     if badsize:
         p.append(f"payload file sizes differ from the inputs: {badsize[:4]}")
+    pf = c.payload_files()                      # (W9, IA8-1) the bytes, not only the sizes (k15/k16 modules: same sizes)
+    if pf is None:
+        p.append(f"payload content unreadable: {c.payload_error}")
+        return p
+    if {k: len(v) for k, v in pf.items()} != {k: x[4] for k, x in have_f.items()}:
+        p.append("payload content and listing disagree (files or sizes)")
+    try:
+        exp = payload_input_sha(c.krel)
+    except (OSError, ValueError, KeyError) as e:
+        p.append(f"payload: host inputs unreadable ({e})")
+        return p
+    hv = _payload_sha(pf)
+    bad = [k for k in sorted(exp) if k in pf and hv[k] != exp[k]]
+    if bad:
+        p.append(f"payload file contents differ from the inputs: {', '.join(bad[:5])}" +
+                 (f" ... {len(bad) - 5} more" if len(bad) > 5 else ""))
+    if pf.get("MANIFEST.sha256") != "".join(f"{hv[k]}  {k}\n" for k in sorted(pf)
+                                            if k != "MANIFEST.sha256").encode():
+        p.append("payload MANIFEST.sha256 does not list exactly the payload's other files with their sha256")
     return p
 
 
@@ -2682,7 +2948,8 @@ def v33(c):
 
 
 ALL, NATIVE, VMS = "all", "native", "vm"
-CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("V5", v5, NATIVE),
+CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("V4b", v4b, ALL),
+          ("V5", v5, NATIVE),
           ("V6", v6, ALL), ("V7", v7, ALL), ("V8", v8, NATIVE), ("V8b", v8b, NATIVE), ("V9", v9, ALL),
           ("V10", v10, ALL), ("V11", v11, ALL), ("V12", v12, ALL), ("V12b", v12b, ALL), ("V13", v13, NATIVE),
           ("V14", v14, ALL),

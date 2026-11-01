@@ -66,7 +66,8 @@ modules for a build are made for the GKI in that build's `boot_<x>`, while this 
   gb-<cur>`, again once on each later boot while the hold is in effect (so the `gblog\` summary shows it), and the
   notification **"System update held"** ("Kernel mismatch: ...") appears (natively, through `gb_notify`) once the
   new slot's initrd and entries are on the ESP, so "(slot X) is in the boot menu" is true when you read it. If the new slot is booted by hand and comes up, it becomes the default as usual. A matching kernel
-  rebuild is the real fix.
+  rebuild is the real fix. Since wave 9 the VM build shows this notice too: it has the same notification queue and
+  delivery script as the native build (before, the VM only wrote the kmsg line).
 
 Lead decision D-a of wave 3; the idea of checking the kernel interface before trusting a new slot comes from gbOS86's
 porting notes (github.com/linuxkid473/gbos-x86 @f8a5c1a, porting.md); the code is ours.
@@ -92,14 +93,18 @@ and checks it at every boot:
     skipping the KeyMint graft, the VINTF manifest, the fstab or the SELinux list would turn a possibly stale
     addition into a certain boot failure.
   * On such a build, at `boot_completed`, the notification **"System update not validated"** appears (tag
-    `gb_update`; natively through `gb_notify`, in the VM posted directly) and one kmsg line is written. From wave 6
+    `gb_update`, through `gb_notify` in both builds since wave 9) and one kmsg line is written. From wave 6
     the notice is posted once for all users (`cmd notification post -u all`): lapis runs in headless system user
     mode, and a notice posted for user 0 (the login screen) is never shown to the person in user 10, which is what
     wave 5 images did. `cmd notification post` exits 0 even when it posts nothing (an unknown option prints its
     usage; a refused user or style prints `Error occurred`). Since wave 7 the native notice path (gb_notify) reads
     that output and tries once more without the missing option: for all users without the text style, for the
     login screen only when a future build has no `-u` at all (logged), or once per signed-in user when `all` is
-    refused. Since wave 8 the VM build's direct post (`gb_otagate_post`) does the same. From wave 6
+    refused. Since wave 8 the VM build's direct post (`gb_otagate_post`) does the same. Since wave 9 a notice is
+    posted once for the user in front of the screen (`cmd notification post -u <user>`), not for all users: a guest
+    or a second user no longer gets the owner's notices, and dismissing one no longer removes it for everyone. A
+    notice raised while nobody is signed in (the login screen after a reboot) is kept and shown as soon as you sign
+    in; it is dropped at the next reboot (the next boot raises it again if it still applies). From wave 6
     the kernel log also gets, after the notification, one line per bind mount of the image
     (`gb_otagate: stock <path> <sha256> ours <sha256>`): the Google file's sha256 where nothing of ours covers it on
     that boot (for example the stock `libz.so` when the libz patch was skipped), otherwise `hidden-by-our-bind` or
@@ -108,8 +113,10 @@ and checks it at every boot:
     From wave 7 the notice also counts: the image keeps a small record in `/data/vendor/gb/ota_unvalidated` (the two
     build fingerprints, the boot id, the count), and from the third boot of the same unvalidated build the notice
     reads **"System update still not validated"**, "Unvalidated boot N of build ... Still paused: VNNI libz patch.
-    Update the ESP from the host, or boot the previous slot." (Boot the previous slot only if this build never
-    reached the lock screen; after a sign-in on it, update the ESP from the host: see below.) The kernel log gets
+    Update the ESP from the host. Previous slot: only before a sign-in." (since wave 9; waves 7 and 8 ended it "...,
+    or boot the previous slot."). Boot the previous slot only if this build never reached the lock screen; after a
+    sign-in on it, update the ESP from the host: see below. Since wave 9 you read the notice after the sign-in, so
+    the rule is now in the notice itself. The kernel log gets
     `gb_otagate: boot count: N
     unvalidated boot(s) of this build pair`. Without a boot id or a usable record the plain notice is shown; nothing
     changes on a validated build.
@@ -118,7 +125,9 @@ and checks it at every boot:
   Before, one type that a later build removes made init's boot-time policy compile fail, which means a reboot loop.
   Now only that block is skipped and that domain is enforcing on that build. lapis .276's own `secilc` compiles both
   forms to the byte-identical policy. (The global SELinux mode is enforcing; this list is what makes the domains
-  permissive, see [ARCHITECTURE.md](ARCHITECTURE.md).)
+  permissive, see [ARCHITECTURE.md](ARCHITECTURE.md).) Since wave 9 both builds restore the SELinux labels of their
+  own audio, permission and camera HAL files after mounting them (they were labelled as `tmpfs`); nothing changes
+  while those services stay permissive.
 * **Build-time checks.** `build_esp.py` refuses an image in which any file below `/odm/vup`, `/odm/vnni`,
   `/odm/etc/selinux` or `/odm/etc/vintf`, or any rc bind source, has no class in `OTA_CLASSES` (skip, keep or
   always), and one whose SELinux list lacks a domain the image needs (`OTA_REQUIRED_PERMISSIVE`: `init`,

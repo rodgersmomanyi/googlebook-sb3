@@ -1021,6 +1021,11 @@ static struct {
   char reason[16], test[12];
   char build[100], krel[100], gfx[520];           /* self-test identity (25.1) */
 } g_gfx = {.policy = -1, .last_all_apps = -1, .reason = "nopkg", .test = "none"};
+/* (Wave 9, BACKLOG HS-O12) the users whose GbGpu declared `ui-caps notify` this boot (peer uid / 100000; root and
+ * shell count as user 0). g_gfx.ui_notify = any declared. */
+#define UI_USERS 16
+static int g_ui_users[UI_USERS], g_ui_nusers;
+static int ui_n08_left(char *why, size_t n);
 static struct { int have, job, stale; } g_sess;   /* gfx_session: on disk; J_MARK pending (1 mark, 2 unmark); earlier boot */
 static struct { int have, job, stale; } g_dsess;  /* (R-4) dgpu_session: the same for "nouveau bound" (23.10a) */
 static int g_shut_marks;                          /* (R-1) the clean-shutdown marker removal ran */
@@ -2629,15 +2634,37 @@ static void decision_busy(int rc, const char *svc) {
   snprintf(txt, sizeof txt, "The NVIDIA GPU is in use by %s. Close them, then press detach again.", who);
   LOGW("detach: refused, nouveau still in use (refcnt %d%s%s): %s", rc, svc ? ", service " : "", svc ? svc : "", pv);
   /* (v1.2, 23.9) GbGpu shows the actionable notification when detach_ref grows; N08 only while GbGpu is absent or
-   * has not declared ui-caps notify this boot (review E7) */
+   * has not declared ui-caps notify this boot (review E7). (Wave 9, HS-O12) ... or only GbGpu instances of users that
+   * are not in front declared it: ui_n08_left() */
   g_gfx.detach_ref++;
   g_bcast_pending = 1;
   /* (R-9) only refusals naming app holders: GbGpu shows its notification for those (busy:N); a service holder
    * (refcnt 0 while it still reads running) gets N08 from gb_power */
-  if (g_gfx.ui_notify && g_hold.n > 0 && path_exists("/odm/app/GbGpu/GbGpu.apk"))
-    LOGI("detach: N08 left to GbGpu (ui-caps notify), detach_ref %d", g_gfx.detach_ref);
-  else notify("gb_dtx", "Can't detach yet", txt);
+  char fgw[48] = "";
+  if (ui_n08_left(fgw, sizeof fgw) && g_hold.n > 0 && path_exists("/odm/app/GbGpu/GbGpu.apk"))
+    LOGI("detach: N08 left to GbGpu (ui-caps notify%s), detach_ref %d", fgw, g_gfx.detach_ref);
+  else {
+    if (fgw[0]) LOGI("detach: N08 posted%s", fgw);
+    notify("gb_dtx", "Can't detach yet", txt);
+  }
   decision_cancel("the NVIDIA GPU is in use", 1);
+}
+/* (Wave 9, BACKLOG HS-O12) 1 = GbGpu shows the detach refusal itself: some user declared ui-caps notify and either
+ * gb_ui publishes no foreground full user (vendor.gb.ui.fg unset, "none" = the login screen, or not a number: the
+ * wave-6 rule; the declaring user's GbGpu shows it when that user is back) or the published one declared it. 0 = N08
+ * through the queue: another full user is in front (its own GbGpu did not declare), gb_notify posts it for that user.
+ * why = a log note when the published user decided. */
+static int ui_n08_left(char *why, size_t n) {
+  if (!g_gfx.ui_notify || g_ui_nusers <= 0) return 0;
+  char fg[PROP_VALUE_MAX];
+  prop_get("vendor.gb.ui.fg", fg);
+  size_t k = strlen(fg);
+  if (!k || k > 5 || strspn(fg, "0123456789") != k) return 1;
+  int u = atoi(fg);
+  for (int i = 0; i < g_ui_nusers; i++)
+    if (g_ui_users[i] == u) { snprintf(why, n, ", user %d in front", u); return 1; }
+  snprintf(why, n, " (user %d in front did not declare ui-caps notify)", u);
+  return 0;
 }
 static void decision_abort(void) {
   decision_cancel(g_dec.ec_canceled ? "the EC ended the detach process" : "detach pressed again (user abort)", 1);
@@ -4951,8 +4978,16 @@ static void cmd_run_selftest(struct client *c, const char *a) {
 static void cmd_ui_caps(struct client *c, const char *a) {
   if (!a || (strcmp(a, "notify") && strcmp(a, "none"))) { reply_err(c, "ui-caps", "EINVAL", "bad argument"); return; }
   int v = !strcmp(a, "notify");
-  if (v != g_gfx.ui_notify) LOGI("control: ui-caps %s by %s uid %d (N08 %s)", a, role_names[c->role], c->uid, v ? "left to GbGpu" : "posted by gb_power");
-  g_gfx.ui_notify = v;
+  /* (wave 9, HS-O12) per declaring user: each running full user has its own GbGpu (12.1a), and its notification is
+   * shown only to that user */
+  int u = c->uid > 0 ? c->uid / 100000 : 0, i;
+  for (i = 0; i < g_ui_nusers && g_ui_users[i] != u; i++) {}
+  int had = i < g_ui_nusers;
+  if (v && !had && g_ui_nusers < UI_USERS) g_ui_users[g_ui_nusers++] = u;
+  else if (!v && had) g_ui_users[i] = g_ui_users[--g_ui_nusers];
+  if (v != had) LOGI("control: ui-caps %s by %s uid %d (user %d; N08 %s)", a, role_names[c->role], c->uid, u,
+                     v ? "left to GbGpu while this user is in front" : "posted by gb_power for this user");
+  g_gfx.ui_notify = g_ui_nusers > 0;
   reply_ok(c, "ui-caps", v ? ",\"notify\":1" : ",\"notify\":0");
 }
 static void cmd_detach_request(struct client *c, const char *a) {

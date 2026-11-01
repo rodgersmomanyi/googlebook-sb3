@@ -31,6 +31,17 @@ dual-boot export (new GUIDs; made with `build_internal.py` and then reused by `b
 which ran all its export cross-checks and `verify_image.py` on it). Only its two ESP objects differ from the previous
 ISO `e223fdc9…`; its 11 other payload objects are byte-identical, and the installer's files are unchanged since
 `afb68d38…`.
+**Wave 9 (2026-10-31): this ISO is not rebuilt yet.** It still carries the Wave 8 system: option 1 writes the
+Wave 8 USB image `35d6043d…` and option 2 installs the Wave 8 dual-boot export (its boot partition `04dde283…`), both
+without the Wave 9 fixes (among them the keyboard base, touchpad, batteries, charger and detach fix from the first
+native boot). For Wave 9 use the image `e0825ee1…`, `C:\GB-x86\out\googlebook-sb3-usb.img`, flashed with Rufus in
+DD mode (README-FLASH.md, "What is new"), or, for a dual boot, the Wave 9 export `D:\gb-export` with
+`install_dualboot.ps1` (README_DUALBOOT.md); do not use a stick made with this ISO to test the Wave 9 fixes. The
+rebuild reads that whole 28.8 GB image and needs that much free space on C: (and 25 GiB on the build VM); it follows
+once you have freed C: (for example by deleting the superseded `C:\GB-x86\out\prev\usb-w7-7ac6ad52\` and
+`usb-w6b-f7a81cf5\`). Every ISO test result in this file applies to the Wave 8 system: the Wave 9 test step
+(2026-11-01) could only re-test this unchanged ISO (T0 67 of 67 against the image it carries, the Windows scripts of
+T8 57 of 57 twice; T1a/T1b and the dual-boot groups were skipped for lack of space on D:).
 **Boot-menu edits** on an installed system (Wave 6 finding): the editor that **e** opens starts with the cursor at
 the start of the line; press **End** before typing an option (README-FLASH.md, "What is new").
 **Performance:** the system it installs started about 47 % faster in VMware with the VNNI patch (first boot until

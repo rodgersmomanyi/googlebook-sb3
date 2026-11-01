@@ -172,7 +172,9 @@ comparison before it rewrites the ESP:
   refuses the binary: `host: GK_FROZEN_V1: PASS`; `host: GK_FROZEN_REF: PASS` (the independent Python check of the
   same vectors); and `android-on-lapis-bionic: GK_FROZEN_V1: PASS`, the Android build run on lapis's own bionic, so
   `build.sh` needs `LAPIS_RT` and `LAPIS_SYSLIB` (without them it writes `NOT RUN`, which is refused). The 0.2.0
-  binary itself predates the test and is accepted by its pinned sha256. Eight
+  binary predates the test; since wave 9 its own `ACCEPTANCE.txt` holds all three results as well (the patched
+  `build.sh` re-run on the builder from the same sources rebuilt it byte for byte, `505b404d`), so `build_esp.py`
+  exempts no binary any more. Eight
   deliberate scheme changes (scrypt N or r, key-file magic or name, HMAC hash, key length, salt, key checksum)
   all fail that test.
 * The native tree is untested on hardware. An OTA with a PIN set has not been tested yet: the design keeps the

@@ -367,7 +367,7 @@ if [ -e "$GBT/ctl/detach_on_bind_marker" ] && grep -q '^mode=bind ' "$GB_ROOT/da
   rm -f "$GBT/ctl/detach_on_bind_marker"
   : > "$GB_ROOT/dev/gb_dgpu/detaching"
 fi
-# (wave 5, B-4) ctl/model_on_marker: the dGPU's device id becomes the file's content once a marker was synced (one shot)
+# (wave 6, B-4) ctl/model_on_marker: the dGPU's device id becomes the file's content once a marker was synced (one shot)
 if [ -e "$GBT/ctl/model_on_marker" ] && [ -s "$GB_ROOT/data/vendor/gb/nouveau.loading" ]; then
   cat "$GBT/ctl/model_on_marker" > "$GB_ROOT/sys/bus/pci/devices/0000:02:00.0/device"
   rm -f "$GBT/ctl/model_on_marker"
@@ -424,8 +424,23 @@ fi
 exit 0
 EOF
 
+# (wave 9, HS-O4) am get-current-user prints ctl/current_user (default 10, the person on lapis), am
+# get-started-user-state <u> prints ctl/user_state.<u> (default RUNNING_UNLOCKED); both are logged to am_q.log (am.log
+# keeps the broadcasts and force-stops) and fail with ctl/am_q_fail; ctl/am_fail fails the other commands only.
 w am <<'EOF'
 #!/bin/sh
+case $1 in
+  get-current-user | get-started-user-state)
+    for a in "$@"; do printf '%s|' "$a"; done >> "$GBT/log/am_q.log"
+    echo >> "$GBT/log/am_q.log"
+    [ -e "$GBT/ctl/am_q_fail" ] && exit 1
+    if [ "$1" = get-current-user ]; then
+      if [ -f "$GBT/ctl/current_user" ]; then cat "$GBT/ctl/current_user"; else echo 10; fi
+    elif [ -f "$GBT/ctl/user_state.$2" ]; then cat "$GBT/ctl/user_state.$2"
+    else echo RUNNING_UNLOCKED; fi
+    exit 0
+    ;;
+esac
 for a in "$@"; do printf '%s|' "$a"; done >> "$GBT/log/am.log"
 echo >> "$GBT/log/am.log"
 [ -e "$GBT/ctl/am_fail" ] && exit 1

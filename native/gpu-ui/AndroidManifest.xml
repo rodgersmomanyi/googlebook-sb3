@@ -27,10 +27,14 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- (wave 9, BACKLOG HS-O8) the application icon is an adaptive icon (res/mipmap-anydpi/ic_launcher.xml): lapis's
+         desktop shade draws a notification's application icon in a white circle, where the white glyph ic_gpu was
+         invisible. The tile, the small icons and the Settings entries keep the white glyphs SystemUI tints. -->
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
-        android:icon="@drawable/ic_gpu"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_label"
         android:supportsRtl="true"
         android:theme="@style/Theme.GbGpu"

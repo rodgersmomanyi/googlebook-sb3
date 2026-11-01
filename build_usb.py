@@ -361,7 +361,8 @@ def main(argv=None):
     super_guid = a.super_guid or str(uuid.uuid4())
     # Same ESP layout as the VM (gb-<slot> entry + /gb/* for the in-guest slot follower gb_slotsync), native cmdline.
     if a.vm_test:   # VM overlay, but the same strict disk selection as the stick (tests boot_part_uuid in VMware)
-        usb_cmdline = f"{be.CMDLINE} gb.hw=vm androidboot.boot_part_uuid={super_guid}"
+        # (wave 9, I-W8-1) efi_pstore off as in the user VM's own entry (build_esp CMDLINE_VM / VM_PSTORE)
+        usb_cmdline = f"{be.CMDLINE} {be.VM_PSTORE} gb.hw=vm androidboot.boot_part_uuid={super_guid}"
         if a.vm_test_gfx:
             tree, title, kind = be.vm_test_gfx_cpio(), TITLE_VM_GFX, "vmtest-gfx"
         elif a.vm_test_kat:

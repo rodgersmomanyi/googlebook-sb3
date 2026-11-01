@@ -139,10 +139,14 @@ def main():
     lc = next((v for k, v in files.items() if k.lower() == "loader/loader.conf"), None)
     defaults = []
     if lc is not None:
-        for line in lc.decode("ascii", "replace").splitlines():
-            m = re.match(r"^default(?:[ \t]+(.*?))?[ \t\r]*$", line)
+        # (wave 9, BACKLOG "SD lows") every default line as systemd-boot 262 reads loader.conf: lines end at LF or CR,
+        # blanks around a line are dropped (a "  default gb-a.conf" line counts), one pair of matching quotes around the
+        # value is removed; a "default" without a value is kept as "" (the installer refuses it)
+        for line in re.split(r"[\n\r]", lc.decode("ascii", "replace")):
+            m = re.match(r"^[ \t]*default(?:[ \t]+(.*?))?[ \t]*$", line)
             if m:
-                defaults.append(m.group(1) or "")
+                v = m.group(1) or ""
+                defaults.append(v[1:-1] if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0] else v)
     res = {"loader_conf": lc is not None, "loader_defaults": defaults, "preserved": [], "skipped": [],
            "gb_cfg": any(k.lower() == "gb/gb.cfg" for k in files),
            "gb_overlay": any(k.lower().startswith("gb/overlay/") for k in files)}

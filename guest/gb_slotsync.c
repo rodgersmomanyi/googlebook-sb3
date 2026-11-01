@@ -44,6 +44,9 @@
  * "preferred" line (nothing here writes one; it would override the default), is rewritten once to the running slot's
  * "default gb-<cur>.conf" (on a HOLD too, before the held slot's entries are written). Reading a default that names
  * a slot (the dangling-default guard of the other slot's entries) still takes both forms.
+ * (Wave 9, BACKLOG 13.3 "SD lows") loader.conf lines end at a CR or an LF, as systemd-boot 262.1 splits them (a line
+ * after a lone CR is a line of its own), and exactly one "default" line is accepted: two (even equal ones; systemd-boot
+ * uses the last) are rewritten to one, at the first one's place.
  *
  * Usage: gb_slotsync [--watch SECONDS] [--dry-run]
  * Build (builder, NDK r27c): /build/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=x86_64-linux-android34
@@ -616,38 +619,51 @@ static size_t conf_key(const char *p, size_t n, const char *key) {
   return a;
 }
 
+/* (Wave 9, BACKLOG 13.3 "SD lows") one loader.conf line as systemd-boot 262.1 splits the file: a line ends at the
+ * first CR or LF (line_get_key_value: a bare CR ends a line too; CRLF is a line and an empty line, i.e. one line
+ * here). Returns the line's length; *term = the bytes of its terminator (2 for CRLF, 1 for a lone CR or LF, 0 at the
+ * end of the text). */
+static size_t conf_line(const char *p, size_t *term) {
+  size_t n = strcspn(p, "\r\n");
+  *term = !p[n] ? 0 : p[n] == '\r' && p[n + 1] == '\n' ? 2 : 1;
+  return n;
+}
+
 /* Whole-line match (finding 5 of the Wave 2 safety review): a substring test also took "default gb-b-nvtest" (or
- * "#default gb-b") for "default gb-b". mode 0: 1 when every "default" line (the key "default" as a whole word, then
- * blanks) names exactly gb-<s>.conf, ignoring a CR and trailing blanks, there is at least one, and there is no
- * "preferred" line; mode 1: 1 when any "default" line names gb-<s>.conf or gb-<s>.
+ * "#default gb-b") for "default gb-b". mode 0: 1 when there is exactly one "default" line (the key "default" as a
+ * whole word, then blanks), it names exactly gb-<s>.conf, ignoring trailing blanks, and there is no "preferred" line;
+ * mode 1: 1 when any "default" line names gb-<s>.conf or gb-<s>.
  * (Wave 8, SLOT-DEFAULT) systemd-boot 262.1 matches the pattern against the entry id, which includes ".conf": only
  * gb-<s>.conf selects slot s's entry. The old form gb-<s> matches no entry (the loader then starts the first entry in
  * its own order), so mode 0 does not accept it (it is rewritten once), and mode 1 (only the dangling-default guard of
- * check_other) still takes it. A "preferred" line would override the default, so mode 0 asks for its removal. */
+ * check_other) still takes it. A "preferred" line would override the default, so mode 0 asks for its removal.
+ * (Wave 9, "SD lows") Lines end at a CR or an LF, as systemd-boot reads them (conf_line), so a default after a lone CR
+ * is seen; and two default lines (systemd-boot uses the last one) are rewritten to one in mode 0, even when equal. */
 static int loader_default(const char *conf, char s, int any) {
   char want[16], old[8];
   snprintf(want, sizeof want, "gb-%c.conf", s); snprintf(old, sizeof old, "gb-%c", s);
   int seen = 0, right = 1, hit = 0;
   for (const char *p = conf; *p;) {
-    const char *e = strchr(p, '\n');
-    size_t n = e ? (size_t)(e - p) : strlen(p), a;
+    size_t t, n = conf_line(p, &t), a;
     if (conf_key(p, n, "preferred")) right = 0;
     else if ((a = conf_key(p, n, "default"))) {
       size_t z = n;
-      while (z > a && (p[z - 1] == ' ' || p[z - 1] == '\t' || p[z - 1] == '\r')) z--;
-      seen = 1;
+      while (z > a && (p[z - 1] == ' ' || p[z - 1] == '\t')) z--;
+      seen++;
       int is_new = z - a == strlen(want) && !strncmp(p + a, want, z - a);
       int is_old = z - a == strlen(old) && !strncmp(p + a, old, z - a);
       if (!is_new) right = 0;
       if (is_new || is_old) hit = 1;
     }
-    p += n + (e ? 1 : 0);
+    p += n + t;
   }
-  return any ? hit : seen && right;
+  return any ? hit : seen == 1 && right;
 }
 
-/* loader.conf -> "default gb-<s>.conf": every "default" line is replaced (one is appended if there is none) and every
- * "preferred" line is removed (wave 8, SLOT-DEFAULT); nothing is written when it already says exactly that. */
+/* loader.conf -> "default gb-<s>.conf": the first "default" line is replaced, every later one and every "preferred"
+ * line is removed (one is appended if there is none; wave 8, SLOT-DEFAULT); nothing is written when it already says
+ * exactly that. (Wave 9, "SD lows") Lines are split at a CR or an LF like systemd-boot (conf_line); every other line
+ * keeps its bytes and its own terminator, a replaced line keeps its terminator (LF if it had none). */
 static int set_default(char s) {
   char lcp[PATH_MAX]; snprintf(lcp, sizeof lcp, "%s/loader/loader.conf", mnt);
   unsigned char *lc = NULL; size_t ll = 0;
@@ -658,23 +674,27 @@ static int set_default(char s) {
   char want[32]; snprintf(want, sizeof want, "default gb-%c.conf", s);
   if (loader_default(conf, s, 0)) { free(conf); return 0; }
   size_t cap = 3 * ll + 64, rem = cap;                      /* a bare "default\n" (8 bytes) becomes 18 */
-  char *outb = malloc(cap), *o = outb, *save = NULL;
+  char *outb = malloc(cap), *o = outb;
   if (!outb) { free(conf); logmsg("loader.conf: out of memory"); return -1; }
-  int done = 0, bad = 0, dropped = 0;
-  for (char *line = strtok_r(conf, "\n", &save); line && !bad; line = strtok_r(NULL, "\n", &save)) {
-    size_t n = strlen(line);
-    const char *cr = n && line[n - 1] == '\r' ? "\r" : "";
-    if (conf_key(line, n, "preferred")) dropped++;
-    else if (conf_key(line, n, "default")) {
-      bad = appendf(&o, &rem, "%s%s\n", want, cr);
+  int done = 0, bad = 0, dropped = 0, dups = 0;
+  for (const char *p = conf; *p && !bad; ) {
+    size_t t, n = conf_line(p, &t);
+    if (n + t > INT_MAX / 2) { bad = -1; break; }            /* (a loader.conf line of 1 GiB is not one we write) */
+    if (conf_key(p, n, "preferred")) dropped++;
+    else if (conf_key(p, n, "default")) {
+      if (done) dups++;
+      else bad = appendf(&o, &rem, "%s%.*s", want, (int)(t ? t : 1), t ? p + n : "\n");
       done = 1;
     }
-    else bad = appendf(&o, &rem, "%s\n", line);
+    else bad = appendf(&o, &rem, "%.*s", (int)(n + t), p);
+    p += n + t;
   }
+  if (!done && !bad && o > outb && o[-1] != '\n' && o[-1] != '\r') bad = appendf(&o, &rem, "\n");
   if (!done && !bad) bad = appendf(&o, &rem, "%s\n", want);
   int r = bad ? -1 : dry_run ? 0 : write_file(lcp, outb, (size_t)(o - outb));
   free(outb); free(conf);
-  if (!r) logmsg("systemd-boot default -> gb-%c.conf%s", s, dropped ? " ('preferred' line removed)" : "");
+  if (!r) logmsg("systemd-boot default -> gb-%c.conf%s%s", s, dropped ? " ('preferred' line removed)" : "",
+                 dups ? " (duplicate 'default' lines removed)" : "");
   else logmsg("writing %s failed", lcp);
   return r;
 }

@@ -50,8 +50,14 @@ NATIVE_EARLY = [
     # cameras (k13): IPU4P on the ipu6 driver + sensors, focus motor, INT3472 power control; before lapis's own
     # intel-ipu6/int3472/v4l2-cci (no 8A19 support), which then EEXIST
     "v4l2-cci", "ipu-bridge", "intel_skl_int3472_common", "intel_skl_int3472_discrete",
-    "ov5693", "ov8865", "ov7251", "dw9719", "intel-ipu6", "intel-ipu6-isys",
+    "ov5693", "ov8865", "dw9719", "intel-ipu6", "intel-ipu6-isys",
 ]
+# (wave 9 hw-native1) staged (signed, same build) but in NO load list and in no modules.alias: the IR camera OV7251
+# (INT347E) is not exposed by the camera HAL (camera_hal.yaml), lapis has no driver for it, and on the Surface Book 3
+# its probe always failed (first native boot: "write reg error -121 ... error during global init", -121). The
+# front/rear sensors register their subdev nodes per bound sensor (ipu6-isys isys_notifier_bound), so they do not
+# depend on it. For a manual test: insmod /odm/lib/modules/ov7251.ko.
+NATIVE_NOLOAD = ["ov7251"]
 # in NO load list. Staged in inject\native\modules as the payload's source: build_esp puts them into
 # ESP:/gb/dgpu-<krel>.erofs (INTERFACES 6), never into the native cpio; gb_nouveau.sh loads them from /odm/dgpu.
 NATIVE_OPTIN = ["drm_exec", "drm_gpuvm", "gpu-sched", "drm_ttm_helper", "nouveau"]
@@ -127,7 +133,7 @@ def main():
     if extra:
         sys.exit(f"unknown arguments {extra}")
     print(f"dist {DIST}; backups -> {os.path.join(ARCHIVE, 'pre-' + tag)}")
-    wanted = sorted(set(VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN + NATIVE_MODALIAS))
+    wanted = sorted(set(VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN + NATIVE_MODALIAS + NATIVE_NOLOAD))
     info = ssh("cd %s && for m in %s; do f=$m.ko; [ -f $f ] || f=$(echo $m | tr - _).ko; "
                "if [ -f $f ]; then echo \"$m|$f|$(modinfo -F depends $f)|$(modinfo -F vermagic $f)|"
                "$(modinfo -F alias $f | tr '\\n' ' ')\"; "
@@ -171,7 +177,10 @@ def main():
     clash = sorted({norm(n) for n in NATIVE_EARLY + NATIVE_LATE} & {norm(n) for n in LAPIS_FIRST_STAGE_LOAD})
     if clash:
         problems.append(f"native list preloads lapis first-stage modules {clash} (fatal at boot)")
-    listed = {norm(n) for n in VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN}
+    listed = {norm(n) for n in VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN + NATIVE_NOLOAD}
+    noload = sorted({norm(n) for n in NATIVE_NOLOAD} & {norm(n) for n in VM_MODS + NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN})
+    if noload:
+        problems.append(f"NATIVE_NOLOAD modules {noload} are also in a load list")
     both = sorted({norm(n) for n in NATIVE_MODALIAS} & (listed | {norm(n) for n in LAPIS_FIRST_STAGE_LOAD}))
     if both:
         problems.append(f"modalias modules {both} are also in a load list or lapis first-stage modules")
@@ -216,7 +225,7 @@ def main():
             put(os.path.join(vm_dir, n + ".ko"), blobs[mods[n][0]])
     nat = os.path.join(HERE, "inject", "native", "modules")
     os.makedirs(nat, exist_ok=True)
-    for n in NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN + NATIVE_MODALIAS:
+    for n in NATIVE_EARLY + NATIVE_LATE + NATIVE_OPTIN + NATIVE_MODALIAS + NATIVE_NOLOAD:
         if n not in missing:
             put(os.path.join(nat, mods[n][0]), blobs[mods[n][0]])
     hdr = f"# kernel build {tag} (bzImage md5 {bz_md5})\n"

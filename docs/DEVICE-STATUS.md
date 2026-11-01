@@ -9,9 +9,13 @@ device in the Windows inventory: the live PnP list, the HID hardware IDs and
 the ACPI tables of a Surface Book 3 (read from `HKLM\HARDWARE\ACPI`, decompiled with iasl; the dumps are not part
 of this repository).
 
-**Nothing in this table has run on the Surface yet.** The VMware VM cannot see this hardware; a VMware boot of the
-native tree (`GB_NATIVE_TEST=1`, see [NATIVE.md](NATIVE.md)) only proves that the modules load and the services
-start. "Ready" means the driver is built (or ships with lapis), the firmware is staged and the configuration exists.
+**The first native boot happened on 2026-10-31** (the wave 8 image; results per item in
+[First real-hardware results](#first-real-hardware-results-2026-10-31-the-wave-8-usb-image)): Android started, and the
+display, touch and pen, Wi-Fi, Bluetooth, the sound card, the buttons and the NVIDIA power saving worked; the keyboard
+base, touchpad, batteries, charger and detach did not (wave 9 fixes them in the image to test next, `e0825ee1…`).
+Every row below that the table does not mark otherwise is still untested on hardware. The VMware VM cannot see this
+hardware; a VMware boot of the native tree (`GB_NATIVE_TEST=1`, see [NATIVE.md](NATIVE.md)) only proves that the
+modules load and the services start. "Ready" means the driver is built (or ships with lapis), the firmware is staged and the configuration exists.
 It still needs a native boot to confirm. Per-subsystem detail: [DRIVERS.md](DRIVERS.md).
 
 Status key:
@@ -26,6 +30,48 @@ Status key:
 | **Off by design** | Must stay unused: TPM, BIOS flash, firmware updaters. |
 
 Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[I]** inferred.
+
+## First real-hardware results (2026-10-31, the wave 8 USB image)
+
+The first native boot: the owner flashed the wave 8 USB image (`35d6043d…`, kernel build #16) and started it three
+times on the Surface Book 3 13.5" with the keyboard base attached. The boot-log analyser
+([native/hwtest](../native/hwtest/), `analyze_gblog.py`) on the third start: **29 PASS, 10 FAIL, 2 UNKNOWN** of 41
+items; Android reached `boot_completed` after 42.8 s. Personal values from those logs (serial numbers, network and
+account names) are not reproduced here. The last column says what wave 9 changed; **the image to test next is the
+wave 9 USB image `e0825ee1…`** (flash it with Rufus in DD mode; the installer ISO still carries the wave 8 system).
+
+| # | Item (row; checklist) | On the laptop (wave 8 image) | Wave 9 |
+|---|---|---|---|
+| 1 | Kernel build #16 | PASS | - |
+| 2 | Kernel command line (`8250.nr_uarts`, native tokens) | PASS | - |
+| 3 | `gbinit` module loading | PASS: 63 modules, none failed | the IR camera's `ov7251` is no longer loaded (row 29) |
+| 4 | 8250 serial driver (row 12; 19) | FAIL: the 8250 ports registered (4 ports), but the item counted the Surface Aggregator's own IRQ failure | the analyser judges that line under item 5, where it belongs |
+| 5 | Surface Aggregator (rows 12, 18, 42; 19) | FAIL: the SAM answered (`SAM firmware version: 10.600.139`), but its first probe failed for good at 1.49 s (`error -EINVAL: failed to setup IRQ`, -22): on kernel build #16 it runs before lapis's `pinctrl-icelake` provides the GPIO controller (INT3455) of its wake-up interrupt | `gb_hw.sh sam` (service `gb_hw_sam`, `on boot`) binds it again once INT3455 is bound and waits for its devices (item 29); a kernel fix (patch 0114) waits for the next kernel build. Unverified on the laptop |
+| 6-10 | SAM registry and hub, base keyboard 045E:09AE, touchpad 045E:09AF, batteries BAT1/BAT2 + charger ADP1, clipboard detach (rows 18, 19, 25, 42; 1, 2, 16) | FAIL: no SAM client device at all (the cause of item 5): no keyboard base, touchpad, battery level, charger or detach | the same re-bind; also the graphics switch, which needs the detach device, stayed on Intel (item 28) |
+| 11 | Power button and volume keys (row 23; 25) | PASS: two `gpio-keys` devices (the wave 5 re-bind) | - |
+| 12 | Posture (rows 18, 24, 25; 1) | PASS: `OPEN`, the built-in input enabled | - |
+| 13 | CPU power limits (row 1; 3) | PASS: the firmware's limits kept (not locked) | - |
+| 14 | Suspend and resume (row 46; 11) | UNKNOWN: no suspend in the logged time | close the lid once next time |
+| 15, 16 | Intel GPU (i915 + DMC firmware), panel, backlight (rows 14, 15; 4, 21) | PASS | - |
+| 17 | Touchscreen and pen (row 21) | PASS: IPTS touchscreen, iptsd's touch and stylus devices | - |
+| 18, 19 | Wi-Fi AX201 and Bluetooth 8087:0026 (rows 37, 38; 23) | PASS: firmware loaded, controller started | - |
+| 20 | Sound card (rows 39-41; 22) | PASS: SOF card `sofhdadsp` | - |
+| 21 | DRAS audio HAL (row 39; 22) | UNKNOWN: its start line was not in the saved log window | play sound and report it (item 22) |
+| 22 | Sensors (rows 27-28; 10) | FAIL in the third start only: the sensor hub's firmware did not start at power-on (`HBM haven't started`), so there was no accelerometer in that start; the first two starts had every sensor | `gb_hw.sh ish` (service `gb_hw_ish`, early-boot) resets and binds the hub once; whether that revives it is unproven (item 29: note cold start or restart) |
+| 23 | Rotation per posture (row 27; 10) | PASS: `ok: laptop posture, rotation locked`; the Auto-rotate default came from our settings overlay (no first-boot write) | - |
+| 24 | Cameras (row 29; 9) | FAIL: the IR camera's sensor (OV7251) never answers (`-121`); the rear camera's focus motor (DW9719) logged a write error in two starts | the IR driver is no longer loaded (Android never used it); DW9719: test autofocus on the rear camera |
+| 25-28 | NVIDIA dGPU: D3cold when idle, nouveau (Auto mode), dGPU report, graphics switching state (row 17; 11, 14, 15, 17, 18) | PASS: D3cold seen, nouveau bound and healthy, Intel active (no detach device yet) | - |
+| 29 | Lock-screen Gatekeeper | PASS: registered and running | - |
+| 30-34 | zram, the VNNI emulator counter, the libz patch binds, fs-verity on /data, the serial login console off (24) | PASS | - |
+| 35-38 | No held update, the OTA gate (the booted build is the one the image was made for), the bring-up config unused, no missing firmware (23, 24) | PASS | - |
+| 39 | Crashes | FAIL: only lapis's `powertool set-soc-slider balanced 1 4` exits 1 at every start (Ice Lake has no SoC slider; it writes nothing) | harmless; the analyser no longer counts it when the log proves the refusal |
+| 40 | SELinux: no enforced denial | PASS | - |
+| 41 | Boot completed | PASS: after 42.8 s | - |
+
+Also seen: lapis's `vpd` tool ran `/vendor/bin/flashrom` at boot; what ran is our refusal stub (the kernel has no path
+to the firmware flash either). Wave 9 also replaces `elogtool` and `cbfstool`, the last two lapis programs that link
+the flash library, by refusal stubs (row 10). The wave 9 analyser on the same logs gives 31 PASS, 8 FAIL; the SAM,
+sensor-hub and camera fixes act only in the wave 9 image, which has not run on the laptop yet.
 
 ## Changes since the audit (kernel build #13)
 
@@ -129,8 +175,8 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     default to on for every user (lapis's SettingsProvider default is off).
   * Notifications reach the person. lapis runs in headless system user mode: user 0 only shows the login screen,
     and you use user 10. Every notice of ours ("System update not validated", "System update held", the NVIDIA
-    notices from `gb_notify`) is now posted once for all users (`cmd notification post -u all`), so it shows in
-    whichever user is signed in; before wave 6 these notices went to user 0 and were never shown. GbGpu's state
+    notices from `gb_notify`) is posted once for the signed-in user in front of the screen (wave 9; waves 6-8 posted
+    it for all users), and held until the sign-in when the login screen is showing; before wave 6 these notices went to user 0 and were never shown. GbGpu's state
     updates, its notification permission and its Quick Settings tile now follow the signed-in user, and the native
     OTA gate's queued notice is readable by `gb_notify` (it was written 0600 and dropped). Shown in a VMware boot
     of the VM tree with the forced OTA gate: the update notice, a `gb_notify` notice and a GbGpu state change all
@@ -215,6 +261,30 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     0 failed). The long-running VM now runs the wave 8 VM build with kernel build #16 (after a verified backup of
     its boot partition; its lock-screen PIN path is unchanged). The SD reader's type and its loading, the native
     `gb_ui.sh` branch and the rotation flag can only be checked on the laptop: items 6, 10, 24 and 28.
+* **Wave 9, 2026-10-31/11-01 (the first native boot's fixes and the remaining hardware-independent items; the
+  wave 9 image has not run on the hardware yet):**
+  * The first native boot ([First real-hardware results](#first-real-hardware-results-2026-10-31-the-wave-8-usb-image)):
+    the keyboard base, touchpad, batteries, charger and detach failed because the Surface Aggregator's first probe
+    fails for good on kernel build #16 (row 12). `gb_hw.sh sam` (service `gb_hw_sam`, `on boot`) binds it again once
+    lapis's GPIO driver is ready and waits for its devices; `gb_hw.sh ish` (service `gb_hw_ish`, early-boot) resets
+    the sensor hub once when its firmware did not start; the IR camera's driver is no longer loaded; `elogtool` and
+    `cbfstool` are refusal stubs; the boot-log summary gains `sam:` and `ish:` lines (item 29) and the analyser
+    names these causes. A kernel fix for the SAM probe (patch 0114) waits for the next kernel build.
+  * Notices go to the user in front of the screen and wait for the sign-in; the VM build shows "System update held"
+    too; GbGpu sets itself up whenever a user comes to the front and shows a real app icon; the "still not
+    validated" notice now says "Previous slot: only before a sign-in" ([OTA.md](OTA.md)).
+  * Smaller items: `gb_slotsync` reads `loader.conf` as systemd-boot does (a lone CR ends a line, exactly one
+    `default` line); the VM entry gets `efi_pstore.pstore_disable=1`; both trees restore the SELinux labels of our
+    HAL files; `verify_image.py` checks the NVIDIA payload's own files (V4/V7) and the packed module index (V4b);
+    the Gatekeeper binary's frozen-vector record is complete.
+  * Tested in VMware: a rehearsal of the VM build (a fresh first boot 51 of 51, a forced unvalidated update with a
+    later sign-in 40 of 40, a validated boot 23 of 23, a held update 36 of 36 with the notice in user 10's panel),
+    VM-1 on the wave 9 USB image `e0825ee1…` (every wave 2, 3, 5, 6, 7, 8 and 9 check VMware can show: the two new
+    services find no Surface hardware and exit cleanly; two checks judged after a project decision: init makes 2
+    more short emulations in the new label-restoring step, accepted, and the key store's early-boot result fell
+    outside that boot's log window; the analyser 17 PASS, 0 FAIL, 24 UNKNOWN). The installer ISO is not rebuilt
+    yet (it still carries the wave 8 system), and the long-running VM stays on the wave 8 boot partition until
+    the host has disk space for its check boot. The SAM and sensor-hub fixes need the laptop: item 29.
 
 ## 1. Platform, CPU, firmware interfaces
 
@@ -229,9 +299,9 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 | 7 | ACPI Wake Alarm ACPI000E (`\_SB.SRTC`) | (ACPI_TAD not built) | – | Alarms use rtc0 | Not needed | Android's alarmtimer wakes through rtc0 (rtc_cmos). |
 | 8 | WMI PNP0C14 "TBFP" | `wmi.ko` (ours) | – | – | Expected | No WMI client driver matches; harmless. |
 | 9 | TPM 2.0 NTC0702 | none: CONFIG_TCG_TPM off; lapis tpm/tpm_tis* listed in `module_blacklist` | – | Software KeyMint + stubs | Off by design | `build_usb.py` NATIVE_BLACKLIST [V]. Keeps Android away from the Windows/BitLocker TPM. |
-| 10 | SPI flash controller 34A4 | `spi_intel_pci`/`spi_intel`/`spi_nor`/`mtd` blacklisted | – | fwupd/flashrom/futility stubbed | Off by design | Protects the UEFI flash [V, build_usb.py, build_esp.py stubs]. |
+| 10 | SPI flash controller 34A4 | `spi_intel_pci`/`spi_intel`/`spi_nor`/`mtd` blacklisted | – | fwupd/flashrom/futility stubbed | Off by design | Protects the UEFI flash [V, build_usb.py, build_esp.py stubs]. **Wave 9:** lapis's `vpd` tool runs `/vendor/bin/flashrom` in the (permissive) `firmware_tool` domain at boot. On our image that file is the refusal stub, so the first native boot's SELinux lines `comm="vpd" ... /vendor/bin/flashrom ... tcontext=tmpfs` show the stub, not Google's flashrom. Every other lapis program that reaches libflashrom is a stub now as well: `futility`, `crossystem`, and new in wave 9 `elogtool` and `cbfstool` (both link libflashrom through libvboot_host; lapis's snapshot collector runs `elogtool`). The kernel itself has no path to the flash: no `/dev/mem` and no `/dev/port` (`CONFIG_DEVMEM`/`DEVPORT` off), no MTD, and the SPI-NOR drivers are blacklisted. |
 | 11 | Intel ME 34E0 | `mei_me` (built in); lapis `mei_hdcp` (optional, i915 HDCP) | – | – | Expected | – |
-| 12 | Serial IO: I2C 34C5/34E8-34EB, UART 34A8, GPIO INT3455 | lapis first stage: `intel-lpss-pci`, `8250_dw`, `pinctrl-intel`; ueventd: `pinctrl-icelake`, `idma64`, `i2c-designware-*` | – | – | Expected | The UART carries the Surface Aggregator. Our builds of these modules are never loaded (see "Changes since the audit"): loading ours natively breaks lapis's first stage and every lapis module linked to them. **Wave 3:** the native command line keeps `8250.nr_uarts=4`: our GKI has `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, so without it the 8250 driver never registers and `8250_dw` fails this UART with `-22` (no base keyboard, touchpad, batteries, charger, detach). Check: `Serial: 8250/16550 driver, 4 ports` in dmesg (checklist 19). Credit: gbOS86's Surface Laptop 7 finding. |
+| 12 | Serial IO: I2C 34C5/34E8-34EB, UART 34A8, GPIO INT3455 | lapis first stage: `intel-lpss-pci`, `8250_dw`, `pinctrl-intel`; ueventd: `pinctrl-icelake`, `idma64`, `i2c-designware-*` | – | – | Expected | The UART carries the Surface Aggregator. Our builds of these modules are never loaded (see "Changes since the audit"): loading ours natively breaks lapis's first stage and every lapis module linked to them. **Wave 3:** the native command line keeps `8250.nr_uarts=4`: our GKI has `CONFIG_SERIAL_8250_RUNTIME_UARTS=0`, so without it the 8250 driver never registers and `8250_dw` fails this UART with `-22` (no base keyboard, touchpad, batteries, charger, detach). Check: `Serial: 8250/16550 driver, 4 ports` in dmesg (checklist 19). Credit: gbOS86's Surface Laptop 7 finding. **Wave 9 (first native boot):** the UART registers and the SAM answers (`SAM firmware version: 10.600.139`), but on kernel k16 the Surface Aggregator's first probe runs in first-stage init, before lapis's `pinctrl-icelake` provides the INT3455 GPIO controller of the SAM's wakeup interrupt. It fails for good with `error -EINVAL: failed to setup IRQ` (an upstream regression since 6.12: `ssam_irq_setup()` no longer defers). `gb_hw.sh sam` (service `gb_hw_sam`, `on boot`) binds the device to `surface_serial_hub` again once INT3455 is bound, then waits for the keyboard, touchpad, batteries, charger and DTX. A kernel fix (patch 0114) is in the backlog for the next kernel build. |
 | 13 | Motherboard resources (PNP0C02, INT3F0D); EPC INT0E0C; CoEx INT3519; 3x MAX34417 power monitors | – | – | – | N/A | All are disabled by `_STA`/NVS on this SKU and absent from Windows PnP [V]. |
 
 ## 2. Display and GPU
@@ -247,23 +317,23 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 
 | # | Device | Linux driver | Android side | Status | Notes |
 |---|---|---|---|---|---|
-| 18 | Base keyboard, SAM HID **045E:09AE** (keyboard, system control, consumer control) [V, Windows HW IDs] | surface_aggregator → registry → hub → `surface_hid` → `hid-surface` (build #13) | **New here:** `vup/usr/idc/Microsoft_Surface_045E_09AE_Keyboard.idc` (`device.internal=1`, `keyboard.builtIn=1`), matched by name so the consumer/system-control siblings do not grab keyboard id 0 | Ready | The SAM firmware reports Fn as BTN_0 (linux-surface patch 0016, written for these exact IDs). It can stick, and on Android a key in [BTN_MISC, BTN_MOUSE) makes EventHub classify the keyboard as a gamepad. Fixed by `native/hw-gap-audit/kernel/0001-HID-surface-...patch`. Media, volume and brightness keys are standard HID usages that Generic.kl already maps, so no custom .kl is needed [V, Generic.kl]. The keyboard backlight is handled by the EC: no LED class device exists, so Android shows no keyboard-backlight control [I]. **Wave 5:** lapis's `DesktopDeviceStateProvider` disables built-in input devices when the posture state is `CLOSED`; `gb_hw.sh diag` logs the committed state and `Enabled:` flag, and `vendor.gb.posture=open` overrides it if needed ([FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)). |
-| 19 | Precision touchpad, SAM HID **045E:09AF** [V] | `surface_hid` → hid-multitouch (built in, Win8 PTP) | **New here:** `Microsoft_Surface_045E_09AF_Touchpad.idc` (`touch.deviceType=touchPad`, internal) → TouchpadInputMapper gestures | Ready + **New here** | Palm rejection uses the PTP confidence bit (MT_TOOL_PALM). hid-multitouch (class WIN_8, `export_all_inputs`) also turns the two vendor collections (FF07:0001 "Navigation Accessory", FF05:0004 "USP Encapsulation") into "Microsoft Surface 045E:09AF UNKNOWN" inputs that carry only BTN_MISC/ABS_MISC codes, which Android sees as a gamepad. **New:** `vup/etc/excluded-input-devices.xml` hides them by exact name, keeping lapis's "Power Button" entry. The legacy "... Mouse" sibling should stay silent in PTP mode; it is not excluded. **Wave 3:** the IDC sets `gestureProp.Change_Timeout = 0.02` (Android's 200 ms default ignores quick flicks; gbos-x86 issue #17 confirmed 0.02 on lapis). Checklist 20. |
+| 18 | Base keyboard, SAM HID **045E:09AE** (keyboard, system control, consumer control) [V, Windows HW IDs] | surface_aggregator → registry → hub → `surface_hid` → `hid-surface` (build #13) | **New here:** `vup/usr/idc/Microsoft_Surface_045E_09AE_Keyboard.idc` (`device.internal=1`, `keyboard.builtIn=1`), matched by name so the consumer/system-control siblings do not grab keyboard id 0 | Ready (failed on the first native boot: no SAM link, see row 12; wave 9: needs the `gb_hw_sam` re-bind, unverified on the laptop) | The SAM firmware reports Fn as BTN_0 (linux-surface patch 0016, written for these exact IDs). It can stick, and on Android a key in [BTN_MISC, BTN_MOUSE) makes EventHub classify the keyboard as a gamepad. Fixed by `native/hw-gap-audit/kernel/0001-HID-surface-...patch`. Media, volume and brightness keys are standard HID usages that Generic.kl already maps, so no custom .kl is needed [V, Generic.kl]. The keyboard backlight is handled by the EC: no LED class device exists, so Android shows no keyboard-backlight control [I]. **Wave 5:** lapis's `DesktopDeviceStateProvider` disables built-in input devices when the posture state is `CLOSED`; `gb_hw.sh diag` logs the committed state and `Enabled:` flag, and `vendor.gb.posture=open` overrides it if needed ([FLASHING.md](FLASHING.md#7-troubleshooting-symptom-log-line-boot-option)). |
+| 19 | Precision touchpad, SAM HID **045E:09AF** [V] | `surface_hid` → hid-multitouch (built in, Win8 PTP) | **New here:** `Microsoft_Surface_045E_09AF_Touchpad.idc` (`touch.deviceType=touchPad`, internal) → TouchpadInputMapper gestures | Ready + **New here** (failed on the first native boot: no SAM link, see row 12; wave 9: needs the `gb_hw_sam` re-bind, unverified on the laptop) | Palm rejection uses the PTP confidence bit (MT_TOOL_PALM). hid-multitouch (class WIN_8, `export_all_inputs`) also turns the two vendor collections (FF07:0001 "Navigation Accessory", FF05:0004 "USP Encapsulation") into "Microsoft Surface 045E:09AF UNKNOWN" inputs that carry only BTN_MISC/ABS_MISC codes, which Android sees as a gamepad. **New:** `vup/etc/excluded-input-devices.xml` hides them by exact name, keeping lapis's "Power Button" entry. The legacy "... Mouse" sibling should stay silent in PTP mode; it is not excluded. **Wave 3:** the IDC sets `gestureProp.Change_Timeout = 0.02` (Android's 200 ms default ignores quick flicks; gbos-x86 issue #17 confirmed 0.02 on lapis). Checklist 20. |
 | 20 | Base vendor HID **045E:09A6**: "Surface HID Color", "Base v3 Firmware Update" (CFU), USP encapsulation, "Surface UCM UCSI HID Client" [V] | hid-generic, hidraw only | – | Gap (UCSI) / Off by design (CFU) | No Linux driver exists for UCSI-over-SAM-HID (see row 33). The firmware-update collection must never be used; fwupd is stubbed. |
 | 21 | Touchscreen + pen, IPTS 8086:34E4 | `ipts.ko` (MEI 34E4 ID patched) | iptsd + IDCs (`native/iptsd`) | Ready | iptsd tested end-to-end on the builder against a fake IPTS uhid device. **Wave 5:** `iptsd.conf` sets `[Touchscreen] DisableOnStylus = true` so touchscreen touches are ignored while the stylus is in proximity (palm rejection while hovering). |
 | 22 | Surface Pen top button: BLE HOGP **045E:0921** (Win+F20 click, F19 double-click, F18 hold) | Android BT HID host → uhid (built in) → hid-generic | **New here:** `vup/usr/keylayout/Vendor_045e_Product_0921.kl` (F20 → STYLUS_BUTTON_TAIL, F19 → SYSRQ, F18 → ASSIST; META dropped) + `Surface_Slim_Pen_2_Keyboard.kl` (name match) | Ready [I] | The pen must be paired in Android's Bluetooth settings. The 0921 ID comes from a published Linux uhid log of this pen model, not from a pen paired on the test machine. STYLUS_BUTTON_TAIL opens the default notes app (SystemUI). |
 | 23 | Power + volume buttons, MSHW0040 "Surface Button" | `soc_button_array` + lapis `pinctrl-icelake` (`gb_hw.sh buttons` rebind) | Generic.kl POWER / VOLUME_* | Ready | DSDT `\_SB.MSBT`: GPIO 0x23 (power, SharedAndWake), 0xF6, 0xF7 (`\_SB.GPI0`, `INT3455`); the `_DSM` OMPR function exists [V]. There is no ACPI fixed power button (FADT: control-method power button; no PNP0C0C) [V], so lapis's "Power Button" exclusion is irrelevant. **Wave 5 (A-H1):** `gbinit` insmods `soc_button_array` before ueventd coldboot loads lapis's `pinctrl-icelake` (`INT3455:00`), and the 6.18 driver ignores `-EPROBE_DEFER` and fails with `-ENODEV` (never retried). `gb_hw.sh buttons` (`on boot`) waits up to 30 s for `INT3455:00` to bind, writes `MSHW0040:00` to `/sys/bus/platform/drivers/soc_button_array/bind`, verifies the two `gpio-keys` input devices, and records the result in `vendor.gb.buttons` (checklist 25). |
 | 24 | Lid PNP0C0D (`\_SB.LID0`) | ACPI button (built in) → SW_LID; wake GPE 0x4D via `surface_gpe` | Lid switch → sleep | Ready | `_L4D` → `Notify(LID0)`; LID0 has no `_PRW`, so surface_gpe is what makes the lid a wake source [V]. |
-| 25 | Clipboard detach, tablet/studio posture; MSHW0005 "Laptop or Slate Indicator" (PNP0C60) | `surface_dtx` SW_TABLET_MODE + `gb_power` DTX handler. MSHW0005: no Linux driver, not needed | Tablet-mode switch | Ready | Without a daemon, detach should still complete through the EC timeout. |
+| 25 | Clipboard detach, tablet/studio posture; MSHW0005 "Laptop or Slate Indicator" (PNP0C60) | `surface_dtx` SW_TABLET_MODE + `gb_power` DTX handler. MSHW0005: no Linux driver, not needed | Tablet-mode switch | Ready (failed on the first native boot: no SAM link, see row 12; wave 9: needs the `gb_hw_sam` re-bind, unverified on the laptop) | Without a daemon, detach should still complete through the EC timeout. |
 | 26 | Windows virtual HIDs 045E:F001/F002/F005, HID\CONVERTEDDEVICE | – | – | N/A | Created by Surface Windows drivers. The Linux equivalents are rows 23, 25 and 28. |
 
 ## 4. Sensors and cameras
 
 | # | Device | Linux driver | Android side | Status | Notes |
 |---|---|---|---|---|---|
-| 27 | ISH 34FC + "HID Sensor Collection V2" 8087:0AC2 (accelerometer, gyro, ...) | lapis `intel-ish-*` + our `hid-sensor-*` (late list) with sensors patch 0001 (`cros-ec-accel` / `cros-ec-gyro`) | sensors component (lapis Desktop IIO sub-HAL, auto-rotate overlay, `gb_sensors.sh`) | Ready (unverified upstream; linux-surface: `?`) | ISH firmware comes from BIOS. QEMU-tested with a fake ISH; upstream linux-surface marks Surface Book 3 sensors as `?`. Rotation follows the posture (Android's own laptop policy, not ours): with the base attached normally (device state `OPEN`) the screen stays in landscape whatever the Auto-rotate setting says; with the clipboard detached or the base reversed (`TABLET`) the **Auto-rotate** setting applies. Every user starts with Auto-rotate on (our SettingsProvider overlay, wave 6); turning it off in Quick Settings is remembered and only matters in tablet posture. `gb_sensors.sh` logs one `GB_SENSORS: rotation:` line at boot and at every attach/detach (unverified on the laptop). |
+| 27 | ISH 34FC + "HID Sensor Collection V2" 8087:0AC2 (accelerometer, gyro, ...) | lapis `intel-ish-*` + our `hid-sensor-*` (late list) with sensors patch 0001 (`cros-ec-accel` / `cros-ec-gyro`) | sensors component (lapis Desktop IIO sub-HAL, auto-rotate overlay, `gb_sensors.sh`) | Ready (unverified upstream; linux-surface: `?`) | ISH firmware comes from BIOS. QEMU-tested with a fake ISH; upstream linux-surface marks Surface Book 3 sensors as `?`. Rotation follows the posture (Android's own laptop policy, not ours): with the base attached normally (device state `OPEN`) the screen stays in landscape whatever the Auto-rotate setting says; with the clipboard detached or the base reversed (`TABLET`) the **Auto-rotate** setting applies. Every user starts with Auto-rotate on (our SettingsProvider overlay, wave 6); turning it off in Quick Settings is remembered and only matters in tablet posture. `gb_sensors.sh` logs one `GB_SENSORS: rotation:` line at boot and at every attach/detach (first native boot: `ok: laptop posture, rotation locked`). **Wave 9:** on one of three first native boots, lapis's `intel-ish-ipc` probe timed out on the ISH firmware (`HBM haven't started`, `ISHTP: Protocol init failed`), so no accelerometer existed for that boot. `gb_hw.sh ish` (service `gb_hw_ish`, early-boot) then resets the ISH once and binds it again while `gb_sensors_wait` still holds the sensors HAL back (8 s). The two other boots had every sensor. |
 | 28 | Ambient light MSHW0184 = APDS-9960 on I2C4 0x39, GpioInt pin 1 [V, DSDT] | `apds9960` with sensors patch 0002 (`cros-ec-light` companion) | sensors component | Ready (unverified upstream; linux-surface: `?`) | The IRQ needs pinctrl-icelake first; I2C probe deferral handles the order. Upstream linux-surface marks Surface Book 3 sensors as `?`. |
-| 29 | Cameras: front OV5693 INT33BE, rear OV8865 INT347A (+ DW9719 focus), IR OV7251 INT347E, INT3472 x3, ISP IPU4P 8086:8A19 | build #13: IPU4P port on the ipu6 driver (`intel-ipu6`, `intel-ipu6-isys`), `ov5693`, `ov8865`, `ov7251`, `dw9719`, `ipu-bridge`, `intel_skl_int3472_*`, `v4l2-cci` (gbinit) | libcamera simple pipeline + software ISP as `camera.sb3.so` (`ro.hardware.camera=sb3`) | Ready, untested (needs your IPU4P firmware) | Mainline Linux has no IPU4 driver; this is the project's own port. The HAL was tested against vimc on the builder only. The IR camera (Windows Hello) is not used by Android. USB UVC webcams should work independently (USB_VIDEO_CLASS=y + lapis USB camera provider). **Wave 5 (C-1):** `stage.sh` now strips before `patchelf` and gates `PT_LOAD` alignment (`V12b`); the re-staged camera libraries, the HAL, `lcam-probe` and `soft_ipa_proxy` load under lapis 276's bionic `linker64` (builder test; first device test pending). Expect front and rear preview/photos at modest quality and frame rate (CPU software ISP, manual focus only on DW9719, no IR camera use in Android). If the IPU4P driver misbehaves at bring-up, `GB_SKIPMOD=intel_ipu6_isys,intel_ipu6` in `gb\gb.cfg` (one boot with `gb.overlay=1`) skips it. |
+| 29 | Cameras: front OV5693 INT33BE, rear OV8865 INT347A (+ DW9719 focus), IR OV7251 INT347E, INT3472 x3, ISP IPU4P 8086:8A19 | build #13: IPU4P port on the ipu6 driver (`intel-ipu6`, `intel-ipu6-isys`), `ov5693`, `ov8865` (`ov7251` staged but not loaded since wave 9), `dw9719`, `ipu-bridge`, `intel_skl_int3472_*`, `v4l2-cci` (gbinit) | libcamera simple pipeline + software ISP as `camera.sb3.so` (`ro.hardware.camera=sb3`) | Ready, untested (needs your IPU4P firmware) | Mainline Linux has no IPU4 driver; this is the project's own port. The HAL was tested against vimc on the builder only. The IR camera (Windows Hello) is not used by Android. USB UVC webcams should work independently (USB_VIDEO_CLASS=y + lapis USB camera provider). **Wave 5 (C-1):** `stage.sh` now strips before `patchelf` and gates `PT_LOAD` alignment (`V12b`); the re-staged camera libraries, the HAL, `lcam-probe` and `soft_ipa_proxy` load under lapis 276's bionic `linker64` (builder test; first device test pending). Expect front and rear preview/photos at modest quality and frame rate (CPU software ISP, manual focus only on DW9719, no IR camera use in Android). If the IPU4P driver misbehaves at bring-up, `GB_SKIPMOD=intel_ipu6_isys,intel_ipu6` in `gb\gb.cfg` (one boot with `gb.overlay=1`) skips it. **Wave 9:** the IR camera's driver is no longer loaded. On the first native boot its probe always failed (`ov7251_write_reg: write reg error -121`, `error during global init`), and Android never used it. The front and rear cameras register on their own and are unaffected. The rear camera's focus motor logged `dw9719 ...: Error writing reg 0x0003: -121` in two boots: watch for autofocus on the first camera test. |
 
 ## 5. Storage, USB, docks
 
@@ -291,7 +361,7 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 
 | # | Function | Driver | Status | Notes |
 |---|---|---|---|---|
-| 42 | Two batteries (clipboard BAT1, base BAT2) + AC | `surface_battery`, `surface_charger` + `gb_power` combined battery | Ready | `native/power` (unit-tested). |
+| 42 | Two batteries (clipboard BAT1, base BAT2) + AC | `surface_battery`, `surface_charger` + `gb_power` combined battery | Ready (failed on the first native boot: no SAM link, see row 12; wave 9: needs the `gb_hw_sam` re-bind, unverified on the laptop) | `native/power` (unit-tested). |
 | 43 | Battery charge limit | none: surface_battery has no `charge_control_*`; lapis charge-control HAL is cros_ec-only | Gap (Android) | Use Surface UEFI → "Enable Battery Limit" (50 % cap, set in firmware setup). |
 | 44 | Performance mode (SAM) | `surface_platform_profile` + `gb_power -p` | Ready | Changes only take effect on AC (linux-surface wiki). |
 | 45 | Thermal sensors / fans; MSHW0187 "Thermal Policy" | lapis `x86_pkg_temp_thermal` (zone x86_pkg_temp), iwlwifi zone. ACPI thermal is useless: the only ThermalZone `\TPOL` has no `_TMP` [V]. Fans are EC-controlled with no OS interface; MSHW0187 has no Linux driver | Partial | Safe: CPU TCC/PROCHOT and the EC fan are firmware-controlled and not affected. Android reports no thermal status, because lapis's thermal HAL config is selected only for product "lapis". A SB3 `thermal_info_config.json` is optional future work. |
@@ -362,8 +432,11 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
 18. The `[NVIDIA test]` boot entry once (follow its on-screen suspend prompts), then keep the whole `gblog\` folder:
     it holds the dGPU power and PM-stress report.
 19. (Wave 3, row 12) Serial / Surface Aggregator: the boot-log summary shows `Serial: 8250/16550 driver, 4 ports`,
-    `dw-apb-uart -22: 0` and a bound `surface_serial_hub`; base keyboard, touchpad and both batteries work. (Wave 5)
-    The `-517` line of `surface_hotplug` under `deferred probes` is expected, not an error.
+    `dw-apb-uart -22: 0`, `serial surface_serial_hub bound: serial0-0` and (wave 9) `sam: MSHW0084
+    serial0-0=surface_serial_hub; keyboard 1, touchpad 1; supplies: BAT1 BAT2 ADP1 ; dtx present; ...`. On k16,
+    `failed to setup IRQ: 1` in `serial errors:` is the SAM's known first-stage failure that gb_hw repairs. Base
+    keyboard, touchpad and both batteries work. (Wave 5) The `-517` line of `surface_hotplug` under `deferred probes`
+    is expected, not an error.
 20. (Wave 3, row 19) Touchpad flicks: a short, fast swipe moves the pointer at once (`gestureProp.Change_Timeout`).
 21. (Wave 3, row 14; wave 5) White veil: the picture should look like Windows on this panel, and Night Light should
     tint it. The summary's `i915 white veil:` line shows `drmhwc LOG_GAMMA_LUT lines: 0` and `hwc: use_log_gamma_lut=false
@@ -389,9 +462,11 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     `D3cold` in `gb_dgpu_check.sh`, no "NVIDIA GPU problem" notification, and the Graphics tile `Intel (NVIDIA not
     supported)`. The analyser shows `nouveau UNKNOWN` and `dgpu_power PASS`.
 27. (Wave 6) Notifications after you sign in: attach and detach the base and check that the notices appear in your
-    notification shade. `dumpsys notification` lists our notices as `-1|com.android.shell|2020|<tag>` (all users)
-    and GbGpu's as `10|gb.sb3.gpu|...` (your user), never as user 0; `dumpsys package gb.sb3.gpu` shows
-    versionCode 29889106 and POST_NOTIFICATIONS granted for user 10; the Graphics tile is in your Quick Settings
+    notification shade. `dumpsys notification` lists our notices as `10|com.android.shell|2020|<tag>` (wave 9: your
+    user only; waves 6-8 used `-1`, all users) and GbGpu's as `10|gb.sb3.gpu|...` (your user), never as user 0;
+    `dumpsys package gb.sb3.gpu` shows versionCode 29890777 (wave 9) and POST_NOTIFICATIONS granted for user 10;
+    (wave 9) the notification shade shows each notice once, in your user only; GbGpu's notifications show a coloured
+    chip icon; the Graphics tile is added when you first sign in, however late after the boot; the Graphics tile is in your Quick Settings
     (`/data/vendor/gb/ui/tile_added.10`) and shows the current state each time you open the panel; logcat has
     `GbGpu: user unlocked: refreshing state` after the sign-in.
 28. (Wave 7) Your user's settings after the first sign-in: `settings get --user 10 system accelerometer_rotation`
@@ -400,6 +475,10 @@ Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[
     density 320. Turn Auto-rotate off, reboot, sign in: it stays off. Turn the Graphics app's notifications off,
     reboot: they stay off. (Wave 8) Change Display size in Settings, reboot, sign in: it stays, and the boot log's
     `GB_UI user=10` line says `the person's own Display size kept`.
+29. (Wave 9) `getprop vendor.gb.sam` starts with `bound` (or `already` / `kernel` on a later kernel) and shows
+    `kbd=1 tp=1 bat=11 adp=1 dtx=1` with the base attached; `getprop vendor.gb.ish` is `already accel=1` (or
+    `rebound ... accel=1`). Write down whether the boot was a cold start (power off, then on) or a restart (from
+    Android or from Windows). Start once with the clipboard detached: the posture must be `TABLET`.
 
 ## Readiness audit (wave 5): what the image proves and what needs the laptop
 

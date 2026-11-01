@@ -10,9 +10,12 @@
 #      per user ever: /data/vendor/gb/ui/granted.<u> (0644) is created after a successful grant and no grant is made
 #      while it exists, so a person who turns GbGpu's notifications off keeps them off (before wave 7 every boot
 #      granted again). Without the directory the grant is made and nothing is recorded (logged).
-#   2. Then wait until a FULL user is in the foreground (am get-current-user; at most 180 checks 10 s apart = 30 min):
-#      the person has signed in. Grant for that user if it has no marker yet (it may have been created during this
-#      boot) and, once per user ever, cmd statusbar add-tile gb.sb3.gpu/.GpuTileService, then create
+#   2. (wave 9, BACKLOG HS-O11: before, the boot run waited here for at most 30 min, so a later sign-in or a user
+#      created later got no tile until the next boot) `gb_gpu_ui_setup.sh user` (service gb_gpu_ui_user) runs whenever
+#      gb_ui publishes the foreground full user in vendor.gb.ui.fg (its id once that user is unlocked, "none"
+#      otherwise; gb_gpu_ui.rc starts the service at every change), at any time in the boot. For that user, while it
+#      is a FULL user still in the foreground: the grant if it has no marker yet (it may have been created during this
+#      boot) and, once per user ever, cmd statusbar add-tile gb.sb3.gpu/.GpuTileService, then
 #      /data/vendor/gb/ui/tile_added.<u>
 #      (0644 shell:shell). The marker is written only after add-tile succeeded; while it exists nothing is added again
 #      for that user, so a user who removed the tile keeps it removed. /data/vendor/gb is 0751 root:shell (shell cannot
@@ -21,8 +24,9 @@
 #   (wave 7) The markers granted.<u> and tile_added.<u> of a user id that pm list users no longer lists are removed
 #   (only when the list names user 0), so a later user that gets a reused id is granted and gets the tile.
 # Does nothing unless /odm/etc/gb_hw is "native" and /odm/app/GbGpu/GbGpu.apk exists.
+#   A change of vendor.gb.ui.fg while the user run is busy is picked up before it ends (at most 5 users per run).
 # Never needs root. Test hooks (never set by init): GB_ROOT (prefix for /odm and /data), GB_TEST_PATH (prepended to
-# PATH), GB_UI_WAIT_CHECKS (the number of foreground checks, default 180).
+# PATH).
 PATH=${GB_TEST_PATH:+$GB_TEST_PATH:}/system/bin:/vendor/bin
 export PATH
 R=${GB_ROOT:-}
@@ -30,8 +34,6 @@ PKG=gb.sb3.gpu
 TILE=$PKG/.GpuTileService
 APK=$R/odm/app/GbGpu/GbGpu.apk
 D=$R/data/vendor/gb/ui
-WAIT=${GB_UI_WAIT_CHECKS:-180}
-case $WAIT in '' | *[!0-9]*) WAIT=180 ;; esac
 set -f
 
 log_i() {
@@ -93,6 +95,13 @@ prune() { # markers of user ids that ULIST no longer lists (only when it names u
   set -f
 }
 
+if [ "${1:-}" = user ]; then
+  FG1=$(getprop vendor.gb.ui.fg 2> /dev/null)
+  case $FG1 in
+    '' | *[!0-9]*) log_i "foreground '$(printf '%s' "$FG1" | tr -cd 'a-z0-9' | cut -c1-8)': no full user to set up"; exit 0 ;;
+  esac
+  [ ${#FG1} -le 5 ] || exit 0
+fi
 hw=$(cat "$R/odm/etc/gb_hw" 2> /dev/null)
 if [ "$hw" != native ]; then
   log_i "not a native boot ($hw): nothing to do"
@@ -114,6 +123,62 @@ while [ -z "$(pm path "$PKG" 2> /dev/null)" ]; do
   sleep 5
 done
 
+setup_user() { # $1 = the foreground full user gb_ui published: grant once, tile once (while it is still in front)
+  if ! full_users; then
+    log_i "user $1: pm list users failed: nothing done (the next foreground change tries again)"
+    return 0
+  fi
+  case " $USERS " in
+    *" $1 "*) ;;
+    *) log_i "user $1 is not a full user: nothing to do"; return 0 ;;
+  esac
+  grant "$1"
+  M=$D/tile_added.$1
+  [ -e "$M" ] && return 0
+  if [ ! -d "$D" ]; then
+    log_i "$D is missing: the tile is not added this boot"
+    return 0
+  fi
+  n=0
+  while :; do
+    if [ "$(timeout 20 am get-current-user 2> /dev/null)" != "$1" ]; then
+      log_i "user $1 left the foreground: the tile is added the next time it is in front"
+      return 0
+    fi
+    if timeout 20 cmd statusbar add-tile "$TILE" > /dev/null 2>&1; then
+      if (umask 022 && : > "$M"); then
+        log_i "Quick Settings tile added for user $1"
+      else
+        log_i "tile added for user $1, but $M could not be written"
+      fi
+      return 0
+    fi
+    n=$((n + 1))
+    [ "$n" -ge 3 ] && break
+    sleep 10
+  done
+  log_i "cmd statusbar add-tile failed for user $1; trying again the next time it is in front"
+  return 1
+}
+
+if [ "${1:-}" = user ]; then
+  # (wave 9, HS-O11) started at every change of vendor.gb.ui.fg (gb_ui); the newest value is read again after each
+  # user, so a change while this run was busy is not lost (init does not start a running oneshot again)
+  rc=0
+  last=
+  u=$FG1
+  k=0
+  while :; do
+    case $u in '' | *[!0-9]*) exit $rc ;; esac
+    if [ ${#u} -gt 5 ] || [ "$u" = "$last" ]; then exit $rc; fi
+    last=$u
+    setup_user "$u" || rc=1
+    k=$((k + 1))
+    [ $k -lt 5 ] || exit $rc
+    u=$(getprop vendor.gb.ui.fg 2> /dev/null)
+  done
+fi
+
 if full_users; then
   [ -n "$USERS" ] || log_i "no full user yet"
   prune
@@ -121,55 +186,10 @@ if full_users; then
 else
   log_i "pm list users failed: no grant before the sign-in"
 fi
-
-# Wait for the person: a FULL user in the foreground (the headless system user 0 shows the login screen). The user list
-# is read again only when the foreground user changes to one it does not hold (a user created during this boot).
-cur=
-prev=
-n=0
-while :; do
-  c=$(timeout 20 am get-current-user 2> /dev/null)
-  case $c in '' | *[!0-9]*) c= ;; esac
-  if [ -n "$c" ]; then
-    case " $USERS " in
-      *" $c "*) cur=$c ;;
-      *) if [ "$c" != "$prev" ] && full_users; then case " $USERS " in *" $c "*) cur=$c ;; esac; fi ;;
-    esac
-    prev=$c
-  fi
-  [ -n "$cur" ] && break
-  n=$((n + 1))
-  if [ "$n" -ge "$WAIT" ]; then
-    log_i "no full user in the foreground after $WAIT checks: the tile is added at a later boot"
-    exit 0
-  fi
-  sleep 10
-done
-grant "$cur"
-
-M=$D/tile_added.$cur
-[ -e "$M" ] && exit 0
-if [ ! -d "$D" ]; then
-  log_i "$D is missing: the tile is not added this boot"
-  exit 0
-fi
-n=0
-while :; do
-  if [ "$(timeout 20 am get-current-user 2> /dev/null)" != "$cur" ]; then
-    log_i "user $cur left the foreground: the tile is added at a later boot"
-    exit 0
-  fi
-  if cmd statusbar add-tile "$TILE" > /dev/null 2>&1; then
-    if (umask 022 && : > "$M"); then
-      log_i "Quick Settings tile added for user $cur"
-    else
-      log_i "tile added for user $cur, but $M could not be written"
-    fi
-    exit 0
-  fi
-  n=$((n + 1))
-  [ "$n" -ge 3 ] && break
-  sleep 10
-done
-log_i "cmd statusbar add-tile failed for user $cur; trying again next boot"
-exit 1
+# (wave 9, HS-O11) the person's tile: `gb_gpu_ui_setup.sh user` at the foreground event (vendor.gb.ui.fg), no wait here.
+# gb_ui never publishes user 0 (headless: the login screen), so a build without headless system user mode, where user
+# 0 is the person (a FULL user), is set up here when user 0 is in the foreground.
+case " $USERS " in
+  *" 0 "*) [ "$(timeout 20 am get-current-user 2> /dev/null)" = 0 ] && { setup_user 0 || exit 1; } ;;
+esac
+exit 0

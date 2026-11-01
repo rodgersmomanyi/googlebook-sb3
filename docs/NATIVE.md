@@ -27,7 +27,9 @@ device. In short:
   `surface_hid_core`, `surface_hid`, `surface_battery scope_device=1`, `surface_charger`, `surface_dtx`,
   `surface_gpe`, `surface_hotplug`, `hid-surface`), `soc_button_array`, `test_power`, i915 and its helpers, lapis's
   HDA codec modules, `apds9960`, ACPI `thermal`, `ipts`, and the camera stack (`v4l2-cci`, `ipu-bridge`,
-  `intel_skl_int3472_*`, `ov5693`, `ov8865`, `ov7251`, `dw9719`, `intel-ipu6`, `intel-ipu6-isys`). A second pass
+  `intel_skl_int3472_*`, `ov5693`, `ov8865`, `dw9719`, `intel-ipu6`, `intel-ipu6-isys`; `ov7251.ko` is staged but
+  loaded by no list since wave 9: the IR camera is not used by Android, and its probe always failed on the first
+  native boot). A second pass
   (`gb_modules.sh`, `modules.load.late`) loads what must link against lapis's first-stage modules:
   `surface_platform_profile` and the HID sensor drivers. nouveau and its four helpers (`NATIVE_OPTIN`) are in
   neither list. They live in the dGPU payload `gb/dgpu-<krel>.erofs` on the ESP, together with the NVIDIA firmware,
@@ -40,7 +42,10 @@ device. In short:
   Wi-Fi HAL with iwlwifi, Google's Bluetooth HAL, the desktop health HAL, the DRAS audio HAL with our SOF card config.
 * **Our daemons and components** (`inject/native/components/*.json`): `gb_power` (batteries, charger, DTX detach,
   dGPU hot-plug, graphics switching, platform profile), `iptsd` (touch + pen), `gb_audio`, `gb_hw` (CPU power limits,
-  backlight permissions, keyboard/touchpad IDCs, pen key layouts, input exclusions), `gb_sensors` (cros-ec style
+  backlight permissions, keyboard/touchpad IDCs, pen key layouts, input exclusions; since wave 9 also the services
+  `gb_hw_sam` (`on boot`: binds the Surface Aggregator again once lapis's GPIO driver is ready, because its first probe
+  fails for good on kernel build #16) and `gb_hw_ish` (early-boot: one reset and re-bind of a sensor hub whose firmware
+  did not start)), `gb_sensors` (cros-ec style
   sensors, auto-rotate overlays: `config_supportAutoRotation` for the framework and Auto-rotate on by default for
   new users; a read-only rotation log line per posture change), the libcamera camera HAL (`camera.sb3.so`), the NVIDIA stack (`gb_nouveau`,
   `nvk_probe` and the self-test, the per-app driver package GbGfxDriver with `ro.gfx.driver.0`, the GbGpu app with
@@ -131,7 +136,7 @@ The same layout can also be installed from a bootable installer ISO that you bui
 ## Safety
 
 * Flashing/EC/firmware tools are replaced by refusing stubs (`fwupdmgr`, `flashrom`, `futility`, `ectool`, the
-  futility executor), `fwupd` idles, and OTA postinstall's Googlebook firmware updater is skipped. lapis's
+  futility executor, since wave 9 `elogtool` and `cbfstool`, which link libflashrom), `fwupd` idles, and OTA postinstall's Googlebook firmware updater is skipped. lapis's
   `android-desktop-install` (it erases the whole disk) refuses.
 * `module_blacklist=tpm,tpm_tis,tpm_tis_core,tpm_tis_spi,tpm_tis_i2c_cr50,spi_intel_pci,spi_intel,spi_nor,mtd,gsmi`:
   no TPM access, no BIOS SPI flash access, no Google SMI. The kernel keeps only the **last** `module_blacklist=` on

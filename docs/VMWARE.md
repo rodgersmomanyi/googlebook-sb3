@@ -141,5 +141,11 @@ prints `slot:` lines. After such an update, build a new ESP for the new slot on 
 * `serial0.log` has everything; useful markers: `GB_MODULES`, `GB_EDID`, `GB_UI` (`GB_UI user=<u> ...` once per user per boot when that
   user is unlocked; `GB_UI user=<u> first unlock: ...` once per user ever), `GB_P<n>` (boot progress loop),
   `gb_slotsync:`, `gb_vmaudio:`, `gb_netwatch:`.
+* Since wave 9 the VM entry also carries `efi_pstore.pstore_disable=1`, as the native entries always did: a kernel
+  panic in the VM is still printed on the serial console (`serial0.log`), but no longer copied into the VM's UEFI
+  variable store (`lapis-boot.nvram`). The user VM gets it with its next ESP update. (Measured on a throwaway VM: with
+  the option, a forced panic logged its full trace on the serial port and left the NVRAM byte-identical; without it,
+  the same panic wrote 18 `dump-type0-*` variables into the NVRAM.) The VM build also has the native build's
+  notification queue since wave 9 ([OTA.md](OTA.md)).
 * `wipe_data.py --yes` (VM off) zeroes the start of userdata; the next boot formats a fresh /data.
 * `cycle.ps1` is the quick reboot-and-grep loop used during bring-up.

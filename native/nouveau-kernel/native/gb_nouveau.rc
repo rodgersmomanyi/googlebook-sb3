@@ -10,6 +10,8 @@
 #                                     (refcnt-gated unbind, then rmmod unless foreign)
 #   boot menu "e", append gb.nouveau=0 (kill switch) | gb.nouveau=once | gb.nouveau=test (or the [NVIDIA test] entry)
 # gb_gfx_selftest (the NVIDIA app-graphics self-test) is started only by gb_power and stopped by gb_power and off.
+# (Wave 9, BACKLOG HS-O4) gb_notify also starts whenever gb_ui publishes the foreground full user (vendor.gb.ui.fg):
+# a notice queued while nobody was signed in is held and posted for the person then (INTERFACES 12.1a).
 # nouveau and its helpers are never in modules.load*; firmware/modules come from /odm (legacy) or the dGPU payload.
 on early-init
     mkdir /dev/gb_dgpu 0700 root root
@@ -97,4 +99,7 @@ on property:vendor.gb.dgpu.dmesg=0
     stop gb_dgpu_dmesg
 
 on property:vendor.gb.notify=*
+    start gb_notify
+
+on property:vendor.gb.ui.fg=*
     start gb_notify

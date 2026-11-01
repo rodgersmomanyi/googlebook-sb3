@@ -1115,12 +1115,46 @@ static int n08_case(int apk, const char *caps) {  /* 1 = N08 posted for a busy r
   pump(31000, 500);
   return notified("title=Can't detach yet\ntext=The NVIDIA GPU is in use by nvk_probe. Close them, then press detach again.\n");
 }
+/* (wave 9, BACKLOG HS-O12) ui-caps per declaring user vs the foreground user gb_ui publishes (vendor.gb.ui.fg) */
+static int n08_users(const char *fg, const int *uids, int n, int none_uid) {   /* 1 = N08 posted */
+  gfx_tree("tree_gfx_n08u");
+  put("/data/system/packages.list", "gb.sb3.gpu 10123 0 /d platform none 0 1\n");
+  put("/sys/module/nouveau/refcnt", "1\n");
+  proc_holder(4243, "nvk_probe", 0, 1, 0);
+  status_tick(T);
+  g_ui_nusers = 0;
+  g_gfx.ui_notify = 0;
+  for (int i = 0; i < n; i++) { int c = cl_pair(uids[i], 200 + i); req(c, "ui-caps notify\n"); drop(c); }
+  if (none_uid) { int c = cl_pair(none_uid, 300); req(c, "ui-caps none\n"); drop(c); }
+  prop_set("vendor.gb.ui.fg", fg);
+  clear_notify();
+  g_bcast_pending = 0;
+  press();
+  pump(31000, 500);
+  int r = notified("title=Can't detach yet\ntext=The NVIDIA GPU is in use by nvk_probe. Close them, then press detach again.\n");
+  prop_set("vendor.gb.ui.fg", "");
+  return r;
+}
 static void test_gfx_n08(void) {
   CHECK(n08_case(0, "notify"), "GP-1B-13 GbGpu absent (even with ui-caps notify): N08 exact text");
   CHECK(n08_case(1, NULL), "GbGpu present without ui-caps notify: N08");
   int posted = n08_case(1, "notify");
   CHECK(!posted && g_gfx.detach_ref == 1 && (g_bcast_pending || notified("kind=broadcast")), "ui-caps notify: no N08, detach_ref 1, broadcast queued");
   CHECK(n08_case(1, "none"), "ui-caps none restores N08");
+  int u10[] = {1010123}, u10u11[] = {1010123, 1110123};
+  CHECK(!n08_users("10", u10, 1, 0), "W9-O12 user 10's GbGpu declared, user 10 in front: no N08 (GbGpu shows it)");
+  CHECK(n08_users("11", u10, 1, 0), "W9-O12 user 10's GbGpu declared, user 11 in front: N08 (for user 11)");
+  CHECK(!n08_users("none", u10, 1, 0), "W9-O12 login screen in front (none): no N08 (user 10's GbGpu shows it when 10 is back)");
+  CHECK(!n08_users("", u10, 1, 0), "W9-O12 no foreground information (no gb_ui): the wave-6 rule, no N08");
+  CHECK(!n08_users("1x", u10, 1, 0), "W9-O12 a malformed vendor.gb.ui.fg: the wave-6 rule, no N08");
+  CHECK(!n08_users("11", u10u11, 2, 0), "W9-O12 users 10 and 11 declared, 11 in front: no N08");
+  CHECK(n08_users("11", u10u11, 2, 1110123), "W9-O12 user 11 sent ui-caps none: N08 for 11 (10 still declared)");
+  CHECK(g_ui_nusers == 1 && g_ui_users[0] == 10 && g_gfx.ui_notify == 1, "W9-O12 the declared set is {10} after 11's none");
+  CHECK(n08_users("10", u10, 1, 1010123), "W9-O12 user 10 declared and then sent none: N08");
+  CHECK(g_ui_nusers == 0 && g_gfx.ui_notify == 0, "W9-O12 nobody declared after that: ui_notify 0");
+  int root[] = {0};
+  CHECK(!n08_users("", root, 1, 0), "W9-O12 root's ui-caps notify (user 0) without foreground information: no N08 (as in wave 6)");
+  CHECK(n08_users("10", root, 1, 0), "W9-O12 root's ui-caps notify (user 0), user 10 in front: N08");
 }
 
 /* ================================================================== GP-1B-14 close-holders-and-detach */

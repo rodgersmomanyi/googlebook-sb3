@@ -8,6 +8,11 @@
 # 4. on boot, own service: bind the power button / volume rocker (MSHW0040) to soc_button_array once lapis's
 #    pinctrl-icelake drives the INT3455 GPIO controller (readiness A-H1; bounded, idempotent, never blocks boot).
 # 5. boot_completed with vendor.gb.posture / persist.vendor.gb.posture set: opt-in device-state override (A-M1).
+# 6. on boot, own service: bind the Surface Aggregator serial device (MSHW0084) to surface_serial_hub again once the
+#    INT3455 GPIO controller has its driver (k16's first-stage probe fails with -EINVAL), then wait for its clients
+#    (wave 9 hw-native1; bounded, idempotent, never blocks boot).
+# 7. early-boot, own service: one reset + re-bind of the Integrated Sensor Hub if lapis's coldboot probe failed, while
+#    gb_sensors_wait (sensors component, after this one in gb.rc) holds the sensors HAL back (wave 9 hw-native1).
 service gb_hw_rapl_snap /system/bin/sh /odm/gb_hw.sh rapl-snapshot
     user root
     group root
@@ -48,12 +53,32 @@ service gb_hw_posture /system/bin/sh /odm/gb_hw.sh posture
     oneshot
     disabled
 
+service gb_hw_sam /system/bin/sh /odm/gb_hw.sh sam
+    user root
+    group root
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+service gb_hw_ish /system/bin/sh /odm/gb_hw.sh ish
+    user root
+    group root
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
 on early-init
     exec_start gb_hw_rapl_snap
+
+on early-boot
+    start gb_hw_ish
 
 on boot
     start gb_hw_boot
     start gb_hw_buttons
+    start gb_hw_sam
 
 on property:sys.boot_completed=1
     start gb_hw_diag

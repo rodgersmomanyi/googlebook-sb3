@@ -1196,11 +1196,11 @@ if want NP-20; then
   run gb_notify.sh
   check "exit 0" eq "$RC" 0
   check "exactly 2 notification posts" eq "$(nlines "$T/log/cmd.log")" 2
-  check "first post exact (queue order)" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|NVIDIA GPU is in use|gb_dgpu|Close nvk_probe to switch the NVIDIA GPU off.|"
-  check "second post exact" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|Ready to detach|gb_dtx|You can remove the screen now.|"
+  check "first post exact (queue order)" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|NVIDIA GPU is in use|gb_dgpu|Close nvk_probe to switch the NVIDIA GPU off.|"
+  check "second post exact" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|Ready to detach|gb_dtx|You can remove the screen now.|"
   check "broadcast delivered to the running full user 10 (also to a stopped GbGpu)" has "$T/log/am.log" "broadcast|--user|10|--include-stopped-packages|-a|gb.sb3.gpu.action.STATE_CHANGED|-p|gb.sb3.gpu|"
   check "no broadcast to the headless system user 0 (wave 6)" hasnt "$T/log/am.log" "broadcast|--user|0|"
-  check "the user list was read once (one broadcast message)" eq "$(grep -c '^list|users|$' "$T/log/pm.log")" 1
+  check "the user list was read 3 times (one broadcast message + the foreground check of the 2 posted notices, wave 9)" eq "$(grep -c '^list|users|$' "$T/log/pm.log")" 3
   check "valid force-stop delivered" has "$T/log/am.log" "force-stop|--user|10|com.example.game|"
   check "bad package dropped" hasnt "$T/log/am.log" "rm -rf"
   check "am called twice" eq "$(nlines "$T/log/am.log")" 2
@@ -1992,14 +1992,14 @@ if want NP-W6-NOTIFY; then
   run gb_notify.sh
   rm -f "$T/ctl/am_fail"
   check "broadcast failure logged (user 10)" has "$R/dev/kmsg" "am broadcast failed for 1792900000104-50-104.msg (user 10)"
-  check "after a failed broadcast the notice is still posted" has "$T/log/cmd.log" "notification|post|-u|all|-S|bigtext|-t|t|gb_dgpu|x|"
+  check "after a failed broadcast the notice is still posted" has "$T/log/cmd.log" "notification|post|-u|10|-S|bigtext|-t|t|gb_dgpu|x|"
   check "queue empty" eq "$(nmsg)" 0
-  # 5: every notice is posted for UserHandle.ALL, exactly once, never without -u all
+  # 5: (wave 9, HS-O4) every notice is posted once, for the foreground full user (10), never for all users or user 0
   : > "$T/log/cmd.log"
   printf 'kind=notify\ntag=gb_update\ntitle=System update held\ntext=-u 0 starts like an option\n' > "$Q/1792900000106-50-106.msg"
   run gb_notify.sh
-  check "one post, for all users, text kept as one argument" eq "$(cat "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|System update held|gb_update|-u 0 starts like an option|"
-  check "never a post without -u all" eq "$(grep -c '^notification|post|' "$T/log/cmd.log")" "$(grep -c '^notification|post|-u|all|' "$T/log/cmd.log")"
+  check "one post, for the foreground user 10, text kept as one argument" eq "$(cat "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|System update held|gb_update|-u 0 starts like an option|"
+  check "never a post without -u 10" eq "$(grep -c '^notification|post|' "$T/log/cmd.log")" "$(grep -c '^notification|post|-u|10|' "$T/log/cmd.log")"
   # 6: a message gb_notify cannot read (a root producer without umask 022: the notify proof found gb_otagate's 0600)
   printf 'kind=notify
 tag=gb_dgpu
@@ -2012,6 +2012,137 @@ text=x
   check "unreadable message: dropped and logged" has "$R/dev/kmsg" "dropped 1792900000107-50-107.msg: not readable by gb_notify (12.1: mode 0644)"
   check "unreadable message: nothing posted" eq "$(nlines "$T/log/cmd.log")" 0
   check "unreadable message: deleted all the same" eq "$(nmsg)" 0
+fi
+
+# (wave 9, BACKLOG HS-O4) a notice is for the person in front of the screen: posted once for the FOREGROUND full user
+# (am get-current-user, running FULL in pm list users, RUNNING_UNLOCKED), held per boot while there is none (the
+# login screen, a user still starting or locked, a profile), posted at the next run once a full user is in front
+# (gb_ui's vendor.gb.ui.fg starts gb_notify), never for user 0 or for all users
+if want NP-W9-FG; then
+  new_case NP-W9-FG
+  Q=$R/data/vendor/gb/notify
+  nq() { printf 'kind=notify\ntag=%s\ntitle=%s\ntext=%s\n' "$2" "$3" "$4" > "$Q/17929000009$1-90-$1.msg"; }
+  posts() { grep -c '^notification|post|' "$T/log/cmd.log"; }
+  held() { (cd "$Q/held" 2>/dev/null && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | tr '\n' ' '); }
+  # 1: the person (10) is in front and unlocked: one post for 10, nothing held, the checks were made
+  : > "$T/log/cmd.log"; nq 01 gb_dgpu 'NVIDIA GPU problem' 'x'
+  run gb_notify.sh
+  check "fg 10: one post, -u 10 -S bigtext" eq "$(cat "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|NVIDIA GPU problem|gb_dgpu|x|"
+  check "fg 10: nothing held" eq "$(held)" ""
+  check "fg 10: current user and its state were asked" eq "$(cut -d'|' -f1,2 "$T/log/am_q.log" | tr '\n' ' ')" "get-current-user| get-started-user-state|10 "
+  # 2: the login screen (current 0, 10 not running): nothing posted, held with this boot's id, 0600
+  printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412}\n' > "$T/ctl/users"
+  echo 0 > "$T/ctl/current_user"
+  : > "$T/log/cmd.log"; nq 02 gb_update 'System update held' 'old text'
+  run gb_notify.sh
+  check "login screen: nothing posted" eq "$(posts)" 0
+  check "login screen: held as gb_update" eq "$(held)" "gb_update "
+  check "login screen: the held notice carries this boot's id" eq "$(sed -n 's/^boot=//p' "$Q/held/gb_update")" "$(tr -cd '0-9a-f-' < "$R/proc/sys/kernel/random/boot_id")"
+  check "login screen: the held file is 0600" eq "$(stat -c %a "$Q/held/gb_update")" 600
+  check "login screen: logged with the reason" has "$R/dev/kmsg" "1792900000902-90-02.msg held until a full user is in the foreground (no full user in the foreground (user 0))"
+  # 3: a newer notice of the same tag replaces the held one; another tag is held next to it
+  nq 03 gb_update 'System update still held' 'new text'; nq 04 gb_dtx "Can't detach yet" 'y'
+  run gb_notify.sh
+  check "login screen: newest per tag held" eq "$(held)/$(sed -n 's/^title=//p' "$Q/held/gb_update")" "gb_dtx gb_update /System update still held"
+  check "login screen: still nothing posted" eq "$(posts)" 0
+  # 4: the person signs in, but user 10 is still RUNNING_LOCKED: still held (gb_ui publishes only once unlocked)
+  rm -f "$T/ctl/users"; echo 10 > "$T/ctl/current_user"; echo RUNNING_LOCKED > "$T/ctl/user_state.10"
+  run gb_notify.sh
+  check "locked: nothing posted, both still held" eq "$(posts)/$(held)" "0/gb_dtx gb_update "
+  nq 05 gb_gfx 'Tablet mode' 'z'
+  run gb_notify.sh
+  check "locked: a new notice is held too" has "$R/dev/kmsg" "1792900000905-90-05.msg held until a full user is in the foreground (user 10 is not unlocked yet (RUNNING_LOCKED))"
+  # 5: unlocked (vendor.gb.ui.fg -> gb_notify with an empty queue): every held notice posted once for 10, the newest text
+  rm -f "$T/ctl/user_state.10"
+  run gb_notify.sh
+  check "unlocked: three posts, all -u 10" eq "$(posts)/$(grep -c '^notification|post|-u|10|-S|bigtext|' "$T/log/cmd.log")" 3/3
+  check "unlocked: the held gb_update posted with its newest text" has "$T/log/cmd.log" "notification|post|-u|10|-S|bigtext|-t|System update still held|gb_update|new text|"
+  check "unlocked: nothing held any more" eq "$(held)" ""
+  check "unlocked: logged" has "$R/dev/kmsg" "held gb_update posted for user 10"
+  run gb_notify.sh
+  check "unlocked: a second run posts nothing" eq "$(posts)" 3
+  # 6: a notice held in another boot is stale: dropped (logged), never posted
+  echo 0 > "$T/ctl/current_user"; nq 06 gb_update 'System update held' 'boot 1'
+  run gb_notify.sh
+  reboot_dev
+  rm -f "$T/ctl/current_user"; : > "$T/log/cmd.log"
+  run gb_notify.sh
+  check "other boot: dropped and logged, nothing posted" eq "$(posts)/$(held)/$(grep -c 'held gb_update of another boot dropped' "$R/dev/kmsg")" "0//1"
+  # 7: a malformed held notice (bad title) and a file with a name that is no tag: removed, never posted
+  mkdir -p "$Q/held"
+  printf 'boot=%s\ntag=gb_update\ntitle=\001bad\ntext=x\n' "$(tr -cd '0-9a-f-' < "$R/proc/sys/kernel/random/boot_id")" > "$Q/held/gb_update"
+  printf 'boot=%s\ntag=evil\ntitle=t\ntext=x\n' "$(tr -cd '0-9a-f-' < "$R/proc/sys/kernel/random/boot_id")" > "$Q/held/evil"
+  run gb_notify.sh
+  check "malformed: nothing posted, both removed" eq "$(posts)/$(held)" "0/"
+  check "malformed: logged" has "$R/dev/kmsg" "held gb_update is malformed: dropped"
+  # 8: a held notice whose tag line differs from its file name is malformed too
+  printf 'boot=%s\ntag=gb_dgpu\ntitle=t\ntext=x\n' "$(tr -cd '0-9a-f-' < "$R/proc/sys/kernel/random/boot_id")" > "$Q/held/gb_update"
+  run gb_notify.sh
+  check "tag mismatch: dropped, nothing posted" eq "$(posts)/$(held)" "0/"
+  # 9: a profile in front (13, flags 1030) is no full user: held
+  printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412} running\n\tUserInfo{13:Work:1030} running\n' > "$T/ctl/users"
+  echo 13 > "$T/ctl/current_user"; nq 09 gb_dgpu 'p' 'q'
+  run gb_notify.sh
+  check "profile in front: nothing posted, held" eq "$(posts)/$(held)" "0/gb_dgpu "
+  rm -rf "$Q/held"; rm -f "$T/ctl/users" "$T/ctl/current_user"
+  # 10: am get-current-user fails, or pm list users fails: held with the reason
+  : > "$T/ctl/am_q_fail"; nq 10 gb_dgpu 'p' 'q'
+  run gb_notify.sh
+  rm -f "$T/ctl/am_q_fail"
+  check "am fails: held" eq "$(posts)/$(held)" "0/gb_dgpu "
+  check "am fails: logged" has "$R/dev/kmsg" "1792900000910-90-10.msg held until a full user is in the foreground (am get-current-user failed)"
+  rm -rf "$Q/held"
+  : > "$T/ctl/pm_fail"; nq 11 gb_dgpu 'p' 'q'
+  run gb_notify.sh
+  rm -f "$T/ctl/pm_fail"
+  check "pm fails: held" has "$R/dev/kmsg" "1792900000911-90-11.msg held until a full user is in the foreground (pm list users failed)"
+  # 11: the next run with the person in front posts it (and only it)
+  : > "$T/log/cmd.log"
+  run gb_notify.sh
+  check "then posted for 10" eq "$(cat "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|p|gb_dgpu|q|"
+  # 12: a build without headless system user mode (user 0 is a FULL user, flags c13): posted for user 0
+  printf '\tUserInfo{0:Owner:c13} running\n' > "$T/ctl/users"; echo 0 > "$T/ctl/current_user"
+  : > "$T/log/cmd.log"; nq 12 gb_dgpu 'p' 'q'
+  run gb_notify.sh
+  check "non-HSUM: posted for the full user 0" eq "$(cat "$T/log/cmd.log")" "notification|post|-u|0|-S|bigtext|-t|p|gb_dgpu|q|"
+  rm -f "$T/ctl/users" "$T/ctl/current_user"
+  # 13: a held notice and a newer queued one of the same tag with the person in front: the held one first, the newer last
+  echo 0 > "$T/ctl/current_user"; nq 13 gb_update 'old' 'a'
+  run gb_notify.sh
+  rm -f "$T/ctl/current_user"; : > "$T/log/cmd.log"; nq 14 gb_update 'new' 'b'
+  run gb_notify.sh
+  check "held + queued, same tag: 2 posts, the newer last" eq "$(posts)/$(sed -n 2p "$T/log/cmd.log")" "2/notification|post|-u|10|-S|bigtext|-t|new|gb_update|b|"
+  check "held + queued: nothing held" eq "$(held)" ""
+  # 14: the held directory is a symlink: nothing is written through it, the notice is dropped (logged)
+  rm -rf "$Q/held"; mkdir -p "$T/elsewhere"; ln -s "$T/elsewhere" "$Q/held"; echo 0 > "$T/ctl/current_user"; nq 15 gb_dgpu 'p' 'q'
+  run gb_notify.sh
+  check "held is a symlink: nothing written through it, dropped" eq "$(find "$T/elsewhere" -mindepth 1 | wc -l | tr -d ' ')" 0
+  check "held is a symlink: logged" has "$R/dev/kmsg" "cannot hold 1792900000915-90-15.msg (no full user in the foreground (user 0);"
+  rm -f "$Q/held" "$T/ctl/current_user"
+  # 15: a held file that is a symlink is never read or posted
+  mkdir -p "$Q/held"; printf 'boot=%s\ntag=gb_dgpu\ntitle=t\ntext=x\n' "$(tr -cd '0-9a-f-' < "$R/proc/sys/kernel/random/boot_id")" > "$T/elsewhere/x"
+  ln -s "$T/elsewhere/x" "$Q/held/gb_dgpu"; : > "$T/log/cmd.log"
+  run gb_notify.sh
+  check "held symlink: not posted" eq "$(posts)" 0
+  # 16 (review) am get-started-user-state with no known state in its answer (another build's wording, an empty answer):
+  #    unlocked, the rule of gb_ui's unlocked() that published the user, so the notice is posted for 10 and not held
+  #    for ever; every known not-ready state (and "not started") still holds it
+  rm -rf "$Q/held"; : > "$T/log/cmd.log"
+  echo 'State: READY_FOR_USE' > "$T/ctl/user_state.10"; nq 16 gb_dgpu 'u' 'v'
+  run gb_notify.sh
+  check "unknown state wording: posted for 10, nothing held" eq "$(cat "$T/log/cmd.log")/$(held)" "notification|post|-u|10|-S|bigtext|-t|u|gb_dgpu|v|/"
+  : > "$T/ctl/user_state.10"; : > "$T/log/cmd.log"; nq 17 gb_dgpu 'u' 'w'
+  run gb_notify.sh
+  check "empty state answer: posted for 10" eq "$(cat "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|u|gb_dgpu|w|"
+  : > "$T/log/cmd.log"; i=18
+  for s in 'User is not started: 10' 'State: BOOTING' 'State: RUNNING_LOCKED' 'State: RUNNING_UNLOCKING' 'State: STOPPING' 'State: SHUTDOWN'; do
+    printf '%s\n' "$s" > "$T/ctl/user_state.10"; nq $i gb_gfx 's' "$i"
+    run gb_notify.sh
+    i=$((i + 1))
+  done
+  check "the 6 known not-ready answers: nothing posted, held" eq "$(posts)/$(held)" "0/gb_gfx "
+  rm -f "$T/ctl/user_state.10"; rm -rf "$Q/held"
+  check "queue empty at the end" eq "$(nmsg)" 0
 fi
 
 # (wave 7, notify O14) at most 8 running full users get the state broadcast
@@ -2040,57 +2171,62 @@ flags:
   nq() { printf 'kind=notify\ntag=gb_update\ntitle=System update held\ntext=x y\n' > "$Q/17929000003$1-70-$1.msg"; }
   posts() { grep -c '^notification|post|' "$T/log/cmd.log"; }
   # 1: a build without -u (its usage lists bigtext): posted again with -S bigtext, no -u (user 0, the login screen)
-  printf '%s\nstyles: (default none)\n  bigtext\n' "$U" > "$T/ctl/post_reply.uall_s"
+  printf '%s\nstyles: (default none)\n  bigtext\n' "$U" > "$T/ctl/post_reply.u_s"
   : > "$T/log/cmd.log"; nq 01
   run gb_notify.sh
   check "no -u: two posts" eq "$(posts)" 2
   check "no -u: the second without -u, with bigtext" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-S|bigtext|-t|System update held|gb_update|x y|"
   check "no -u: logged" has "$R/dev/kmsg" "this build's cmd notification post has no -u: 1792900000301-70-01.msg posted for user 0 only"
   # 2: a build without -u and without bigtext: plain post
-  printf '%s\nstyles: (default none)\n  inbox\n' "$U" > "$T/ctl/post_reply.uall_s"
+  printf '%s\nstyles: (default none)\n  inbox\n' "$U" > "$T/ctl/post_reply.u_s"
   : > "$T/log/cmd.log"; nq 02
   run gb_notify.sh
   check "no -u, no bigtext: plain second post" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-t|System update held|gb_update|x y|"
   # 3: -u listed, bigtext not: for all users without -S
-  printf '%s\n  -u|--user <user_id>\nstyles: (default none)\n  inbox\n' "$U" > "$T/ctl/post_reply.uall_s"
+  printf '%s\n  -u|--user <user_id>\nstyles: (default none)\n  inbox\n' "$U" > "$T/ctl/post_reply.u_s"
   : > "$T/log/cmd.log"; nq 03
   run gb_notify.sh
-  check "no bigtext: second post -u all without -S" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-t|System update held|gb_update|x y|"
+  check "no bigtext: second post -u 10 without -S" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|10|-t|System update held|gb_update|x y|"
   check "no bigtext: logged" has "$R/dev/kmsg" "1792900000303-70-03.msg posted without -S bigtext"
-  # 4: the style is unknown (an error, not the usage): for all users without -S
-  printf 'Error occurred. Check logcat for details. unrecognized notification style: bigtext\n' > "$T/ctl/post_reply.uall_s"
+  # 4: the style is unknown (an error, not the usage): for the foreground user without -S
+  printf 'Error occurred. Check logcat for details. unrecognized notification style: bigtext\n' > "$T/ctl/post_reply.u_s"
   : > "$T/log/cmd.log"; nq 04
   run gb_notify.sh
-  check "unknown style: second post -u all without -S" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-t|System update held|gb_update|x y|"
-  # 5: -u all refused ("Bad user"): one post per running full user (10 runs, 11 does not)
-  printf 'Error occurred. Check logcat for details. Bad user number: all\n' > "$T/ctl/post_reply.uall_s"
+  check "unknown style: second post -u 10 without -S" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|10|-t|System update held|gb_update|x y|"
+  # 5: (wave 9) -u <user> refused ("Bad user": the user went away between the check and the post): held; the run's
+  #    last look at the held notices tries it once more (refused again: held again), nothing else is posted
+  printf 'Error occurred. Check logcat for details. Bad user number: 10\n' > "$T/ctl/post_reply.u_s"
   printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412} running\n\tUserInfo{11:B:412}\n' > "$T/ctl/users"
   : > "$T/log/cmd.log"; nq 05
   run gb_notify.sh
-  check "bad user: posts -u all, then -u 10 only" eq "$(cut -d'|' -f3,4 "$T/log/cmd.log" | tr '\n' ' ')" "-u|all -u|10 "
-  check "bad user: logged" has "$R/dev/kmsg" "cmd notification post -u all refused for 1792900000305-70-05.msg: posted per running full user (1 of 10)"
-  # 6: -u all refused at the login screen (no running full user): logged with the reason, nothing else posted
+  check "bad user: -u 10, retried once at the end of the run, nothing else" eq "$(cut -d'|' -f3,4 "$T/log/cmd.log" | tr '\n' ' ')" "-u|10 -u|10 "
+  check "bad user: held, logged with the reason" has "$R/dev/kmsg" "1792900000305-70-05.msg held until a full user is in the foreground (user 10 refused: Error occurred. Check logcat for details. Bad user number: 10)"
+  check "bad user: the held notice exists" eq "$(sed -n 's/^title=//p' "$Q/held/gb_update")" "System update held"
+  rm -rf "$Q/held"
+  # 6: (wave 9) the login screen (current user 0, user 10 not running): nothing posted, the notice is held
   printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412}\n' > "$T/ctl/users"
+  echo 0 > "$T/ctl/current_user"
   : > "$T/log/cmd.log"; nq 06
   run gb_notify.sh
-  check "bad user, login screen: one post" eq "$(posts)" 1
-  check "bad user, login screen: the reason logged" has "$R/dev/kmsg" "cmd notification post failed for 1792900000306-70-06.msg (Error occurred. Check logcat for details. Bad user number: all)"
+  check "login screen: no post" eq "$(posts)" 0
+  check "login screen: held, the reason logged" has "$R/dev/kmsg" "1792900000306-70-06.msg held until a full user is in the foreground (no full user in the foreground (user 0))"
+  rm -rf "$Q/held" "$T/ctl/current_user"
   rm -f "$T/ctl/users"
   # 7: the fallback is refused too: two posts, one failure line
-  printf '%s\nstyles: (default none)\n  bigtext\n' "$U" > "$T/ctl/post_reply.uall_s"
+  printf '%s\nstyles: (default none)\n  bigtext\n' "$U" > "$T/ctl/post_reply.u_s"
   printf '%s\n' "$U" > "$T/ctl/post_reply.s"
   : > "$T/log/cmd.log"; nq 07
   run gb_notify.sh
   check "fallback refused: two posts" eq "$(posts)" 2
   check "fallback refused: logged as a failure" has "$R/dev/kmsg" "cmd notification post failed for 1792900000307-70-07.msg (usage: cmd notification post"
-  rm -f "$T/ctl/post_reply.uall_s" "$T/ctl/post_reply.s"
+  rm -f "$T/ctl/post_reply.u_s" "$T/ctl/post_reply.s"
   # 8: any other error: logged, no second post
-  printf 'Error occurred. Check logcat for details. something else\n' > "$T/ctl/post_reply.uall_s"
+  printf 'Error occurred. Check logcat for details. something else\n' > "$T/ctl/post_reply.u_s"
   : > "$T/log/cmd.log"; nq 08
   run gb_notify.sh
   check "other error: one post" eq "$(posts)" 1
   check "other error: logged" has "$R/dev/kmsg" "cmd notification post failed for 1792900000308-70-08.msg (Error occurred. Check logcat for details. something else)"
-  rm -f "$T/ctl/post_reply.uall_s"
+  rm -f "$T/ctl/post_reply.u_s"
   # 9: exit status 1 without output (as before wave 7): logged, no second post
   : > "$T/ctl/cmd_fail"
   : > "$T/log/cmd.log"; nq 09
@@ -2112,8 +2248,8 @@ if want NP-1B-18; then
   printf 'kind=notify\ntag=gb_gfx\ntitle=Performance base connected\ntext=NVIDIA graphics on for apps you open now. Restart apps that are already open to switch them.\n' > "$Q/1792900000001-30-1.msg"
   printf 'kind=notify\ntag=gb_gfx\ntitle=Tablet mode - Intel graphics\ntext=Apps use Intel graphics while the keyboard base is detached. Reattach it to use NVIDIA graphics again.\n' > "$Q/1792900000002-30-2.msg"
   run gb_notify.sh
-  check "N16 posted under gb_gfx" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|Performance base connected|gb_gfx|NVIDIA graphics on for apps you open now. Restart apps that are already open to switch them.|"
-  check "N17 posted under gb_gfx" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|Tablet mode - Intel graphics|gb_gfx|Apps use Intel graphics while the keyboard base is detached. Reattach it to use NVIDIA graphics again.|"
+  check "N16 posted under gb_gfx" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|Performance base connected|gb_gfx|NVIDIA graphics on for apps you open now. Restart apps that are already open to switch them.|"
+  check "N17 posted under gb_gfx" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|Tablet mode - Intel graphics|gb_gfx|Apps use Intel graphics while the keyboard base is detached. Reattach it to use NVIDIA graphics again.|"
 fi
 
 if want NP-W3-01; then                            # wave 3 (lead decision D-a): tag gb_update, gb_slotsync's N22/N23
@@ -2136,8 +2272,8 @@ text=x
 ' > "$Q/1792900000003-40-3.msg"
   run gb_notify.sh
   check "exit 0" eq "$RC" 0
-  check "N22 posted under gb_update" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|System update held|gb_update|Kernel mismatch: the update (slot B) needs kernel 6.18-android17-6, this system runs 6.18-android17-5. Startup stays on slot A; (slot B) is in the boot menu.|"
-  check "N23 posted under gb_update" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|all|-S|bigtext|-t|System update held|gb_update|Kernel check failed: the kernel version of the update (slot B) could not be checked. Startup stays on slot A; (slot B) is in the boot menu.|"
+  check "N22 posted under gb_update" eq "$(sed -n 1p "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|System update held|gb_update|Kernel mismatch: the update (slot B) needs kernel 6.18-android17-6, this system runs 6.18-android17-5. Startup stays on slot A; (slot B) is in the boot menu.|"
+  check "N23 posted under gb_update" eq "$(sed -n 2p "$T/log/cmd.log")" "notification|post|-u|10|-S|bigtext|-t|System update held|gb_update|Kernel check failed: the kernel version of the update (slot B) could not be checked. Startup stays on slot A; (slot B) is in the boot menu.|"
   check "exactly 2 posts (gb_updates is not a tag)" eq "$(nlines "$T/log/cmd.log")" 2
   check "the near-miss tag is dropped and logged" has "$R/dev/kmsg" "1792900000003-40-3.msg: bad tag"
   check "no .msg left" eq "$(nmsg)" 0
@@ -2752,6 +2888,7 @@ if want NP-B4; then
     np auto
     check "TU117 $_id loads (clean, one nouveau insmod)" eq "$(prop vendor.gb.nouveau.result)/$(nins)" clean/1
     check "TU117 $_id: no model line" hasnt "$R/dev/kmsg" "not the 13.5-inch"
+    check "TU117 $_id: no model gate line at all (wave 9, nvidia-b4 R3)" hasnt "$R/dev/kmsg" "model gate"
   done
   for _id in 0x1f7f 0x2000 0x1e00 0x2180 0x10fa; do                # just outside the block, and the HDA id
     new_case "NP-B4-edge-$_id"

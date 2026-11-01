@@ -30,6 +30,10 @@
 #       (--test-loader-default, both modes), every write is "default gb-<x>.conf", an old "default gb-<x>" line is
 #       rewritten once to the running slot (the user VM's slot-b ESP, a switch, a HOLD), a "preferred" line is
 #       removed, the [NVIDIA test] entry is never the default, --dry-run writes nothing
+#   S14 (Wave 9, BACKLOG 13.3 "SD lows") loader.conf lines end at a CR or an LF, as systemd-boot 262.1 splits them, and
+#       exactly one "default" line is kept: a lone-CR file keeps its terminators, a missing final newline, empty lines,
+#       two equal default lines collapsed once (the next run writes nothing), the dangling-default guard sees a default
+#       after a lone CR
 set -u
 S=$(cd "$1" && pwd); W=$2
 NDK_CC=/build/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang
@@ -275,7 +279,10 @@ rm -rf "$LK" "$LK".stale.*
 for v in nvtest:'default gb-b-nvtest' nvconf:'default gb-b-nvtest.conf' hash:'#default gb-b.conf' \
          crlf:'default gb-b.conf\r' last:'default gb-b.conf\ndefault gb-a.conf' ok:'default gb-b.conf' \
          old:'default gb-b' oldcr:'default gb-b\r' glob:'default gb-b*' upper:'default GB-B.CONF' \
-         lead:'  default gb-b.conf' pref:'default gb-b.conf\npreferred gb-a.conf' preflead:'\tpreferred gb-b.conf'; do
+         lead:'  default gb-b.conf' pref:'default gb-b.conf\npreferred gb-a.conf' preflead:'\tpreferred gb-b.conf' \
+         dup:'default gb-b.conf\ndefault gb-b.conf' crsplit:'timeout 9\rdefault gb-a.conf' crok:'default gb-b.conf\rtimeout 9' \
+         crdup:'default gb-b.conf\rdefault gb-a.conf' crpref:'default gb-b.conf\rpreferred gb-a.conf' \
+         crhash:'#x\rdefault gb-a.conf'; do
   k=${v%%:*}; line=${v#*:}
   E=$W/s9-$k/esp; mkesp "$E" nvtest
   printf "$line"'\ntimeout 4\neditor yes\n' > "$E/loader/loader.conf"
@@ -287,10 +294,15 @@ for v in nvtest:'default gb-b-nvtest' nvconf:'default gb-b-nvtest.conf' hash:'#d
     hash) printf '#default gb-b.conf\ntimeout 4\neditor yes\ndefault gb-b.conf\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
     preflead) printf 'timeout 4\neditor yes\ndefault gb-b.conf\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
     crlf|ok|lead) [ "$before" = "$after" ]; r=$? ;;
-    last) printf 'default gb-b.conf\ndefault gb-b.conf\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    last|dup) printf 'default gb-b.conf\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;  # (wave 9) one line
+    crsplit) printf 'timeout 9\rdefault gb-b.conf\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    crok) [ "$before" = "$after" ]; r=$? ;;                     # (wave 9) "timeout 9" after the CR is kept: nothing written
+    crdup|crpref) printf 'default gb-b.conf\rtimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
+    crhash) printf '#x\rdefault gb-b.conf\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
     oldcr) printf 'default gb-b.conf\r\ntimeout 4\neditor yes\n' | cmp -s - "$E/loader/loader.conf"; r=$? ;;
   esac
-  case $k in pref|preflead) grep -q "systemd-boot default -> gb-b.conf ('preferred' line removed)" "$W/s9-$k/out" || r=1 ;; esac
+  case $k in pref|preflead|crpref) grep -q "systemd-boot default -> gb-b.conf ('preferred' line removed)" "$W/s9-$k/out" || r=1 ;; esac
+  case $k in last|dup|crdup) grep -q "(duplicate 'default' lines removed)" "$W/s9-$k/out" || r=1 ;; esac
   [ $rc = 0 ] && [ $r = 0 ] && clean "$W/s9-$k/err"
   ok $? "S9 loader.conf '$line' -> $(tr '\r\n\t' '^|>' < "$E/loader/loader.conf")"
 done
@@ -599,8 +611,21 @@ default gb-*\n|a|0|0
 default GB-A.CONF\n|a|0|0
 default gb-b.conf\n|b|0|1
 default gb-b\n|b|1|1
+default gb-a.conf\ndefault gb-a.conf\n|a|0|0
+default gb-a.conf\ndefault gb-a.conf\n|a|1|1
+default gb-a.conf\ntimeout 3\n  default gb-a.conf\n|a|0|0
+timeout 3\rdefault gb-a.conf\n|a|0|1
+default gb-a.conf\rtimeout 3|a|0|1
+default gb-a.conf\r|a|0|1
+default gb-a.conf\r\r\n|a|0|1
+default gb-b.conf\rdefault gb-a.conf\n|a|1|1
+default gb-b.conf\rdefault gb-a.conf\n|a|0|0
+default gb-a.conf\rpreferred gb-b.conf\n|a|0|0
+#x\rdefault gb-a.conf\n|a|1|1
+#x\rdefault gb-b.conf\n|a|1|0
+default gb-a.conf\r#default gb-b.conf\n|a|0|1
 VEC
-[ "$nv" -ge 30 ]; ok $(( v + $? )) "S13a loader_default(): $nv vectors (mode 0 only gb-<s>.conf and no preferred; mode 1 both forms)"
+[ "$nv" -ge 44 ]; ok $(( v + $? )) "S13a loader_default(): $nv vectors (mode 0 only gb-<s>.conf and no preferred; mode 1 both forms; (wave 9) lines end at a CR or an LF, exactly one default line)"
 
 s13run() {   # s13run TAG SUFFIX BOOT_ID ATTRS ARGS...: one run on $W/s13-TAG (fake device as S12); output $X/out{,.err,.rc}
   X=$W/s13-$1; sfx=$2; b=$3; at=$4; shift 4
@@ -701,6 +726,55 @@ s13run noent _b test-boot-id '01ff000000000000 010e000000000000' --test-ticks 1
 [ "$h1" = "$(sha256sum < "$W/s13-noent/esp/loader/loader.conf")" ] && [ ! -e "$W/s13-noent/esp/loader/entries/gb-a.conf" ] &&
   [ "$(cat "$W/s13-noent/out.rc")" = 1 ] && grep -q 'no template entry' "$W/s13-noent/out" && clean "$W/s13-noent/out.err"
 ok $? "S13i switch to a without a template entry: fails, loader.conf unchanged (the default never names a missing entry)"
+
+# ---- S14 (wave 9, BACKLOG 13.3 "SD lows"): loader.conf lines end at a CR or an LF (systemd-boot 262.1
+#      line_get_key_value), exactly one "default" line; every other line keeps its bytes and its own terminator
+# S14a a file with lone-CR terminators only (old default form): each line keeps its CR, the default line is rewritten
+s13dev cr 'default gb-a\rtimeout 3\reditor yes\r'
+s13run cr _a boot-1 '' --test-ticks 1
+printf 'default gb-a.conf\rtimeout 3\reditor yes\r' | cmp -s - "$W/s13-cr/esp/loader/loader.conf" &&
+  [ "$(cat "$W/s13-cr/out.rc")" = 0 ] && clean "$W/s13-cr/out.err"
+ok $? "S14a lone-CR loader.conf 'default gb-a' -> 'default gb-a.conf\\r', the other lines and their CRs kept"
+# S14b no default line and no final newline: one LF is added before the appended default
+s13dev nonl 'timeout 3\neditor yes'
+s13run nonl _a boot-1 '' --test-ticks 1
+printf 'timeout 3\neditor yes\ndefault gb-a.conf\n' | cmp -s - "$W/s13-nonl/esp/loader/loader.conf"
+ok $? "S14b no default line, no final newline: 'default gb-a.conf' appended on a line of its own"
+# S14c a default line without a final newline keeps the file's other bytes; empty lines are kept
+s13dev nonl2 'timeout 3\n\neditor yes\ndefault gb-a'
+s13run nonl2 _a boot-1 '' --test-ticks 1
+printf 'timeout 3\n\neditor yes\ndefault gb-a.conf\n' | cmp -s - "$W/s13-nonl2/esp/loader/loader.conf"
+ok $? "S14c 'default gb-a' as the last line without a newline -> 'default gb-a.conf\\n', the empty line kept"
+# S14d two equal default lines (systemd-boot uses the last): collapsed at the first one's place, logged once; the next
+#      run (a new boot) writes nothing
+s13dev dup 'default gb-a.conf\ntimeout 3\ndefault gb-a.conf\neditor yes\n'
+s13run dup _a boot-1 '' --test-ticks 2
+X=$W/s13-dup
+printf 'default gb-a.conf\ntimeout 3\neditor yes\n' | cmp -s - "$X/esp/loader/loader.conf" &&
+  [ "$(grep -c "systemd-boot default -> gb-a.conf (duplicate 'default' lines removed)" "$X/out")" = 1 ] && clean "$X/out.err"
+ok $? "S14d two equal 'default gb-a.conf' lines -> one (logged once over 2 ticks)"
+h1=$(t13 dup); s13run dup _a boot-2 '' --test-ticks 1
+[ "$h1" = "$(t13 dup)" ] && ! grep -q 'systemd-boot default' "$X/out"
+ok $? "S14d the next boot: nothing written"
+# S14e a default after a lone CR names the other slot: --dry-run keeps the default (no write) and the guard of
+#      check_other sees it, so the other slot's stale entries are left (before wave 9 they were reported for removal)
+s13dev guard 'timeout 3\rdefault gb-a.conf\n' b
+E=$W/s13-guard/esp
+for f in "" -nvtest; do sed -e 's/(slot B)/(slot A)/' -e 's|^initrd  /initrd-b\.img|initrd  /initrd-a.img|' \
+  "$E/loader/entries/gb-b$f.conf" > "$E/loader/entries/gb-a$f.conf"; done
+cp "$E/initrd-b.img" "$E/initrd-a.img"
+before=$(t13 guard)
+s13run guard _b boot-1 "$A_DEAD" --dry-run
+X=$W/s13-guard
+[ "$before" = "$(t13 guard)" ] && grep -q 'loader.conf names gb-a: left alone' "$X/out" &&
+  ! grep -q 'would remove the boot entries of slot a' "$X/out" && clean "$X/out.err"
+ok $? "S14e --dry-run, 'timeout 3\\rdefault gb-a.conf' while b runs and a is not bootable: the guard sees gb-a (entries left)"
+# S14f the same without --dry-run: the running slot is made the default first (one line), then a's stale entries go
+s13run guard _b boot-2 "$A_DEAD" --test-ticks 1
+printf 'timeout 3\rdefault gb-b.conf\n' | cmp -s - "$E/loader/loader.conf" && [ ! -e "$E/loader/entries/gb-a.conf" ] &&
+  [ ! -e "$E/loader/entries/gb-a-nvtest.conf" ] && [ -f "$E/loader/entries/gb-b.conf" ] &&
+  grep -q 'slot a: removed its boot entries (2)' "$X/out" && clean "$X/out.err"
+ok $? "S14f the real run: 'timeout 3\\rdefault gb-b.conf', then slot a's entries removed (not bootable)"
 
 # ---- S6: --dry-run end to end on a fake ESP dir, no OTA pending
 E=$W/s6/esp; mkesp "$E" nvtest

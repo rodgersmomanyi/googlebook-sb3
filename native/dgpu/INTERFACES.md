@@ -1346,7 +1346,11 @@ runs as **user shell** (the identity `adb shell cmd notification post` uses) and
   the held slot's initrd and entries are on the ESP (r4, E-14: the text says "(slot X) is in the boot menu"). It writes the
   message exactly as above (`<epoch_ms>-<pid>-<n>.msg` via an exclusive `.tmp`, `O_NOFOLLOW`, `fchmod 0644`,
   `rename`) and sets `vendor.gb.notify` with `__system_property_set`; without `/data/vendor/gb/notify` (a tree without
-  the nouveau component, e.g. the VM) it logs to kmsg only. The kmsg line is the contract of WAVE3_PLAN 2.6:
+  the nouveau component, e.g. the VM) it logs to kmsg only. **(Wave 9, BACKLOG HS-O7)** The VM tree has the queue too:
+  its gb.rc (build_esp `GB_RC`) creates `/data/vendor/gb` 0751 root:shell and `notify/` 0770 root:shell at
+  post-fs-data and runs the same `gb_notify.sh` (packed from this component as `/odm/vup/bin/gb_notify.sh`, service
+  `gb_notify` as here, started on `vendor.gb.notify` and `vendor.gb.ui.fg`), so the VM's "System update held" notice
+  reaches the person like natively (and gb_otagate queues its notice there instead of posting it directly). The kmsg line is the contract of WAVE3_PLAN 2.6:
   `gb_slotsync: HOLD slot <x>: <reason>; default stays gb-<cur>`.
   Failures are logged to kmsg (`gb_notify: `) and dropped.
 
@@ -1378,6 +1382,24 @@ the whitelists of 12.1 are unchanged):
   (at most 120 printable characters). At most 1 + 8 posts per notice. **(Wave 8, lows-a: BACKLOG HS-O5-otagate)**
   gb_otagate_post (build_esp `GB_OTAGATE_SH`, the VM tree and native without the queue) judges its post the same
   way and has the same fallbacks (its log lines go to kmsg or, as the shell user, to logcat `gb_otagate`).
+  **(Wave 9, BACKLOG HS-O4) replaced by the foreground user.** A UserHandle.ALL record is shown to every full user (a
+  guest too) and one dismissal removes it for all of them, but every notice here is a matter for the person in front of
+  the screen. gb_notify posts a notice ONCE, for the **foreground full user**: `timeout 20 am get-current-user` = `<u>`,
+  `<u>` is a running FULL user in `pm list users` (as for `kind=broadcast`; a non-HSUM build's user 0 with FULL counts),
+  and `am get-started-user-state <u>` says `RUNNING_UNLOCKED` (review: judged as gb_ui's `unlocked()` does, only a
+  known not-ready answer, `BOOTING`, `RUNNING_LOCKED`, `RUNNING_UNLOCKING`, `STOPPING`, `SHUTDOWN` or `not started`,
+  holds; an answer without a known state counts as unlocked, so another build's wording cannot hold a notice for ever
+  after gb_ui published that user); then `timeout 20 cmd notification post -u <u> -S bigtext
+  -t "<title>" "<tag>" "<text>"` (a `<u>|com.android.shell|2020|<tag>|2000` record). Nothing is posted for the headless
+  user 0 or for all users. Otherwise (the login screen before the sign-in, a user that is still starting or locked, a
+  profile in front, `am`/`pm` failing) the notice is **held**: `/data/vendor/gb/notify/held/<tag>` (0700 directory and
+  0600 file of user shell; `boot=<boot_id>`, `tag=`, `title=`, `text=`; the newest per tag), logged with the reason.
+  gb_notify posts the held notices (re-validated; another boot's are dropped and logged) at its next run with a full
+  user in front: gb_ui (build_esp `GB_UI_SH`, both trees) publishes the foreground full user in **`vendor.gb.ui.fg`**
+  (its id once `RUNNING_UNLOCKED`, `none` otherwise; set at every change) and both trees start `gb_notify` on
+  `on property:vendor.gb.ui.fg=*`. A notice posted directly removes an older held one of its tag. The O5 fallbacks
+  stay, with `-u <u>` in place of `-u all`; `Bad user` (the user went away between the check and the post) holds the
+  notice. gb_otagate_post (no queue: no tree of ours since wave 9) keeps `-u all`.
 * `kind=broadcast`: `pm list users` (timeout 20); for each line `UserInfo{<id>:<name>:<hex flags>} running` whose
   flags have FULL (0x400) -- never the headless system user (811), never a profile -- one
   `timeout 20 am broadcast --user <id> --include-stopped-packages -a gb.sb3.gpu.action.STATE_CHANGED -p gb.sb3.gpu`
@@ -1514,6 +1536,15 @@ signs in later refreshes at its `BOOT_COMPLETED` (12.1a); the instance in the he
   GbGpu's notifications off keeps them off (a missing `ui` directory: granted, not recorded, logged). The markers
   `granted.<u>` and `tile_added.<u>` of a user id that `pm list users` no longer lists are removed (only when that list
   names user 0), so a later user that gets a reused id is granted and gets the tile. At most 16 users (O14: tested).
+  **(Wave 9, BACKLOG HS-O11) the wait is an event.** The boot run (`gb_gpu_ui_setup`) grants every full user (and
+  prunes) and no longer waits; a build without headless system user mode, whose user 0 is a FULL user in the
+  foreground, is set up there. The person's grant and tile come from **`gb_gpu_ui_setup.sh user`** (service
+  `gb_gpu_ui_user`, user shell, started by `on property:vendor.gb.ui.fg=*` at every change of the foreground full user
+  that gb_ui publishes, 12.1a): for the published user, while it is a FULL user (`pm list users`) and still the
+  current user, the grant if it has no `granted.<u>` and, once per user ever, `cmd statusbar add-tile` + `tile_added.<u>`
+  (3 tries 10 s apart, each after a fresh `am get-current-user` check). `none`, a non-number or more than 5 digits: no
+  call at all. After each user it reads the property again (a change while it was busy, at most 5 users per run).
+  So a sign-in after 30 minutes and a user created at any time get their tile in the same boot.
 * (Wave 6, notify) `.UserReceiver` (`android:exported="false"`, action `android.intent.action.BOOT_COMPLETED` only,
   permission `RECEIVE_BOOT_COMPLETED`, normal): at each user's unlock it runs the same refresh as `.StateReceiver`
   (`status`, notifications 12.3, tile, `ui-caps`, catalog when `apps_sync` = 0). `.StateReceiver` and `.UserReceiver`
@@ -1706,9 +1737,12 @@ on property:vendor.gb.dgpu.dmesg=0
 
 on property:vendor.gb.notify=*
     start gb_notify
+
+on property:vendor.gb.ui.fg=*
+    start gb_notify
 ```
 
-7 services. An unset `gfx_mode` (the default, auto) needs no trigger: the boot-time `start gb_nouveau` reads it as
+(Wave 9, BACKLOG HS-O4: the `vendor.gb.ui.fg` trigger, 12.1a.) 7 services. An unset `gfx_mode` (the default, auto) needs no trigger: the boot-time `start gb_nouveau` reads it as
 `auto`, and `set-mode` always writes an explicit value. `gb_gfx_selftest` is started only by gb_power
 (`ctl.start`) and stopped by gb_power and `gb_nouveau.sh off` (`ctl.stop`).
 
@@ -1833,13 +1867,25 @@ service gb_gpu_ui_setup /system/bin/sh /vendor/bin/gb_gpu_ui_setup.sh
     oneshot
     disabled
 
+service gb_gpu_ui_user /system/bin/sh /vendor/bin/gb_gpu_ui_setup.sh user
+    user shell
+    group shell
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
 on post-fs-data
     mkdir /data/vendor/gb 0751 root shell
     mkdir /data/vendor/gb/ui 0700 shell shell
 
 on property:sys.boot_completed=1
     start gb_gpu_ui_setup
+
+on property:vendor.gb.ui.fg=*
+    start gb_gpu_ui_user
 ```
+
+(Wave 9, BACKLOG HS-O11: the `gb_gpu_ui_user` service and its `vendor.gb.ui.fg` trigger, 13.2.)
 
 ### 15.5 `gb_nvk.rc` (component 4): change to the existing file
 
@@ -2503,6 +2549,12 @@ stop that for PCI (evidence E6). gb_power marks that probe as a load window:
   sent `ui-caps notify` this boot. **(R-9)** With `ui-caps notify`, N08 is left to GbGpu only when the refusal names
   app holders (GbGpu shows "Can't detach yet" for `busy:N`); a refusal caused by a GPU-user service alone (refcnt 0
   while it still reads running) posts N08 naming the service.
+  **(Wave 9, BACKLOG HS-O12)** `ui-caps` is kept per DECLARING USER (peer uid / 100000; root and shell count as user 0;
+  at most 16): each running full user has its own GbGpu, whose notification only that user sees. N08 is left to GbGpu
+  only when a declaring user is the foreground full user gb_ui publishes (`vendor.gb.ui.fg`, 12.1a); another full user
+  in front gets N08 through the queue (gb_notify posts it for that user). Without foreground information (no
+  `vendor.gb.ui.fg`, `none` = the login screen, or not a number) the wave-6 rule stays: the declaring user's GbGpu shows
+  it when that user is in front again. `ui-caps none` removes only its own user.
 * **(R-12)** A detected system resume (`suspend_stats/success` changed) clears a pending detach, so the latch never
   opens long after the user acted.
 * **Pending detach** (`close-holders-and-detach`, 26.1): after the force-stops are queued and `gpu_users_stop()` ran,
@@ -2844,7 +2896,7 @@ does not depend on the verdict (it needs only `standby`/`busy:N`, 9.3).
 | `run-selftest` | root, shell, ui | start `gb_gfx_selftest` now (25.2 conditions except the record ones; bypasses `attempts` and a stored `fail`) | `test` (`running`) | `ENODEV` (`cap` 0, or nouveau not bound), `EBUSY` (already running, detaching, pending detach, wedged, fault, mode `intel`), `EAGAIN` (loading, rebind guard) |
 | `list-holders` | root, shell, ui | alias of `holders` (`cmd_holders()`): fresh scan; reply `cmd` is `list-holders` | `holders` | `ENODEV` (nouveau not loaded) |
 | `close-holders-and-detach <pid>[,<pid>...]` | root, shell, ui | as `close-holders` (same parser and checks, `cmd_close_holders()`), then the pending detach of 23.9 | `closed`, `refused` (as `close-holders`), `detach` (`pending`) | as `close-holders`, plus `ENODEV` (no DTX, or base not attached), `EBUSY` (a decision runs or a detach is already pending) |
-| `ui-caps <c>`, c in `notify`, `none` | ui, root, shell | `notify`: GbGpu posts the actionable detach notification itself this boot, so gb_power suppresses N08 (23.9); `none` revokes it. Not remembered across a gb_power restart | `notify` (0/1) | `EINVAL` |
+| `ui-caps <c>`, c in `notify`, `none` | ui, root, shell | `notify`: GbGpu posts the actionable detach notification itself this boot, so gb_power suppresses N08 (23.9); `none` revokes it. Not remembered across a gb_power restart. (Wave 9, HS-O12) per declaring user (uid / 100000): N08 is suppressed only while a declaring user is the foreground full user (`vendor.gb.ui.fg`), 23.9 | `notify` (0/1) | `EINVAL` |
 
 `compute-svc`, `compute-client` and `other` get `EPERM` for every new command.
 

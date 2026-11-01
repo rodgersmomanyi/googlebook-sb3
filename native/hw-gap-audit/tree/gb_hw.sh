@@ -14,8 +14,17 @@
 #                            Idempotent, bounded (GB_HW_BTN_WAIT s for the GPIO controller, default 30), never fatal.
 #   gb_hw.sh posture         boot_completed with vendor.gb.posture or persist.vendor.gb.posture set: opt-in override
 #                            of lapis's device-state posture (open|tablet|docked|closed|reset); off by default.
+#   gb_hw.sh sam             'on boot', own oneshot service (first native boot, wave 9 hw-native1): binds the Surface
+#                            Aggregator serial device (ACPI MSHW0084, e.g. serial0-0) to surface_serial_hub again once
+#                            the INT3455 GPIO controller has its driver (k16's first-stage probe fails for good with
+#                            -EINVAL), then waits for the keyboard, touchpad, batteries, charger and DTX. Idempotent,
+#                            bounded (GB_HW_SAM_WAIT s for the GPIO controller, default 30), never fatal.
+#   gb_hw.sh ish             'early-boot', own oneshot service: if lapis's intel_ish_ipc probe of the Integrated Sensor
+#                            Hub (8086:34fc) failed at coldboot, one PCI function reset and one re-bind, in parallel with
+#                            gb_sensors_wait, so the accelerometer can still be there when the sensors HAL scans.
 #   gb_hw.sh diag            after boot_completed: one hardware summary to the kernel log (ends up in gb_bootlog),
-#                            including the buttons binding and the posture (device_state, built-in input enabled).
+#                            including the buttons binding, the posture (device_state, built-in input enabled), the
+#                            Surface Aggregator and its clients, and the sensor hub.
 #
 # Properties:
 #   persist.vendor.gb.rapl.mode   fw (default) = restore the Surface firmware limits | lapis = leave lapis's values |
@@ -24,9 +33,14 @@
 #   vendor.gb.buttons             written by buttons: "bound driver=.. inputs=N ..." | "FAILED ..." | "absent ..."
 #   vendor.gb.posture             one boot (gb\gb.cfg GB_PROP_n=vendor.gb.posture=open with gb.overlay=1, or setprop
 #   persist.vendor.gb.posture     at runtime) | every boot: a device-state name to force, reset to cancel; unset/off = no-op
+#   vendor.gb.sam                 written by sam: "bound|kernel|already binds=.. waited_ms=.. kbd= tp= bat= adp= dtx=
+#                                 base=" | "FAILED ..." | "absent" (at most 91 characters)
+#   vendor.gb.ish                 written by ish: "already accel=N" | "rebound reset=.. accel=N ms=.." | "FAILED ..." |
+#                                 "absent"
 #
 # Test hooks: GB_HW_ROOT prefixes /sys, /dev and /proc (host tests with a fake tree); GB_HW_LOG=- logs to stdout;
-# GB_HW_MSR (rapl-snapshot); GB_HW_BTN_WAIT, GB_HW_BTN_KO (buttons).
+# GB_HW_MSR (rapl-snapshot); GB_HW_BTN_WAIT, GB_HW_BTN_KO (buttons); GB_HW_SAM_WAIT, GB_HW_SAM_CLIENT_WAIT (sam);
+# GB_HW_ISH_WAIT (ish).
 # mksh arithmetic is 32-bit signed: all MSR math is done on single bytes and stays far below 2^31.
 
 R=${GB_HW_ROOT:-}
@@ -233,6 +247,194 @@ buttons() {         # $1 = how long to wait for the GPIO controller's driver, in
 	return 0
 }
 
+# ---------------------------------------------------------------------------------------------------- sam
+# Surface Aggregator (SAM): base keyboard and touchpad, both batteries, the charger, the performance profile and the
+# clipboard detach (first native boot 2026-10-31, wave 9 hw-native1). The SAM's serial device (ACPI MSHW0084 on the
+# dw-apb-uart of lapis's first-stage intel-lpss-pci, e.g. serial0-0) probes in first stage, before lapis's vendor_dlkm
+# pinctrl-icelake (ueventd coldboot) has registered the INT3455 GPIO controller of the SAM wakeup GpioInt. k16's
+# ssam_irq_setup() then falls back from gpiod_get()'s -EPROBE_DEFER to fwnode_irq_get(), which finds no plain interrupt
+# on ACPI: "error -EINVAL: failed to setup IRQ", probe -22, never retried (kernel fix for a later build: w9prep
+# hw-native1 kernel patch 0114). The probe's error path undoes everything (k16 core.c ssam_serial_hub_probe
+# err_irq..err_ctrl_init; devres released by the driver core), so a bind write once INT3455:00 has its driver is a clean
+# second probe; the registry's platform hub, deferred while there was no controller, then registers the clients.
+# Idempotent (a bound device is only reported; after a wait for the GPIO controller, 2 s of grace for a kernel that
+# defers by itself), bounded (the GPIO-controller wait, 3 bind writes per device, the client wait), never fatal (always
+# returns 0; own oneshot service, started with 'start'). Result: one 'gb_hw: sam:' line, /dev/gb_hw/sam, vendor.gb.sam.
+SAM_HID=MSHW0084
+SAM_DRV=surface_serial_hub
+SAM_KBD='Microsoft Surface 045E:09AE Keyboard'
+SAM_TP='Microsoft Surface 045E:09AF Touchpad'
+
+sam_devs() {        # the SAM's serial devices (names below /sys/bus/serial/devices), one per line
+	for x in "$R"/sys/bus/serial/devices/*; do
+		[ -e "$x" ] || continue
+		case "${x##*/}" in *[!A-Za-z0-9._:-]*) continue;; esac
+		case "$(cat "$x/modalias" 2>/dev/null)" in "acpi:$SAM_HID:"*) echo "${x##*/}"; continue;; esac
+		[ "$(cat "$x/firmware_node/hid" 2>/dev/null)" = "$SAM_HID" ] && echo "${x##*/}"
+	done
+}
+sam_drv_of() {      # the driver bound to serial device $1, or none
+	l=$(readlink "$R/sys/bus/serial/devices/$1/driver" 2>/dev/null); l=${l##*/}
+	echo "${l:-none}"
+}
+sam_bound_wait() {  # $1 = serial device, $2 = polls of 0.25 s; 0 as soon as it has a driver
+	k=0
+	while [ ! -e "$R/sys/bus/serial/devices/$1/driver" ]; do
+		[ $k -ge "$2" ] && return 1
+		sleep 0.25; k=$((k + 1))
+	done
+	return 0
+}
+sam_has_input() {   # 1 if an input device is named exactly $1, else 0
+	for x in "$R"/sys/class/input/input*/name; do
+		[ "$(cat "$x" 2>/dev/null)" = "$1" ] && { echo 1; return 0; }
+	done
+	echo 0
+}
+sam_clients() {     # sets kbd tp b1 b2 adp dtx (1/0), base (gb_power's vendor.gb.dtx.base or -), nc (SAM bus devices)
+	kbd=$(sam_has_input "$SAM_KBD"); tp=$(sam_has_input "$SAM_TP")
+	b1=0; [ -e "$R/sys/class/power_supply/BAT1" ] && b1=1
+	b2=0; [ -e "$R/sys/class/power_supply/BAT2" ] && b2=1
+	adp=0; [ -e "$R/sys/class/power_supply/ADP1" ] && adp=1
+	dtx=0; [ -e "$R/sys/class/misc/surface_dtx" ] && dtx=1
+	base=$(prop vendor.gb.dtx.base); case "$base" in attached|detached) ;; *) base=-;; esac
+	nc=0; for x in "$R"/sys/bus/surface_aggregator/devices/*; do [ -e "$x" ] && nc=$((nc + 1)); done
+}
+sam_clients_wait() { # $1 = polls of 0.5 s, until BAT1, ADP1 and DTX exist and the keyboard, touchpad and BAT2 too (or
+	k=0              # gb_power reports a detached base); 0 when complete, k = polls used
+	while :; do
+		sam_clients
+		if [ "$b1$adp$dtx" = 111 ] && { [ "$kbd$tp$b2" = 111 ] || [ "$base" = detached ]; }; then return 0; fi
+		[ $k -ge "$1" ] && return 1
+		sleep 0.5; k=$((k + 1))
+	done
+}
+sam_state() {       # $1 = short state: /dev/gb_hw/sam and vendor.gb.sam (at most 91 characters)
+	mkdir -p "$STATE" 2>/dev/null; echo "$1" > "$STATE/sam" 2>/dev/null
+	setprop vendor.gb.sam "$1" 2>/dev/null
+}
+sam_klast() {       # the kernel's last surface_serial_hub line for device $1 saying why its probe failed (not the
+	dmesg 2>/dev/null | grep -F "$SAM_DRV $1: " | grep -v -F 'probe with driver' | tail -n 1 |    # driver core's
+		sed "s/^[^]]*\] $SAM_DRV $1: //" | cut -c1-160                                           # summary), <= 160
+}
+sam() {             # $1 = GPIO-controller wait in 0.5 s polls (0 = none), $2 = client wait in 0.5 s polls
+	drv=$R/sys/bus/serial/drivers/$SAM_DRV
+	devs=$(sam_devs | tr '\n' ' '); devs=${devs% }
+	if [ -z "$devs" ]; then
+		if [ -e "$R/sys/bus/acpi/devices/$SAM_HID:00" ]; then
+			log "sam: ACPI $SAM_HID:00 exists but no serial device has it: the SAM UART did not register (see the 8250.nr_uarts, dw-apb-uart and intel-lpss lines of the kernel log)"
+			sam_state "FAILED nouart"
+		else
+			log "sam: no $SAM_HID device (no Surface Aggregator here), nothing to do"
+			sam_state absent
+		fi
+		return 0
+	fi
+	todo=; for s in $devs; do [ -e "$R/sys/bus/serial/devices/$s/driver" ] || todo="$todo $s"; done
+	w=0; b=0; how=already
+	if [ -n "$todo" ]; then
+		while [ "$(btn_gpioc)" = unbound ] && [ $w -lt "$1" ]; do sleep 0.5; w=$((w + 1)); done
+		how=kernel
+		for s in $todo; do
+			[ $w -gt 0 ] && sam_bound_wait "$s" 8 && continue     # a kernel that defers the probe binds it by itself
+			n=0
+			while [ ! -e "$R/sys/bus/serial/devices/$s/driver" ] && [ $n -lt 3 ] && [ -e "$drv/bind" ]; do
+				[ $n -gt 0 ] && sleep 1
+				n=$((n + 1)); b=$((b + 1)); how=bound
+				echo "$s" > "$drv/bind" 2>/dev/null
+				sam_bound_wait "$s" 8
+			done
+		done
+	fi
+	ms=$((w * 500)); g=$(btn_gpioc)
+	bad=; for s in $devs; do [ -e "$R/sys/bus/serial/devices/$s/driver" ] || bad="$bad $s"; done
+	if [ -n "$bad" ]; then
+		dl=no; [ -e "$drv" ] && dl=yes
+		why=; for s in $bad; do why="$why $s: $(sam_klast "$s");"; done
+		log "sam: binding$bad to $SAM_DRV FAILED after $ms ms waiting for $BTN_GPIOC ($g), $b bind write(s), $SAM_DRV loaded: $dl; kernel:$why"
+		sam_state "FAILED gpio=$g drv=$dl binds=$b waited_ms=$ms"
+		return 0
+	fi
+	sam_clients_wait "$2"; cms=$((k * 500))
+	m=
+	for x in "keyboard:$kbd" "touchpad:$tp" "BAT2:$b2"; do [ "${x#*:}" = 1 ] || [ "$base" = detached ] || m="$m ${x%:*}"; done
+	for x in "BAT1:$b1" "ADP1:$adp" "DTX:$dtx"; do [ "${x#*:}" = 1 ] || m="$m ${x%:*}"; done
+	c="keyboard=$kbd touchpad=$tp BAT1=$b1 BAT2=$b2 ADP1=$adp dtx=$dtx base=$base ssam_devices=$nc after $cms ms"
+	[ -n "$m" ] && c="$c, missing:$m"
+	case $how in
+	already) log "sam: $SAM_DRV already bound to $devs, nothing to do; clients: $c" ;;
+	kernel) log "sam: $SAM_DRV bound $devs by the kernel itself after $ms ms waiting for $BTN_GPIOC, 0 bind writes; clients: $c" ;;
+	*) log "sam: $SAM_DRV bound $devs after $ms ms waiting for $BTN_GPIOC, $b bind write(s); clients: $c" ;;
+	esac
+	if [ "$how" = already ]; then
+		case "$(cat "$STATE/sam" 2>/dev/null)" in bound*|kernel*) return 0;; esac    # keep this boot's earlier result
+	fi
+	sam_state "$how binds=$b waited_ms=$ms kbd=$kbd tp=$tp bat=$b1$b2 adp=$adp dtx=$dtx base=$base"
+	return 0
+}
+
+# ---------------------------------------------------------------------------------------------------- ish
+# Integrated Sensor Hub (ISH 8086:34fc: the clipboard's accelerometer, gyroscope and orientation; first native boot,
+# boot 3): lapis's intel-ish-ipc probe at ueventd coldboot can time out waiting for the ISH firmware ("waiting for ishtp
+# start failed", "HBM haven't started", "ISHTP: Protocol init failed": -ENODEV, never retried); then there is no HID
+# sensor hub and no accelerometer for the whole boot, and the sensors HAL scans /sys/bus/iio only once. Started at
+# early-boot: hw.json sorts before sensors.json in gb.rc, so this runs while gb_sensors_wait holds init (at most 8 s,
+# before class hal) waiting for cros-ec-accel. An unbound ISH gets one PCI function reset (pci_reset_function, as the
+# driver's own _ish_hw_reset does) and one bind write. Idempotent (a bound ISH is only reported), bounded (one reset, one
+# bind, then GB_HW_ISH_WAIT s for the accelerometer), never fatal. Result: one 'gb_hw: ish:' line, /dev/gb_hw/ish and
+# vendor.gb.ish.
+ISH_IDS="0x34fc"
+ISH_DRV=intel_ish_ipc
+
+ish_dev() {         # the PCI address of the ISH, or nothing
+	for x in "$R"/sys/bus/pci/devices/*; do
+		[ "$(cat "$x/vendor" 2>/dev/null)" = 0x8086 ] || continue
+		case " $ISH_IDS " in *" $(cat "$x/device" 2>/dev/null) "*) echo "${x##*/}"; return 0;; esac
+	done
+}
+ish_accel() {       # 1 if the sensor hub's IIO accelerometer exists (cros-ec-accel in Android mode, else accel_3d)
+	for x in "$R"/sys/bus/iio/devices/iio:device*/name; do
+		case "$(cat "$x" 2>/dev/null)" in cros-ec-accel|accel_3d*) echo 1; return 0;; esac
+	done
+	echo 0
+}
+ish_state() {       # $1 = short state: /dev/gb_hw/ish and vendor.gb.ish
+	mkdir -p "$STATE" 2>/dev/null; echo "$1" > "$STATE/ish" 2>/dev/null
+	setprop vendor.gb.ish "$1" 2>/dev/null
+}
+ish_klast() {       # the kernel's last intel_ish_ipc line for $1 (its message only), at most 160 characters
+	dmesg 2>/dev/null | grep -F "$ISH_DRV $1: " | tail -n 1 | sed "s/^[^]]*\] $ISH_DRV $1: //" | cut -c1-160
+}
+ish() {             # $1 = accelerometer wait after a re-bind, in 0.5 s polls
+	p=$(ish_dev)
+	if [ -z "$p" ]; then log "ish: no Intel ISH ($ISH_IDS) here, nothing to do"; ish_state absent; return 0; fi
+	d=$R/sys/bus/pci/devices/$p; drv=$R/sys/bus/pci/drivers/$ISH_DRV
+	if [ -e "$d/driver" ]; then
+		a=$(ish_accel); l=$(readlink "$d/driver" 2>/dev/null)
+		log "ish: $p already bound to ${l##*/}, accelerometer=$a, nothing to do"
+		ish_state "already accel=$a"
+		return 0
+	fi
+	if [ ! -e "$drv/bind" ]; then
+		log "ish: $p has no driver and $ISH_DRV is not loaded (lapis's ueventd loads it by modalias), nothing to do"
+		ish_state "FAILED nodriver"
+		return 0
+	fi
+	r=none; if [ -e "$d/reset" ]; then if echo 1 > "$d/reset" 2>/dev/null; then r=ok; else r=failed; fi; fi
+	echo "$p" > "$drv/bind" 2>/dev/null
+	k=0; while [ ! -e "$d/driver" ] && [ $k -lt 8 ]; do sleep 0.25; k=$((k + 1)); done
+	if [ ! -e "$d/driver" ]; then
+		log "ish: re-probe of $p by $ISH_DRV FAILED (reset: $r); kernel: $(ish_klast "$p")"
+		ish_state "FAILED reset=$r"
+		return 0
+	fi
+	k=0; while [ "$(ish_accel)" = 0 ] && [ $k -lt "$1" ]; do sleep 0.5; k=$((k + 1)); done
+	a=$(ish_accel)
+	log "ish: $p bound to $ISH_DRV again after its failed coldboot probe (reset: $r); accelerometer=$a after $((k * 500)) ms"
+	ish_state "rebound reset=$r accel=$a ms=$((k * 500))"
+	return 0
+}
+
 # ---------------------------------------------------------------------------------------------------- posture
 # lapis's device-state policy (com.android.server.desktop.power.DesktopDeviceStateProvider, desktop-services.jar;
 # states CLOSED=0, DOCKED=1, OPEN=2, TABLET=3 on build 276) follows the lid switch (ACPI LID0), SW_TABLET_MODE
@@ -327,9 +529,22 @@ diag() {
 		buttons 0
 	fi
 	log "diag: buttons $BTN driver=$(btn_driver) gpio-keys inputs=$(btn_inputs) $BTN_GPIOC=$(btn_gpioc) result: $(cat "$STATE/buttons" 2>/dev/null || echo none)"
+	# (wave 9 hw-native1) Surface Aggregator: one more bind attempt (no waiting) if a SAM serial device still has no
+	# driver and gb_hw_sam has finished, then the devices, the clients and the result; the sensor hub's state
+	sd=$(sam_devs | tr '\n' ' '); u=
+	for s in $sd; do [ -e "$R/sys/bus/serial/devices/$s/driver" ] || u="$u $s"; done
+	if [ -n "$u" ] && [ "$(prop init.svc.gb_hw_sam)" != running ]; then
+		log "diag: sam:$u still without a driver, one more bind attempt"
+		sam 0 10
+	fi
+	sam_clients; x=
+	for s in $sd; do x="$x $s=$(sam_drv_of "$s")"; done
+	log "diag: sam${x:- none} keyboard=$kbd touchpad=$tp BAT1=$b1 BAT2=$b2 ADP1=$adp dtx=$dtx base=$base ssam_devices=$nc result: $(cat "$STATE/sam" 2>/dev/null || echo none)"
+	p=$(ish_dev); l=; [ -n "$p" ] && l=$(readlink "$R/sys/bus/pci/devices/$p/driver" 2>/dev/null)
+	log "diag: ish ${p:-none} driver=$([ -n "$l" ] && echo "${l##*/}" || echo none) accelerometer=$(ish_accel) result: $(cat "$STATE/ish" 2>/dev/null || echo none)"
 	# (readiness A-M1) posture: lapis's device state and whether InputReader enabled the built-in keyboard/touchpad
 	posture_report "diag: posture"
-	dmesg 2>/dev/null | grep -iE 'firmware|dmc|ibt-|iwlwifi.*loaded|sof.*(fw|tplg)|surface_|soc_button|gpio-keys|MSHW0040|INT3455|apds9960|lid|tablet' | tail -n 60 |
+	dmesg 2>/dev/null | grep -iE 'firmware|dmc|ibt-|iwlwifi.*loaded|sof.*(fw|tplg)|surface_|soc_button|gpio-keys|MSHW0040|INT3455|apds9960|lid|tablet|intel_ish|ISHTP|HBM haven' | tail -n 60 |
 		while read -r l; do log "diag: k: $l"; done
 }
 
@@ -340,10 +555,17 @@ buttons)
 	bw=${GB_HW_BTN_WAIT:-30}; case "$bw" in ''|*[!0-9]*) bw=30;; esac; [ ${#bw} -gt 3 ] && bw=300
 	buttons $((bw * 2)) ;;
 posture) posture ;;
+sam)
+	sw=${GB_HW_SAM_WAIT:-30}; case "$sw" in ''|*[!0-9]*) sw=30;; esac; [ ${#sw} -gt 3 ] && sw=300; [ "$sw" -gt 300 ] && sw=300
+	sc=${GB_HW_SAM_CLIENT_WAIT:-15}; case "$sc" in ''|*[!0-9]*) sc=15;; esac; [ ${#sc} -gt 3 ] && sc=120; [ "$sc" -gt 120 ] && sc=120
+	sam $((sw * 2)) $((sc * 2)) ;;
+ish)
+	iw=${GB_HW_ISH_WAIT:-8}; case "$iw" in ''|*[!0-9]*) iw=8;; esac; [ ${#iw} -gt 2 ] && iw=60; [ "$iw" -gt 60 ] && iw=60
+	ish $((iw * 2)) ;;
 diag)
 	[ -n "$R" ] || sleep 45
 	rapl_restore
 	diag ;;
-*) echo "usage: $0 rapl-snapshot|boot|buttons|posture|diag"; exit 2 ;;
+*) echo "usage: $0 rapl-snapshot|boot|buttons|posture|sam|ish|diag"; exit 2 ;;
 esac
 exit 0

@@ -71,7 +71,13 @@ GPU under Windows ([VMWARE.md](VMWARE.md)).
   running full user, the notification permission and the tile are set up for your user (wave 7: the permission is
   granted once per user, so if you turn the Graphics app's notifications off they stay off), the app refreshes itself
   when your user is unlocked, and the tile refreshes each time you open Quick Settings (it is no longer an "active"
-  tile, whose update requests lapis's SystemUI dropped). Notices from `gb_notify` are posted for all users.
+  tile, whose update requests lapis's SystemUI dropped). Notices from `gb_notify` are posted for the user in front of the screen and wait for the
+  sign-in when nobody is signed in (wave 9). Since wave 9 the Graphics tile and the notification permission are set up
+  whenever a user comes to the front, at any time (before, only within 30 minutes of the boot); the app's
+  notifications show its own icon instead of a blank circle; and "Can't detach yet" reaches the user in front even
+  when another signed-in user's apps hold the GPU. After restoring a settings backup the Graphics tile can be missing
+  (Android replaces the whole tile list, which looks the same as removing it yourself, so it is not put back
+  automatically): add it again with Quick Settings > Edit.
 
 The full interface (properties, files, socket protocol, notification texts, state tables) is
 [native/dgpu/INTERFACES.md](../native/dgpu/INTERFACES.md), version 1.2 r2.

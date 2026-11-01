@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- (wave 9, HS-O8) the background of GbGpu's adaptive application icon (no vendor colour or artwork) -->
+<resources>
+    <color name="gb_icon_background">#FF37474F</color>
+</resources>
