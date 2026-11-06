@@ -118,7 +118,8 @@ python -I -B build_usb.py --esp-only esp.img    # only the ESP, checked with ver
 **Logs**: there is no serial console natively. `gb_bootlog` writes `\gblog\bootN-t40.txt` ... `-t900.txt` (at 40,
 90, 180, 420 and 900 s) onto the stick's ESP (FAT32, readable on Windows). They hold the cmdline, module loading
 (`gbinit_modules.log`), DMI, block devices, input devices, IIO, ALSA, GPU, PCI drivers, power supplies, getprop, the
-dGPU report, dmesg and logcat. The newest 8 boots are kept, and nothing is written when the ESP has less than
+dGPU report (from the 420 s file on: it samples power for about 5 minutes first), dmesg and logcat. The newest 8
+boots are kept, and nothing is written when the ESP has less than
 128 MiB free. `gb_bootlog` mounts the ESP inside the same lock the nouveau policy takes, so the two never overlap (it
 waits up to 10 minutes for the lock, then writes anyway, because logs matter most). Audio has its own report
 (`gblog\audio-*.txt`, `native/audio`).

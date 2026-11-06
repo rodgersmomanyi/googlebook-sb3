@@ -22,9 +22,14 @@
 #   gb_hw.sh ish             'early-boot', own oneshot service: if lapis's intel_ish_ipc probe of the Integrated Sensor
 #                            Hub (8086:34fc) failed at coldboot, one PCI function reset and one re-bind, in parallel with
 #                            gb_sensors_wait, so the accelerometer can still be there when the sensors HAL scans.
+#   gb_hw.sh vcm             'early-init', own oneshot service (second native boot, wave 10 misc-cameras): loads the
+#                            rear camera's focus-motor driver dw9719.ko once ipu-bridge has created the motor's i2c
+#                            device (i2c-INT347A:00-VCM) AND its runtime-PM link to the rear sensor, so the sensor that
+#                            powers the motor is on for its probe and its first runtime suspend. Idempotent, bounded
+#                            (GB_HW_VCM_WAIT s for the device and its link, default 30), never fatal.
 #   gb_hw.sh diag            after boot_completed: one hardware summary to the kernel log (ends up in gb_bootlog),
 #                            including the buttons binding, the posture (device_state, built-in input enabled), the
-#                            Surface Aggregator and its clients, and the sensor hub.
+#                            Surface Aggregator and its clients, the sensor hub and the rear focus motor.
 #
 # Properties:
 #   persist.vendor.gb.rapl.mode   fw (default) = restore the Surface firmware limits | lapis = leave lapis's values |
@@ -37,10 +42,12 @@
 #                                 base=" | "FAILED ..." | "absent" (at most 91 characters)
 #   vendor.gb.ish                 written by ish: "already accel=N" | "rebound reset=.. accel=N ms=.." | "FAILED ..." |
 #                                 "absent"
+#   vendor.gb.vcm                 written by vcm: "loaded|bound|already|rebound rpm=.. sensor=.. waited_ms=.." |
+#                                 "FAILED ..." | "absent"
 #
 # Test hooks: GB_HW_ROOT prefixes /sys, /dev and /proc (host tests with a fake tree); GB_HW_LOG=- logs to stdout;
 # GB_HW_MSR (rapl-snapshot); GB_HW_BTN_WAIT, GB_HW_BTN_KO (buttons); GB_HW_SAM_WAIT, GB_HW_SAM_CLIENT_WAIT (sam);
-# GB_HW_ISH_WAIT (ish).
+# GB_HW_ISH_WAIT (ish); GB_HW_VCM_WAIT, GB_HW_VCM_KO (vcm).
 # mksh arithmetic is 32-bit signed: all MSR math is done on single bytes and stays far below 2^31.
 
 R=${GB_HW_ROOT:-}
@@ -435,6 +442,131 @@ ish() {             # $1 = accelerometer wait after a re-bind, in 0.5 s polls
 	return 0
 }
 
+# ---------------------------------------------------------------------------------------------------- vcm
+# The rear camera's focus motor (second native boot, wave 10 misc-cameras): the DW9719 voice-coil driver at 0x0c on
+# I2C3, the OV8865 module's second I2cSerialBus, powered with the module (its own "vdd" is a dummy regulator).
+# ipu-bridge creates its i2c client i2c-INT347A:00-VCM with the sensor runtime-resumed (k16 ipu-bridge.c
+# ipu_bridge_instantiate_vcm_work) and only then adds the runtime-PM device link VCM -> sensor (DL_FLAG_PM_RUNTIME,
+# without DL_FLAG_RPM_ACTIVE). Loaded by gbinit (modules.load up to wave 9), dw9719 probed inside that client creation,
+# before the link existed: the link then never held the sensor for it, the sensor powered off when ipu-bridge dropped
+# its reference, and 1 s later the VCM's first runtime suspend parked the lens by writing reg 0x0003 to an unpowered
+# motor ("dw9719 i2c-INT347A:00-VCM: Error writing reg 0x0003: -121" in all four native boots), which left the VCM in
+# the runtime-PM error state (no focus control; its system-suspend callback runs the same write). From wave 10
+# dw9719.ko is in no load list (stage_kernel NATIVE_NOLOAD) and this loads it once the device AND that link exist: the
+# driver core powers the sensor for the probe (pm_runtime_get_suppliers) and the link keeps it on until the VCM's first
+# runtime suspend has parked the lens; then both power off. A dw9719 already bound in the error state (an older load
+# list) gets one unbind + bind (the same path as reloading the module). It never touches the sensors themselves.
+# Idempotent (a healthy bound VCM is only reported), bounded (GB_HW_VCM_WAIT s for the device and its link, then at
+# most 2 + 4 + 2 s, a re-bind 2 + 2 + 4 s more), never fatal. Result: one 'gb_hw: vcm:' line, /dev/gb_hw/vcm and
+# vendor.gb.vcm.
+VCM_DEV=i2c-INT347A:00-VCM
+VCM_SUP=i2c-INT347A:00
+VCM_DRV=dw9719
+VCM_KO=${GB_HW_VCM_KO:-/odm/lib/modules/dw9719.ko}
+
+vcm_rpm() {         # the runtime-PM status of i2c device $1 (active | suspended | error | ...), or none
+	v=$(cat "$R/sys/bus/i2c/devices/$1/power/runtime_status" 2>/dev/null); echo "${v:-none}"
+}
+vcm_drv() {         # the driver bound to the VCM, or none
+	l=$(readlink "$R/sys/bus/i2c/devices/$VCM_DEV/driver" 2>/dev/null); l=${l##*/}
+	echo "${l:-none}"
+}
+vcm_link() {        # the VCM's device link to the sensor: 1 = with runtime PM, 0 = without, - = none
+	L=$R/sys/bus/i2c/devices/$VCM_DEV/supplier:i2c:$VCM_SUP
+	if [ ! -e "$L" ]; then echo -; elif [ "$(cat "$L/runtime_pm" 2>/dev/null)" = 1 ]; then echo 1; else echo 0; fi
+}
+vcm_wait_drv() {    # $1 = yes (until the VCM has a driver) | no (until it has none), $2 = polls of 0.25 s
+	k=0
+	while :; do
+		if [ -e "$R/sys/bus/i2c/devices/$VCM_DEV/driver" ]; then [ "$1" = yes ] && return 0
+		else [ "$1" = no ] && return 0; fi
+		[ $k -ge "$2" ] && return 1
+		sleep 0.25; k=$((k + 1))
+	done
+}
+vcm_settle() {      # $1 = polls of 0.25 s, until the VCM is runtime-suspended or in the error state; sets vr, vms
+	k=0; vr=$(vcm_rpm $VCM_DEV)
+	while [ "$vr" != suspended ] && [ "$vr" != error ] && [ $k -lt "$1" ]; do
+		sleep 0.25; k=$((k + 1)); vr=$(vcm_rpm $VCM_DEV)
+	done
+	vms=$((k * 250))
+}
+vcm_sensor() {      # the sensor's runtime-PM status once the VCM has let it go (at most 2 s)
+	k=0; v=$(vcm_rpm $VCM_SUP)
+	while [ "$v" = active ] && [ $k -lt 8 ]; do sleep 0.25; k=$((k + 1)); v=$(vcm_rpm $VCM_SUP); done
+	echo "$v"
+}
+vcm_state() {       # $1 = short state: /dev/gb_hw/vcm and vendor.gb.vcm (at most 91 characters)
+	mkdir -p "$STATE" 2>/dev/null; echo "$1" > "$STATE/vcm" 2>/dev/null
+	setprop vendor.gb.vcm "$1" 2>/dev/null
+}
+vcm_klast() {       # the kernel's last dw9719 line for the VCM (its message only), at most 160 characters
+	dmesg 2>/dev/null | grep -F "$VCM_DRV $VCM_DEV: " | tail -n 1 | sed "s/^[^]]*\] $VCM_DRV $VCM_DEV: //" | cut -c1-160
+}
+vcm() {             # $1 = wait for the VCM device and its runtime-PM link, in 0.25 s polls
+	d=$R/sys/bus/i2c/devices/$VCM_DEV; drv=$R/sys/bus/i2c/drivers/$VCM_DRV
+	if [ ! -e "$R/sys/bus/acpi/devices/INT347A:00" ] && [ ! -e "$d" ]; then
+		log "vcm: no rear camera (ACPI INT347A:00) here, nothing to do"; vcm_state absent; return 0
+	fi
+	w=0
+	while { [ ! -e "$d" ] || [ "$(vcm_link)" != 1 ]; } && [ $w -lt "$1" ]; do sleep 0.25; w=$((w + 1)); done
+	wms=$((w * 250)); lk=$(vcm_link); ins=-
+	# a link that has just appeared: its sysfs entry exists before device_link_add() has put it in the VCM's
+	# supplier list (core.c: device_register() of the link, then the list_add); let that finish
+	[ $w -gt 0 ] && [ "$lk" = 1 ] && sleep 0.25
+	if [ ! -e "$d" ]; then
+		log "vcm: loading $VCM_DRV FAILED: no $VCM_DEV after $wms ms (ipu-bridge creates it once the rear sensor ov8865 is bound to the IPU)"
+		vcm_state "FAILED nodev waited_ms=$wms"; return 0
+	fi
+	if [ -e "$d/driver" ]; then
+		how=already
+	elif [ "$lk" != 1 ]; then
+		log "vcm: loading $VCM_DRV FAILED: $VCM_DEV has no runtime-PM device link to $VCM_SUP after $wms ms (link=$lk), so the sensor would be off for its probe: not loaded"
+		vcm_state "FAILED nolink link=$lk waited_ms=$wms"; return 0
+	elif [ -d "$R/sys/module/$VCM_DRV" ]; then
+		how=bound       # loaded (by hand, or an older load list), but the VCM has no driver: one bind write
+		[ -e "$drv/bind" ] && echo "$VCM_DEV" > "$drv/bind" 2>/dev/null
+		vcm_wait_drv yes 8
+	else
+		how=loaded
+		if insmod "$VCM_KO" 2>/dev/null; then ins=ok; else ins=failed; fi
+		vcm_wait_drv yes 8
+	fi
+	if [ ! -e "$d/driver" ]; then
+		log "vcm: binding $VCM_DEV to $VCM_DRV FAILED after $wms ms waiting for it and its runtime-PM link to $VCM_SUP (insmod $ins); kernel: $(vcm_klast)"
+		vcm_state "FAILED unbound insmod=$ins waited_ms=$wms"; return 0
+	fi
+	vcm_settle 16
+	if [ "$how" = already ] && [ "$vr" = error ] && [ "$lk" = 1 ] && [ -e "$drv/unbind" ] && [ -e "$drv/bind" ]; then
+		how=rebound     # bound before its link existed (an older load list): one re-probe, now through the link
+		echo "$VCM_DEV" > "$drv/unbind" 2>/dev/null; vcm_wait_drv no 8
+		echo "$VCM_DEV" > "$drv/bind" 2>/dev/null; vcm_wait_drv yes 8
+		if [ ! -e "$d/driver" ]; then
+			log "vcm: re-binding $VCM_DEV to $VCM_DRV (it was in the runtime-PM error state) FAILED; kernel: $(vcm_klast)"
+			vcm_state "FAILED rebind waited_ms=$wms"; return 0
+		fi
+		vcm_settle 16
+	fi
+	vs=$(vcm_sensor); dn=$(vcm_drv); st="rpm=$vr sensor=$vs waited_ms=$wms"
+	case "$vr" in
+	error)
+		log "vcm: $dn on $VCM_DEV ($how): its runtime suspend FAILED (runtime_status error after $vms ms, sensor $vs); kernel: $(vcm_klast)"
+		vcm_state "FAILED $how $st" ;;
+	suspended)
+		case $how in
+		loaded) log "vcm: $VCM_DRV loaded after $wms ms waiting for $VCM_DEV and its runtime-PM link to $VCM_SUP: bound, runtime suspended after $vms ms (lens parked), sensor $vs" ;;
+		bound) log "vcm: $VCM_DEV bound to the already loaded $VCM_DRV after $wms ms waiting, 1 bind write: runtime suspended after $vms ms (lens parked), sensor $vs" ;;
+		rebound) log "vcm: $VCM_DEV was bound to $VCM_DRV before its runtime-PM link existed (runtime_status error, an older load list): unbound and bound again once, runtime suspended after $vms ms (lens parked), sensor $vs" ;;
+		*) log "vcm: $VCM_DEV already bound to $dn, runtime suspended, sensor $vs, nothing to do" ;;
+		esac
+		vcm_state "$how $st" ;;
+	*)
+		log "vcm: $dn on $VCM_DEV ($how): runtime $vr after $vms ms (an open focus control keeps it active), sensor $vs"
+		vcm_state "$how $st" ;;
+	esac
+	return 0
+}
+
 # ---------------------------------------------------------------------------------------------------- posture
 # lapis's device-state policy (com.android.server.desktop.power.DesktopDeviceStateProvider, desktop-services.jar;
 # states CLOSED=0, DOCKED=1, OPEN=2, TABLET=3 on build 276) follows the lid switch (ACPI LID0), SW_TABLET_MODE
@@ -542,6 +674,9 @@ diag() {
 	log "diag: sam${x:- none} keyboard=$kbd touchpad=$tp BAT1=$b1 BAT2=$b2 ADP1=$adp dtx=$dtx base=$base ssam_devices=$nc result: $(cat "$STATE/sam" 2>/dev/null || echo none)"
 	p=$(ish_dev); l=; [ -n "$p" ] && l=$(readlink "$R/sys/bus/pci/devices/$p/driver" 2>/dev/null)
 	log "diag: ish ${p:-none} driver=$([ -n "$l" ] && echo "${l##*/}" || echo none) accelerometer=$(ish_accel) result: $(cat "$STATE/ish" 2>/dev/null || echo none)"
+	# (wave 10 misc-cameras) the rear focus motor, read only: its driver, the runtime PM of the VCM and of the sensor,
+	# the device link between them and gb_hw_vcm's result
+	log "diag: vcm $VCM_DEV driver=$(vcm_drv) runtime=$(vcm_rpm $VCM_DEV) sensor=$(vcm_rpm $VCM_SUP) link=$(vcm_link) result: $(cat "$STATE/vcm" 2>/dev/null || echo none)"
 	# (readiness A-M1) posture: lapis's device state and whether InputReader enabled the built-in keyboard/touchpad
 	posture_report "diag: posture"
 	dmesg 2>/dev/null | grep -iE 'firmware|dmc|ibt-|iwlwifi.*loaded|sof.*(fw|tplg)|surface_|soc_button|gpio-keys|MSHW0040|INT3455|apds9960|lid|tablet|intel_ish|ISHTP|HBM haven' | tail -n 60 |
@@ -562,10 +697,13 @@ sam)
 ish)
 	iw=${GB_HW_ISH_WAIT:-8}; case "$iw" in ''|*[!0-9]*) iw=8;; esac; [ ${#iw} -gt 2 ] && iw=60; [ "$iw" -gt 60 ] && iw=60
 	ish $((iw * 2)) ;;
+vcm)
+	vw=${GB_HW_VCM_WAIT:-30}; case "$vw" in ''|*[!0-9]*) vw=30;; esac; [ ${#vw} -gt 3 ] && vw=300; [ "$vw" -gt 300 ] && vw=300
+	vcm $((vw * 4)) ;;
 diag)
 	[ -n "$R" ] || sleep 45
 	rapl_restore
 	diag ;;
-*) echo "usage: $0 rapl-snapshot|boot|buttons|posture|sam|ish|diag"; exit 2 ;;
+*) echo "usage: $0 rapl-snapshot|boot|buttons|posture|sam|ish|vcm|diag"; exit 2 ;;
 esac
 exit 0

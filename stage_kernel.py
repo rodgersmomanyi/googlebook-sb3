@@ -47,17 +47,23 @@ NATIVE_EARLY = [
     "wmi", "wmi-bmof", "video", "i2c-algo-bit", "drm_buddy", "drm_display_helper", "intel-gtt", "i915",
     # light sensor, thermal, touch
     "kfifo_buf", "industrialio-triggered-buffer", "apds9960", "thermal", "ipts",
-    # cameras (k13): IPU4P on the ipu6 driver + sensors, focus motor, INT3472 power control; before lapis's own
-    # intel-ipu6/int3472/v4l2-cci (no 8A19 support), which then EEXIST
+    # cameras (k13): IPU4P on the ipu6 driver + sensors, INT3472 power control; before lapis's own
+    # intel-ipu6/int3472/v4l2-cci (no 8A19 support), which then EEXIST. (wave 10 misc-cameras) The focus motor's
+    # dw9719 is NATIVE_NOLOAD: gb_hw.sh vcm loads it later (see there).
     "v4l2-cci", "ipu-bridge", "intel_skl_int3472_common", "intel_skl_int3472_discrete",
-    "ov5693", "ov8865", "dw9719", "intel-ipu6", "intel-ipu6-isys",
+    "ov5693", "ov8865", "intel-ipu6", "intel-ipu6-isys",
 ]
 # (wave 9 hw-native1) staged (signed, same build) but in NO load list and in no modules.alias: the IR camera OV7251
 # (INT347E) is not exposed by the camera HAL (camera_hal.yaml), lapis has no driver for it, and on the Surface Book 3
 # its probe always failed (first native boot: "write reg error -121 ... error during global init", -121). The
 # front/rear sensors register their subdev nodes per bound sensor (ipu6-isys isys_notifier_bound), so they do not
 # depend on it. For a manual test: insmod /odm/lib/modules/ov7251.ko.
-NATIVE_NOLOAD = ["ov7251"]
+# (wave 10 misc-cameras) the rear camera's focus motor DW9719 (i2c-INT347A:00-VCM): loaded by gbinit it probed inside
+# ipu-bridge's creation of its i2c client, before ipu-bridge adds the runtime-PM device link VCM -> sensor, so nothing
+# kept the sensor (which powers the motor) on for its first runtime suspend: "Error writing reg 0x0003: -121" in every
+# native boot and a VCM stuck in the runtime-PM error state. gb_hw.sh vcm (native gb.rc, early-init) loads it once the
+# device and that link exist; the driver core then powers the sensor for the probe and the link until the lens is parked.
+NATIVE_NOLOAD = ["ov7251", "dw9719"]
 # in NO load list. Staged in inject\native\modules as the payload's source: build_esp puts them into
 # ESP:/gb/dgpu-<krel>.erofs (INTERFACES 6), never into the native cpio; gb_nouveau.sh loads them from /odm/dgpu.
 NATIVE_OPTIN = ["drm_exec", "drm_gpuvm", "gpu-sched", "drm_ttm_helper", "nouveau"]

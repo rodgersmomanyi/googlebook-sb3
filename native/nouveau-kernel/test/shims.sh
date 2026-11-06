@@ -56,6 +56,29 @@ case $1 in '' | *[!A-Za-z0-9._-]*) exit 1 ;; esac
 if [ -f "$P/$1" ]; then printf '%s\n' "$(cat "$P/$1")"; else printf '\n'; fi
 EOF
 
+# (wave 10, notify-stale) the wall clock: with ctl/now (epoch seconds), date +%s prints it and date +%s%N prints it in
+# ns; otherwise (and for any other argument) the next date in PATH runs (GNU, or toybox's under GB_TEST_TOOLS), so
+# every case without ctl/now sees the real clock as before. (review 2) This directory is skipped by identity (-ef),
+# not by its spelling: a work directory given as /w/ or /w//x puts the shims in PATH as /w//shim, and a text compare
+# would exec this shim again forever
+w date <<'EOF'
+#!/bin/sh
+if [ -f "$GBT/ctl/now" ]; then
+  case $* in
+    +%s) cat "$GBT/ctl/now"; exit 0 ;;
+    +%s%N) printf '%s000000000\n' "$(cat "$GBT/ctl/now")"; exit 0 ;;
+  esac
+fi
+_me=$(cd "$(dirname "$0")" && pwd)
+_ifs=$IFS
+IFS=:
+for _d in $PATH; do
+  { [ "$_d" = "$_me" ] || [ "$_d" -ef "$_me" ]; } && continue
+  if [ -x "$_d/date" ]; then IFS=$_ifs; exec "$_d/date" "$@"; fi
+done
+exit 127
+EOF
+
 w setprop <<'EOF'
 #!/bin/sh
 [ $# -eq 2 ] || exit 1

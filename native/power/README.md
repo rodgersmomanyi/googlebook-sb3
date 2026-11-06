@@ -41,6 +41,21 @@ attach; 20 (1039 in all) checks, 0 failures, also under ASan/UBSan; socket 146/1
 (`w6prep\nvidia-b4\tests\power_b4_mutation.py`). Binary `bin\gb_power` `170f0eb2...` (source `d54a038e...`; the unpatched source
 rebuilds `0ac03a00...` byte for byte); the r4 binary is kept as `bin\gb_power.pre-w6`.
 
+**Wave 10 (w10prep battery-userspace, BACKLOG HW battery 0 %):** the combined battery is published in **percent
+units**. The lapis desktop health HAL takes its charge counter from `test_battery/charge_now`, which `test_power`
+hard-wires to `battery_capacity`, and shows `floor(charge_now*100/charge_full + 0.05)` %: with the real uAh values of
+waves 1-9 (`charge_full` 5776291) that was 0 % on the second native boot. Now `capacity` (= `charge_now`) is the level,
+`charge_full` is 100, `current` 0 (the HAL's time to full and time to shutdown are then -1 instead of ~0 s),
+`charge_counter` -1, and `charge_full_design` is scaled so that the HAL's state of health equals the packs'
+full/design. `gb_power -o` is now read-only (it re-ran the old start defaults `present=false`/`ac=on`/`current=0`
+on every run, and gb_dgpu_report.sh runs it 30 times 10 s apart: the "battery none" lines and the charger-connected
+animation flicker); the daemon writes the numbers before `present`/`ac`, and a voltage-only change below 20 mV waits
+(at most 60 s) for the next real change. Details and evidence: `C:\GB-build\native\w10prep\battery-userspace\RESULT.md`. Binary `bin\gb_power`
+`29c86218...` (source `f467d5d1...`, NDK static build on the builder by the wave-10 integration, == the reviewed
+hash; unit 1081 checks / 0 failures, also under ASan/UBSan; socket 146/146; rc lint clean; the unpatched source
+`aa08dc2a...` rebuilds the wave-9 `163e6f83...` byte for byte); the wave-9 binary is kept as `bin\gb_power.pre-w10`
+and in `C:\GB-x86\archive\pre-w10\`.
+
 `gb_power` is the Surface Book 3 power daemon for Googlebook OS native images (`gb.hw=native`). It is a static
 bionic binary started by init at `early-init` and runs as root in `u:r:shell:s0`. It implements plan Phase 3
 (gb_power hot-plug hardening, deliverables 1-8), the server side of the Phase 7 control socket, plan P1 item 7
@@ -54,7 +69,7 @@ notes: `C:\GB-build\native\dgpu\integration\gb-power.md` (section 7 is v1.2).
 
 | Area | Behaviour |
 |---|---|
-| A. Battery (unchanged) | Sums BAT1 + BAT2 into `test_power`'s `test_battery`, mirrors ADP1, hides BATn from the health HAL. |
+| A. Battery (wave 10: percent units) | Sums BAT1 + BAT2 into `test_power`'s `test_battery` (capacity = charge_now = level, charge_full 100, current 0, design scaled for the state of health), mirrors ADP1, hides BATn from the health HAL. The only writer of `test_power`. |
 | B. Detach, quick path (unchanged) | No driver on any NVIDIA function and nouveau not used this boot: `HB`, then `CONFIRM`. |
 | B. Detach, slow path | `/dev/gb_dgpu/detaching` set, load-window check (a live `gb_nouveau` ESP lock owner, or v1.2 gb_power's own rebind watch, refuses with N15), boot-disk guard, **(v1.2) app graphics forced to Intel (`vendor.gb.gfx_active=intel`) before anything else**, LATCH_LOCK, N07, `ctl.stop` of `gb_dgpu_test`, `gb_nvk_probe`, (v1.2) `gb_gfx_selftest` and `gb_gpu_compute`, nouveau DRM nodes `chmod 000` (also nodes that appear later), wait for the services, the load window and the `/sys/module/nouveau/refcnt` gate (30 s; **v1.2: refused after 5 s when every holder is a closable app process**), worker job 1 unbinds, main-loop re-check, worker job 2 PCI-removes every 10de function (the child re-checks the gate before each write), last checks, N12, `CONFIRM`. A refusal because of holders increments `detach_ref` (v1.2) and posts N08 unless GbGpu declared `ui-caps notify`. |
 | B. Latch lifecycle | `LATCH_LOCK` while any driver is bound to any 10de function or a base drive is mounted, re-issued after every resume and every `BASE_CONNECTION`; `LATCH_UNLOCK` when driverless, at start only if driverless, at shutdown, on SIGTERM only if driverless or shutting down. |
@@ -140,6 +155,9 @@ the real uid 1000 as role `other`, answers `get-mode` with `EPERM`, and `strings
 
 `-p <profile>` | `-o` | `-r <root>` | `-S <path>` (test socket, only with `-r`) | `-H` | `-D` | `-G` | `-I` | `-K <driver>`
 | `-v` | `--dtx-monitor` (unchanged in v1.2)
+
+`-o` (wave 10) prints one combined-battery pass and the values the daemon publishes, and writes nothing (no
+`test_power` parameter, no BATn hiding).
 
 `-K` changes which driver gb_power leaves bound on the VGA function (default `nouveau`; `-K ''` unbinds every
 driver, tests only). Non-VGA functions are always kept driverless (except with `-G`/`gb.dgpu=keep`).

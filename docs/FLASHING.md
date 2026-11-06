@@ -31,7 +31,7 @@ certutil -hashfile out\googlebook-sb3-usb.img SHA256   # must equal the first wo
   `pvmfw_a/b`, `misc`, `metadata`, `frp_persist`, `desktop_security_persist`, `desktop_security_storage`, `super`,
   `userdata`) and the vbmeta slot attributes (at least one slot marked successful);
 * the copied partitions are identical to `lapis.bin` (full compare; `super` sampled), the blank ones are zero;
-* the ESP (checks V1-V31 and V12b):
+* the ESP (checks V1-V37):
   * the FAT32 layout and its free space;
   * exactly the default entry and its `[NVIDIA test]` twin, whose `androidboot.boot_part_uuid` names this image's
     `super`, with the native options (`gb.hw=native`, `efi_pstore.pstore_disable=1`, `module_blacklist=`,
@@ -53,6 +53,12 @@ certutil -hashfile out\googlebook-sb3-usb.img SHA256   # must equal the first wo
   * (wave 4) the software Gatekeeper's binary, VINTF fragment and init block (V29);
   * (wave 5) the VNNI libz patch: `/odm/vnni` equal to `inject/vnni`, gated on the exact build fingerprint (V31,
     [PERFORMANCE.md](PERFORMANCE.md#checking-it));
+  * (wave 6) the OTA gate (V32) and (wave 8) the loader's default line as systemd-boot reads it (V33);
+  * (wave 9) the whole native module load lists against the staged copies and stage_kernel.py's lists, with the IR
+    camera's ov7251 shipped but in no list (V19; since wave 10 also the rear focus motor's dw9719); the flashing
+    tools as refusal stubs, elogtool and cbfstool included (V35); the Surface Aggregator re-bind and ISH re-probe
+    services and their start points (V36); the C-6 label line in every tree (V34); in the VM tree, the
+    notification queue (V37) and efi_pstore.pstore_disable=1 once (V24);
 * every x86-64 ELF executable and shared object in the initrd cpio has bionic-compatible `PT_LOAD` segments (`p_offset == p_vaddr mod max(p_align, 4 KiB)`, check `V12b`).
 
 Pass `--krel FILE` to also check the kernel release against a file. Use `--esp FILE` for an ESP image alone. It ends
@@ -116,8 +122,8 @@ press End and add ` gb.nouveau=0` (this boot only), and Settings → System → 
 ## 4. Logs
 
 There is no serial console natively. Every boot writes logs to the stick's ESP at 40 s, 90 s, 3 min, 7 min and
-15 min, even if the screen stays black: `gblog\bootN-tSECONDS.txt` (plus `audio-*` and, after an NVIDIA start, the
-dGPU report). If something fails, wait 15 minutes (or at least 7), hold Power for 10 s to switch off, put the stick
+15 min, even if the screen stays black: `gblog\bootN-tSECONDS.txt` (plus `audio-*` and, from the 7-minute file on,
+the dGPU report, which takes about 5 minutes to write). If something fails, wait 15 minutes (or at least 7), hold Power for 10 s to switch off, put the stick
 into a Windows PC and read `gblog\` from its FAT32 partition. Include those files when you report a result.
 
 Each snapshot starts with a one-screen `== summary` block for triage: the 8250 / Surface Aggregator lines, the

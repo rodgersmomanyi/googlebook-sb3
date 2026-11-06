@@ -2,8 +2,36 @@
 
 What each wave changed, newest first. Details per device: [docs/DEVICE-STATUS.md](docs/DEVICE-STATUS.md) ("Changes
 since the audit"). The first native boot on the Surface Book 3 happened on 2026-10-31 (the wave 8 image; results
-per item in DEVICE-STATUS, "First real-hardware results"); every other result below is from VMware VMs, QEMU, the
-Linux build machine or disk-image files.
+per item in DEVICE-STATUS, "First real-hardware results"), the second on 2026-11-01 (the wave 9 image; "Second
+real-hardware results"); every other result below is from VMware VMs, QEMU, the Linux build machine or disk-image
+files.
+
+## Wave 10 (2026-11-05/06): the second native boot, the battery level, an installer ISO for the current system
+
+* **The second native boot** (the wave 9 image `e0825ee1…`, one start on the Surface Book 3 13.5" with the keyboard
+  base attached, 2026-11-01; analyser 38 PASS, 2 FAIL, 1 UNKNOWN): the Surface Aggregator re-bind of wave 9 works.
+  The keyboard base, touchpad, both batteries, the charger and the detach device appeared about 31 s after the start
+  (the first probe still fails on kernel build #16, as expected), and the keyboard, the touchpad and sound worked;
+  Wi-Fi associated, Bluetooth started, every sensor was there and the laptop posture stayed rotation-locked;
+  `boot_completed` after 92.1 s (the first start of a freshly written stick). Failed: the rear camera's focus motor
+  (DW9719, the same `-121` write error as on the first boot) and the dGPU report (no report file yet: it was still being written when that start's logs end, see below); no suspend
+  happened in the logged time. **New bug (HIGH):** Android's battery level read 0 % with the charging symbol, also on the charger,
+  while the combined battery read about 55 %, and after unplugging the charger animation kept flickering.
+* **Battery level:** Cause (a disassembly of lapis's desktop health HAL and the second boot's log): the HAL takes its charge counter from the combined battery's `charge_now`, which the kernel's test_power ties to the capacity (a percentage), and shows charge_now × 100 / charge_full; `gb_power` published charge_full in µAh, so the level came out as 0 %. The flicker: the dGPU report runs `gb_power -o` 30 times 10 s apart, and every run briefly rewrote the combined battery's start values (no battery, on mains). Fix (`gb_power` only, native image): the combined battery in percent units (charge_full 100, so the HAL's level equals the combined level), `gb_power` the only writer, `gb_power -o` read-only, a fixed write order. Tested on the build machine (the gb_power unit tests, 1,081 checks, also under the address and undefined-behaviour sanitisers; a battery harness against a model of the HAL, 28 runs without a violation, 10 of 10 mutants killed), with the hwtest analyser's new `battery_hal` item (it finds the bug in the second boot's log) and in VMware (the HAL's level equals the battery's). Known limit until wave 11: Android does not yet shut down by itself at a real 0 % (the combined battery always reports a normal level band), so do not run the battery below about 10 %. Untested on the laptop.
+* **dGPU report:** The second boot's FAIL came from the analyser's 120 s rule: the report is requested at 40 s and samples the power for about 5 minutes (30 runs of `gb_power -o`, 10 s apart), and that start's last log file was taken at 237 s, so the report was still being written. The wave 10 analyser judges the run time (PASS for a report of this boot, UNKNOWN while the run is inside its time, FAIL for a refusal, a bad exit, a hang or a report that was written but not collected); on those logs it gives 38 PASS, 2 FAIL (the cameras, and the new `battery_hal` item on the 0 % level), 2 UNKNOWN (suspend, the dGPU report). Keep one start running for 15 minutes (at least 7) so the report is collected.
+* **Rear camera focus motor:** The motor gets its power from the rear camera module, through a runtime power link that the camera bridge driver adds only after the motor's device appears. `gbinit` loaded the motor's driver `dw9719` first, so it probed before that link existed, lost power with the sensor and failed to park its lens (`Error writing reg 0x0003: -121` about 1 s after its probe, in every native start); pictures were not affected. The wave 10 image stages `dw9719` but loads it from no list; `gb_hw.sh vcm` (service `gb_hw_vcm`, early-init) loads it once the link exists and reports `vendor.gb.vcm`. Tested on the build machine (128 cases, 17 of 17 guard mutants) and in VMware (no camera there: the loader reports none and exits cleanly).
+* **Suspend:** No lid close or sleep request happened in the logged time (the start ended between the 4- and the 7-minute log files); the kernel side is ready (s2idle by default, the lid switch and its wake event registered). The wave 10 analyser judges suspend from more sources (the kernel's `PM:` lines, gb_power's and the touch launcher's resume lines, a closed lid, and the next start's copy of the kernel log, which shows a suspend that never resumed) and counts each SELinux record once; the image's touch launcher logs the deep-sleep (S0ix) time after every resume (`gb_iptsd: resume diag: ... last_hw_sleep=`).
+* **Stale notices**: gb_notify no longer shows a notice that is no longer true (left over from an earlier start, the
+  update validated meanwhile, another slot, a graphics state that changed, an old detach answer); lasting graphics
+  notices are kept until you have seen them (INTERFACES 12.1b, BACKLOG I-W9-1).
+* Tooling (no image change): `verify_image.py` checks the wave-9 items that the build generates outside the component
+  manifests (V19 whole load lists, V24 the VM's efi_pstore token, V34-V37: the C-6 label line, the refusal stubs, the
+  SAM/ISH services, the VM notification queue). The wave-9 outputs pass; the wave-8 image fails exactly these new
+  checks.
+* **Installer ISO for the current system:** the ISO is rebuilt (`e0bb15d5…`): option 1 writes the wave 10 USB
+  image `3b6330d9…` and option 2 installs the wave 10 dual-boot export; wave 9 had no ISO of its own. Tested in
+  VMware: T0, T1a/T1b (option 1 wrote a disk byte-identical to the wave 10 USB image), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-11-06 (12 test ids, 378 checks, 0 failed; the same counts as the wave 8 ISO's).
+* Tested in VMware: VM-1 on the wave 10 USB image (the analyser 17 PASS, 0 FAIL, 25 UNKNOWN; every wave 2-10 check VMware can show, among them the desktop health HAL's level equal to the combined battery's), a rehearsal of the VM build on a throwaway VM (a fresh first boot, forced and validated update boots: the planted stale notices dropped, this start's notice shown once after the sign-in), `verify_image.py` on the USB image, the export and the VM build, the host suites and every post area test. The long-running VM now runs the wave 10 VM build (written 2026-11-06 after a verified backup of its boot partition; its lock-screen PIN path is unchanged; its check boot passed without a sign-in).
 
 ## Wave 9 (2026-10-31/11-01): the first native boot's fixes, notices for the user in front, the last hardware-independent items
 

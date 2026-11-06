@@ -5,13 +5,21 @@
  *    android.hardware.health-service.android-desktop, AOSP BatteryMonitor inside) reports ONE battery: the first
  *    Battery-type supply in /sys/class/power_supply whose "scope" is not "Device" (it scans once, at start). This
  *    daemon sums both packs energy-weighted (what Windows shows) into the test_power module's test_battery, mirrors
- *    ADP1 into test_ac (the HAL scans test_ac at start even if ADP1 probes late), keeps test_usb off, and keeps the
- *    HAL off BAT1/BAT2: kernel patch 0001 (surface_battery scope_device=1 -> scope "Device", skipped by the HAL) or,
- *    on a kernel without it, a bind mount of a file reading "Unknown" over BATn/type (the HAL then ignores BATn).
- *    The desktop HAL derives the level from charge_counter*100/charge_full and the "time to full" ETA from
- *    (charge_full - charge_counter) / average current_now, so with kernel patch 0002 (test_power charge_full params)
- *    real uAh/uA values are published (correct level AND ETA); without it charge_counter=-1 / current=0 (the HAL then
- *    uses capacity and reports ETA -1, so Android falls back to its own step-based estimate).
+ *    ADP1 into test_ac (the HAL ORs every Mains supply it knows: test_ac from its start scan, ADP1 once it appears),
+ *    keeps test_usb off, and keeps the HAL off BAT1/BAT2: kernel patch 0001 (surface_battery scope_device=1 -> scope
+ *    "Device", skipped by the HAL) or, on a kernel without it, a bind mount of a file reading "Unknown" over BATn/type
+ *    (the HAL then ignores BATn).
+ *    Units (wave 10, w10prep battery-userspace; from the HAL's disassembly, checked against the second native boot's
+ *    log): the desktop HAL takes its charge counter from <battery>/charge_NOW, which test_power hard-wires to
+ *    battery_capacity, and computes Level = floor(charge_now*100/charge_full + 0.05), time to full =
+ *    (charge_full - charge_now) / average current (only at >= 1 mA) and time to shutdown = charge_now / average
+ *    discharge current (only at <= -1 mA). So test_battery carries PERCENT units: capacity = charge_now = the combined
+ *    level, charge_full = 100, current 0 (both estimates are then -1; Android estimates the time to full itself),
+ *    charge_counter -1, and (kernel patch 0002) charge_full_design chosen so that the HAL's state of health
+ *    lround(100 * charge_full / charge_full_design) is the packs' full/design. The real uAh/uA values waves 1-9
+ *    published made the HAL show 0 % (charge_now = 54 over charge_full = 5776291).
+ *    One writer: only the daemon writes test_power ("gb_power -o" is read-only); present=false only while no pack is
+ *    usable; every value in one fixed order, the numbers before present and ac (no defaults pass at a (re)start).
  * B. Detach (DTX, /dev/surface/dtx) and the latch lifecycle (C:\GB-build\native\dgpu\INTERFACES.md 10.2, 10.3).
  *    * Quick path (unchanged): no driver on any NVIDIA function and nouveau never used this boot -> the request is
  *      confirmed at once.
@@ -64,7 +72,8 @@
  * Logs to /dev/kmsg as "gb_power: ...". Needs root (bind mount, sysfs writes). Single-threaded poll loop on the kernel
  * uevent netlink socket, the DTX fd, the control socket and the worker pipe.
  * Build: clang --target=x86_64-linux-android34 -O2 -Wall -Wextra -Werror -static -Iuapi -o gb_power gb_power.c
- * Options: -p <profile> set platform profile and exit | -o one battery pass, print, exit | -r <root> sysfs/dev prefix
+ * Options: -p <profile> set platform profile and exit | -o one battery pass, print, exit (read-only: never writes
+ *          test_power, never hides BATn; the daemon is the bridge's only writer) | -r <root> sysfs/dev prefix
  *          (tests) | -S <path> control socket path (tests, only with -r) | -H no BATn/type hiding | -D no DTX | -G no
  *          dGPU handling (as gb.dgpu=keep: no unbind/runtime PM at start or hot-plug; detach still removes) | -I no
  *          studio-mode input inhibit | -v | -K <driver> VGA functions bound to <driver> stay bound (default nouveau;
@@ -525,8 +534,9 @@ static const char *tech_key(const char *t) {
 
 /* The battery math: energy-weighted sum of all real packs (charge units are converted with the pack's design
  * voltage), one status, and uAh/uA values expressed at one virtual pack voltage v_conv, so that
- *   charge_counter*100/charge_full == E_now*100/E_full   (the HAL's level) and
- *   (charge_full-charge_counter)/current == (E_full-E_now)/P_net   (the HAL's time-to-full, in hours). */
+ *   q_now*100/q_full == E_now*100/E_full   and   (q_full-q_now)/i_ua == (E_full-E_now)/P_net   (hours).
+ * (wave 10) The uAh/uA values are for the log line, "gb_power -o" and the state of health; test_battery carries the
+ * level in percent units (publish()). */
 static void combine(const struct psy *ps, int n, struct combo *c) {
   memset(c, 0, sizeof *c);
   c->status = S_DISCHARGING;
@@ -595,7 +605,8 @@ static void combine(const struct psy *ps, int n, struct combo *c) {
   c->q_full = ef * 1000000 / c->v_conv;
   c->q_design = ed * 1000000 / c->v_conv;
   if (c->q_full <= 0) c->q_full = 1;
-  /* level exactly as the desktop HAL computes it from counter/full: floor(counter*100/full + 0.05) */
+  /* the level, rounded like the desktop HAL rounds its own derivation: floor(x + 0.05) (it then gets this value back
+   * exactly: floor(cap*100/100 + 0.05) == cap) */
   int cap = (int)((c->q_now * 2000 + c->q_full) / (20 * c->q_full));
   if (cap > 100) cap = 100;
   if (cap < 0) cap = 0;
@@ -621,18 +632,19 @@ static const char *const tp_param[TP_N] = {
   "battery_present", "battery_technology", "battery_health", "battery_voltage", "battery_charge_full_design",
   "battery_charge_full", "battery_charge_counter", "battery_current", "battery_temp", "battery_capacity",
   "battery_status", "ac_online", "usb_online"};
-static struct { int ok, full, temp, writes; char last[TP_N][24]; } g_tp;
+static struct { int ok, full, temp, writes; char last[TP_N][24]; long long v_ms; } g_tp;
+static int g_readonly;                            /* -o: compute and print only; test_power is never written */
 
 static int tp_put(int idx, const char *val) {
   char path[PATH_MAX];
-  if (!strcmp(g_tp.last[idx], val)) return 0;
+  if (g_readonly || !strcmp(g_tp.last[idx], val)) return 0;
   int r = write_text(rpath(path, sizeof path, TP "%s", tp_param[idx]), val);
   if (r) { LOGW("write %s=%s failed: %s", tp_param[idx], val, strerror(-r)); return -1; }
   snprintf(g_tp.last[idx], sizeof g_tp.last[idx], "%s", val);
   g_tp.writes++;
+  trace("tp:%s=%s", tp_param[idx], val);
   return 1;
 }
-static int tp_putll(int idx, long long v) { char b[24]; snprintf(b, sizeof b, "%lld", v); return tp_put(idx, b); }
 
 static int tp_probe(void) {
   char path[PATH_MAX];
@@ -643,47 +655,84 @@ static int tp_probe(void) {
                 !access(rpath(path, sizeof path, TP "battery_charge_full_design"), W_OK);
     g_tp.temp = !access(rpath(path, sizeof path, TP "battery_temp"), W_OK);
     memset(g_tp.last, 0, sizeof g_tp.last);
-    LOGI("test_power found (%s); combined battery -> test_battery", g_tp.full ?
-         "charge_full params: real uAh/uA, HAL level + time-to-full from them" :
-         "no charge_full param (kernel patch 0002 missing): capacity only, Android estimates the ETA itself");
-    /* Defaults until real batteries show up: no battery, on mains, no USB charger, no bogus counter/current. */
-    tp_put(TP_USB, "off");
-    tp_put(TP_HEALTH, "good");
-    tp_put(TP_TECH, "LION");
-    tp_put(TP_COUNTER, "-1");
-    tp_put(TP_CURRENT, "0");
-    if (g_tp.temp) tp_put(TP_TEMP, "250");       /* no battery thermistor reading available: 25.0 C */
-    tp_put(TP_PRESENT, "false");
-    tp_put(TP_AC, "on");
+    g_tp.v_ms = 0;
+    if (!g_readonly)
+      LOGI("test_power found (%s); combined battery -> test_battery in percent units (capacity = charge_now = level, "
+           "charge_full 100, current 0)", g_tp.full ? "charge_full params: design scaled for the state of health" :
+           "no charge_full param (kernel patch 0002 missing): charge_full is 100 already, no state of health");
+    /* (wave 10) no defaults are written here: publish() sets every value in its fixed order, so a (re)start or a
+     * test_power reload never shows the HAL present=false / ac=on / current 0 while a pack is present. */
   }
   return 1;
 }
 
+#define V_DEADBAND_UV 20000LL                     /* a voltage-only change below this is not published ... */
+#define V_REFRESH_MS 60000                        /* ... unless the published voltage is this old */
+
+/* charge_full_design in percent units: the HAL's state of health is lround(100 * charge_full / design) with
+ * charge_full = 100, so design is a d with lround(10000 / d) == S, S = lround(100 * full / design) of the packs
+ * (1..100; a pack above its design capacity reads 100). */
+static long long pct_design(const struct combo *c) {
+  if (c->q_design <= 0 || c->q_full <= 0) return 100;
+  long long s = (c->q_full * 200 + c->q_design) / (2 * c->q_design);
+  if (s >= 100) return 100;
+  if (s < 1) s = 1;
+  long long d = (20000 + s) / (2 * s);
+  for (long long k = d - 2; k <= d + 2; k++)
+    if (k >= 100 && (20000 + k) / (2 * k) == s) return k;
+  return d < 100 ? 100 : d;
+}
+
+/* What test_battery / test_ac / test_usb carry for combination c (NULL = parameter left alone). */
+struct tpv { const char *v[TP_N]; char buf[TP_N][24]; };
+static void tp_values(const struct combo *c, struct tpv *o) {
+  memset(o, 0, sizeof *o);
+#define TPS(i, s) (o->v[i] = (s))
+#define TPN(i, n) (snprintf(o->buf[i], sizeof o->buf[i], "%lld", (long long)(n)), o->v[i] = o->buf[i])
+  TPS(TP_USB, "off");
+  TPS(TP_HEALTH, "good");
+  if (g_tp.temp) TPS(TP_TEMP, "250");             /* no battery thermistor reading available: 25.0 C */
+  TPS(TP_CURRENT, "0");                           /* |avg| >= 1 mA would make the HAL's estimates ~0 s in % units */
+  TPS(TP_COUNTER, "-1");                          /* unused by the HAL (it reads charge_now); <= 0 is neutral */
+  if (g_tp.full) TPS(TP_FULL, "100");             /* (legacy test_power: 100 already, not a parameter) */
+  TPS(TP_AC, c->ac ? "on" : "off");
+  if (!c->nbat) { TPS(TP_PRESENT, "false"); return; }
+  TPS(TP_TECH, c->tech);
+  TPN(TP_VOLTAGE, c->v_uv / 1000 * 1000);         /* test_power hands it out raw as voltage_now: uV */
+  if (g_tp.full) TPN(TP_FULL_DESIGN, pct_design(c));
+  TPN(TP_CAPACITY, c->capacity);                  /* = charge_now: the HAL's level floor(cap*100/100 + 0.05) */
+  TPS(TP_STATUS, status_name(c->status));
+  TPS(TP_PRESENT, "true");
+#undef TPS
+#undef TPN
+}
+
+/* Write order (every write is one HAL re-read): with a pack, current first (a |current| >= 1 mA read with percent
+ * values would enter the HAL's 5-sample average and give a ~0 s estimate for 5 more reads), then charge_full and the
+ * level, the rest, present, ac last (the HAL never sees present=true with stale numbers); without a pack,
+ * present=false first. */
+static const int TP_ORDER_BAT[] = {TP_CURRENT, TP_FULL, TP_CAPACITY, TP_COUNTER, TP_FULL_DESIGN, TP_TECH, TP_HEALTH,
+                                   TP_TEMP, TP_USB, TP_VOLTAGE, TP_STATUS, TP_PRESENT, TP_AC};
+static const int TP_ORDER_NONE[] = {TP_PRESENT, TP_CURRENT, TP_FULL, TP_COUNTER, TP_HEALTH, TP_TEMP, TP_USB, TP_AC};
+
 static void publish(const struct combo *c) {
-  if (!g_tp.ok) return;
-  if (!c->nbat) {
-    tp_put(TP_COUNTER, "-1");
-    tp_put(TP_CURRENT, "0");
-    tp_put(TP_PRESENT, "false");
-    tp_put(TP_AC, c->ac ? "on" : "off");
-    return;
+  if (!g_tp.ok || g_readonly) return;
+  struct tpv v;
+  tp_values(c, &v);
+  const int *ord = c->nbat ? TP_ORDER_BAT : TP_ORDER_NONE;
+  int n = c->nbat ? (int)(sizeof TP_ORDER_BAT / sizeof *TP_ORDER_BAT) : (int)(sizeof TP_ORDER_NONE / sizeof *TP_ORDER_NONE);
+  /* every test_power write is a power_supply uevent, a health-HAL update and (voltage changed) an Android
+   * BATTERY_CHANGED broadcast: a voltage-only change below the deadband waits for the next real change */
+  if (v.v[TP_VOLTAGE] && g_tp.last[TP_VOLTAGE][0]) {
+    int other = 0;
+    for (int k = 0; k < n; k++)
+      if (ord[k] != TP_VOLTAGE && v.v[ord[k]] && strcmp(g_tp.last[ord[k]], v.v[ord[k]])) other = 1;
+    if (!other && llabs(atoll(v.v[TP_VOLTAGE]) - atoll(g_tp.last[TP_VOLTAGE])) < V_DEADBAND_UV &&
+        now_ms() - g_tp.v_ms < V_REFRESH_MS)
+      v.v[TP_VOLTAGE] = NULL;
   }
-  tp_put(TP_TECH, c->tech);
-  tp_put(TP_HEALTH, "good");
-  tp_putll(TP_VOLTAGE, c->v_uv / 1000 * 1000);    /* test_power hands it out raw as voltage_now: uV */
-  if (g_tp.full) {
-    tp_putll(TP_FULL_DESIGN, c->q_design);
-    tp_putll(TP_FULL, c->q_full);
-    tp_putll(TP_COUNTER, c->q_now);
-    tp_putll(TP_CURRENT, c->i_ua / 1000 * 1000);
-  } else {
-    tp_put(TP_COUNTER, "-1");                     /* <=0: the HAL keeps "capacity" (counter*100/100 would be wrong) */
-    tp_put(TP_CURRENT, "0");                      /* <1 mA: the HAL reports no ETA instead of a bogus one */
-  }
-  tp_putll(TP_CAPACITY, c->capacity);
-  tp_put(TP_STATUS, status_name(c->status));
-  tp_put(TP_PRESENT, "true");
-  tp_put(TP_AC, c->ac ? "on" : "off");
+  for (int k = 0; k < n; k++)
+    if (v.v[ord[k]] && tp_put(ord[k], v.v[ord[k]]) > 0 && ord[k] == TP_VOLTAGE) g_tp.v_ms = now_ms();
 }
 
 /* Kernel without patch 0001: hide BATn from the HAL's type scan by bind-mounting "Unknown" over BATn/type. */
@@ -5738,19 +5787,29 @@ int main(int argc, char **argv) {
     return r ? 1 : 0;
   }
   if (once) {
-    tp_probe();
+    /* (wave 10) read-only: a second writer next to the daemon made the HAL see present=false / ac=on / current 0 for
+     * ~20 ms on every run (gb_dgpu_report's 30 samples 10 s apart: "battery none" + charger animation flicker) */
+    g_readonly = 1;
+    int tp = tp_probe();
     struct psy ps[MAXPSY];
     struct combo c;
     int n = psy_scan(ps, MAXPSY);
-    if (g_tp.ok) hide_batteries(ps, n);
     combine(ps, n, &c);
-    publish(&c);
     char d[256];
     describe(ps, n, &c, d, sizeof d);
     printf("combined: %s\npresent=%d nbat=%d capacity=%d status=%s ac=%d voltage_uV=%lld current_uA=%lld "
            "counter_uAh=%lld full_uAh=%lld design_uAh=%lld e_now_uWh=%lld e_full_uWh=%lld net_uW=%lld%s\n",
            d, c.present, c.nbat, c.capacity, status_name(c.status), c.ac, c.v_uv, c.i_ua, c.q_now, c.q_full,
-           c.q_design, c.e_now, c.e_full, c.p_net, g_tp.ok ? "" : " (test_power absent: nothing published)");
+           c.q_design, c.e_now, c.e_full, c.p_net, tp ? "" : " (test_power absent)");
+    if (tp) {
+      struct tpv v;
+      tp_values(&c, &v);
+      printf("test_power (what the daemon publishes; this run writes nothing):");
+      for (int i = 0; i < TP_N; i++)
+        if (v.v[i]) printf(" %s=%s", tp_param[i], v.v[i]);
+      printf("\n");
+    }
+    g_readonly = 0;                               /* (unit tests call main() in-process) */
     return 0;
   }
 

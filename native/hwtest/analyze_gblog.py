@@ -512,6 +512,11 @@ class Item:
         return self
 
 
+# (wave 10 misc-suspend) signals that end a process by a crash (SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV,
+# SIGSYS); init's own stop of a service is SIGTERM/SIGKILL (15/9) and is not one
+CRASH_SIGNALS = {"4", "5", "6", "7", "8", "11", "31"}
+
+
 class Analysis:
     def __init__(self, boot, env_override=None, expect_kernel=EXPECT_KERNEL):
         self.b = boot
@@ -647,6 +652,17 @@ class Analysis:
             add(m.group(1), e)
         for e, m in b.lc(r"ANR in (\S+)"):
             add(m.group(1), e)
+        # (wave 10 misc-suspend) the event-log records of the same events, which stay in the 6000-line logcat window
+        # when the AndroidRuntime / ActivityManager text lines have scrolled out of it (am_crash: [user,pid,process,..];
+        # am_anr: [user,pid,package,...]); a zygote child ended by a crash signal; the kernel's ANOM_ABEND audit record of a
+        # core-dumping signal (the kernel log covers more time than the logcat window)
+        for e, m in b.lc(r"\bam_(?:crash|anr)\s*: \[-?\d+,-?\d+,([^,\]]+),"):
+            add(m.group(1), e)
+        for e, m in b.lc(r"Zygote\s*: Process (\d+) exited due to signal (\d+)"):
+            if m.group(2) in CRASH_SIGNALS:     # (review) 9 = killed by the ActivityManager or lmkd: a stop, not a crash
+                add(f"app-pid-{m.group(1)}", e)
+        for e, m in b.dm(r"type=1701 audit\([^)]*\):.*?comm=\"([^\"]*)\".*?\bsig=(\d+)"):
+            add(m.group(1), e)
         loops = Counter()
         loop_ev = {}
         for e, m in b.dm(r"init: Service '([^']+)' \(pid \d+\) (?:exited with status (\d+)|received signal (\d+)|"
@@ -656,6 +672,9 @@ class Analysis:
                 continue
             loops[m.group(1)] += 1
             loop_ev.setdefault(m.group(1), []).append(e)
+            sig = m.group(3) or m.group(4)
+            if sig in CRASH_SIGNALS:      # (wave 10 misc-suspend) one crash by a signal is a crash, not only a loop
+                procs.setdefault(f"{m.group(1)} (init service, signal {sig})", []).append(e)
         for svc, c in loops.items():
             if c >= 3:
                 procs.setdefault(f"{svc} (init service, {c} abnormal exits)", []).extend(loop_ev[svc])
@@ -1231,32 +1250,263 @@ def c_rapl(a, it):
     it.set(UNKNOWN, "no gb_hw rapl lines (gb_hw logs to the kernel log; wrapped?)")
 
 
+# (wave 10 misc-suspend) What a suspend leaves in this image's logs, besides the kernel's own PM: lines:
+#   gb_power  "gb_power: system resumed (suspend_stats/success A -> B)" (resume_check(), after every resume)
+#   gb_iptsd  "gb_iptsd: iptsd stopped: resume, rc=..." (it restarts iptsd after every resume) and, with the wave-10
+#             gb_iptsd.sh, "gb_iptsd: resume diag: success=.. fail=.. last_hw_sleep=.. total_hw_sleep=.. max_hw_sleep=..
+#             lpi_system_us=.. lpi_cpu_us=.." (the kernel's suspend counters and the SoC's hardware-sleep (S0ix)
+#             microseconds of the last suspend; '-' = the kernel has no such file)
+#   logcat    the PowerManager's sleep line (AOSP texts, not yet seen on lapis: "Powering off display group due to
+#             <reason>" (PowerGroup, Android 12+), "Sleeping power group (... reason=<reason>)", the older "Going to
+#             sleep due to <reason>"), "Waking up from ..." and the event-log power_sleep_requested / screen_toggled
+#             records (only while they are in the 6000-line logcat window)
+#   posture   device state CLOSED in a snapshot summary (a snapshot ran while the lid was closed)
+#   next boot this boot's live kernel log (gb_dgpu_dmesg's dmesg-live.txt) as the NEXT boot's snapshots copy it:
+#             lines written after this boot's last snapshot, e.g. a suspend that never resumed (a forced power-off)
+# gb_bootlog's snapshots go by /proc/uptime, which counts the time spent suspended.
+# the kernel time of a PM: line itself, also inside gb_hw's 'diag: k: [t] ...' replays (the same t: counted once)
+SUSP_TS = r"\[\s*(\d+\.\d+)\]\s+"
+# (review) a failed or aborted suspend ATTEMPT. k16's pm_suspend() prints 'PM: suspend entry' and 'PM: suspend exit' and
+# counts suspend_stats/fail for every attempt, also one that a wakeup event or a busy driver stopped (alarmtimer returns
+# -EBUSY when an alarm is due within 2 s: the usual abort on Android), and Android's autosuspend simply tries again: such
+# an attempt is a FAIL only while no suspend completed. k16 prints a device's failure through dev_err with 'PM: ' as
+# '<driver> <device>: PM: failed to suspend[ async| late| noirq]: error N' (older kernels 'PM: Device <device> failed to
+# suspend ...'), the freezer 'Freezing <what> failed|aborted after ...'
+SUSP_BAD_RE = (r"PM: (Some devices failed to suspend|suspend of devices aborted|Device \S+ failed to (?:suspend|resume)|"
+               r"noirq suspend of devices failed|late suspend of devices failed|Wakeup pending, aborting suspend|"
+               r"dpm_run_callback\(\): \S+ returns -?\d+|failed to (?:suspend|freeze|quiesce))|"
+               r"Freezing of tasks failed|Freezing (?:user space processes|remaining freezable tasks) (?:failed|aborted)")
+# (review) a device that failed to RESUME ('<driver> <device>: PM: failed to resume[ async| early| noirq]: error N', its
+# 'PM: dpm_run_callback(): <..resume..> returns N', or the older 'PM: Device <device> failed to resume'): a FAIL even
+# after a completed cycle (that device may be dead until the next boot)
+SUSP_RESUME_BAD_RE = r"PM: (?:Device \S+ )?failed to resume|PM: dpm_run_callback\(\): \S*resume\S* returns -?\d+"
+# (review) the device named by a failure line, in either format
+SUSP_DEV_RE = r"PM: Device (\S+) failed to|(\S+): PM: (?:failed to|dpm_run_callback\(\))"
+SUSP_DIAG_RE = (r"gb_iptsd: resume diag: success=(\S+) fail=(\S+) last_hw_sleep=(\S+) total_hw_sleep=(\S+) "
+                r"max_hw_sleep=(\S+) lpi_system_us=(\S+) lpi_cpu_us=(\S+)")
+SLEEP_REQ_RE = (r"(?:Going to sleep due to |Powering off display group due to |Sleeping power group \(.*?reason=)"
+                r"(\w+)|\bpower_sleep_requested\b|\bscreen_toggled\s*: 0\b")
+# (wave 10) a device driver error in the minute after a resume: noted (the resume itself completed)
+RESUME_ERR_RE = re.compile(r"(?i)(i915|iwlwifi|surface_|ssam|ipts|nouveau|xhci|usb \d|snd_|sof-|intel_ish|cros_ec|"
+                           r"mei|ipu6|btintel|Bluetooth).*(error|fail|timed? ?out|-110|-5\b|-19\b)")
+
+
+def _num(v):
+    return int(v) if v and v.isdigit() else None
+
+
+def _susp_t(e, m):
+    """(review) The kernel time of a matched PM: line: the last '[t]' before the match (inside a gb_hw 'diag: k: [t]'
+    replay the replayed line's own time), else None."""
+    ts = re.findall(r"\[\s*(\d+\.\d+)\]", e.text[:m.start()])
+    return float(ts[-1]) if ts else None
+
+
+def _susp_dev(lines):
+    """(review) The first device named by the failure lines [(Ev, match)], or None."""
+    for e, _m in lines:
+        md = re.search(SUSP_DEV_RE, e.text)
+        if md:
+            return md.group(1) or md.group(2)
+    return None
+
+
+def _dgpu_before(a, t):
+    """(Snap, function dict) of the NVIDIA VGA function in the newest snapshot taken before kernel time t (before a
+    suspend /proc/uptime and the kernel's clock agree), or None."""
+    best = None
+    for sn in a.b.snaps:
+        if sn.uptime is not None and sn.uptime < t:
+            vga = [f for f in parse_dgpu(sn) if f["vendor"] == "0x10de" and f["class"].startswith("0x03")]
+            if vga:
+                best = (sn, vga[0])
+    return best
+
+
+def next_boot_tail(src, n):
+    """(wave 10 misc-suspend) This boot's own live kernel log as the NEXT boot (n+1) of the same folder copies it:
+    gb_dgpu_dmesg's dmesg-live.txt is the previous boot's until it rotates it into dmesg-live.prev.txt at its start
+    (gb_nouveau.sh do_dmesg_stream), so boot n+1's snapshots show boot n's file either as a stale '== dmesg-live
+    (tail)' (ahead of that snapshot's own kernel; live_limit) or, once rotated, as '== dmesg-live.prev (tail)' next to
+    a fresh '== dmesg-live (tail)'. The copy counts as boot n's only if it shares at least 20 timestamped kernel lines
+    with boot n's own snapshots (checked by the caller). [Ev] (each line once), [] when there is no such copy."""
+    try:
+        snaps, _audio, _d = find_files(src)
+    except OSError:
+        return []
+    out, seen = [], set()
+    for bn, t, p in sorted(snaps):
+        if bn != n + 1:
+            continue
+        try:
+            sn = Snap(p, bn, t)
+        except OSError:
+            continue
+        live = sn.lines("dmesg_live")
+        ts = [float(m.group(1)) for _ln, s in live for m in [KTS_RE.match(s)] if m]
+        lim = live_limit(sn)
+        stale = bool(ts) and lim is not None and max(ts) > lim
+        body = live if stale else (sn.lines("dmesg_live_prev") if ts else [])
+        for ln, s in body:
+            if KTS_RE.match(s) and s not in seen:
+                seen.add(s)
+                out.append(sn.ev(ln, s))
+    return out
+
+
 @check("suspend", "Suspend (s2idle) and resume", "row 46; checklist 11", "HW")
 def c_suspend(a, it):
     d = a.b.dm(r"gb_hw: diag: mem_sleep '([^']*)' suspend_stats success=(\d*) fail=(\d*)")
-    entry = a.b.dm(r"PM: suspend entry \((\w+)\)")
-    exit_ = a.b.dm(r"PM: suspend exit")
-    bad = a.b.dm(r"PM: (Some devices failed to suspend|suspend of devices aborted|Device \S+ failed to suspend|"
-                 r"noirq suspend of devices failed|late suspend of devices failed)|Freezing of tasks failed|"
-                 r"Freezing user space processes failed")
-    it.add(d[-1:]).add(entry[:1]).add(exit_[:1]).add(bad[:3])
+    entry = a.b.dm(SUSP_TS + r"PM: suspend entry \((\w+)\)")
+    exit_ = a.b.dm(SUSP_TS + r"PM: suspend exit")
+    bad = a.b.dm(SUSP_BAD_RE)
+    gbp = a.b.dm(r"gb_power: system resumed \(suspend_stats/success (\d+) -> (\d+)\)")
+    ipt = a.b.dm(r"gb_iptsd: iptsd stopped: resume\b")
+    rdg = a.b.dm(SUSP_DIAG_RE)
+    sleep = a.b.lc(SLEEP_REQ_RE)
+    wake = a.b.lc(r"PowerManagerService: Waking up from (\S+)")
+    closed = [x for x in _posture_summary(a) if x[2] == "CLOSED"]
+    dg_test = []                    # gb_dgpu_report's [NVIDIA test] suspend phase (report test-<N>.txt)
+    for sn in a.b.snaps:
+        for (_hl, _hs), body in sn.reports:
+            dg_test += [(sn.ev(ln, s), m) for ln, s in body for m in [re.search(r"\bsuspends_seen=(\d+)", s)] if m]
+    # this boot's live kernel log as the next boot copied it: only the part after this boot's own newest kernel line
+    tail = list(getattr(a.b, "next_tail", None) or [])
+    own = {e.text for e in a.b.dmesg}
+    newest = max((float(m.group(1)) for e in a.b.dmesg for m in [KTS_RE.match(e.text)] if m), default=None)
+    late = []
+    if tail and len([e for e in tail if e.text in own]) >= 20 and newest is not None:
+        late = [e for e in tail if float(KTS_RE.match(e.text).group(1)) > newest]
+    late_entry = [(e, m) for e in late for m in [re.search(SUSP_TS + r"PM: suspend entry", e.text)] if m]
+    late_exit = [(e, m) for e in late for m in [re.search(SUSP_TS + r"PM: suspend exit", e.text)] if m]
+    late_bad = [(e, m) for e in late for m in [re.search(SUSP_BAD_RE, e.text)] if m]
+    rbad = a.b.dm(SUSP_RESUME_BAD_RE) + [(e, m) for e in late for m in [re.search(SUSP_RESUME_BAD_RE, e.text)] if m]
+    it.add(rbad[:2])
+    it.add(d[-1:]).add(entry[:1]).add(exit_[:1]).add(bad[:3]).add(gbp[-1:]).add(ipt[:1]).add(rdg[-1:])
+    it.add(sleep[:2]).add(wake[:1]).add([x[1] for x in closed[:1]]).add([x[0] for x in dg_test[-1:]])
+    it.add(late_entry[-1:]).add(late_exit[-1:]).add(late_bad[:2])
     if not a.judge_hw:
         return a.not_here(it)
     if d:
         ms = d[-1][1].group(1)
         if "[s2idle]" not in ms:
             it.note(f"mem_sleep '{ms}': s2idle is expected (FADT low-power S0 idle)")
-    if entry and entry[0][1].group(1) != "s2idle":
-        it.note(f"suspend entry ({entry[0][1].group(1)}): s2idle is expected")
+    if entry and entry[0][1].group(2) != "s2idle":
+        it.note(f"suspend entry ({entry[0][1].group(2)}): s2idle is expected")
+    if late:
+        it.note(f"the next boot's copy of this boot's live kernel log has {len(late)} line(s) after this boot's last "
+                f"snapshot (up to {KTS_RE.match(late[-1].text).group(1)} s)")
+    # the newest gb_iptsd resume diag (wave-10 images): counters and the SoC hardware sleep of the last suspend
+    rd = rdg[-1][1] if rdg else None
     fl = d[-1][1].group(3) if d else ""
-    if bad or (fl and int(fl) > 0):
-        return it.set(FAIL, "a suspend failed" + (f" (suspend_stats fail={fl})" if fl and int(fl) > 0 else ""))
-    if exit_:
-        return it.set(PASS, f"{len(exit_)} suspend/resume cycle(s) completed (PM: suspend exit)")
-    ok = d[-1][1].group(2) if d else ""
-    if ok and int(ok) > 0:
-        return it.set(PASS, f"suspend_stats success={ok} fail={fl or 0}")
-    it.set(UNKNOWN, "no suspend happened during the logged time: close the lid once, then read a later snapshot")
+    rfl = _num(rd.group(2)) if rd else None
+    t_in = max((float(m.group(1)) for _e, m in late_entry), default=None)
+    t_out = max((float(m.group(1)) for _e, m in late_exit), default=None)
+    if t_in is not None and (t_out is None or t_out < t_in):
+        return it.set(FAIL, f"the system suspended and never resumed: this boot's live kernel log (copied by the next "
+                            f"boot) ends inside a suspend (PM: suspend entry at {t_in:.1f} s, no PM: suspend exit "
+                            "after it); it was powered off by hand")
+    if rbad:
+        dev = _susp_dev(rbad)
+        return it.set(FAIL, "a device failed to resume" + (f" ({dev})" if dev else "") + ": "
+                      + redact(KTS_RE.sub("", rbad[0][0].text).strip())[:160])
+    # (review) each attempt = the newest 'PM: suspend entry' at or before its 'PM: suspend exit'; it failed (or was
+    # aborted) when a failure line lies between the two. Only a clean attempt or a success counter is a completed cycle
+    exits = {m.group(1) for _e, m in exit_} | {m.group(1) for _e, m in late_exit}
+    ents = sorted({float(m.group(1)) for _e, m in entry} | {float(m.group(1)) for _e, m in late_entry})
+    bad_t = [t for t in (_susp_t(e, m) for e, m in bad + late_bad) if t is not None]
+    clean, failed_att = [], []
+    for te in sorted(float(x) for x in exits):
+        tn = max((t for t in ents if t <= te), default=te)
+        (failed_att if any(tn <= tb <= te for tb in bad_t) else clean).append(te)
+    why = []
+    if fl and int(fl) > 0:
+        why.append(f"suspend_stats fail={fl}")
+    if rfl:
+        why.append(f"resume diag fail={rfl}")
+    dev = _susp_dev(bad + late_bad)
+    if dev:
+        why.append(f"device {dev}")
+    failed = bool(bad or late_bad or (fl and int(fl) > 0) or (rfl and rfl > 0))
+    succ = [_num(m.group(2)) for _e, m in gbp] + ([_num(rd.group(1))] if rd else [])
+    if d and _num(d[-1][1].group(2)):
+        succ.append(_num(d[-1][1].group(2)))
+    cycles = max([len(clean), len(ipt), len({m.group(2) for _e, m in gbp})]
+                 + [s for s in succ if s] + [_num(m.group(1)) or 0 for _e, m in dg_test])
+    if failed and not cycles:
+        return it.set(FAIL, "a suspend failed" + (f" ({', '.join(why)})" if why else "") + ": no suspend completed")
+    if cycles:
+        if failed:
+            n = max([len(failed_att), _num(fl) or 0, rfl or 0, 1])
+            first = (bad + late_bad)[0][0] if bad or late_bad else None
+            it.add([first] if first else []).note(
+                f"{n} suspend attempt(s) failed or were aborted" + (f" ({', '.join(why)})" if why else "")
+                + (f", first: {redact(KTS_RE.sub('', first.text).strip())[:120]}" if first else "")
+                + ": Android retries a suspend that a wakeup event or a busy driver stopped (alarmtimer -16 = an alarm "
+                  "due within 2 s); not a FAIL while suspends complete")
+        src = []
+        if clean:
+            src.append(f"{len(clean)} 'PM: suspend exit'")
+        if gbp:
+            src.append(f"gb_power 'system resumed' x{len(gbp)}")
+        if ipt:
+            src.append(f"gb_iptsd restarted iptsd after a resume x{len(ipt)}")
+        if dg_test:
+            src.append(f"[NVIDIA test] suspends_seen={dg_test[-1][1].group(1)}")
+        if rd:
+            hw, tot, lpi = _num(rd.group(3)), _num(rd.group(4)), _num(rd.group(6))
+            if hw == 0 and lpi:
+                # two independent counters: intel_pmc_core's per-suspend report and ACPI LPIT's SLP_S0 residency since
+                # boot (acpi_lpit.c); when they disagree both are said and nothing is judged
+                it.note(f"last_hw_sleep=0 (intel_pmc_core) but the LPIT system residency is {lpi / 1e6:.1f} s since "
+                        "boot: S0ix was reached at some time; whether in this suspend is not certain")
+            elif hw == 0:
+                it.note("the SoC did not reach its hardware sleep state (S0ix) in the last suspend (gb_iptsd resume diag "
+                        "last_hw_sleep=0, LPIT system residency " + ("0" if lpi == 0 else "not reported") + "): suspend "
+                        "works but drains the battery like idle; find the blocker with the Intel PMC substate/LTR lines "
+                        "(BACKLOG HW-S0IX)")
+                dg = _dgpu_before(a, float(entry[-1][1].group(1))) if entry else None
+                if dg and dg[1]["state"] != "D3cold":
+                    it.add([dg[1]["ev"]]).note(f"the dGPU was in {dg[1]['state']} in {dg[0].name}, the last snapshot "
+                                               "before the suspend: there is no S0ix while it is powered (row 46)")
+            elif hw is not None:
+                it.note(f"S0ix reached: {hw / 1e6:.1f} s of hardware sleep in the last suspend"
+                        + (f" ({tot / 1e6:.1f} s over all suspends of this boot)" if tot is not None else ""))
+            else:
+                it.note("this kernel reports no hardware-sleep time (last_hw_sleep '-'): S0ix not judged")
+        else:
+            it.note("S0ix (the SoC hardware sleep during suspend) is not in this image's logs: the wave-10 gb_iptsd "
+                    "resume diag line adds it")
+        # a resume completed: driver errors in the next 60 s are noted (keyboard base, Wi-Fi, touch, GPU after resume)
+        t_ex = sorted(float(t) for t in exits)
+        errs = []
+        for t0 in t_ex:
+            errs += [e for e in a.b.dmesg for m in [KTS_RE.match(e.text)] if m and t0 < float(m.group(1)) <= t0 + 60
+                     and "avc:" not in e.text and RESUME_ERR_RE.search(e.text) and not DEFERRED_RE.search(e.text)]
+        if errs:
+            it.add(errs[:3]).note(f"{len(errs)} driver error line(s) within 60 s after a resume (first: "
+                                  f"{redact(KTS_RE.sub('', errs[0].text).strip())[:120]})")
+        return it.set(PASS, f"{cycles} suspend/resume cycle(s) completed ({'; '.join(src) or 'suspend_stats'})")
+    last = a.b.latest
+    up = f"{last.uptime:.0f} s" if last.uptime is not None else "?"
+    if entry:           # cannot be seen in this boot's own snapshots after a resume, which logs 'PM: suspend exit'
+        return it.set(UNKNOWN, f"'PM: suspend entry' at {entry[-1][1].group(1)} s without a 'PM: suspend exit' in this "
+                               "boot's snapshots: read the next boot's snapshots too (its copy of this boot's live "
+                               "kernel log shows whether it resumed)")
+    if sleep or closed:
+        what = []
+        if sleep:
+            r = next((m.group(1) for _e, m in sleep if m.group(1)), None)
+            what.append("the display went to sleep" + (f" ({r})" if r else ""))
+        if closed:
+            what.append(f"device state CLOSED in {closed[0][0].name}")
+        return it.set(UNKNOWN, f"{' and '.join(what)}, but the kernel never suspended in the logged time (no PM: "
+                               f"suspend entry; last snapshot {last.name} at {up}): a wake lock kept it awake, or the "
+                               "lid was opened again too soon; repeat with the lid closed for 60 s (DEVICE-STATUS row 46)")
+    it.set(UNKNOWN, f"no suspend in the logged time (last snapshot {last.name} at {up} uptime; no lid close, sleep "
+                    "request or PM: suspend line): to test it, on a start that is not the first one after writing the "
+                    "stick, close the lid for 60 s about 5 min after power-on, then keep the system on until 16 min "
+                    "(the t420/t900 snapshots record the resume; DEVICE-STATUS row 46)")
 
 
 # ------------------------------------------------------------------------------------------------ display
@@ -1656,11 +1906,33 @@ def c_cameras(a, it):
     # always failed on the Surface Book 3 (-121); images from wave 9 on no longer load it: a note, never a FAIL
     serr_ir = [x for x in serr if re.search(r"\bov7251\b", x[0].text, re.I)]
     serr = [x for x in serr if x not in serr_ir]
+    # (wave 10 misc-cameras) gb_hw.sh vcm loads the rear focus motor's dw9719 once ipu-bridge has created its i2c device
+    # and its runtime-PM link to the sensor. Its own lines ('gb_hw: vcm:', 'gb_hw: diag: vcm') are judged here, never
+    # as a sensor driver's error; a FAILED one (or runtime=error) is the FAIL reason.
+    vcm = a.b.dm(r"gb_hw: (diag: )?vcm[: ]")
+    serr = [x for x in serr if not re.search(r"gb_hw: (diag: )?vcm[: ]", x[0].text)]
+    vbad = [x for x in vcm if re.search(r"\bFAILED\b|\bruntime=error\b", x[0].text)]
+    park = [x for x in serr if re.search(r"\bdw9719\b.*Error writing reg 0x0003: -121", x[0].text)]
     it.add([dev[3]] if dev else []).add(hw[:1]).add(fwbad[:3]).add(found[:3]).add(conn[:1]).add(serr[:4]) \
-        .add(serr_ir[:1])
+        .add(serr_ir[:1]).add(vbad[:1] or vcm[-1:])
     if serr_ir:
         it.note("the IR camera ov7251 (INT347E) logged errors: not used by Android (the camera HAL exposes only the "
                 "front and rear cameras); images from wave 9 on do not load it")
+    # (misc-cameras review) the old-order cause only when gb_hw vcm did not load the motor itself (no vcm line, or
+    # its re-bind of a VCM that an older load list had bound before the link)
+    old_order = not vcm or any("before its runtime-PM link existed" in x[0].text for x in vcm)
+    if park and old_order:
+        it.note("dw9719 'Error writing reg 0x0003: -121' = the rear focus motor's first runtime suspend (the lens park) "
+                "without power: dw9719 probed before ipu-bridge's VCM -> sensor runtime-PM link existed (gbinit loaded "
+                "it, images before wave 10). The rear sensor is not affected (the lens stays at rest); the VCM stays "
+                "in the runtime-PM error state (w10prep misc-cameras)")
+    elif park:
+        it.note("dw9719 'Error writing reg 0x0003: -121' although gb_hw vcm loaded dw9719 after ipu-bridge's VCM -> "
+                "sensor runtime-PM link existed: the lens park failed with the link in place, so the load-order cause "
+                "of the earlier boots does not explain it (see the gb_hw vcm line; w10prep misc-cameras RESULT "
+                "section 5)")
+    if vcm and not vbad:
+        it.note("rear focus motor: " + vcm[-1][0].text.split("gb_hw: ", 1)[-1][:200])
     # (W5, C-1) the HAL must load on any machine: a dlopen failure is software, so it FAILs in VMware too (it hid
     # behind "no hardware" in every native VM smoke before wave 5)
     hal = a.b.lc(r"Could not load (/odm/lib64/hw/camera\.sb3\.so|camera HAL module)")
@@ -1701,6 +1973,8 @@ def c_cameras(a, it):
     if serr:
         bad.append("a sensor driver logged errors (" + ", ".join(sorted({re.search(
             r"\b(ov5693|ov8865|dw9719)\b", x[0].text, re.I).group(1).lower() for x in serr})) + ")")
+    if vbad:
+        bad.append("the rear focus motor's loader (gb_hw vcm) reported: " + vbad[0][0].text.split("gb_hw: ", 1)[-1][:160])
     if bad:
         return it.set(FAIL, "; ".join(bad))
     if not found and not conn:
@@ -1794,24 +2068,171 @@ def c_nouveau(a, it):
     it.set(FAIL, f"mode {mode}: result '{res or 'unset'}', driver '{drv or 'none'}' at uptime {up:.0f} s")
 
 
+# (wave 10 misc-dgpu-report) When a dgpu-<N>.txt can exist. gb_bootlog requests the report at t40 (setprop
+# vendor.gb.dgpu_report 1); gb.rc ('on property:vendor.gb.dgpu_report=1' in nouveau-kernel\native\gb_nouveau.rc) sets
+# the property back to 0 and starts the oneshot service gb_dgpu_report, so 0 is the trigger at rest, never a result
+# (dgpu\INTERFACES.md section 6: "rc resets to 0"). 'gb_dgpu_report.sh report' writes report/dgpu-<N>.txt.tmp and
+# renames it only at its end, and on the normal entry its '== power' part takes 30 'gb_power -o' samples 10 s apart
+# (INTERFACES 7.10): the first native boot's boot 2 ran 295.75 s (started 40.3 s, "report written" 336.1 s), so the t420
+# snapshot is the first that can hold it. A gb.nouveau=test boot skips that part (boot 3: 3.15 s).
+DGPU_REPORT_TYPICAL_S = 300    # normal entry: 29 x 10 s sleeps + 30 short samples
+DGPU_REPORT_MAX_S = 840        # normal entry at worst: 29 x 10 s + 30 x 15 s (each sample's timeout) + 2 x 30 s (the
+#                                vkjson and SurfaceFlinger timeouts) + 40 s; a run from t40 still running at t900 hangs
+DGPU_REPORT_TEST_MAX_S = 120   # gb.nouveau=test boot (no '== power' part): the two 30 s timeouts + slack
+DGPU_START_RE = re.compile(r"init: starting service 'gb_dgpu_report'")
+DGPU_EXIT_RE = re.compile(r"init: Service 'gb_dgpu_report' \(pid (\d+)\) (exited with status (\d+)|received "
+                          r"(SIG[A-Z0-9]+|signal \d+)|killed by signal (\d+))")
+DGPU_WRITTEN_RE = re.compile(r"gb_dgpu_report: report written: dgpu-(\d+)\.txt")
+DGPU_REFUSED_RE = re.compile(r"gb_dgpu_report: report: (.+)$")
+DGPU_HDR_RE = re.compile(r"^== gb_dgpu_report report n=(\d+)")
+
+
+def _dgpu_klines(sns):
+    """(wave 10 misc-dgpu-report) gb_dgpu_report's service and report lines of THIS boot: only the snapshots' own
+    '== dmesg' dumps (the kernel ring buffer), never dmesg-live or a report file, which can hold an earlier boot's lines.
+    {kind: [(timestamp, Ev, match)]} for kind start, exit, written, refused (each line once)."""
+    out = {"start": [], "exit": [], "written": [], "refused": []}
+    seen = set()
+    for sn in sns:
+        for ln, s in sn.lines("dmesg"):
+            if "gb_dgpu_report" not in s or s in seen:
+                continue
+            seen.add(s)
+            mt = KTS_RE.match(s)
+            if not mt:
+                continue
+            for kind, rx in (("start", DGPU_START_RE), ("exit", DGPU_EXIT_RE), ("written", DGPU_WRITTEN_RE),
+                             ("refused", DGPU_REFUSED_RE)):
+                m = rx.search(s)
+                if m:
+                    out[kind].append((float(mt.group(1)), sn.ev(ln, s), m))
+                    break
+    return out
+
+
+def _dgpu_report_stale(a, sn, hdr, kl):
+    """(wave 10 misc-dgpu-report) A reason text when the dgpu report hdr found in snapshot sn cannot be this boot's,
+    else None. gb_bootlog adds the NEWEST report/dgpu-*.txt, which is an earlier boot's while this boot's run has not
+    renamed its .tmp yet. Proven only from complete evidence: (1) this boot's kernel log names its own file (every run of
+    a boot writes dgpu-<bootseq>.txt) and n differs; (2) sn's getprop shows gb_dgpu_report running, and sn's own dmesg
+    dump (taken after the report was read) is whole (the file is not cut inside it), starts at boot and holds exactly
+    one start of it and no exit or write. (On the SB3 the ring buffer starts at boot only in the early snapshots: the
+    second native boot's t180 dump starts at 17.9 s, so (2) proves nothing there and the report counts as before.)"""
+    m = DGPU_HDR_RE.match(hdr)
+    n = m.group(1) if m else None
+    own = sorted({w[2].group(1) for w in kl["written"]})
+    if n is not None and own and n not in own:
+        return f"n={n}, but this boot writes dgpu-{own[-1]}.txt"
+    st, _e = a.b.prop_in(sn, "init.svc.gb_dgpu_report")
+    dm = sn.lines("dmesg")
+    first = next((KTS_RE.match(s) for _ln, s in dm if KTS_RE.match(s)), None)
+    # (review 2026-11-05) a file cut inside its dmesg dump can lack this run's 'report written' and exit lines
+    if st != "running" or not sn.whole("dmesg") or not first or float(first.group(1)) >= 2.0:
+        return None
+    k = _dgpu_klines([sn])
+    if len(k["start"]) == 1 and not k["exit"] and not k["written"]:
+        return (f"n={n or '?'}, while this boot's only gb_dgpu_report run (started at {k['start'][0][0]:.1f} s) was "
+                "still running")
+    return None
+
+
+def _dgpu_report_missing(a, it, kl):
+    """(wave 10 misc-dgpu-report) No dgpu-<N>.txt of this boot in any snapshot: UNKNOWN while gb_dgpu_report is still
+    inside its run time (or not requested yet), FAIL when it was refused, exited or was killed without a report, wrote
+    one that no snapshot holds, runs longer than it can (hung) or never started."""
+    v, ve = a.b.prop("vendor.gb.dgpu_report")
+    if v is not None:
+        it.add([ve])
+        if v in ("1", "2"):
+            # (review 2026-11-05) seconds after the setprop the trigger still set: gb.rc's property trigger never acted
+            it.note(f"vendor.gb.dgpu_report={v}: requested, but gb.rc has not set it back to 0 (it does that as it "
+                    f"starts {'gb_dgpu_report' if v == '1' else 'gb_dgpu_test'}): the rc trigger did not act")
+        else:
+            it.note(f"vendor.gb.dgpu_report={v}: the request trigger at rest (gb_bootlog sets 1 at t40, gb.rc sets it "
+                    "back to 0 as it starts gb_dgpu_report; 2 = the test sequence): never a result")
+    nv = [t.split("=", 1)[1] for t in a.cmdline if t.startswith("gb.nouveau=")]
+    test = bool(nv) and nv[-1] == "test"
+    bound = DGPU_REPORT_TEST_MAX_S if test else DGPU_REPORT_MAX_S
+    kind = "a gb.nouveau=test boot (no '== power' part)" if test else "the normal entry"
+    for k in ("start", "exit", "written", "refused"):
+        it.add([x[1] for x in kl[k]])
+    if kl["refused"]:
+        return it.set(FAIL, f"gb_dgpu_report refused: {kl['refused'][-1][2].group(1)}")
+    bad = [x for x in kl["exit"] if x[2].group(3) != "0"]
+    if bad:
+        m = bad[-1][2]
+        return it.set(FAIL, f"gb_dgpu_report (pid {m.group(1)}) {m.group(2)} without a report")
+    # the newest snapshot whose getprop holds the service's state (a file cut before getprop judges nothing)
+    sn = next((x for x in reversed(a.b.snaps) if a.b.prop_in(x, "init.svc.gb_dgpu_report")[0] is not None), None)
+    if sn is None:
+        sn = next((x for x in reversed(a.b.snaps) if x.whole("getprop")), None)
+    if sn is None:
+        return it.set(UNKNOWN, "no dGPU report yet and no whole getprop in any snapshot (files cut short?)")
+    up = sn.uptime or 0
+    st, se = a.b.prop_in(sn, "init.svc.gb_dgpu_report")
+    bt, be = a.b.prop_in(sn, "ro.boottime.gb_dgpu_report")
+    it.add([se, be])
+    # the newest start line first: ro.boottime.<service> is write-once (the FIRST start of the boot)
+    starts = [x[0] for x in kl["start"] if x[0] <= up + 5]
+    start = starts[-1] if starts else (int(bt) / 1e9 if bt and bt.isdigit() else None)
+    # gb_bootlog reads report/*.txt after getprop and before '== dmesg-live (tail)': a file cut before that point
+    # never listed the reports, so it is no evidence that one is missing
+    listed = any(k in sn.hdr for k in ("dmesg_live", "dmesg_live_prev", "nouveau_log", "dmesg", "logcat"))
+    if (kl["written"] or (st and st != "running")) and not listed:
+        return it.set(UNKNOWN, f"no dGPU report yet: {sn.name} is cut short before gb_bootlog's report listing")
+    if kl["written"]:
+        w = kl["written"][-1]
+        if w[0] <= up:
+            return it.set(FAIL, f"gb_dgpu_report wrote dgpu-{w[2].group(1)}.txt at {w[0]:.1f} s, but no snapshot "
+                                f"holds it ({sn.name} at uptime {up:.0f} s reads the newest report/dgpu-*.txt)")
+        return it.set(UNKNOWN, f"dgpu-{w[2].group(1)}.txt was written at {w[0]:.1f} s, after the newest snapshot "
+                               f"({sn.name}) had started")
+    if st == "running":
+        if start is None:
+            return it.set(UNKNOWN, f"gb_dgpu_report is running in {sn.name} (uptime {up:.0f} s), start time unknown")
+        age = up - start
+        if age > bound:
+            return it.set(FAIL, f"gb_dgpu_report is still running {age:.0f} s after its start at {start:.1f} s ("
+                                f"{sn.name}, uptime {up:.0f} s): it takes at most {bound} s on {kind}, so it hangs")
+        if not test and age > DGPU_REPORT_TYPICAL_S + 60:
+            it.note(f"slower than usual: about {DGPU_REPORT_TYPICAL_S} s is typical")
+        due = "within seconds" if test else (f"about {DGPU_REPORT_TYPICAL_S // 60} min after its start (30 power "
+                                             "samples 10 s apart), so the t420 snapshot is the first to hold it: "
+                                             "keep the machine on for at least 7 min (15 min for t900)")
+        return it.set(UNKNOWN, f"gb_dgpu_report is still running in the newest snapshot ({sn.name}, uptime {up:.0f} "
+                               f"s; started at {start:.1f} s, {age:.0f} s ago): on {kind} it writes dgpu-<N>.txt {due}")
+    if st:
+        return it.set(FAIL, f"gb_dgpu_report ended (init.svc.gb_dgpu_report={st} in {sn.name}) without a "
+                            "dgpu-<N>.txt in that snapshot")
+    if start is not None:
+        if up - start > bound:
+            return it.set(FAIL, f"no dGPU report {up - start:.0f} s after gb_dgpu_report started at {start:.1f} s "
+                                f"(at most {bound} s on {kind})")
+        return it.set(UNKNOWN, f"gb_dgpu_report started at {start:.1f} s; no dGPU report yet ({sn.name}, uptime "
+                               f"{up:.0f} s)")
+    if up > DGPU_REPORT_TEST_MAX_S:
+        return it.set(FAIL, f"gb_dgpu_report never started ({sn.name}, uptime {up:.0f} s): gb_bootlog requests it at "
+                            "t40 (vendor.gb.dgpu_report=1)")
+    return it.set(UNKNOWN, f"no dGPU report yet ({sn.name}, uptime {up:.0f} s): gb_bootlog requests it at t40")
+
+
 @check("dgpu_report", "gb_dgpu_report written (dGPU report, NVIDIA payload check)", "row 17; checklist 14, 18", "SW")
 def c_dgpu_report(a, it):
-    reps = []
+    kl = _dgpu_klines(a.b.snaps)
+    reps, stale = [], []
     for sn in a.b.snaps:
         for (ln, hdr), body in sn.reports:
             for ln2, s in body:
                 if s.startswith("== gb_dgpu_report report"):
-                    reps.append((sn, ln2, s, body))
+                    why = _dgpu_report_stale(a, sn, s, kl)
+                    (stale if why else reps).append((sn, ln2, s, body, why))
                     break
+    for sn, ln2, s, _b, why in stale[-1:]:
+        it.add([sn.ev(ln2, s)])
+        it.note(f"{sn.name} holds an earlier boot's dGPU report ({why}): not counted for this boot")
     if not reps:
-        v, e = a.b.prop("vendor.gb.dgpu_report")
-        if e:
-            it.add([e])
-        if (a.b.latest.uptime or 0) > 120:
-            return it.set(FAIL, "no /data/vendor/gb/report/dgpu-<N>.txt in any snapshot"
-                                + (f" (vendor.gb.dgpu_report={v})" if v is not None else ""))
-        return it.set(UNKNOWN, "no dGPU report yet (it is requested at t40 and written a few seconds later)")
-    sn, ln, s, body = reps[-1]
+        return _dgpu_report_missing(a, it, kl)
+    sn, ln, s, body, _w = reps[-1]
     it.add([sn.ev(ln, s)])
     kinds = sorted({re.sub(r"-\d+\.txt$", "", h.rsplit("/", 1)[-1]) for x in a.b.snaps for (_l, h), _b in x.reports})
     other = [k for k in kinds if k != "dgpu"]
@@ -2263,6 +2684,7 @@ def c_crashes(a, it):
 AVC_RE = re.compile(r"avc:\s+denied\s+\{([^}]*)\}.*?scontext=(\S+)\s+tcontext=(\S+)\s+tclass=(\S+)"
                     r"(?:.*?permissive=(\d))?")
 OWN_RE = re.compile(r"gb_|gb\.|/odm|iptsd|vnni|gatekeeper|nouveau|dgpu|gfxdriver|sb3|surface|vendor_init|libz")
+LOGCAT_TAG_RE = re.compile(r"^\d\d-\d\d \d\d:\d\d:\d\d\.\d+\s+\d+\s+\d+\s+[VDIWEFS]\s+(\S+?)\s*:")   # (wave 10) the tag
 
 
 @check("selinux", "SELinux denials (enforced ones touching our components)", "all rows", "SW")
@@ -2272,15 +2694,20 @@ def c_selinux(a, it):
         m = AVC_RE.search(e.text)
         if not m:
             continue
-        au = re.search(r"audit\((\d+\.\d+:\d+)\)", e.text)
-        key = au.group(1) if au else e.text
+        # (wave 10 misc-suspend) one audit record = one serial: the kernel log writes 'audit(<time>:<serial>)', logd's
+        # logcat copies 'audit(0.0:<serial>)' (twice: tag auditd with comm=, and the process's own tag without it), so
+        # the time part is not part of the key (it counted each record seen in both logs twice: 3957 for 2549 records
+        # on the second native boot)
+        au = re.search(r"audit\(\d+\.\d+:(\d+)\)", e.text)
+        key = ("audit", au.group(1)) if au else e.text
         if key in seen:
             continue
         seen.add(key)
         comm = re.search(r'comm="([^"]*)"', e.text)
+        tag = LOGCAT_TAG_RE.match(e.text) if not comm else None
         obj = re.search(r'(?:path|name)="([^"]*)"', e.text)
         rows.append((e, m.group(1).strip(), m.group(2), m.group(3), m.group(4), m.group(5),
-                     comm.group(1) if comm else "", obj.group(1) if obj else ""))
+                     comm.group(1) if comm else (tag.group(1) if tag else ""), obj.group(1) if obj else ""))
     mode = None
     sn = a.b.newest_with("dgpu")
     if sn:
@@ -2306,6 +2733,13 @@ def c_selinux(a, it):
     if ours_p:
         it.note(f"{len(ours_p)} permissive=1 denial(s) touch our components: allowed only because that domain is "
                 "permissive")
+        # (wave 10 misc-suspend) by command: our services run in u:r:shell:s0 and every domain is permissive
+        # (inject\odm_sepolicy.cil typepermissive list; gb-power.md 3.5, W2-15), so these are expected; the same access
+        # is logged again whenever the kernel's AVC cache drops the entry (e.g. gb_iptsd's 2 s suspend_stats poll)
+        byc = Counter(r[6] or "?" for r in ours_p)
+        it.note("ours by command: " + ", ".join(f"{c} {n}" for c, n in byc.most_common(6))
+                + (f", {len(byc) - 6} more" if len(byc) > 6 else "") + " (accepted noise while the domains stay "
+                "permissive; each record counted once)")
     it.add([r[0] for r in ours][:MAX_EV])
     if ours:
         return it.set(FAIL, f"{len(ours)} enforced denial(s) touch our components (gb_*, /odm, iptsd, ...)")
@@ -2334,6 +2768,17 @@ def c_boot(a, it):
     it.add([e] if e else []).add(sf[:1])
     last = a.b.latest
     if done:
+        # (wave 10 misc-suspend) gb_bootlog counts boots on the stick's ESP from 1: boot 1 is the first start after
+        # writing the image, which sets up /data and user 10 and optimises the apps (first-boot dex2oat), so its
+        # boot_completed comes about 50 s later than on the next starts (first native boots: boot 1 at 89.8 s and
+        # 92.1 s, boots 2/3 at 33.3/42.8 s), while the boot animation ends at about the same time (38.4 / 38.2 s)
+        anim = a.b.dm(r"init: Service 'bootanim' \(pid \d+\) exited")
+        if anim:
+            it.add(anim[:1]).note(f"the boot animation ended at {float(KTS_RE.match(anim[0][0].text).group(1)):.1f} s")
+        if a.b.n == 1 and t is not None and t > 60:
+            it.note("boot 1 (the first start after writing the image: /data and user 10 are set up and the apps "
+                    "optimised): about 90 s is normal here; compare boot times from boot 2 on (33-43 s on the first "
+                    "native boots)")
         if t is not None:
             if t > 120:
                 it.note(f"slow: {t:.0f} s")
@@ -2350,6 +2795,191 @@ def c_boot(a, it):
     if up < 180:
         return it.set(UNKNOWN, f"not completed by the last snapshot at {up:.0f} s (too early to judge)")
     it.set(FAIL, f"sys.boot_completed never set (last snapshot at {up:.0f} s)")
+
+
+# (wave 10, w10prep battery-userspace) The battery as the lapis health HAL shows it. The desktop HAL logs every update
+# to logcat ("Battery Debug: Level=N% Status=S CurrentUA=I AC=A USB=U batteryChargeTimeToFullNowSeconds=E
+# PluggedIn=P ..." and, unplugged, "Time to shutdown sec: N"); its AOSP BatteryMonitor part logs the raw values to the
+# kernel log ("healthd: battery l=.. st=.. chg=a" or "healthd: battery none chg=.."); gb_power logs its combined
+# battery on every level/status/AC change ("gb_power: battery N% <status> ac=A | BAT1 ..."). Second native boot (USB
+# e0825ee1): Level=0% for a 54 % composite (the HAL's charge_now = test_power's capacity over a uAh charge_full) and
+# "battery none" + chg=a for ~20 ms every 10 s (gb_dgpu_report's "gb_power -o" re-ran the old start defaults).
+HAL_BD_RE = re.compile(r"Battery Debug: Level=(-?\d+)% Status=(\d+) CurrentUA=(-?\d+) AC=(\d) USB=(\d) "
+                       r"batteryChargeTimeToFullNowSeconds=(-?\d+) PluggedIn=(\d)")
+HAL_TTS_RE = re.compile(r"android\.hardware\.health-service\.android-desktop: Time to shutdown sec: (-?\d+)")
+HAL_HD_RE = re.compile(r"healthd: battery (?:l=(-?\d+) v=-?\d+ t=\S+ h=\d+ st=(\d+)(?: c=(-?\d+))?(?: fc=-?\d+)?"
+                       r"(?: cc=-?\d+)?|none) chg=(\S*)$")
+HAL_GBP_RE = re.compile(r"gb_power: (?:battery (\d+)% (\S+) ac=(\d)|no battery present \(.*\) ac=(\d))")
+HAL_LCTS_RE = re.compile(r"^(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d\.\d+)\s")
+HAL_FLAP_S = 2.0          # two AC (or presence) changes closer than this: flapping, not a plug event
+HAL_SETTLE_S = 2.0        # a HAL Level may still show the previous composite this long after gb_power's change
+
+
+def _hal_kts(e):
+    m = KTS_RE.match(e.text)
+    return float(m.group(1)) if m else None
+
+
+def _hal_wall(e):
+    m = HAL_LCTS_RE.match(e.text)
+    if not m:
+        return None
+    mo, d, hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), float(m.group(5))
+    return (((mo * 31 + d) * 24 + hh) * 60 + mm) * 60 + ss
+
+
+def _hal_offset(bd, hd):
+    """(logcat wall - kernel) offset in s: each desktop-HAL update logs its 'Battery Debug' line and, right after it,
+    the 'healthd:' kmsg line; the mode (50 ms bins) of the differences of the pairs whose status and AC agree and
+    whose raw level equals the Level or whose current agrees (non-zero); None without a pair."""
+    cands = []
+    for eb, mb in bd:
+        tb = _hal_wall(eb)
+        if tb is None:
+            continue
+        lv, st, cur, ac = int(mb.group(1)), int(mb.group(2)), int(mb.group(3)), mb.group(4) == "1"
+        for eh, mh in hd:
+            if mh.group(1) is None:
+                continue
+            th = _hal_kts(eh)
+            hl, hst, hc, hac = int(mh.group(1)), int(mh.group(2)), int(mh.group(3) or 0), "a" in mh.group(4)
+            if th is None or hst != st or hac != ac:
+                continue
+            if hl == lv or (cur != 0 and (hc == cur or (st == 3 and hc == -abs(cur)))):
+                cands.append(tb - th)
+    if not cands:
+        return None
+    bins = Counter(round(c / 0.05) for c in cands)
+    best = max(bins.items(), key=lambda kv: (kv[1], -abs(kv[0])))[0]
+    near = sorted(c for c in cands if abs(c / 0.05 - best) <= 1)
+    return near[len(near) // 2]
+
+
+def _hal_flaps(seq):
+    """[(t1, t2)] where a value changed and changed again within HAL_FLAP_S; seq = [(t, value)] in time order."""
+    ch = [seq[i][0] for i in range(1, len(seq)) if seq[i][1] != seq[i - 1][1]]
+    return [(ch[i], ch[i + 1]) for i in range(len(ch) - 1) if ch[i + 1] - ch[i] < HAL_FLAP_S]
+
+
+@check("battery_hal", "Battery level and charger state as the health HAL shows them (wave 10)",
+       "row 42; w10prep battery-userspace", "HW")
+def c_battery_hal(a, it):
+    gbp = [(e, m, _hal_kts(e)) for e, m in a.b.dm(HAL_GBP_RE.pattern)]
+    gbp = sorted(((e, m, t) for e, m, t in gbp if t is not None), key=lambda g: g[2])   # dm() is file order
+    hd = a.b.dm(HAL_HD_RE.pattern)
+    bd = a.b.lc(HAL_BD_RE.pattern)
+    tts = a.b.lc(HAL_TTS_RE.pattern)
+    packs = [(t, int(m.group(1)), m.group(2), int(m.group(3))) for e, m, t in gbp if m.group(1) is not None]
+    if not a.judge_hw:
+        return a.not_here(it, "gb_power reports no battery here" if not packs else "")
+    if not packs:
+        it.add([e for e, _m, _t in gbp[-1:]])
+        return it.set(UNKNOWN, "no 'gb_power: battery N%' line: no pack was combined (see item batteries)")
+    it.add([e for e, m, _t in gbp if m.group(1) is not None][-1:])
+    problems = []
+    first_pack = packs[0][0]
+
+    def composite_at(t):
+        """(the composite in force at kernel time t, the one before it, the time of the last change) or None."""
+        cur = prev = None
+        tc = -1e9
+        for tg, e_m in ((g[2], g[1]) for g in gbp):
+            if tg > t + 0.05:
+                break
+            v = int(e_m.group(1)) if e_m.group(1) is not None else None
+            if v != cur:
+                prev, cur, tc = cur, v, tg
+        return cur, prev, tc
+
+    # 1. "battery none" (present=false) while gb_power has a pack
+    none = []
+    for e, m in hd:
+        t = _hal_kts(e)
+        if m.group(1) is None and t is not None and t > first_pack:
+            cur, _p, _tc = composite_at(t)
+            if cur is not None:
+                none.append((e, t))
+    if none:
+        it.add([none[0][0]])
+        times = sorted(t for _e, t in none)
+        step = [round(times[i + 1] - times[i]) for i in range(len(times) - 1) if times[i + 1] - times[i] > 1.0]
+        cad = Counter(step).most_common(1)
+        problems.append(f"{len(none)} 'healthd: battery none' line(s) while gb_power had a pack (present flapping"
+                        + (f", every ~{cad[0][0]} s" if cad and cad[0][1] >= 2 else "") + ")")
+        if cad and cad[0][0] == 10 and cad[0][1] >= 2:
+            it.note("a 10 s cadence is gb_dgpu_report.sh's 30 'gb_power -o' power samples: before wave 10 each run "
+                    "re-wrote the start defaults present=false / ac_online=on / current 0 (w10prep battery-userspace)")
+    # 2. AC flapping in the kernel log (healthd chg=) and in logcat (AC=, PluggedIn=)
+    kseq = sorted((t, "a" in m.group(4)) for e, m in hd for t in [_hal_kts(e)] if t is not None)
+    kfl = _hal_flaps(kseq)
+    if kfl:
+        problems.append(f"AC flapping in the kernel log: {len(kfl)} chg= change pair(s) < {HAL_FLAP_S:.0f} s apart "
+                        f"(first at {kfl[0][0]:.3f} s)")
+        it.add([e for e, m in hd if _hal_kts(e) in (kfl[0][0], kfl[0][1])][:2])
+    lseq = sorted((t, m.group(4) + m.group(7)) for e, m in bd for t in [_hal_wall(e)] if t is not None)
+    lfl = _hal_flaps(lseq)
+    if lfl:
+        problems.append(f"AC/PluggedIn flapping in the HAL's logcat: {len(lfl)} change pair(s) "
+                        f"< {HAL_FLAP_S:.0f} s apart")
+    gac = [(t, ac) for t, _p, _s, ac in packs]
+    gch = sum(1 for i in range(1, len(gac)) if gac[i][1] != gac[i - 1][1])
+    kch = sum(1 for i in range(1, len(kseq)) if kseq[i][1] != kseq[i - 1][1] and kseq[i][0] > first_pack)
+    # 3. Level against gb_power's composite
+    off = _hal_offset(bd, hd)
+    bad_lv, zero_lv, n_lv = [], [], 0
+    allv = sorted({p for _t, p, _s, _a in packs})
+    for e, m in bd:
+        lv = int(m.group(1))
+        if off is not None:
+            tw = _hal_wall(e)
+            tk = tw - off if tw is not None else None
+            if tk is None or tk < first_pack + 0.5:
+                continue
+            cur, prev, tc = composite_at(tk)
+            if cur is None:
+                continue
+            n_lv += 1
+            ok = abs(lv - cur) <= 1 or (prev is not None and tk - tc < HAL_SETTLE_S and abs(lv - prev) <= 1)
+            ref = cur
+        else:
+            n_lv += 1
+            ok = any(abs(lv - p) <= 1 for p in allv)
+            ref = allv[-1] if allv else None
+        if not ok:
+            bad_lv.append(e)
+            if lv == 0 and ref is not None and ref >= 2:
+                zero_lv.append(e)
+    if bad_lv:
+        it.add(bad_lv[:2])
+        if zero_lv:
+            problems.append(f"the HAL shows 0 % while gb_power's composite is {min(allv)}-{max(allv)} % "
+                            f"({len(zero_lv)} of {n_lv} 'Battery Debug' lines; before wave 10 test_power carried uAh "
+                            "while the HAL reads charge_now = capacity)")
+        else:
+            problems.append(f"{len(bad_lv)} of {n_lv} 'Battery Debug' Level values differ from gb_power's composite "
+                            f"by more than 1 % (composites {allv})")
+    # 4. estimates: time to shutdown < 60 s with a >= 2 % battery; time to full 0..59 s while not Full
+    short = [(e, int(m.group(1))) for e, m in tts if 0 <= int(m.group(1)) < 60]
+    if short and min(allv) >= 2:
+        it.add([short[0][0]])
+        problems.append(f"{len(short)} 'Time to shutdown sec' value(s) under 60 s with a {min(allv)}-{max(allv)} % "
+                        "battery")
+    eta = [e for e, m in bd if 0 <= int(m.group(6)) < 60 and m.group(2) != "5"]
+    if eta:
+        it.add(eta[:1])
+        problems.append(f"{len(eta)} time-to-full value(s) under 60 s while not Full")
+    it.note(f"gb_power composite values {allv}; AC changes: gb_power {gch}, healthd chg= {kch} after the first pack"
+            + ("; Battery Debug lines paired with the healthd kmsg lines (Level judged against the composite of "
+               "that moment)" if off is not None else "; no Battery Debug / healthd pairing (Level compared with every "
+               "composite of the boot)"))
+    if problems:
+        return it.set(FAIL, "; ".join(problems))
+    if not bd:
+        return it.set(UNKNOWN, "no 'Battery Debug' line in logcat (logcat missing or cut): the HAL's Level is not "
+                               "visible; no 'battery none' and no AC flapping in the kernel log")
+    it.add(bd[-1:])
+    it.set(PASS, f"the HAL's Level matches gb_power's composite in {n_lv} 'Battery Debug' line(s) "
+                 f"({sorted({int(m.group(1)) for _e, m in bd})}); no 'battery none' with a pack; no AC flapping")
 
 
 MANUAL = [
@@ -2489,6 +3119,7 @@ def load_boot(src, boot_no=None):
 def analyze(src, boot_no=None, env=None, expect_kernel=EXPECT_KERNEL):
     """Analysis object (with .items) for one boot of a gblog folder."""
     boot, others, folder = load_boot(src, boot_no)
+    boot.next_tail = next_boot_tail(src, boot.n) if boot.n + 1 in others else []   # (wave 10) the suspend item
     a = Analysis(boot, env_override=env, expect_kernel=expect_kernel)
     a.run()
     a.others, a.folder = others, folder

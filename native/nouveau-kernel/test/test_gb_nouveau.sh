@@ -126,6 +126,9 @@ mk_tree() {
   echo 0 > "$R/proc/sys/kernel/panic"
   echo 1 > "$R/proc/sys/kernel/panic_on_oops"
   echo "boot-$$-$(date +%s%N)" > "$R/proc/sys/kernel/random/boot_id"
+  # (wave 10, notify-stale) gb_notify has already looked at this boot's queue (its ledger names this boot), so the
+  # fixed message names below (epoch 1792900000) are this boot's; NP-W10-STALE tests the first look itself
+  printf 'boot=%s\n' "$(tr -cd '0-9a-f-' < "$R/proc/sys/kernel/random/boot_id")" > "$R/data/vendor/gb/notify/.boot"
   echo ' 0 [sofhdadsp      ]: sof-hda-dsp - sof-hda-dsp' > "$R/proc/asound/cards"
   : > "$R/dev/kmsg"
   : > "$R/dev/block/sda1"
@@ -2142,6 +2145,249 @@ if want NP-W9-FG; then
   done
   check "the 6 known not-ready answers: nothing posted, held" eq "$(posts)/$(held)" "0/gb_gfx "
   rm -f "$T/ctl/user_state.10"; rm -rf "$Q/held"
+  check "queue empty at the end" eq "$(nmsg)" 0
+fi
+
+# (wave 10, BACKLOG I-W9-1) stale messages (INTERFACES 12.1b): a message queued in an earlier boot (judged once, at
+# this boot's first run, from its epoch-ms name, this boot's start and vendor.gb.notify) and a notice whose state no
+# longer holds are dropped (logged); a notice of an earlier boot whose lasting state still holds is delivered; a held
+# detach answer expires after 300 s of uptime; nothing is ever posted for user 0 or for all users
+if want NP-W10-STALE; then
+  new_case NP-W10-STALE
+  Q=$R/data/vendor/gb/notify
+  K=$T/log/cmd.log
+  N=1793000000                           # the fake wall clock (ctl/now, epoch s); uptime 100 s: this boot began at N-100
+  echo "$N" > "$T/ctl/now"
+  echo '100.00 400.00' > "$R/proc/uptime"
+  ago() { printf '%s123' "$((N - $1))"; }                       # 13-digit epoch ms, $1 s before now
+  qn() { printf 'kind=notify\ntag=%s\ntitle=%s\ntext=%s\n' "$3" "$4" "$5" > "$Q/$1-$2.msg"; }   # ms, pid-n, tag, title, text
+  posts() { grep -c '^notification|post|' "$K"; }
+  held() { (cd "$Q/held" 2>/dev/null && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | tr '\n' ' '); }
+  bidt() { tr -cd '0-9a-f-' < "$R/proc/sys/kernel/random/boot_id"; }
+  newboot() { echo "boot-$$-$1" > "$R/proc/sys/kernel/random/boot_id"; }   # another boot id; the ledger stays
+  rn() { : > "$K"; run gb_notify.sh; cat "$K" >> "$T/allk"; }
+  at_login() { printf '\tUserInfo{0:System User:811} running\n\tUserInfo{10:User:412}\n' > "$T/ctl/users"; echo 0 > "$T/ctl/current_user"; }
+  signin() { rm -f "$T/ctl/users" "$T/ctl/current_user"; }
+  : > "$T/allk"
+  # 1: this boot's first run (the ledger names an earlier boot): every message older than this boot's start (N-100,
+  #    less 2 s) is of an earlier boot; such notices are dropped, except one whose lasting state still holds
+  printf 'boot=b-0-0\n' > "$Q/.boot"
+  setp persist.vendor.gb.gfx_mode intel
+  qn "$(ago 3600)" 1-1 gb_dgpu 'Restart required' 'The NVIDIA GPU stopped responding. Restart before detaching the screen.'
+  qn "$(ago 3600)" 1-2 gb_update 'System update held' 'Kernel check failed: the kernel version of the update (slot A) could not be checked. Startup stays on slot B; (slot A) is in the boot menu.'
+  qn "$(ago 3600)" 1-3 gb_gfx 'Switched to Intel graphics' 'The system restarted unexpectedly twice while apps used NVIDIA graphics, so graphics were set to Intel only. Choose Auto in Settings > System > Graphics to try again.'
+  printf 'kind=force-stop\npkg=com.example.game\nuser=10\n' > "$Q/$(ago 3600)-1-4.msg"
+  printf 'kind=settings\nkey=updatable_driver_all_apps\nvalue=3\n' > "$Q/$(ago 3600)-1-5.msg"
+  printf 'kind=broadcast\n' > "$Q/$(ago 3600)-1-6.msg"
+  qn "$(ago 103)" 1-7 gb_dgpu 'edge old' 'x'
+  qn "$(ago 102)" 1-8 gb_dgpu 'edge new' 'y'
+  qn "$(ago 5)" 1-9 gb_dgpu 'fresh' 'z'
+  rn
+  check "first look: exactly the 3 notices still true or of this boot are posted, in queue order" eq "$(tr '\n' ' ' < "$K")" \
+    "notification|post|-u|10|-S|bigtext|-t|Switched to Intel graphics|gb_gfx|The system restarted unexpectedly twice while apps used NVIDIA graphics, so graphics were set to Intel only. Choose Auto in Settings > System > Graphics to try again.| notification|post|-u|10|-S|bigtext|-t|edge new|gb_dgpu|y| notification|post|-u|10|-S|bigtext|-t|fresh|gb_dgpu|z| "
+  check "first look: one summary line (7 older than this boot, the cut N-102)" has "$R/dev/kmsg" "gb_notify: this boot's first look at the queue: 7 message(s) older than this boot (epoch s < 1792999898)"
+  check "first look: a boot-bound notice of an earlier boot dropped, logged" has "$R/dev/kmsg" "gb_notify: dropped $(ago 3600)-1-1.msg: stale (queued before this boot)"
+  check "first look: the HOLD of an earlier boot dropped" has "$R/dev/kmsg" "gb_notify: dropped $(ago 3600)-1-2.msg: stale (queued before this boot)"
+  check "first look: 103 s before now (1 s before the cut) is of an earlier boot" has "$R/dev/kmsg" "gb_notify: dropped $(ago 103)-1-7.msg: stale (queued before this boot)"
+  check "first look: N19 of an earlier boot while the mode is still intel: kept (posted), logged" has "$R/dev/kmsg" "gb_notify: $(ago 3600)-1-3.msg is older than this boot, still true (persist.vendor.gb.gfx_mode=intel): kept"
+  check "first look: a force-stop of an earlier boot is not run" eq "$(grep -c 'force-stop' "$T/log/am.log")/$(grep -c "dropped $(ago 3600)-1-4.msg: stale (a force-stop queued before this boot)" "$R/dev/kmsg")" 0/1
+  check "first look: settings of an earlier boot are not written" eq "$(grep -c '^settings|' "$K")/$(grep -c "dropped $(ago 3600)-1-5.msg: stale (settings queued before this boot; gb_power queues them again at every boot)" "$R/dev/kmsg")" 0/1
+  check "first look: a broadcast is never stale (GbGpu reads the current state)" has "$T/log/am.log" "broadcast|--user|10|--include-stopped-packages|"
+  check "first look: the ledger names this boot, the queue is empty" eq "$(cat "$Q/.boot")/$(nmsg)" "boot=$(bidt)/0"
+  # 2: a later run of the same boot judges nothing by the clock: an old-looking name (a clock correction) is this boot's
+  qn "$(ago 7200)" 2-1 gb_dgpu 'later' 'w'
+  rn
+  check "same boot: an old-looking name is posted" eq "$(cat "$K")" "notification|post|-u|10|-S|bigtext|-t|later|gb_dgpu|w|"
+  # 3: vendor.gb.notify (this boot's newest queue write; no earlier boot leaves it) keeps what is at or after it (1 s)
+  newboot w10m; setp vendor.gb.notify "$(ago 500)"
+  qn "$(ago 501)" 3-1 gb_dgpu 'at the newest write' 'a'
+  qn "$(ago 502)" 3-2 gb_dgpu 'before it' 'b'
+  rn
+  check "vendor.gb.notify: 1 s before the newest write is this boot's, 2 s is not" eq "$(cat "$K")/$(grep -c "dropped $(ago 502)-3-2.msg: stale (queued before this boot)" "$R/dev/kmsg")" \
+    "notification|post|-u|10|-S|bigtext|-t|at the newest write|gb_dgpu|a|/1"
+  rm -f "$T/props/vendor.gb.notify"
+  # 4: no boot id: boots cannot be told apart, nothing is judged old, no ledger is written
+  : > "$R/proc/sys/kernel/random/boot_id"; L0=$(cat "$Q/.boot")
+  qn "$(ago 3600)" 4-1 gb_dgpu 'no boot id' 'c'
+  rn
+  check "no boot id: posted, the ledger unchanged" eq "$(posts)/$(cat "$Q/.boot")" "1/$L0"
+  # 5: a wall clock or an uptime that cannot be read: nothing is judged old (the ledger is written: judged once)
+  newboot w10c; echo 'no clock' > "$T/ctl/now"
+  qn "$(ago 3600)" 5-1 gb_dgpu 'no clock' 'd'
+  rn
+  echo "$N" > "$T/ctl/now"
+  check "no wall clock: posted, the ledger names this boot" eq "$(posts)/$(cat "$Q/.boot")" "1/boot=$(bidt)"
+  newboot w10d; rm -f "$R/proc/uptime"
+  qn "$(ago 3600)" 5-2 gb_dgpu 'no uptime' 'e'
+  rn
+  echo '100.00 400.00' > "$R/proc/uptime"
+  check "no uptime: posted" eq "$(posts)" 1
+  newboot w10f; echo 2200000000 > "$T/ctl/now"         # past 2033: outside mksh's 32-bit-safe range, not judged
+  qn "$(ago 3600)" 5-3 gb_dgpu 'clock past 2033' 'g'
+  rn
+  echo "$N" > "$T/ctl/now"
+  check "a wall clock past 2033 (mksh arithmetic is 32-bit): nothing judged, posted" eq "$(posts)" 1
+  # 6: a ledger that is a symlink (even to a file naming this boot) is not believed, and it is replaced, not followed
+  newboot w10e; printf 'boot=%s\n' "$(bidt)" > "$T/planted"; rm -f "$Q/.boot"; ln -s "$T/planted" "$Q/.boot"
+  qn "$(ago 3600)" 6-1 gb_dgpu 'planted' 'f'
+  rn
+  check "symlinked ledger: the old message is still judged and dropped" eq "$(posts)/$(grep -c "dropped $(ago 3600)-6-1.msg: stale" "$R/dev/kmsg")" 0/1
+  check "symlinked ledger: replaced by a regular file, its target untouched" eq "$([ -L "$Q/.boot" ] && echo link || echo file)/$(cat "$T/planted")" "file/boot=$(bidt)"
+  # 7: the OTA gate's notice: stale once this boot is not unvalidated, or when it names another build than this boot's
+  #    (/odm/etc/gb/ota_state); both of build_esp's texts are read; no state file or another text: shown
+  OT='Build CL3B.260622.271.R1 is not the build this boot setup was made for (CL3B.260622.276.R4). Paused until the next ESP update: VNNI libz patch.'
+  OL='Unvalidated boot 3 of build CL3B.260622.271.R1 (setup made for CL3B.260622.276.R4). Still paused: VNNI libz patch. Update the ESP from the host. Previous slot: only before a sign-in.'
+  ost() { printf 'state=%s\nvalidated=google/lapis/lapis:17/CL3B.260622.276.R4/14612580:user/release-keys\nbooted=google/lapis/lapis:17/%s/1:user/release-keys\ntoken=none\n' "$1" "$2" > "$R/odm/etc/gb/ota_state"; }
+  ost validated CL3B.260622.276.R4
+  qn "$(ago 1)" 7-1 gb_update 'System update not validated' "$OT"
+  rn
+  check "OTA notice on a validated boot: dropped" eq "$(posts)/$(grep -c "dropped $(ago 1)-7-1.msg: stale (this boot's ota_state is validated, not unvalidated)" "$R/dev/kmsg")" 0/1
+  ost unvalidated CL3B.260622.271.R1
+  qn "$(ago 1)" 7-2 gb_update 'System update not validated' "$OT"
+  qn "$(ago 1)" 7-3 gb_update 'System update still not validated' "$OL"
+  rn
+  check "OTA notices naming this boot's build (both texts): posted" eq "$(posts)" 2
+  ost unvalidated CL3B.260700.001.R1
+  qn "$(ago 1)" 7-4 gb_update 'System update not validated' "$OT"
+  qn "$(ago 1)" 7-5 gb_update 'System update still not validated' "$OL"
+  rn
+  check "OTA notices naming another build: both dropped" eq "$(posts)/$(grep -c 'stale (it names build CL3B.260622.271.R1, this boot runs CL3B.260700.001.R1)' "$R/dev/kmsg")" 0/2
+  qn "$(ago 1)" 7-6 gb_update 'System update not validated' 'another wording'
+  rn
+  check "OTA notice in a wording that names no build: posted" eq "$(posts)" 1
+  rm -f "$R/odm/etc/gb/ota_state"
+  qn "$(ago 1)" 7-7 gb_update 'System update not validated' "$OT"
+  rn
+  check "OTA notice without an ota_state: posted" eq "$(posts)" 1
+  # 8: "System update held" is stale when its "Startup stays on slot <Y>" is not this boot's slot
+  HT='Kernel mismatch: the update (slot B) needs kernel 6.18-android17-6, this system runs 6.18-android17-5. Startup stays on slot A; (slot B) is in the boot menu.'
+  setp ro.boot.slot_suffix _b
+  qn "$(ago 1)" 8-1 gb_update 'System update held' "$HT"
+  rn
+  check "HOLD for slot A on slot B: dropped" eq "$(posts)/$(grep -c "dropped $(ago 1)-8-1.msg: stale (it keeps slot A, this boot runs slot B)" "$R/dev/kmsg")" 0/1
+  setp ro.boot.slot_suffix _a
+  qn "$(ago 1)" 8-2 gb_update 'System update held' "$HT"
+  rn
+  check "HOLD for slot A on slot A: posted" eq "$(posts)" 1
+  rm -f "$T/props/ro.boot.slot_suffix"
+  # 9: the lasting graphics states, read again before every post: N01/N19/N21 (gfx_mode), N18 (gfx_ok), N17 (the base);
+  #    N16 while apps use Intel graphics; an unset property never makes a notice stale. (review 2) A queued N18 of this
+  #    boot is posted even while gfx_ok still reads 1: gb_power mirrors the new verdict only after it queues N18 (11-7..)
+  i=10
+  for c in 'gb_dgpu|Switched to Intel graphics|persist.vendor.gb.gfx_mode|auto|0' 'gb_gfx|Switched to Intel graphics|persist.vendor.gb.gfx_mode|nvidia|0' \
+    'gb_gfx|Switched to Intel graphics|persist.vendor.gb.gfx_mode|intel|1' 'gb_dgpu|Switched to Intel graphics|persist.vendor.gb.gfx_mode||1' \
+    'gb_gfx|NVIDIA app graphics off|persist.vendor.gb.gfx_ok|1|1' 'gb_gfx|NVIDIA app graphics off|persist.vendor.gb.gfx_ok|0|1' \
+    'gb_gfx|NVIDIA app graphics off|persist.vendor.gb.gfx_ok||1' 'gb_gfx|Tablet mode - Intel graphics|vendor.gb.dtx.base|attached|0' \
+    'gb_gfx|Tablet mode - Intel graphics|vendor.gb.dtx.base|not-feasible|0' 'gb_gfx|Tablet mode - Intel graphics|vendor.gb.dtx.base|detached|1' \
+    'gb_gfx|Tablet mode - Intel graphics|vendor.gb.dtx.base||1' 'gb_gfx|Performance base connected|vendor.gb.gfx_active|intel|0' \
+    'gb_gfx|Performance base connected|vendor.gb.gfx_active|nvidia|1' \
+    'gb_dgpu|NVIDIA GPU problem|persist.vendor.gb.gfx_mode|auto|0' 'gb_dgpu|NVIDIA GPU problem|persist.vendor.gb.gfx_mode|intel|1'; do
+    IFS='|' read -r ctag ctit cprop cval cwant <<CASE
+$c
+CASE
+    rm -f "$T/props/$cprop"; [ -z "$cval" ] || setp "$cprop" "$cval"
+    qn "$(ago 1)" "9-$i" "$ctag" "$ctit" 'state text'
+    rn
+    check "$ctit ($ctag) with $cprop='$cval': posted $cwant time(s)" eq "$(posts)" "$cwant"
+    rm -f "$T/props/$cprop"
+    i=$((i + 1))
+  done
+  check "the graphics states: each drop logged with the state" eq "$(grep -c 'stale (the graphics mode is auto now)' "$R/dev/kmsg")/$(grep -c 'stale (the graphics mode is nvidia now)' "$R/dev/kmsg")/$(grep -c 'stale (the graphics self-test passed since)' "$R/dev/kmsg")/$(grep -c 'stale (the keyboard base is attached now)' "$R/dev/kmsg")/$(grep -c 'stale (apps use Intel graphics now)' "$R/dev/kmsg")" 2/1/0/2/1
+  # 10: a held detach answer (gb_dtx) answers one press of the button: stale after 300 s of uptime held (this boot)
+  at_login; echo '100.00 400.00' > "$R/proc/uptime"
+  qn "$(ago 1)" 10-1 gb_dtx 'Ready to detach' 'You can remove the screen now.'
+  rn
+  check "held gb_dtx: its uptime is recorded" eq "$(sed -n 's/^up=//p' "$Q/held/gb_dtx")/$(posts)" 100/0
+  signin; echo '400.99 900.00' > "$R/proc/uptime"
+  rn
+  check "held gb_dtx 300 s: still posted" eq "$(cat "$K")/$(held)" "notification|post|-u|10|-S|bigtext|-t|Ready to detach|gb_dtx|You can remove the screen now.|/"
+  at_login; echo '100.00 400.00' > "$R/proc/uptime"
+  qn "$(ago 1)" 10-2 gb_dtx "Can't detach yet" 'The NVIDIA GPU is in use by x. Close them, then press detach again.'
+  rn
+  signin; echo '401.00 900.00' > "$R/proc/uptime"
+  rn
+  check "held gb_dtx 301 s: dropped, logged" eq "$(posts)/$(held)/$(grep -c 'held gb_dtx dropped: stale (held 301 s; it answered one press of the detach button, the next press answers again)' "$R/dev/kmsg")" "0//1"
+  mkdir -p "$Q/held"; printf 'boot=%s\ntag=gb_dtx\ntitle=Ready to detach\ntext=v\n' "$(bidt)" > "$Q/held/gb_dtx"
+  echo '5000.00 9000.00' > "$R/proc/uptime"
+  rn
+  check "held gb_dtx without its uptime (age unknown): posted" eq "$(posts)/$(held)" "1/"
+  qn "$(ago 1)" 10-3 gb_dgpu 'NVIDIA GPU fault' 'The NVIDIA GPU is not responding to power management (rpm-error). Graphics are set to Intel only. Restart, then detach.'
+  at_login; echo '100.00 400.00' > "$R/proc/uptime"; rn
+  signin; echo '9000.00 9000.00' > "$R/proc/uptime"; rn
+  check "held for 8900 s, not gb_dtx: still posted" eq "$(posts)" 1
+  # 11: a held notice of another boot whose lasting state still holds is carried into this boot (held again with this
+  #     boot's id) and posted once at the sign-in; once the state is gone it is dropped; a state that changes while it
+  #     is held is read at the sign-in
+  setp persist.vendor.gb.gfx_mode intel; at_login
+  qn "$(ago 1)" 11-1 gb_gfx 'Switched to Intel graphics' 'The system restarted unexpectedly twice while the NVIDIA GPU was in use, so graphics were set to Intel only. Choose Auto in Settings > System > Graphics to try again.'
+  rn
+  reboot_dev; echo "$N" > "$T/ctl/now"
+  rn
+  check "another boot, mode still intel: kept, held again with this boot's id, nothing posted" eq "$(posts)/$(sed -n 's/^boot=//p' "$Q/held/gb_gfx")/$(grep -c 'held gb_gfx of another boot kept: still true (persist.vendor.gb.gfx_mode=intel)' "$R/dev/kmsg")" "0/$(bidt)/1"
+  signin; rn
+  check "then the sign-in: posted once" eq "$(posts)/$(held)" "1/"
+  rn
+  check "a further run: nothing more" eq "$(posts)" 0
+  at_login
+  qn "$(ago 1)" 11-2 gb_gfx 'Switched to Intel graphics' 'x'
+  rn
+  reboot_dev; echo "$N" > "$T/ctl/now"; setp persist.vendor.gb.gfx_mode auto
+  rn
+  check "another boot, the mode is auto now: dropped" eq "$(held)/$(grep -c 'held gb_gfx dropped: stale (the graphics mode is auto now)' "$R/dev/kmsg")" "/1"
+  qn "$(ago 1)" 11-3 gb_gfx 'NVIDIA GPU fault' 'y'
+  rn
+  reboot_dev; echo "$N" > "$T/ctl/now"
+  rn
+  check "another boot, a boot-bound notice: dropped as before" eq "$(held)/$(grep -c 'held gb_gfx of another boot dropped' "$R/dev/kmsg")" "/1"
+  setp vendor.gb.dtx.base detached
+  qn "$(ago 1)" 11-4 gb_gfx 'Tablet mode - Intel graphics' 'z'
+  rn
+  setp vendor.gb.dtx.base attached; signin; rn
+  check "held N17, the base attached before the sign-in: dropped at the sign-in, not posted" eq "$(posts)/$(held)/$(grep -c 'held gb_gfx dropped: stale (the keyboard base is attached now)' "$R/dev/kmsg")" "0//1"
+  # (review) N02 "NVIDIA GPU problem ... Graphics are set to Intel only" is raised once too (gb_nouveau.sh unhealthy(),
+  #     gb_power rb_fail() set persist gfx_mode=intel first): kept like N01 while the mode is intel, held or queued
+  setp persist.vendor.gb.gfx_mode intel; at_login
+  qn "$(ago 1)" 11-5 gb_dgpu 'NVIDIA GPU problem' 'The NVIDIA driver started with errors (bind). Graphics are set to Intel only.'
+  rn
+  reboot_dev; echo "$N" > "$T/ctl/now"
+  rn
+  check "another boot, N02 while the mode is still intel: kept, held again with this boot's id" eq "$(posts)/$(sed -n 's/^boot=//p' "$Q/held/gb_dgpu")/$(grep -c 'held gb_dgpu of another boot kept: still true (persist.vendor.gb.gfx_mode=intel)' "$R/dev/kmsg")" "0/$(bidt)/1"
+  signin; rn
+  check "then the sign-in: N02 posted once" eq "$(posts)/$(held)" "1/"
+  newboot w10n; echo '100.00 400.00' > "$R/proc/uptime"
+  qn "$(ago 3600)" 11-6 gb_dgpu 'NVIDIA GPU problem' 'The NVIDIA driver started with errors (dmesg). Graphics are set to Intel only.'
+  rn
+  check "first look: N02 of an earlier boot while the mode is intel: kept (posted), logged" eq "$(posts)/$(grep -c "$(ago 3600)-11-6.msg is older than this boot, still true (persist.vendor.gb.gfx_mode=intel): kept" "$R/dev/kmsg")" "1/1"
+  # (review 2) N18 and gb_power's write order: gb_power queues N18 (the queue is written at once) a few ms before it
+  #     mirrors that fail verdict to persist.vendor.gb.gfx_ok, so the run the queue write starts may still read the pass
+  #     before it: a queued N18 of this boot is not judged by gfx_ok; a held one is (at the sign-in), and so is one of
+  #     an earlier boot (the first look)
+  setp persist.vendor.gb.gfx_ok 0; at_login
+  qn "$(ago 1)" 11-7 gb_gfx 'NVIDIA app graphics off' 'The NVIDIA graphics self-test failed (vk). w'
+  rn
+  setp persist.vendor.gb.gfx_ok 1; signin; rn
+  check "held N18, a self-test passed before the sign-in: dropped at the sign-in, not posted" eq "$(posts)/$(held)/$(grep -c 'held gb_gfx dropped: stale (the graphics self-test passed since)' "$R/dev/kmsg")" "0//1"
+  newboot w10a                           # (boot ids keep hex digits only: w10a, not w10o, differs from w10n)
+  qn "$(ago 3600)" 11-8 gb_gfx 'NVIDIA app graphics off' 'u'
+  rn
+  check "first look: N18 of an earlier boot, a self-test passed since: dropped, logged" eq "$(posts)/$(grep -c "dropped $(ago 3600)-11-8.msg: stale (the graphics self-test passed since)" "$R/dev/kmsg")" "0/1"
+  newboot w10b; setp persist.vendor.gb.gfx_ok 0
+  qn "$(ago 3600)" 11-9 gb_gfx 'NVIDIA app graphics off' 'v'
+  rn
+  check "first look: N18 of an earlier boot while the verdict is still fail: kept (posted), logged" eq "$(posts)/$(grep -c "$(ago 3600)-11-9.msg is older than this boot, still true (persist.vendor.gb.gfx_ok=0): kept" "$R/dev/kmsg")" "1/1"
+  setp persist.vendor.gb.gfx_ok 1
+  qn "$(ago 1)" 11-10 gb_gfx 'NVIDIA app graphics off' 'r'
+  rn
+  check "a queued N18 of this boot while gfx_ok still reads the earlier pass: posted (gb_power mirrors after it queues)" eq "$(posts)" 1
+  rm -f "$T/props/persist.vendor.gb.gfx_ok"
+  # (review 2) the date shim finds the next date in PATH by the directory's identity, not by its spelling: a work
+  #     directory given with a trailing or a double slash puts the shims in PATH as <work>//shim (an exec loop before)
+  y0=$(date +%Y)
+  y1=$(PATH="${SHIM%/*}//${SHIM##*/}:/usr/bin:/bin" timeout 20 date +%Y 2>&1)
+  y2=$(PATH="$SHIM/:/usr/bin:/bin" timeout 20 date +%Y 2>&1)
+  check "the date shim with the shim directory in PATH as <work>//shim and <work>/shim/: the real date answers" eq "$y1/$y2" "$y0/$y0"
+  # 12: over the whole case: every post was for the foreground full user 10, none for user 0 or for all users
+  check "31 posts in all, each once and -u 10, never -u 0 or -u all" eq "$(grep -c '^notification|post|' "$T/allk")/$(grep -c '^notification|post|-u|10|-S|bigtext|' "$T/allk")/$(grep -c -e '|-u|all|' -e '|-u|0|' "$T/allk")" "31/31/0"
   check "queue empty at the end" eq "$(nmsg)" 0
 fi
 

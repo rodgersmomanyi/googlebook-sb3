@@ -11,6 +11,6 @@ intel_skl_int3472_common.ko
 intel_skl_int3472_discrete.ko
 ov5693.ko
 ov8865.ko
-dw9719.ko
+# dw9719.ko: staged, loaded by gb_hw.sh vcm (wave 10) once ipu-bridge's VCM device and runtime-PM link exist
 intel-ipu6.ko
 intel-ipu6-isys.ko

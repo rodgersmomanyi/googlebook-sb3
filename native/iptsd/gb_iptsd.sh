@@ -41,6 +41,21 @@ log() { echo "gb_iptsd: $*"; }
 prop() { getprop "$1" 2>/dev/null; }
 uptime_s() { read -r _u _ < /proc/uptime; echo "${_u%%.*}"; }
 suspend_count() { _s=; read -r _s < "$SUSP" 2>/dev/null; echo "$_s"; }
+# (wave 10) one kernel-log line per resume for the boot-log triage (analyze_gblog.py 'suspend'): the kernel's suspend
+# counters next to $SUSP, the SoC's hardware-sleep (S0ix) microseconds of the last suspend and in all (last_hw_sleep,
+# total_hw_sleep, max_hw_sleep: reported by intel_pmc_core) and the LPIT low-power-idle residencies; '-' = no such
+# file in this kernel. Read-only; runs only after a resume was seen.
+resume_diag() {
+	_o=
+	for _k in success fail last_hw_sleep total_hw_sleep max_hw_sleep; do
+		_v=; read -r _v 2> /dev/null < "${SUSP%/*}/$_k"
+		_o="$_o $_k=${_v:--}"
+	done
+	_c=$SYS/devices/system/cpu/cpuidle
+	_ls=; read -r _ls 2> /dev/null < "$_c/low_power_idle_system_residency_us"
+	_lc=; read -r _lc 2> /dev/null < "$_c/low_power_idle_cpu_residency_us"
+	log "resume diag:$_o lpi_system_us=${_ls:--} lpi_cpu_us=${_lc:--}"
+}
 
 # Android's IDC lookup name for an input device: every char except [A-Za-z0-9_-] becomes '_'.
 canon() { echo "${1//[!A-Za-z0-9_-]/_}"; }
@@ -200,6 +215,7 @@ while :; do
 	rc=$?
 	ran=$(($(uptime_s) - t0))
 	log "iptsd stopped: $why, rc=$rc after ${ran}s"
+	[ $why = resume ] && resume_diag
 
 	# 4. back off when iptsd keeps failing right away
 	if [ $why = exit ] && [ $ran -lt 10 ]; then

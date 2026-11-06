@@ -885,8 +885,12 @@ names), `== pci` (every 10de function and the root port: vendor/device/class/dri
 `power_state`/`runtime_active_time`/`runtime_suspended_time`/`iommu_group` members), `== acpi` (table list and
 `/sys/firmware/acpi/tables/dynamic`), `== usb` (topology and the sysfs path of every mounted block device),
 `== asound`, `== firmware` (sha256 of the active firmware dir vs `/odm/etc/gb/tu117.sha256`), `== power` (30 samples
-of `gb_power -o` 10 s apart, only when `mode` is not `test`), `== dtx` (`vendor.gb.dtx.*`), `== props`
-(`getprop | grep vendor.gb.`). It never opens a DRM node and never writes sysfs.
+of `gb_power -o` 10 s apart, only when `mode` is not `test`; (wave 10) `gb_power -o` is read-only: it never writes
+test_power or hides BATn), `== dtx` (`vendor.gb.dtx.*`), `== props`
+(`getprop | grep vendor.gb.`). It never opens a DRM node and never writes sysfs. (Wave 10, misc-dgpu-report)
+With the `== power` part (every mode but `test`) a report takes about 5 minutes (296 s on the first native
+boot); the file is renamed at the end, so gb_bootlog's t420 snapshot is the first that holds a report requested
+at t40.
 
 (v1.2) A third verb `selftest` (service `gb_gfx_selftest`, started only by gb_power) runs the automatic self-test of
 section 25.3; usage text becomes `gb_dgpu_report.sh report|test|selftest`.
@@ -1394,7 +1398,7 @@ the whitelists of 12.1 are unchanged):
   user 0 or for all users. Otherwise (the login screen before the sign-in, a user that is still starting or locked, a
   profile in front, `am`/`pm` failing) the notice is **held**: `/data/vendor/gb/notify/held/<tag>` (0700 directory and
   0600 file of user shell; `boot=<boot_id>`, `tag=`, `title=`, `text=`; the newest per tag), logged with the reason.
-  gb_notify posts the held notices (re-validated; another boot's are dropped and logged) at its next run with a full
+  gb_notify posts the held notices (re-validated; another boot's are dropped and logged; (wave 10) unless still true, 12.1b) at its next run with a full
   user in front: gb_ui (build_esp `GB_UI_SH`, both trees) publishes the foreground full user in **`vendor.gb.ui.fg`**
   (its id once `RUNNING_UNLOCKED`, `none` otherwise; set at every change) and both trees start `gb_notify` on
   `on property:vendor.gb.ui.fg=*`. A notice posted directly removes an older held one of its tag. The O5 fallbacks
@@ -1410,6 +1414,53 @@ the whitelists of 12.1 are unchanged):
   already per user / per device and stay as they are.
 * GbGpu: an instance in the headless system user ignores `STATE_CHANGED` and `BOOT_COMPLETED` (it would declare
   `ui-caps notify` and post the detach notification where nobody sees it, and push user 0's catalog); 13.2.
+
+#### 12.1b (Wave 10, BACKLOG I-W9-1) Stale messages
+
+A notice is shown only while what it says can still be true. A message names no boot (12.1), so a message left in the
+queue (a run that ended between a producer's write and its trigger, a power-off, or a tree without `gb_notify` after
+a rollback: the wave-8 VM tree's `gb_slotsync` still queues "System update held") could be shown boots later. Since
+wave 10 `gb_notify` drops stale messages, one log line each (`dropped <file>: stale (<why>)`, `held <tag> dropped:
+stale (<why>)`, and the wave-9 line `held <tag> of another boot dropped`):
+
+* **Which boot.** At the first run of a boot (the ledger `/data/vendor/gb/notify/.boot`, `boot=<boot_id>`, 0600
+  shell, written after that run's first pass, names another boot, is missing, or is a symlink) every queued message
+  is judged once: it is of an **earlier boot** when its 13-digit epoch-ms name is more than 2 s older than this
+  boot's start (`date +%s` minus `/proc/uptime`), unless it is at or after (1 s) this boot's newest queue write
+  (`vendor.gb.notify`, which only this boot's producers set: 12.1). One line `this boot's first look at the queue:
+  <n> message(s) older than this boot (epoch s < <cut>)`. Every message queued after that first look is this boot's:
+  a later clock correction (NTP, a dual-boot RTC kept in local time) never makes it old. No boot id, no readable
+  clock or uptime, or a clock past 2033 (mksh's 32-bit arithmetic): nothing is judged old. A held notice carries
+  `boot=` (12.1a) and, since wave 10, `up=` (whole seconds of uptime when it was held).
+* **Notices of an earlier boot** are stale, except while the lasting state they report still holds (their producers
+  raise them once, never at a later boot): N01, N19, N21 ("Switched to Intel graphics", tags `gb_dgpu` / `gb_gfx`)
+  and (review) N02 ("NVIDIA GPU problem": "... Graphics are set to Intel only."; gb_nouveau.sh `unhealthy()` and
+  gb_power's rebind failure set the mode to `intel` first) while `persist.vendor.gb.gfx_mode` is not `auto` or
+  `nvidia`; N18 ("NVIDIA app graphics off") while
+  `persist.vendor.gb.gfx_ok` is not `1`; N17 ("Tablet mode - Intel graphics") while `vendor.gb.dtx.base` is not
+  `attached` or `not-feasible`. Such a held notice is held again with this boot's id (`held <tag> of another boot
+  kept: still true (<property>=<value>)`) and posted once at the sign-in; a queued one is posted (`<file> is older
+  than this boot, still true (...): kept`). Every other notice speaks of the boot that raised it (N03, N05,
+  N06, N07-N12, N15, N16, N20: "Restart required", "until restart", the holders, this start, one detach attempt, an
+  attach event; N13/N14 the test boot; N22/N23 the ESP state of the boot whose update completed, gb_slotsync posts them only
+  then) or is raised again by its producer at every boot it applies to (the OTA gate's notice).
+* **State re-checks, any boot,** right before a notice is posted or kept held: the OTA gate's notice ("System update
+  not validated" / "System update still not validated") is stale when `/odm/etc/gb/ota_state` says another state
+  than `unvalidated`, or when the build its text names ("Build <B> is not ..." / "... of build <B> (setup ...") is
+  not this boot's (`booted=`, cut as gb_otagate's `bid()`); "System update held" when its "Startup stays on slot <Y>"
+  is not this boot's slot (`ro.boot.slot_suffix`); N01/N02/N19/N21, N18 and N17 by the states above; N16 ("Performance
+  base connected") while `vendor.gb.gfx_active` is `intel`. (Review 2) Not an N18 of this boot read from the queue:
+  gb_power queues N18 (the queue file is written at once) a few ms before it mirrors that fail verdict to
+  `persist.vendor.gb.gfx_ok` (25.4; its `st_mirror()` runs after `n18()` in the same tick), so the run that the
+  queue write starts can still read the pass before it; a held N18 and one of an earlier boot are judged by `gfx_ok`.
+* **Age:** a held `gb_dtx` notice (N07-N12, N15: the answer to one press of the detach button; the next press answers
+  again) is stale after more than 300 s of uptime held (the longest detach attempt of 10.3 is about 130 s). No other
+  notice expires by age: it stays true until its boot ends or its state changes.
+* **Other kinds of an earlier boot:** `force-stop` is stale (it named the holders of that boot); `settings` is stale
+  (gb_power queues all three settings at every boot, 23.4); `broadcast` never is (GbGpu then reads the current
+  state).
+* A state that cannot be read (an empty property, no `ota_state`, a text in another wording) never makes a notice
+  stale. Nothing else changes: still once, for the foreground full user only, never user 0 or all users (12.1a).
 
 ### 12.2 Catalog (exact strings; `<...>` substituted, truncated to fit 200 characters)
 

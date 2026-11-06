@@ -13,6 +13,9 @@
 #    (wave 9 hw-native1; bounded, idempotent, never blocks boot).
 # 7. early-boot, own service: one reset + re-bind of the Integrated Sensor Hub if lapis's coldboot probe failed, while
 #    gb_sensors_wait (sensors component, after this one in gb.rc) holds the sensors HAL back (wave 9 hw-native1).
+# 8. early-init, own service: load the rear camera's focus-motor driver dw9719.ko once ipu-bridge has created the
+#    motor's device and its runtime-PM link to the rear sensor, so the sensor powers the motor for its probe and
+#    its first runtime suspend (wave 10 misc-cameras; bounded, idempotent, never blocks boot).
 service gb_hw_rapl_snap /system/bin/sh /odm/gb_hw.sh rapl-snapshot
     user root
     group root
@@ -69,8 +72,17 @@ service gb_hw_ish /system/bin/sh /odm/gb_hw.sh ish
     oneshot
     disabled
 
+service gb_hw_vcm /system/bin/sh /odm/gb_hw.sh vcm
+    user root
+    group root
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
 on early-init
     exec_start gb_hw_rapl_snap
+    start gb_hw_vcm
 
 on early-boot
     start gb_hw_ish

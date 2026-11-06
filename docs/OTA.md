@@ -116,7 +116,10 @@ and checks it at every boot:
     Update the ESP from the host. Previous slot: only before a sign-in." (since wave 9; waves 7 and 8 ended it "...,
     or boot the previous slot."). Boot the previous slot only if this build never reached the lock screen; after a
     sign-in on it, update the ESP from the host: see below. Since wave 9 you read the notice after the sign-in, so
-    the rule is now in the notice itself. The kernel log gets
+    the rule is now in the notice itself. (Wave 10) A notice raised in an earlier start is not shown again in a
+    later one: every unvalidated start raises its own notice with its own count, and a notice that names another
+    build than the running one, or arrives on a validated start, is dropped (logged as `gb_notify: dropped ...:
+    stale (...)`). The kernel log gets
     `gb_otagate: boot count: N
     unvalidated boot(s) of this build pair`. Without a boot id or a usable record the plain notice is shown; nothing
     changes on a validated build.

@@ -49,10 +49,16 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
   V13 the vulkan.nouveau.so symlink and the empty payload mount points   V14 no libvulkan.so
   V15 the GbGpu / GbGfxDriver APKs   V16 the default entry's native options, incl. 8250.nr_uarts >= 1 and no
       console=ttyS / earlycon (WAVE3 item 1)   V17 --compare-export: same tree as ESP
-  V18 gb/slot_<slot>.stamp and initrd-<slot>.img   V19 modules.load names this vmlinuz (md5)
+  V18 gb/slot_<slot>.stamp and initrd-<slot>.img   V19 modules.load names this vmlinuz (md5); (W9b, image audit IA9-3)
+      gbnative/lib/modules/modules.load and .load.late are 0644 and byte-identical to the staged inject\\native\\modules
+      copies, and each is stage_kernel.py's list (read with ast): modules.load = its header + one line per NATIVE_EARLY
+      module (<m>.ko with "-" or "_", + MODULE_ARGS) with the lapis audio modules.load.audio lines right after i915,
+      modules.load.late = the same header + NATIVE_LATE; every listed .ko is packed; every NATIVE_NOLOAD module
+      (hw-native1: ov7251, the IR camera) is packed and named by no list
   V20 /odm/etc/gb/gfx_build_id   V21 gb_nouveau.sh has GB_PANIC_TIMEOUT=30   V22 gfx_app_prefs.default, tu117.sha256
   V23 no gb_gfxdriver.sh   V24 VM kinds: gb.hw=vm, console=ttyS0,115200 and 8250.nr_uarts=4 (the VM is unchanged;
-      vmtest-gfx/vmtest-kat/vmtest-nogk: the test title)
+      vmtest-gfx/vmtest-kat/vmtest-nogk: the test title); (W9b, IA9-3; wave 9 I-W8-1) efi_pstore.pstore_disable=1
+      exactly once (build_esp CMDLINE_VM / VM_PSTORE, build_usb --vm-test)
   V25 ESP bring-up (WAVE3 item 12): no gb/gb.cfg, no gb/overlay/, no gb.overlay= in any entry (--expect-bringup-test:
       the R-12b test ESP instead carries them); gbinit has the three-token gate, the timed call and exec /init last, and
       no cmdline module-option forwarder (D-d); /gbbringup.sh in the native cpio only
@@ -97,10 +103,25 @@ ESP checks (the tree kind comes from the default entry's gb.hw= unless --expect-
       entry, so the loader would start the first entry in its own order: gb-b.conf whenever it exists); one default
       line; a "preferred" line matches exactly the same entry; image mode: <slot> is the slot the vbmeta GPT attributes
       want (gb_slotsync's wanted_slot); --esp: the --expect-slot slot when given
+  (W9b, image audit IA9-3: the wave-9 items build_esp generates outside the component manifests)
+  V34 (wave 9 C-6) every kind: the tree's gb.rc has build_esp's C-6 restorecon line once, right after C6_ANCHOR (the
+      overlay binds), naming exactly the tree's regular files below vup/etc (as /vendor/etc/...) and lib64/hw (as
+      /odm/lib64/hw/...) without a PIN-path word (== build_esp _c6_line / _check_c6), audio_default.xml among them
+  V35 (wave 9 hw-native1) native: every lapis binary that reaches libflashrom or flashes (REFUSE_STUBS, == build_esp's
+      native GB_REFUSE entries; elogtool and cbfstool since wave 9) is build_esp's GB_REFUSE stub (0755), and GB_REFUSE
+      still refuses (exit 1, "is disabled on this hardware")
+  V36 (wave 9 hw-native1) native gb.rc: service gb_hw_sam (gb_hw.sh sam) started once under 'on boot', service
+      gb_hw_ish (gb_hw.sh ish) started once under 'on early-boot' before 'exec_start gb_sensors_wait' (both oneshot,
+      disabled)
+  V37 (wave 9 HS-O7) VM kinds: the notification queue: gbstage/vup/bin/gb_notify.sh (0755) == the nouveau component's
+      gb_notify.sh, and gb.rc has build_esp's GB_NOTIFY_VM_RC once (one gb_notify service, the queue dirs, both
+      triggers)
 Read-only: images, lapis.bin and the host inputs are opened "rb"; only --extract writes (into OUTDIR).
 Exit 0 and last line "RESULT: OK"; exit 1 and "RESULT: <n> problem(s)" with one "PROBLEM: V<n> ..." line each;
 exit 2 = usage. Module API (build_iso.py imports this file by path): esp_of_disk, fat_files, fat_parse, cpio_entries,
-gunzip_padded, native_tree, erofs_listing, kernel_release, compare_export; (W9) erofs_read.
+gunzip_padded, native_tree, erofs_listing, kernel_release, compare_export; (W9) erofs_read; (W9b, IA9-3: TB-3 judges
+its recorded kept images with them) modlist_header_problems, modlist_problems, c6_line, c6_problems, refuse_problems,
+hw_rc_problems.
 VP (W6 prep, SA-7) --expect-pin-path ESP (an ESP image or a disk image; before a user-VM write: the ESP now in
     lapis.bin): the PIN path of the verified ESP's booted tree (pin_path: the Gatekeeper binary, fragment and rc
     service, the KeyMint service and its vup/lib64 NEEDED closure, the Trusty/Weaver masks and gbinit whiteouts, the
@@ -163,6 +184,8 @@ HOST = {
     "vnni_patcher": os.path.join(GB_BUILD, r"native\vnni-perf\patcher\manifest.json"),
     # W6 (V32): the SELinux cil build_esp packs in its OTA-robust form
     "odm_cil": os.path.join(HERE, r"inject\odm_sepolicy.cil"),
+    # (W9b, IA9-3, V19) stage_kernel.py: the native load lists it writes (literal constants read with ast, never imported)
+    "stage_kernel": os.path.join(HERE, r"stage_kernel.py"),
 }
 SIG_TRAILER = b"~Module signature appended~\n"
 OPTIN = ("drm_exec", "drm_gpuvm", "gpu_sched", "drm_ttm_helper", "nouveau")          # names with "-" -> "_"
@@ -247,6 +270,25 @@ GFXDRIVER_MEMBERS = {"AndroidManifest.xml", "resources.arsc", "assets/sphal_libr
                      "lib/x86_64/vulkan.intel.so"}
 MODULES_DGPU = b"drm_exec.ko\ndrm_gpuvm.ko\ngpu-sched.ko\ndrm_ttm_helper.ko\nnouveau.ko\n"
 SYMLINK_ICD = ("gbnative/vup/lib64/hw/vulkan.nouveau.so", b"/odm/dgpu/lib64/hw/vulkan.nouveau.so")
+# (W9b, image audit IA9-3) the wave-9 items build_esp generates outside the component manifests (V19, V24, V34-V37)
+# V35: the native paths build_esp packs as its GB_REFUSE stub (== its native list, TB-3 T1 reads it with ast); wave 9
+# hw-native1 added elogtool and cbfstool (they link libvboot_host -> libflashrom in-process)
+REFUSE_STUBS = ("vup/bin/fwupdmgr", "vup/bin/flashrom", "vup/bin/futility", "vup/bin/ectool", "vup/bin/elogtool",
+                "vup/bin/cbfstool", "vup/bin/hw/vendor.google.desktop.futility-executor",
+                "vup/bin/android-desktop-install")
+REFUSE_MARK = b"is disabled on this hardware"       # GB_REFUSE's message; with "exit 1" what makes it a refusal
+# V34 (wave 9 C-6): == build_esp _C6_SKIP (TB-3 T1); the C-6 line exists for this file (VM-1: hal_audio_default read it
+# with tcontext=tmpfs)
+C6_SKIP = re.compile(r"gatekeeper|keymint|keymaster|keystore|weaver|secretkeeper|trusty|gbkm|empty_vintf|/vintf/", re.I)
+C6_MUST = "/vendor/etc/data/hal_configs/audio_default.xml"
+# V36 (wave 9 hw-native1, hw.json rc_text): the SAM re-bind and the ISH re-probe services and where they start. The
+# reviewed place of gb_hw_sam's start is 'on boot' (hw-native1 RESULT 3 step 10); its review note 6.1 (LOW) may move it
+# to 'on post-fs-data' or 'on late-init' after the owner's detached-boot test: change HW_SAM_ON with that hw.json change.
+HW_SAM_SVC = "service gb_hw_sam /system/bin/sh /odm/gb_hw.sh sam"
+HW_ISH_SVC = "service gb_hw_ish /system/bin/sh /odm/gb_hw.sh ish"
+HW_SAM_ON, HW_ISH_ON = "on boot", "on early-boot"
+SENSORS_WAIT = "exec_start gb_sensors_wait"
+VM_PSTORE = "efi_pstore.pstore_disable=1"            # V24: == build_esp VM_PSTORE (wave 9, I-W8-1)
 # INTERFACES 15.1-v12 (exact, below the file's comment header)
 NOUVEAU_RC_V12 = """on early-init
     mkdir /dev/gb_dgpu 0700 root root
@@ -1107,6 +1149,25 @@ def be_bytes(name):
     if None in parts:
         raise ValueError(f"{name} is not a plain concatenation of literals")
     return b"".join(parts)
+
+
+_SK = {}
+
+
+def sk_const(name):
+    """(W9b, IA9-3, V19) a literal top-level constant of stage_kernel.py (HOST["stage_kernel"]), read with ast like
+    be_const: stage_kernel is never imported (its main() talks to the builder). KeyError if it is not a literal."""
+    path = HOST["stage_kernel"]
+    if path not in _SK:
+        tab = {}
+        for n in ast.parse(rd_host(path).decode("utf-8")).body:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                try:
+                    tab[n.targets[0].id] = ast.literal_eval(n.value)
+                except ValueError:
+                    pass
+        _SK[path] = tab
+    return _SK[path][name]
 
 
 def parts_match(parts, data):
@@ -2204,17 +2265,100 @@ def v18(c):
     return p
 
 
-def v19(c):
-    ml = c.data("gbnative/lib/modules/modules.load")
-    if ml is None:
-        return ["no gbnative/lib/modules/modules.load"]
+MODLISTS = ("modules.load", "modules.load.late")
+
+
+def modlist_header_problems(ml, md5):
+    """(V19) [] if modules.load (bytes) starts with stage_kernel's header naming the bzImage of that md5, else one
+    problem."""
     first = (ml.decode("utf-8", "replace").splitlines() or [""])[0]
     m = re.fullmatch(r"# kernel build (\S+) \(bzImage md5 ([0-9a-f]{32})\)", first)
     if not m:
         return [f"modules.load line 1 is {first[:80]!r}"]
-    if m.group(2) != hashlib.md5(c.files.get("vmlinuz", b"")).hexdigest():
-        return [f"modules.load names bzImage md5 {m.group(2)}, vmlinuz is {hashlib.md5(c.files.get('vmlinuz', b'')).hexdigest()}"]
+    if m.group(2) != md5:
+        return [f"modules.load names bzImage md5 {m.group(2)}, vmlinuz is {md5}"]
     return []
+
+
+def _sk_lists():
+    """(W9b, IA9-3) what stage_kernel.py writes below each load list's header: ([(file names, args)] of modules.load =
+    NATIVE_EARLY with the lapis audio modules.load.audio lines (its AUDIO_DIR == HOST lapis_mods) right after i915,
+    [(file names, args)] of modules.load.late = NATIVE_LATE, NATIVE_NOLOAD). A module's file is <m>.ko or, when the
+    build has only that one, <m with "_">.ko (stage_kernel's ssh probe); its line is "<file>[ <MODULE_ARGS>]"."""
+    args = sk_const("MODULE_ARGS")
+    ent = lambda m: ((m + ".ko", m.replace("-", "_") + ".ko"), args.get(m, ""))
+    audio = [ln.strip() for ln in rd_host(os.path.join(HOST["lapis_mods"], "modules.load.audio")).decode(
+        "utf-8", "replace").splitlines() if ln.strip() and not ln.startswith("#")]
+    early = []
+    for m in sk_const("NATIVE_EARLY"):
+        early.append(ent(m))
+        if m == "i915":
+            early += [((a, a), "") for a in audio]
+    return early, [ent(m) for m in sk_const("NATIVE_LATE")], list(sk_const("NATIVE_NOLOAD"))
+
+
+def modlist_problems(lists, kos):
+    """(W9b, image audit IA9-3, V19) the native load lists beyond their header line. lists: {name: (mode, bytes) or None}
+    of gbnative/lib/modules/modules.load and modules.load.late; kos: {file name: mode} of every packed
+    gbnative/lib/modules/*.ko. Problems, in this order: a list missing, not 0644 or not the staged inject\\native\\modules
+    copy; a list that is not stage_kernel.py's (_sk_lists; the two headers equal); a listed .ko that is not packed; a
+    NATIVE_NOLOAD module (hw-native1: ov7251) not packed, or named by a list. TB-3 computes a kept image's expected V19
+    lines with this function from the texts its prev_images.json record holds."""
+    p, text = [], {}
+    for n in MODLISTS:
+        e = lists.get(n)
+        try:
+            want = rd_host(os.path.join(HOST["modules"], n))
+        except OSError as x:
+            want = None
+            p.append(f"inject\\native\\modules\\{n} unreadable ({x.__class__.__name__}; stage_kernel writes both lists)")
+        if e is None or e[1] is None:
+            p.append(f"no gbnative/lib/modules/{n}")
+            continue
+        text[n] = e[1].decode("utf-8", "replace")
+        if want is not None and (e[0] != 0o100644 or e[1] != want):
+            p.append(f"gbnative/lib/modules/{n} is not 0644 or not the staged inject\\native\\modules copy")
+    try:
+        early, late, noload = _sk_lists()
+    except (OSError, KeyError, ValueError, SyntaxError) as x:
+        return p + [f"stage_kernel.py's lists or modules.load.audio unreadable ({x.__class__.__name__}: {x})"]
+    rows = {}
+    for n, exp in (("modules.load", early), ("modules.load.late", late)):
+        if n not in text:
+            continue
+        body = text[n].split("\n")
+        rows[n] = body[1:-1] if body[-1] == "" else body[1:] + ["(no final newline)"]
+        allowed = [{f + (" " + a if a else "") for f in fs} for fs, a in exp]
+        r = rows[n]
+        if len(r) != len(exp) or any(x not in al for x, al in zip(r, allowed)):
+            i = next((k for k, (x, al) in enumerate(zip(r, allowed)) if x not in al), min(len(r), len(exp)))
+            want = (exp[i][0][0] + (" " + exp[i][1] if exp[i][1] else "")) if i < len(exp) else "(the end)"
+            p.append(f"{n} is not stage_kernel.py's list: line {i + 2} is {r[i] if i < len(r) else '(the end)'!r}, "
+                     f"expected {want!r} ({len(r)} module lines, stage_kernel {len(exp)})")
+    if len(text) == 2 and text["modules.load"].split("\n")[0] != text["modules.load.late"].split("\n")[0]:
+        p.append("modules.load.late's header line is not modules.load's (stage_kernel writes one header)")
+    listed = {n: [x.split()[0] for x in r if x.split() and not x.startswith("#")] for n, r in rows.items()}
+    unpacked = sorted({f for n in MODLISTS for f in listed.get(n, []) if not is_reg(kos.get(f, 0))})
+    if unpacked:
+        p.append(f"the load lists name modules that gbnative/lib/modules does not pack: {unpacked[:4]}")
+    for m in noload:
+        fs = (m + ".ko", m.replace("-", "_") + ".ko")
+        if not any(is_reg(kos.get(f, 0)) for f in fs):
+            p.append(f"the NATIVE_NOLOAD module {fs[0]} is not packed (stage_kernel stages it for a manual insmod)")
+        for n in MODLISTS:
+            hit = [f for f in listed.get(n, []) if f in fs]
+            if hit:
+                p.append(f"{n} loads {hit[0]}, a NATIVE_NOLOAD module (stage_kernel: staged, in no load list)")
+    return p
+
+
+def v19(c):
+    ml = c.data("gbnative/lib/modules/modules.load")
+    p = modlist_header_problems(ml, hashlib.md5(c.files.get("vmlinuz", b"")).hexdigest()) if ml is not None else []
+    lists = {n: c.tree.get("gbnative/lib/modules/" + n) for n in MODLISTS}       # (W9b, IA9-3) the whole lists
+    kos = {k[len("gbnative/lib/modules/"):]: v[0] for k, v in c.tree.items()
+           if k.startswith("gbnative/lib/modules/") and k.endswith(".ko") and k.count("/") == 3}
+    return p + modlist_problems(lists, kos)
 
 
 def v20(c):
@@ -2299,6 +2443,10 @@ def v24(c):
     # [W3R-19] the VM entry is unchanged by WAVE3 item 1
     if "console=ttyS0,115200" not in t or [x for x in t if x.startswith("8250.nr_uarts=")] != ["8250.nr_uarts=4"]:
         p.append("the VM entry must keep exactly 8250.nr_uarts=4 and console=ttyS0,115200")
+    # (W9b, IA9-3; wave 9 I-W8-1) no kernel panic into the VM's NVRAM: every VMware entry carries the token, once
+    if t.count(VM_PSTORE) != 1:
+        p.append(f"the VM entry must carry {VM_PSTORE} exactly once (build_esp CMDLINE_VM, build_usb --vm-test; "
+                 f"has {t.count(VM_PSTORE)})")
     if c.kind == "vmtest-gfx" and VMTEST_TITLE not in (c.base["title"] or ""):
         p.append(f"the VM test gfx title lacks {VMTEST_TITLE!r}")
     if c.kind == "vmtest-kat" and VMTEST_KAT_TITLE not in (c.base["title"] or ""):
@@ -2947,6 +3095,124 @@ def v33(c):
     return loader_match_problems(c.files, c.slot, c.expect_slot)
 
 
+# ------------------------------------------------------------- (W9b, image audit IA9-3) the wave-9 items, V34-V37
+def c6_line(paths, tr):
+    """(wave 9 C-6) build_esp _c6_line over the regular-file cpio paths `paths` of tree tr ("gbnative"/"gbstage"):
+    (b"    restorecon <runtime path> ...\\n" or b"", [runtime paths init cannot take as one word])"""
+    out = []
+    for p in paths:
+        if C6_SKIP.search(p):
+            continue
+        if p.startswith(tr + "/vup/etc/"):
+            out.append("/vendor/etc/" + p[len(tr + "/vup/etc/"):])
+        elif p.startswith(tr + "/lib64/hw/"):
+            out.append("/odm/lib64/hw/" + p[len(tr + "/lib64/hw/"):])
+    bad = [q for q in out if not re.fullmatch(r"/[A-Za-z0-9._/+-]+", q)]
+    out.sort()
+    return (b"    restorecon " + " ".join(out).encode() + b"\n") if out else b"", bad
+
+
+def c6_problems(rc, paths, tr):
+    """(W9b, IA9-3, V34) [] if gb.rc (bytes) holds build_esp's C-6 line for these regular-file paths once, right after
+    C6_ANCHOR (== build_esp _check_c6), else one or more problems. TB-3 uses it on a kept image's record."""
+    try:
+        anchor = be_const("C6_ANCHOR")
+    except (OSError, KeyError, ValueError, SyntaxError) as e:
+        return [f"build_esp.py C6_ANCHOR unreadable ({e.__class__.__name__})"]
+    line, bad = c6_line(paths, tr)
+    p = [f"C-6: tree paths init cannot take as one word: {bad[:3]}"] if bad else []
+    if (" " + C6_MUST).encode() not in line:
+        p.append(f"C-6: no {tr}/vup/etc/data/hal_configs/audio_default.xml in the tree (the file the line exists for)")
+    if line and rc.count(anchor + line) != 1:
+        p.append(f"gb.rc lacks the C-6 restorecon line (once, right after '{anchor.decode().strip()}', naming exactly "
+                 f"the tree's {len(line.split()) - 1} /vendor/etc and /odm/lib64/hw files)")
+    return p
+
+
+def v34(c):
+    """(W9b, IA9-3; wave 9 C-6) every kind: the C-6 restorecon line in the tree's gb.rc"""
+    tr = "gbnative" if c.kind == "native" else "gbstage"
+    rc = c.data(f"{tr}/etc/init/gb.rc")
+    if rc is None:
+        return [f"no {tr}/etc/init/gb.rc"]
+    paths = [k for k, (m, d) in c.tree.items() if d is not None and is_reg(m)]
+    p = c6_problems(rc, paths, tr)
+    if not p:
+        c.notes.append(("V34", f"the C-6 restorecon line names {len(c6_line(paths, tr)[0].split()) - 1} path(s)"))
+    return p
+
+
+def refuse_problems(entry):
+    """(W9b, IA9-3, V35) entry(cpio path) -> (mode, sha256 hex) or None. [] if every REFUSE_STUBS path of the native
+    tree is build_esp's GB_REFUSE (0755) and GB_REFUSE refuses (exit 1 and REFUSE_MARK), else one problem per rule."""
+    try:
+        refuse = be_const("GB_REFUSE")
+    except (OSError, KeyError, ValueError, SyntaxError) as e:
+        return [f"build_esp.py GB_REFUSE unreadable ({e.__class__.__name__})"]
+    p = []
+    if REFUSE_MARK not in refuse or b"\nexit 1\n" not in refuse:
+        p.append("build_esp's GB_REFUSE no longer refuses (exit 1, 'is disabled on this hardware')")
+    want = (0o100755, sha256(refuse))
+    bad = [x for x in REFUSE_STUBS if entry("gbnative/" + x) != want]
+    if bad:
+        p.append(f"refusal stubs missing, not 0755 or not build_esp's GB_REFUSE: {bad}")
+    return p
+
+
+def v35(c):
+    """(W9b, IA9-3; wave 9 hw-native1) native: the flashing/libflashrom tools are the refusal stub"""
+    def entry(p):
+        e = c.tree.get(p)
+        return (e[0], sha256(e[1])) if e is not None and e[1] is not None else None
+    return refuse_problems(entry)
+
+
+def hw_rc_problems(rc):
+    """(W9b, IA9-3, V36) [] if the native gb.rc text starts gb_hw_sam once under HW_SAM_ON and gb_hw_ish once under
+    HW_ISH_ON before SENSORS_WAIT (in gb.rc order, as init queues them), both services once (oneshot, disabled); else
+    one problem naming the rules it misses. TB-3 uses it on a kept image's recorded gb.rc."""
+    secs = rc_sections(rc)
+    miss = []
+    for svc in (HW_SAM_SVC, HW_ISH_SVC):
+        s = [x for x in secs if x[0] == svc]
+        if len(s) != 1 or not {"oneshot", "disabled"} <= set(s[0][1:]):
+            miss.append(f"'{svc}' once (oneshot, disabled)")
+    if [x[0] for x in secs for ln in x[1:] if ln == "start gb_hw_sam"] != [HW_SAM_ON]:
+        miss.append(f"'start gb_hw_sam' once, under '{HW_SAM_ON}'")
+    eb = [ln for x in secs if x[0] == HW_ISH_ON for ln in x[1:]]
+    if [x[0] for x in secs for ln in x[1:] if ln == "start gb_hw_ish"] != [HW_ISH_ON] or SENSORS_WAIT not in eb or \
+            eb.index("start gb_hw_ish") > eb.index(SENSORS_WAIT):
+        miss.append(f"'start gb_hw_ish' once, under '{HW_ISH_ON}', before '{SENSORS_WAIT}'")
+    return [f"native gb.rc lacks {miss}"] if miss else []
+
+
+def v36(c):
+    """(W9b, IA9-3; wave 9 hw-native1) native gb.rc: the SAM re-bind and ISH re-probe services and their start points"""
+    rc = c.rc()
+    return ["no gbnative/etc/init/gb.rc"] if rc is None else hw_rc_problems(rc)
+
+
+def v37(c):
+    """(W9b, IA9-3; wave 9 HS-O7) VM kinds: the notification queue (build_esp GB_NOTIFY_VM / GB_NOTIFY_VM_RC)"""
+    try:
+        want_rc = be_const("GB_NOTIFY_VM_RC")
+        src = [e["src"] for _, m in manifests(False) if m.get("name") == "nouveau" for e in m.get("files", [])
+               if e.get("dest") == "vup/bin/gb_notify.sh"]
+        if len(src) != 1:
+            raise ValueError(f"{len(src)} nouveau component files with dest vup/bin/gb_notify.sh")
+        want_sh = rd_host(src[0])
+    except (OSError, KeyError, ValueError, SyntaxError) as e:
+        return [f"build_esp.py GB_NOTIFY_VM_RC or the nouveau component's gb_notify.sh unreadable ({e})"]
+    p = []
+    if c.tree.get("gbstage/vup/bin/gb_notify.sh") != (0o100755, want_sh):
+        p.append("gbstage/vup/bin/gb_notify.sh missing, not 0755 or not the nouveau component's gb_notify.sh")
+    rc = c.data("gbstage/etc/init/gb.rc") or b""
+    if rc.count(want_rc) != 1 or rc.count(b"service gb_notify ") != 1:
+        p.append("the VM gb.rc lacks build_esp's GB_NOTIFY_VM_RC once (one gb_notify service, the queue dirs, the "
+                 "vendor.gb.notify and vendor.gb.ui.fg triggers)")
+    return p
+
+
 ALL, NATIVE, VMS = "all", "native", "vm"
 CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("V4b", v4b, ALL),
           ("V5", v5, NATIVE),
@@ -2956,7 +3222,8 @@ CHECKS = [("V1", v1, ALL), ("V2", v2, ALL), ("V3", v3, ALL), ("V4", v4, ALL), ("
           ("V15", v15, NATIVE), ("V16", v16, NATIVE), ("V17", v17, ALL), ("V18", v18, ALL), ("V19", v19, NATIVE),
           ("V20", v20, NATIVE), ("V21", v21, NATIVE), ("V22", v22, NATIVE), ("V23", v23, ALL), ("V24", v24, VMS),
           ("V25", v25, ALL), ("V26", v26, ALL), ("V27", v27, ALL), ("V28", v28, ALL), ("V29", v29, ALL),
-          ("V30", v30, ALL), ("V31", v31, ALL), ("V32", v32, ALL), ("V33", v33, ALL)]
+          ("V30", v30, ALL), ("V31", v31, ALL), ("V32", v32, ALL), ("V33", v33, ALL),
+          ("V34", v34, ALL), ("V35", v35, NATIVE), ("V36", v36, NATIVE), ("V37", v37, VMS)]   # (W9b, IA9-3)
 
 
 def run_checks(c, only=None):

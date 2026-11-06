@@ -22,20 +22,21 @@ Every destructive step asks you to type a confirmation. The installer refuses di
 [The installer menu](#the-installer-menu)).
 
 **Status.** Tested in VMware only, never on the real Surface Book 3. Rufus and Ventoy themselves were never run;
-equivalent stick layouts were tested in VMware. **Wave 9 has no ISO yet:** the wave 8 ISO below installs the wave 8
-system with both options 1 and 2, without the wave 9 fixes (among them the keyboard base fix from the first native
-boot); for wave 9 flash the USB image with Rufus in DD mode, or use the wave 9 dual-boot export with
-`install_dualboot.ps1`. Its rebuild needs more free disk space on the build host. The last ISO built and tested is
-the wave 8 build (2026-10-31):
-kernel build #16 (since wave 8; build #15 before), the native tree with the wave 3 fixes (the keyboard base's `8250.nr_uarts=4` among them, see
-[Boot entries](#boot-entries-and-the-nvidia-payload)), the wave 4/5 software Gatekeeper, the VNNI libz patch, the OTA
-gate, the wave 5 readiness fixes, the wave 6, wave 7 and wave 8 changes (README, CHANGELOG; wave 8: the loader's
-`default gb-<slot>.conf` line), and a fresh dual-boot export with new GUIDs. Its VMware tests: T0, T1a/T1b, the
-dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 (whose `-UpdateEspOnly` loader check wave 8
-changed; its image test now edits either `default` form, so an export made before wave 8 passes too) passed on
-2026-10-31 (11 test ids, 378 checks, 0 failed). Its installer is the same as the wave 6 builds' (only the two ESP
-objects differ): T2b/T2c/T2h passed on the final
-wave 6 build and the other 22 test ids of the full suite on the wave 6 build before it. The full suite (`iso/test/run_all.py`, all 38 test ids: static, whole disk, dual boot install and uninstall,
+equivalent stick layouts were tested in VMware. **The current ISO is the wave 10 build (2026-11-06)**: it installs
+the current system with both options (option 1 writes the wave 10 USB image `3b6330d9…`, option 2 installs the
+wave 10 dual-boot export): kernel build #16, the native tree with the wave 3 fixes (the keyboard
+base's `8250.nr_uarts=4` among them, see [Boot entries](#boot-entries-and-the-nvidia-payload)), the wave 4/5 software
+Gatekeeper, the VNNI libz patch, the OTA gate, the wave 5 readiness fixes, the wave 6 to 8 changes, the wave 9 fixes
+from the first native boot (the Surface Aggregator re-bind, which the second native boot confirmed: the keyboard
+base, touchpad, batteries, charger and detach device came up) and the wave 10 changes (README, CHANGELOG; among them
+the battery level fix from the second native boot), and a fresh dual-boot export with new GUIDs. Its VMware tests:
+T0, T1a/T1b (option 1 wrote a disk byte-identical to the wave 10 USB image), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-11-06 (12 test ids, 378 checks, 0 failed; the same counts as the wave 8 ISO's). Wave 9 had no ISO of its own: its system was installed by flashing the USB image or with the
+dual-boot export. The wave 8 ISO (2026-10-31) installed the wave 8 system and passed T0, T1a/T1b, the dual-boot
+groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 (whose `-UpdateEspOnly` loader check wave 8 changed;
+its image test edits either `default` form, so an export made before wave 8 passes too) on 2026-10-31 (11 test ids,
+378 checks, 0 failed); do not use a stick made with it any more. The installer itself is the same as the wave 6 builds' (only the payload objects and the build id differ):
+T2b/T2c/T2h passed on the final wave 6 build and the other 22 test ids of the full suite on the wave 6 build before
+it. The full suite (`iso/test/run_all.py`, all 38 test ids: static, whole disk, dual boot install and uninstall,
 media and the Windows side) last passed on the wave 3 build (2026-10-26), so all four options were exercised in
 VMware. Run the suite again on every ISO you build before you use options 2 and 3 on a real disk.
 

@@ -131,6 +131,7 @@ static void set_root(const char *name) {
   memset(&g_tp, 0, sizeof g_tp);
   memset(g_psy_cache, 0, sizeof g_psy_cache);
   g_hidden = 0;
+  g_readonly = 0;
   reset_daemon();
 }
 
@@ -154,10 +155,16 @@ static int mk(struct psy *ps, int n, const char *txt, const char *driver) {
   snprintf(ps[n].driver, sizeof ps[n].driver, "%s", driver ? driver : "");
   return n + 1;
 }
-static int hal_level(const struct combo *c) {   /* what the desktop HAL derives (disassembled formula) */
-  double real = (c->q_now > 0 && c->q_full > 0) ? c->q_now * 100.0 / c->q_full : c->capacity;
-  int l = (int)floor(real / 100.0 * 100.0 + 0.05);
+/* (wave 10) what the lapis desktop health HAL shows (disassembled, checked against the second native boot): its
+ * charge counter is <battery>/charge_now, which test_power hard-wires to battery_capacity, over charge_full; raw is
+ * the capacity file (used when the counter or full is <= 0) */
+static int hal_level_of(long long charge_now, long long charge_full, long long raw) {
+  double x = (charge_now > 0 && charge_full > 0) ? charge_now * 100.0 / charge_full : (double)raw;
+  int l = (int)floor(x / 100.0 * 100.0 + 0.05);
   return l < 0 ? 0 : l > 100 ? 100 : l;
+}
+static int hal_level(const struct combo *c) {   /* the level the HAL shows for what publish() writes: cap/100 */
+  return hal_level_of(c->capacity, 100, c->capacity);
 }
 
 static void test_parse(void) {
@@ -200,11 +207,14 @@ static void test_combine(void) {
   CHECK(c.nbat == 2 && c.present && c.ac == 1 && c.status == S_CHARGING, "1 status %s ac %d", status_name(c.status), c.ac);
   CHECK(c.capacity == 62, "1 cap %d (47.5/75.5 Wh = 62.9%%)", c.capacity);
   CHECK(hal_level(&c) == c.capacity, "1 HAL level %d vs %d", hal_level(&c), c.capacity);
+  /* (wave 10) the waves 1-9 publication (charge_full = q_full uAh, charge_now = capacity): what the HAL showed */
+  CHECK(hal_level_of(c.capacity, c.q_full, c.capacity) == 0, "1 uAh charge_full: the HAL's 0 %% (%d)",
+        hal_level_of(c.capacity, c.q_full, c.capacity));
   double vconv = (7.6 * 17500 + 11.4 * 58000) / 75500.0;
   CHECK(fabs(c.v_conv / 1e6 - vconv) < 0.01, "1 vconv %lld vs %.3f", c.v_conv, vconv);
   CHECK(c.i_ua > 0 && fabs(c.i_ua - 25.0 / vconv * 1e6) < 2000, "1 current %lld", c.i_ua);
   double ttf_h = (double)(c.q_full - c.q_now) / c.i_ua, want = (75.5 - 47.5) / 25.0;
-  CHECK(fabs(ttf_h - want) / want < 0.01, "1 HAL time-to-full %.3f h vs %.3f h", ttf_h, want);
+  CHECK(fabs(ttf_h - want) / want < 0.01, "1 combined time-to-full %.3f h vs %.3f h", ttf_h, want);
   CHECK(!strcmp(c.tech, "LION") && c.cycle == 87, "1 tech %s", c.tech);
   CHECK(c.v_uv > 8700000 && c.v_uv < 12300000, "1 voltage %lld", c.v_uv);
 
@@ -370,8 +380,9 @@ static void test_publish(void) {
   fake_psy("ADP1", ADP_ON, "Mains\n", "surface_charger");
   put("/sys/module/surface_battery/parameters/scope_device", "N\n");
   CHECK(tp_probe() == 1 && g_tp.ok && g_tp.full && g_tp.temp, "probe");
-  CHECK(!strcmp(get(TP "usb_online"), "off") && !strcmp(get(TP "battery_temp"), "250"), "defaults");
+  CHECK(g_tp.writes == 0 && !strcmp(get(TP "battery_present"), "x"), "(wave 10) the probe writes no defaults");
   battery_update(1);
+  CHECK(!strcmp(get(TP "usb_online"), "off") && !strcmp(get(TP "battery_temp"), "250"), "static values");
   CHECK(!strcmp(get(TP "battery_status"), "charging"), "status %s", get(TP "battery_status"));
   CHECK(!strcmp(get(TP "battery_capacity"), "62"), "capacity %s", get(TP "battery_capacity"));
   CHECK(!strcmp(get(TP "battery_present"), "true") && !strcmp(get(TP "ac_online"), "on"), "present/ac");
@@ -379,8 +390,11 @@ static void test_publish(void) {
   long long full = atoll(get(TP "battery_charge_full")), cnt = atoll(get(TP "battery_charge_counter")),
             cur = atoll(get(TP "battery_current")), design = atoll(get(TP "battery_charge_full_design")),
             volt = atoll(get(TP "battery_voltage"));
-  CHECK(full > 7000000 && full < 7300000 && cnt * 100 / full == 62 && design > full, "uAh full %lld cnt %lld design %lld", full, cnt, design);
-  CHECK(cur > 2300000 && cur < 2450000 && cur % 1000 == 0, "uA current %lld", cur);
+  /* (wave 10) percent units: the HAL's level floor(charge_now*100/charge_full + 0.05) with charge_now = capacity */
+  CHECK(full == 100 && cnt == -1 && cur == 0, "percent units: full %lld counter %lld current %lld", full, cnt, cur);
+  CHECK(hal_level_of(atoll(get(TP "battery_capacity")), full, 62) == 62, "HAL level 62");
+  /* state of health: packs 75.5 of 77.5 Wh design = 97 %; the HAL's lround(100 * 100 / design) */
+  CHECK(design == 103 && lround(100.0 * 100 / design) == 97, "design %lld for SoH 97", design);
   CHECK(volt > 11000000 && volt < 12300000 && volt % 1000 == 0, "uV voltage %lld", volt);
   /* hiding: BAT1 has no scope -> hidden, BAT2 scope=Device -> left alone */
   CHECK(!strcmp(get("/sys/class/power_supply/BAT1/type"), "Unknown") && g_hidden == 1, "BAT1 hidden");
@@ -411,7 +425,7 @@ static void test_publish(void) {
   fake_psy("BAT1", bat(b, "BAT1", "Discharging", 17500000, 17500000, 2000000, 8500000, 7600000, NULL), "Unknown\n", "surface_battery");
   battery_update(0);
   CHECK(!strcmp(get(TP "battery_status"), "discharging") && !strcmp(get(TP "ac_online"), "off"), "unplugged %s", get(TP "battery_status"));
-  CHECK(atoll(get(TP "battery_current")) < -1000000, "discharge current %s", get(TP "battery_current"));
+  CHECK(!strcmp(get(TP "battery_current"), "0"), "(wave 10) no current in percent units: %s", get(TP "battery_current"));
   /* base detached: BAT2 disappears */
   char cmd[PATH_MAX + 32];
   snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/power_supply/BAT2'", g_root);
@@ -422,7 +436,8 @@ static void test_publish(void) {
   snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/power_supply/BAT1'", g_root);
   if (system(cmd)) {}
   battery_update(0);
-  CHECK(!strcmp(get(TP "battery_present"), "false") && !strcmp(get(TP "battery_charge_counter"), "-1"), "none present");
+  CHECK(!strcmp(get(TP "battery_present"), "false") && !strcmp(get(TP "battery_charge_counter"), "-1") &&
+        !strcmp(get(TP "ac_online"), "off"), "none present");
 
   /* legacy test_power (no charge_full param): counter -1, current 0, capacity carries the level */
   set_root("tree_legacy");
@@ -455,6 +470,150 @@ static void test_publish(void) {
   CHECK(g_tp.writes == 0, "nothing written");
   CHECK(!strcmp(get("/sys/class/power_supply/BAT1/type"), "Battery") && g_hidden == 0, "no hiding without test_power");
   CHECK(!strcmp(get("/sys/module/surface_battery/parameters/scope_device"), "N"), "scope_device off without test_power");
+}
+
+/* ---- (wave 10, w10prep battery-userspace) W10-BAT: percent units, one writer, write order, AC timing ---- */
+static char g_tptrace[8192];
+static void tp_trace(const char *what) {
+  if (strncmp(what, "tp:", 3)) return;
+  size_t l = strlen(g_tptrace);
+  if (l + strlen(what) + 2 < sizeof g_tptrace) snprintf(g_tptrace + l, sizeof g_tptrace - l, "%s ", what + 3);
+}
+static int trace_pos(const char *item) {         /* index of "item " in the trace, -1 if absent */
+  char k[96];
+  snprintf(k, sizeof k, "%s ", item);
+  const char *p = strstr(g_tptrace, k);
+  return p ? (int)(p - g_tptrace) : -1;
+}
+static int w10_count(const char *hay, const char *needle) {
+  int n = 0;
+  for (const char *p = hay; (p = strstr(p, needle)); p++) n++;
+  return n;
+}
+static void test_battery_w10(void) {
+  char b[2048];
+  /* W10-BAT-1 first publication: numbers, then present, then ac; never present=false while a pack is present */
+  set_root("tree_w10");
+  fake_tp(1);
+  fake_psy("BAT1", bat(b, "BAT1", "Discharging", 14900000, 14900000, 3030000, 7974000, 7500000, "POWER_SUPPLY_SCOPE=Device\n"),
+           "Battery\n", "surface_battery");
+  fake_psy("BAT2", bat(b, "BAT2", "Discharging", 18130000, 45190000, 20249000, 11780000, 11360000, "POWER_SUPPLY_SCOPE=Device\n"),
+           "Battery\n", "surface_battery");
+  fake_psy("ADP1", ADP_OFF, "Mains\n", "surface_charger");
+  g_tptrace[0] = 0;
+  g_trace = tp_trace;
+  tp_probe();
+  battery_update(1);
+  int pp = trace_pos("battery_present=true"), pa = trace_pos("ac_online=off"), pc = trace_pos("battery_capacity=55");
+  CHECK(pc >= 0 && pp > pc && pa > pp && trace_pos("battery_present=false") < 0 && trace_pos("ac_online=on") < 0,
+        "W10-BAT-1 order capacity < present < ac, no present=false / ac=on: %s", g_tptrace);
+  CHECK(trace_pos("battery_charge_full=100") >= 0 && trace_pos("battery_charge_full=100") < pc &&
+        trace_pos("battery_current=0") >= 0, "W10-BAT-1 percent units before the level: %s", g_tptrace);
+  /* the second boot's pack energies: 33.03 of 60.09 Wh = 54.97 % -> 55 (floor(x + 0.05)); the HAL's level 55 */
+  CHECK(hal_level_of(atoll(get(TP "battery_capacity")), atoll(get(TP "battery_charge_full")), 0) == 55, "W10-BAT-1 level 55");
+  /* SoH: 60.09 of 62.09 Wh design (bat(): design = full + 1 Wh) = 96.8 % -> 97 */
+  long long d = atoll(get(TP "battery_charge_full_design"));
+  CHECK(lround(100.0 * 100 / d) == 97, "W10-BAT-1 design %lld -> SoH %ld", d, lround(100.0 * 100 / d));
+
+  /* W10-BAT-2 a restart (init respawns gb_power) over the waves 1-9 values: no defaults pass */
+  put(TP "battery_charge_full", "5776291\n");
+  put(TP "battery_capacity", "54\n");
+  put(TP "battery_present", "true\n");
+  put(TP "ac_online", "off\n");
+  memset(&g_tp, 0, sizeof g_tp);
+  memset(g_psy_cache, 0, sizeof g_psy_cache);
+  g_tptrace[0] = 0;
+  tp_probe();
+  battery_update(1);
+  CHECK(trace_pos("battery_present=false") < 0 && trace_pos("ac_online=on") < 0 && trace_pos("battery_current=0") >= 0 &&
+        trace_pos("battery_charge_full=100") >= 0 && trace_pos("battery_charge_full=100") < trace_pos("battery_present=true"),
+        "W10-BAT-2 restart: no present=false/ac=on, charge_full=100 first: %s", g_tptrace);
+  CHECK(!strcmp(get(TP "battery_charge_full"), "100"), "W10-BAT-2 uAh charge_full replaced");
+
+  /* W10-BAT-3 test_power reloaded (module add uevent): republished, still no present=false */
+  struct uev um = {.action = "add", .subsystem = "module", .devpath = "/module/test_power"};
+  g_tptrace[0] = 0;
+  uev_handle(&um);
+  CHECK(!g_tp.ok && g_tp_due > 0, "W10-BAT-3 reload re-probes");
+  T += 200;
+  run_due(T);
+  CHECK(g_tp.ok && trace_pos("battery_present=true") >= 0 && trace_pos("battery_present=false") < 0,
+        "W10-BAT-3 reload republished without present=false: %s", g_tptrace);
+
+  /* W10-BAT-4 voltage deadband: 10 mV alone waits, 30 mV is written, 10 mV after 61 s is written */
+  int w = g_tp.writes;
+  fake_psy("BAT2", bat(b, "BAT2", "Discharging", 18130000, 45190000, 20249000, 11790000, 11360000, "POWER_SUPPLY_SCOPE=Device\n"),
+           "Battery\n", "surface_battery");
+  battery_update(0);
+  CHECK(g_tp.writes == w, "W10-BAT-4 a 7 mV change alone is not published (%d -> %d)", w, g_tp.writes);
+  fake_psy("BAT2", bat(b, "BAT2", "Discharging", 18130000, 45190000, 20249000, 11860000, 11360000, "POWER_SUPPLY_SCOPE=Device\n"),
+           "Battery\n", "surface_battery");
+  battery_update(0);
+  CHECK(g_tp.writes == w + 1, "W10-BAT-4 a 50 mV change is published (%d -> %d)", w, g_tp.writes);
+  w = g_tp.writes;
+  T += 61000;
+  fake_psy("BAT2", bat(b, "BAT2", "Discharging", 18130000, 45190000, 20249000, 11870000, 11360000, "POWER_SUPPLY_SCOPE=Device\n"),
+           "Battery\n", "surface_battery");
+  battery_update(0);
+  CHECK(g_tp.writes == w + 1, "W10-BAT-4 a small change after 61 s is published (%d -> %d)", w, g_tp.writes);
+
+  /* W10-BAT-5 AC follows ADP1 within 2 s (300 ms coalescing), one ac write per change, none in between */
+  g_tptrace[0] = 0;
+  fake_psy("ADP1", ADP_ON, "Mains\n", "surface_charger");
+  struct uev ua = {.action = "change", .subsystem = "power_supply", .psy_name = "ADP1"};
+  long long t0 = T;
+  uev_handle(&ua);
+  long long ton = -1;
+  for (int k = 0; k < 40 && ton < 0; k++) { T += 50; run_due(T); if (!strcmp(get(TP "ac_online"), "on")) ton = T; }
+  CHECK(ton > 0 && ton - t0 <= 2000, "W10-BAT-5 ac on %lld ms after the ADP1 uevent", ton - t0);
+  for (int k = 0; k < 30; k++) { T += 1000; run_due(T); }        /* periodic passes: nothing toggles */
+  fake_psy("ADP1", ADP_OFF, "Mains\n", "surface_charger");
+  t0 = T;
+  uev_handle(&ua);
+  long long toff = -1;
+  for (int k = 0; k < 40 && toff < 0; k++) { T += 50; run_due(T); if (!strcmp(get(TP "ac_online"), "off")) toff = T; }
+  CHECK(toff > 0 && toff - t0 <= 2000, "W10-BAT-5 ac off %lld ms after the ADP1 uevent", toff - t0);
+  CHECK(w10_count(g_tptrace, "ac_online=") == 2 && trace_pos("battery_present=false") < 0, "W10-BAT-5 one write per change: %s",
+        g_tptrace);
+  g_trace = NULL;
+
+  /* W10-BAT-6 pct_design: every state of health 1..100 is reproduced by the HAL's lround(100*100/design) */
+  int bad = 0;
+  for (long long s = 1; s <= 100; s++) {
+    struct combo c;
+    memset(&c, 0, sizeof c);
+    c.q_full = s * 100000;
+    c.q_design = 10000000;
+    long long dd = pct_design(&c);
+    if (lround(10000.0 / dd) != s) { bad++; printf("  SoH %lld -> design %lld -> %ld\n", s, dd, lround(10000.0 / dd)); }
+  }
+  struct combo cn;
+  memset(&cn, 0, sizeof cn);
+  cn.q_full = 120; cn.q_design = 100;
+  CHECK(!bad && pct_design(&cn) == 100, "W10-BAT-6 SoH 1..100 exact (%d bad), above design -> 100", bad);
+  cn.q_design = 0;
+  CHECK(pct_design(&cn) == 100, "W10-BAT-6 no design -> 100");
+
+  /* W10-BAT-7 HAL level == the energy-weighted composite (independent double math) over a sweep */
+  int off = 0;
+  double worst = 0;
+  for (long long en1 = 0; en1 <= 14900000; en1 += 745000)
+    for (long long en2 = 0; en2 <= 45190000; en2 += 1129750) {
+      struct psy ps[4];
+      struct combo c;
+      int n = 0;
+      char b1[2048], b2[2048];
+      n = mk(ps, n, bat(b1, "BAT1", "Discharging", en1, 14900000, 3000000, 7900000, 7500000, NULL), "surface_battery");
+      n = mk(ps, n, bat(b2, "BAT2", "Discharging", en2, 45190000, 9000000, 11500000, 11360000, NULL), "surface_battery");
+      n = mk(ps, n, ADP_OFF, NULL);
+      combine(ps, n, &c);
+      double want = (en1 + en2) * 100.0 / (14900000 + 45190000);
+      int got = hal_level_of(c.capacity, 100, c.capacity);
+      double dlt = fabs(got - want);
+      if (dlt > 1.0) off++;
+      if (dlt > worst) worst = dlt;
+    }
+  CHECK(off == 0 && worst <= 1.0, "W10-BAT-7 HAL level within 1 of the composite (%d off, worst %.3f)", off, worst);
 }
 
 /* ---- uevent netlink message parsing ---- */
@@ -2525,7 +2684,10 @@ static void test_main_once(void) {
   char *argv[] = {"gb_power", "-o", "-r", root, NULL};
   optind = 1;
   int r = gb_power_main(4, argv);
-  CHECK(r == 0 && !strcmp(get(TP "battery_capacity"), "50") && !strcmp(get(TP "battery_status"), "discharging"), "main -o");
+  /* (wave 10) -o is read-only: every test_power parameter keeps its value ("x"), BAT1 is not hidden */
+  CHECK(r == 0 && !strcmp(get(TP "battery_capacity"), "x") && !strcmp(get(TP "battery_present"), "x") &&
+        !strcmp(get(TP "ac_online"), "x") && !strcmp(get(TP "battery_current"), "x") && g_tp.writes == 0 &&
+        !strcmp(get("/sys/class/power_supply/BAT1/type"), "Battery") && !g_readonly, "main -o writes nothing");
   put("/sys/firmware/acpi/platform_profile_choices", "low-power balanced balanced-performance performance\n");
   put("/sys/firmware/acpi/platform_profile", "balanced\n");
   char *argv2[] = {"gb_power", "-r", root, "-p", "balanced-performance", NULL};
@@ -2547,6 +2709,7 @@ int main(int argc, char **argv) {
   test_parse();
   test_combine();
   test_publish();
+  test_battery_w10();
   test_uevent();
   test_dgpu_passes();
   test_dtx();
