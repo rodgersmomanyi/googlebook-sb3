@@ -103,3 +103,51 @@ on property:sys.boot_completed=1 && property:vendor.gb.posture=*
 
 on property:sys.boot_completed=1 && property:persist.vendor.gb.posture=*
     start gb_hw_posture
+
+# 9. (wave 11 power-drain) boot_completed, own services: 'power' measures the power draw in windows late in the boot
+#    (read-only; persist.vendor.gb.power.measure=0 turns it off; vendor.gb.power.now=1 measures one window now);
+#    'pwrpolicy' (pwr.policy=1: EPP / battery PL1 cap / battery platform profile per power source) and 'pmtune'
+#    (pm.tune=1: NMI watchdog off, runtime PM auto for PCI USB/audio/IPU) are opt-in: without their property they log
+#    one line and exit. All four: disabled oneshot root services in u:r:shell:s0, only ever started with 'start'.
+service gb_hw_power /system/bin/sh /odm/gb_hw.sh power
+    user root
+    group root system log readproc
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+service gb_hw_power_now /system/bin/sh /odm/gb_hw.sh power-now
+    user root
+    group root system log readproc
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+service gb_hw_pwrpolicy /system/bin/sh /odm/gb_hw.sh pwrpolicy
+    user root
+    group root system
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+service gb_hw_pmtune /system/bin/sh /odm/gb_hw.sh pmtune
+    user root
+    group root system
+    seclabel u:r:shell:s0
+    stdio_to_kmsg
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start gb_hw_power
+    start gb_hw_pwrpolicy
+    start gb_hw_pmtune
+
+on property:sys.boot_completed=1 && property:vendor.gb.power.now=1
+    start gb_hw_power_now
+
+on property:sys.boot_completed=1 && property:persist.vendor.gb.pwr.policy=1
+    start gb_hw_pwrpolicy

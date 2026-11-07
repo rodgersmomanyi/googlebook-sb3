@@ -65,10 +65,15 @@
    "src": "${GB_BUILD}\\native\\camera-userspace\\out-w5\\odm\\etc\\libcamera\\ipa\\simple\\uncalibrated.yaml",
    "dest": "etc/libcamera/ipa/simple/uncalibrated.yaml",
    "mode": "0644"
+  },
+  {
+   "src": "${GB_BUILD}\\native\\camera-userspace\\integration\\gb_camtest.sh",
+   "dest": "bin/gb_camtest.sh",
+   "mode": "0755"
   }
  ],
  "rc_files": [],
- "rc_text": "",
+ "rc_text": "# (wave 11, w11prep camera-hw3) the opt-in camera self-test: off unless vendor.gb.camtest=1 (for one boot through\n# the ESP's gb.cfg GB_PROP_<n>=vendor.gb.camtest=1 and gb.overlay=1); its gb_camtest: lines go to the kernel log\nservice gb_camtest /system/bin/sh /odm/bin/gb_camtest.sh\n    user root\n    group root system camera\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\non property:sys.boot_completed=1 && property:vendor.gb.camtest=1\n    start gb_camtest",
  "build_prop": [
   "ro.hardware.camera=sb3"
  ]

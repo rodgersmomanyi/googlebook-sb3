@@ -22,15 +22,22 @@ Every destructive step asks you to type a confirmation. The installer refuses di
 [The installer menu](#the-installer-menu)).
 
 **Status.** Tested in VMware only, never on the real Surface Book 3. Rufus and Ventoy themselves were never run;
-equivalent stick layouts were tested in VMware. **The current ISO is the wave 10 build (2026-11-06)**: it installs
-the current system with both options (option 1 writes the wave 10 USB image `3b6330d9…`, option 2 installs the
-wave 10 dual-boot export): kernel build #16, the native tree with the wave 3 fixes (the keyboard
+equivalent stick layouts were tested in VMware. **The current ISO is the wave 11 build (2026-11-07), the final release**: it installs
+the current system with both options (option 1 writes the wave 11 USB image `e43a463b…`, option 2 installs the
+wave 11 dual-boot export): kernel build #16, the native tree with the wave 3 fixes (the keyboard
 base's `8250.nr_uarts=4` among them, see [Boot entries](#boot-entries-and-the-nvidia-payload)), the wave 4/5 software
 Gatekeeper, the VNNI libz patch, the OTA gate, the wave 5 readiness fixes, the wave 6 to 8 changes, the wave 9 fixes
 from the first native boot (the Surface Aggregator re-bind, which the second native boot confirmed: the keyboard
-base, touchpad, batteries, charger and detach device came up) and the wave 10 changes (README, CHANGELOG; among them
-the battery level fix from the second native boot), and a fresh dual-boot export with new GUIDs. Its VMware tests:
-T0, T1a/T1b (option 1 wrote a disk byte-identical to the wave 10 USB image), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-11-06 (12 test ids, 378 checks, 0 failed; the same counts as the wave 8 ISO's). Wave 9 had no ISO of its own: its system was installed by flashing the USB image or with the
+base, touchpad, batteries, charger and detach device came up), the wave 10 changes (among them the battery level fix
+from the second native boot, which the third native boot confirmed) and the wave 11 changes (README, CHANGELOG: the
+low-battery shutdown, the camera self-test, the power measurement, the boot-log scrub, and Google updates followed
+automatically: [OTA.md](OTA.md#google-updates-on-the-usb-stick-and-on-native-installs-wave-11)), and a fresh dual-boot export with new GUIDs. Its VMware tests:
+T0, T1a/T1b (option 1 wrote a disk byte-identical to the wave 11 USB image), the dual-boot groups G1-G4 (T3 with its
+refusal cases, T4, T4b, T9) and T8 passed on 2026-11-07 (12 test ids, 378 checks, 0 failed; the same counts as the
+wave 10 and wave 8 ISOs'). The installer's own files are unchanged; one library in its start-up image (libpcre2-8,
+which the disk listing uses) is an Ubuntu security update of the build machine, and every one of those tests lists
+disks with it. The wave 10 ISO (2026-11-06) installed the wave 10 system and passed the same 12 test ids (378
+checks, 0 failed); do not use a stick made with it any more. Wave 9 had no ISO of its own: its system was installed by flashing the USB image or with the
 dual-boot export. The wave 8 ISO (2026-10-31) installed the wave 8 system and passed T0, T1a/T1b, the dual-boot
 groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 (whose `-UpdateEspOnly` loader check wave 8 changed;
 its image test edits either `default` form, so an export made before wave 8 passes too) on 2026-10-31 (11 test ids,

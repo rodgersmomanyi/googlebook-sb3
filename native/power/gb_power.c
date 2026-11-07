@@ -20,6 +20,18 @@
  *    published made the HAL show 0 % (charge_now = 54 over charge_full = 5776291).
  *    One writer: only the daemon writes test_power ("gb_power -o" is read-only); present=false only while no pack is
  *    usable; every value in one fixed order, the numbers before present and ac (no defaults pass at a (re)start).
+ *    Low-battery guard (wave 11, w11prep battery-lowshut): nothing else in lapis shuts the laptop down on an empty
+ *    battery (k16's test_power hard-wires capacity_level Normal, and AOSP's BatteryService then requests its
+ *    low-battery shutdown only at capacity level CRITICAL), so at a combined level <= 3 % on battery (no charger,
+ *    discharging, every present pack read) for 60 s, and not before 60 s after sys.boot_completed=1, the daemon
+ *    requests the clean shutdown init performs for sys.powerctl=shutdown,battery; once per boot, hysteresis 3/5 %;
+ *    kill switch gb.power.lowshut=0. A test_power with a battery_capacity_level parameter (a later kernel) also
+ *    carries the class (full/low/normal; critical only once the guard decided): Android's own shutdown goes first.
+ *    (wave 11 final, LEAD_W11 b) A false shutdown is worse than none: a hold starts only after 2 consecutive
+ *    consistent readings at <= 3 %; every reading must be fresh (no cached pack or charger value), the charger must
+ *    read offline, BAT1 must be read and, while the base is not known to be detached, BAT2 too; a change of the
+ *    present packs, a charger uevent or a resume from suspend ends a hold; ADP1 and test_ac are read again right
+ *    before the request.
  * B. Detach (DTX, /dev/surface/dtx) and the latch lifecycle (C:\GB-build\native\dgpu\INTERFACES.md 10.2, 10.3).
  *    * Quick path (unchanged): no driver on any NVIDIA function and nouveau never used this boot -> the request is
  *      confirmed at once.
@@ -394,6 +406,7 @@ struct psy {
   long long q_now, q_full, q_design;   /* uAh */
   long long p_now, i_now;              /* uW, uA (surface_battery reports magnitudes) */
   long long v_now, v_design;           /* uV */
+  int cached;                          /* (wave 11 final) this round's read failed: the values are the cache's */
 };
 
 static void psy_init(struct psy *p) {
@@ -477,8 +490,19 @@ static struct { char name[40]; struct psy p; long long t; } g_psy_cache[MAXPSY];
 
 static int psy_cmp(const void *a, const void *b) { return strcmp(((const struct psy *)a)->name, ((const struct psy *)b)->name); }
 
+/* (wave 11 final, W11-S3) CLOCK_BOOTTIME - CLOCK_MONOTONIC: the time spent suspended since boot (ms). The cache's
+ * age and the guard's resume check use it, so a suspend ages a cached value and is seen as an event. */
+static long long real_susp_ms(void) {
+  struct timespec b, m;
+  if (clock_gettime(CLOCK_BOOTTIME, &b) || clock_gettime(CLOCK_MONOTONIC, &m)) return 0;
+  long long d = (b.tv_sec - m.tv_sec) * 1000LL + (b.tv_nsec - m.tv_nsec) / 1000000;
+  return d > 0 ? d : 0;
+}
+static long long (*g_susp_clock)(void) = real_susp_ms;   /* unit tests and the simulator use a fake one */
+
 /* Reads every non-test_* supply's uevent file. A transient read error (SAM timeout -> -EIO) reuses the last good
- * parse for up to 60 s, so a single failed EC request does not make a pack vanish from the sum. */
+ * parse for up to 60 s, so a single failed EC request does not make a pack vanish from the sum. (wave 11 final) The
+ * 60 s include suspended time, and a reused entry is marked cached (the low-battery guard never acts on one). */
 static int psy_scan(struct psy *out, int max) {
   char dir[PATH_MAX], path[PATH_MAX + 64], buf[4096];
   DIR *d = opendir(rpath(dir, sizeof dir, "/sys/class/power_supply"));
@@ -494,9 +518,10 @@ static int psy_scan(struct psy *out, int max) {
     int ci;
     for (ci = 0; ci < MAXPSY && g_psy_cache[ci].name[0] && strcmp(g_psy_cache[ci].name, e->d_name); ci++) {}
     if (!ok) {
-      if (ci < MAXPSY && g_psy_cache[ci].name[0] && now_ms() - g_psy_cache[ci].t < 60000) {
+      if (ci < MAXPSY && g_psy_cache[ci].name[0] && now_ms() + g_susp_clock() - g_psy_cache[ci].t < 60000) {
         LOGD("%s: uevent read failed, using cached values", e->d_name);
-        out[n++] = g_psy_cache[ci].p;
+        out[n] = g_psy_cache[ci].p;
+        out[n++].cached = 1;
       }
       continue;
     }
@@ -506,7 +531,7 @@ static int psy_scan(struct psy *out, int max) {
     if (ci < MAXPSY) {
       snprintf(g_psy_cache[ci].name, sizeof g_psy_cache[ci].name, "%s", p.name);
       g_psy_cache[ci].p = p;
-      g_psy_cache[ci].t = now_ms();
+      g_psy_cache[ci].t = now_ms() + g_susp_clock();
     }
     out[n++] = p;
   }
@@ -520,6 +545,7 @@ static int psy_scan(struct psy *out, int max) {
 
 struct combo {
   int nreal, nbat;           /* real battery supplies seen / present and usable */
+  int nskip;                 /* (wave 11) present but without usable data this round: the sum is incomplete */
   int present, capacity, status, ac, cycle, p_known;
   long long e_now, e_full, e_design, p_net;   /* uWh, uW (signed: + into the packs) */
   long long v_uv, v_conv, i_ua, q_now, q_full, q_design;
@@ -568,9 +594,10 @@ static void combine(const struct psy *ps, int n, struct combo *c) {
       full = design = E_FALLBACK;
       now = full * p->capacity / 100;
     } else {
+      c->nskip++;
       continue;                                   /* no usable data this round */
     }
-    if (full <= 0) continue;
+    if (full <= 0) { c->nskip++; continue; }
     if (now > full) now = full;
     if (now < 0) now = 0;
     c->nbat++;
@@ -627,12 +654,13 @@ static void combine(const struct psy *ps, int n, struct combo *c) {
 /* test_power module parameters */
 #define TP "/sys/module/test_power/parameters/"
 enum { TP_PRESENT, TP_TECH, TP_HEALTH, TP_VOLTAGE, TP_FULL_DESIGN, TP_FULL, TP_COUNTER, TP_CURRENT, TP_TEMP,
-       TP_CAPACITY, TP_STATUS, TP_AC, TP_USB, TP_N };
+       TP_CAPACITY, TP_STATUS, TP_AC, TP_USB, TP_LEVEL, TP_N };
 static const char *const tp_param[TP_N] = {
   "battery_present", "battery_technology", "battery_health", "battery_voltage", "battery_charge_full_design",
   "battery_charge_full", "battery_charge_counter", "battery_current", "battery_temp", "battery_capacity",
-  "battery_status", "ac_online", "usb_online"};
-static struct { int ok, full, temp, writes; char last[TP_N][24]; long long v_ms; } g_tp;
+  "battery_status", "ac_online", "usb_online", "battery_capacity_level"};
+/* level: (wave 11) the module has a battery_capacity_level parameter (k16 has none: capacity_level reads Normal) */
+static struct { int ok, full, temp, level, writes; char last[TP_N][24]; long long v_ms; } g_tp;
 static int g_readonly;                            /* -o: compute and print only; test_power is never written */
 
 static int tp_put(int idx, const char *val) {
@@ -654,12 +682,16 @@ static int tp_probe(void) {
     g_tp.full = !access(rpath(path, sizeof path, TP "battery_charge_full"), W_OK) &&
                 !access(rpath(path, sizeof path, TP "battery_charge_full_design"), W_OK);
     g_tp.temp = !access(rpath(path, sizeof path, TP "battery_temp"), W_OK);
+    g_tp.level = !access(rpath(path, sizeof path, TP "battery_capacity_level"), W_OK);
     memset(g_tp.last, 0, sizeof g_tp.last);
     g_tp.v_ms = 0;
     if (!g_readonly)
       LOGI("test_power found (%s); combined battery -> test_battery in percent units (capacity = charge_now = level, "
            "charge_full 100, current 0)", g_tp.full ? "charge_full params: design scaled for the state of health" :
            "no charge_full param (kernel patch 0002 missing): charge_full is 100 already, no state of health");
+    if (g_tp.level && !g_readonly)
+      LOGI("test_power has battery_capacity_level: test_battery carries the capacity level; the low-battery guard "
+           "asks Android's BatteryService first (capacity level critical)");
     /* (wave 10) no defaults are written here: publish() sets every value in its fixed order, so a (re)start or a
      * test_power reload never shows the HAL present=false / ac=on / current 0 while a pack is present. */
   }
@@ -683,6 +715,306 @@ static long long pct_design(const struct combo *c) {
   return d < 100 ? 100 : d;
 }
 
+/* (wave 11, w11prep battery-lowshut) The low-battery guard. What decides a low-battery shutdown in lapis (RESULT.md
+ * section 2 of the area): AOSP's BatteryService.shouldShutdownLocked() requests ACTION_REQUEST_SHUTDOWN (reason
+ * "battery") only at capacity level CRITICAL whenever the HAL reports a supported capacity level (it then ignores the
+ * Level, the status and the charger); the desktop HAL reads <battery>/capacity_level and passes CRITICAL through
+ * (reported as LOW only while the battery has been plugged in since the HAL's first reading); k16's test_power
+ * hard-wires capacity_level to Normal and has no parameter for it. So on k16 nothing shuts down at 0 % and the EC's
+ * cut-off ends the boot uncleanly. The guard: a combined level <= LS_PCT on battery (no charger online, discharging,
+ * every present pack read) held for LS_HOLD_MS, and not before LS_BOOT_MS after sys.boot_completed=1 was seen ->
+ * once per boot, sys.powerctl=shutdown,battery (init: services stopped, vold shut down, /data unmounted; the next
+ * boot's sys.boot.reason.last reads shutdown,battery). A running hold ends at a level >= LS_CLEAR_PCT, a charger, a
+ * status other than discharging or an incomplete sum (hysteresis: 4 % keeps a running hold, starts none). With a
+ * battery_capacity_level parameter (a later kernel), test_battery carries the class and the guard's decision is
+ * capacity level critical (Android's own graceful shutdown); sys.powerctl then follows only if Android has not
+ * started it within LS_FALLBACK_MS. Critical is never published before the decision (BatteryService would shut down
+ * at once, even on the charger). Kill switch: gb.power.lowshut=0 on the kernel command line.
+ * (wave 11 final, LEAD_W11 b: the safety audit's W11-S2 / W11-S3 and the ~0 % hardware glitch; a shutdown that should
+ * not happen is worse than none) A reading counts only when it is CLEAN: every present pack and every charger supply
+ * read fresh this round (a cached value after a failed read never counts), the charger supplies (ADP1) read offline
+ * (at least one must exist), the packs discharging, BAT1 (the clipboard's pack) present with usable data and, unless
+ * the DTX reports the base detached, BAT2 (the base's pack) too. A hold starts only at the second of 2 consecutive
+ * clean readings at <= LS_PCT, at least LS_CONF_MS apart and within LS_CONF_DIFF points of each other. A hold (and a
+ * started confirmation) ends at any unclean reading, at a change of the set of present packs, at a charger uevent
+ * (a plug or unplug) and at a resume from suspend (CLOCK_BOOTTIME gains on CLOCK_MONOTONIC, or suspend_stats/success
+ * changes); then it starts again from 2 new readings. Right before the decision (and before every later
+ * sys.powerctl request) ADP1 and the other charger supplies are read again, and test_ac's state (test_power's
+ * ac_online): online or unreadable -> no shutdown, the hold ends. */
+#define LS_PCT 3                                  /* shutdown at a combined level <= this ... */
+#define LS_CLEAR_PCT 5                            /* ... a running hold ends at >= this (or a charger) */
+#define LS_HOLD_MS 60000                          /* ... held this long on battery */
+#define LS_BOOT_MS 60000                          /* ... and never earlier than this after sys.boot_completed=1 */
+#define LS_FALLBACK_MS 30000                      /* capacity_level path: Android's shutdown must have started by then */
+#define LS_RETRY_MS 30000                         /* sys.powerctl did not read back: asked again this often ... */
+#define LS_TRIES 3                                /* ... at most this often in all */
+#define LS_CONF_MS 5000                           /* (w11 final) the 2 readings that start a hold: >= this apart ... */
+#define LS_CONF_DIFF 1                            /* ... and their levels within this many points */
+#define LS_RESUME_MS 1000                         /* (w11 final) suspended this long since the last pass: a resume */
+#define LS_PACK_CLIP "BAT1"                       /* (w11 final) the clipboard's pack: always required */
+#define LS_PACK_BASE "BAT2"                       /* the keyboard base's pack: required unless the base is detached */
+#define CL_LOW_PCT 10                             /* capacity_level low at <= this ... */
+#define CL_LOW_CLEAR_PCT 12                       /* ... normal again at >= this */
+enum { CL_NORMAL, CL_LOW, CL_CRITICAL, CL_FULL };
+static const char *const cl_names[] = {"normal", "low", "critical", "full"};
+static struct {
+  int off;                                        /* gb.power.lowshut=0 */
+  int low;                                        /* capacity_level low (hysteresis state) */
+  int gate_logged, tripped, tries;
+  long long bc_ms;                                /* sys.boot_completed=1 first seen by this process (0: not yet) */
+  long long hold_ms;                              /* start of the running hold (0: none) */
+  long long req_ms;                               /* the decision / the last sys.powerctl request */
+  /* (wave 11 final) */
+  int conf_n, conf_cap;                           /* clean readings at <= LS_PCT so far (2 start a hold), the first's level */
+  long long conf_ms;                              /* the first of them */
+  int set_init, susp_init;
+  char packs[64];                                 /* the present packs of the last pass, e.g. "BAT1,BAT2," */
+  long long susp_ms;                              /* the suspended time seen at the last pass */
+  int chg_ev, resume_ev;                          /* a charger uevent / a resume (resume_check) since the last pass */
+  char why[96];                                   /* the last 'no shutdown hold' reason logged (once per reason) */
+} g_ls;
+static int boot_completed(void);
+static int ls_base_detached(void);                /* (w11 final) after the DTX state (section B) */
+static const char *ls_charger_reread(void);
+static void ls_reset(const struct combo *c, const char *why);
+
+static int ls_class(const struct combo *c) {
+  if (g_ls.tripped) return CL_CRITICAL;
+  if (!c->nbat || c->capacity < 0) return CL_NORMAL;
+  if (c->status == S_FULL || c->capacity >= 100) return CL_FULL;
+  return (g_readonly ? c->capacity <= CL_LOW_PCT : g_ls.low) ? CL_LOW : CL_NORMAL;
+}
+
+static int ls_request(long long t, const struct combo *c) {
+  char v[PROP_VALUE_MAX];
+  const char *rr = ls_charger_reread();           /* (w11 final, W11-S3) the charger read again right before */
+  if (rr) {
+    LOGW("low battery: shutdown request withdrawn (%s)", rr);
+    trace("lowshut:withdrawn");
+    g_ls.tripped = 0;
+    g_ls.tries = 0;
+    ls_reset(c, rr);
+    return -1;
+  }
+  g_ls.tries++;
+  g_ls.req_ms = t;
+  trace("lowshut:powerctl");
+  prop_set("sys.powerctl", "shutdown,battery");
+  prop_get("sys.powerctl", v);
+  if (strcmp(v, "shutdown,battery"))
+    LOGE("low battery: sys.powerctl=shutdown,battery not taken (reads '%s'; request %d of %d)", v, g_ls.tries, LS_TRIES);
+  return 0;
+}
+
+static const char *ls_end_why(const struct combo *c) {
+  if (!c->nbat) return "no pack";
+  if (c->nskip) return "a present pack has no usable data";
+  if (c->ac || c->status != S_DISCHARGING) return "charger connected";
+  return "level back up";
+}
+
+/* (wave 11 final) a pack's own data: the same "usable" rule combine() applies */
+static int ls_usable(const struct psy *p) {
+  return (p->e_now >= 0 && (p->e_full > 0 || p->e_design > 0)) || (p->q_now >= 0 && (p->q_full > 0 || p->q_design > 0))
+         || p->capacity >= 0;
+}
+
+/* (wave 11 final, W11-S2) the named pack is in this round's scan, a real battery, present, with usable data, read
+ * fresh (not the cache's values) */
+static int ls_pack_ok(const struct psy *ps, int n, const char *name) {
+  for (int i = 0; i < n; i++)
+    if (!strcmp(ps[i].name, name))
+      return is_real_battery(&ps[i]) && ps[i].present != 0 && ls_usable(&ps[i]) && !ps[i].cached;
+  return 0;
+}
+
+/* (wave 11 final) the set of present real packs, e.g. "BAT1,BAT2," (psy_scan sorts by name) */
+static void ls_pack_set(const struct psy *ps, int n, char *out, size_t cap) {
+  size_t k = 0;
+  out[0] = 0;
+  for (int i = 0; i < n && k + 1 < cap; i++)
+    if (is_real_battery(&ps[i]) && ps[i].present != 0) {
+      int w = snprintf(out + k, cap - k, "%s,", ps[i].name);
+      if (w < 0 || (size_t)w >= cap - k) break;
+      k += (size_t)w;
+    }
+}
+
+/* (wave 11 final) NULL when this round's reading is CLEAN (see above), else the reason it is not */
+static const char *ls_unclean(const struct psy *ps, int n, const struct combo *c) {
+  int nchg = 0;
+  if (!c->nbat || c->capacity < 0) return "no pack";
+  if (c->nskip) return "a present pack has no usable data";
+  for (int i = 0; i < n; i++) {
+    const struct psy *p = &ps[i];
+    if (p->type == T_BATTERY) {
+      if (is_real_battery(p) && p->cached) return "a pack read failed (cached values)";
+      continue;
+    }
+    if (!strncmp(p->name, "test_", 5)) continue;
+    nchg++;
+    if (p->cached) return "charger unreadable (cached values)";
+    if (p->online < 0) return "charger unreadable (no online state)";
+  }
+  if (!nchg) return "no charger supply to read";
+  if (c->ac || c->status != S_DISCHARGING) return "charger connected";
+  if (!ls_pack_ok(ps, n, LS_PACK_CLIP)) return LS_PACK_CLIP " (clipboard) missing or unreadable";
+  if (!ls_base_detached() && !ls_pack_ok(ps, n, LS_PACK_BASE))
+    return LS_PACK_BASE " (base) missing or unreadable while the base is not known detached";
+  return NULL;
+}
+
+/* (wave 11 final, W11-S3) right before a shutdown request: every charger supply's uevent and test_ac's state
+ * (test_power's ac_online) read again; NULL = on battery for sure, else the reason not to shut down */
+static const char *ls_charger_reread(void) {
+  char dir[PATH_MAX], path[PATH_MAX + 64], buf[4096];
+  int nchg = 0;
+  const char *why = NULL;
+  DIR *d = opendir(rpath(dir, sizeof dir, "/sys/class/power_supply"));
+  if (!d) return "charger re-read: no power_supply class";
+  struct dirent *e;
+  while (!why && (e = readdir(d))) {
+    if (e->d_name[0] == '.' || !strncmp(e->d_name, "test_", 5)) continue;
+    struct psy p;
+    psy_init(&p);
+    snprintf(path, sizeof path, "%s/%s/uevent", dir, e->d_name);
+    if (read_text(path, buf, sizeof buf) <= 0 || psy_parse(buf, &p) <= 0) {
+      /* a pack's failed read is the next pass's business; an unreadable supply of unknown type counts as a charger */
+      char ty[32];
+      snprintf(path, sizeof path, "%s/%s/type", dir, e->d_name);
+      if (read_text(path, ty, sizeof ty) > 0 && !strncmp(ty, "Battery", 7)) continue;
+      why = "charger re-read: a supply is unreadable";
+      break;
+    }
+    if (p.type == T_BATTERY) continue;
+    nchg++;
+    if (p.online < 0) why = "charger re-read: no online state";
+    else if (p.online > 0) why = "charger re-read: online";
+  }
+  closedir(d);
+  if (why) return why;
+  if (!nchg) return "charger re-read: no charger supply";
+  if (g_tp.ok) {
+    char v[16];
+    if (read_text(rpath(path, sizeof path, TP "ac_online"), v, sizeof v) <= 0) return "test_ac re-read: unreadable";
+    if (strcmp(v, "off") && strcmp(v, "0") && strcmp(v, "N")) return "test_ac re-read: online";
+  }
+  return NULL;
+}
+
+/* (wave 11 final) end a running hold (logged) and drop a started confirmation */
+static void ls_reset(const struct combo *c, const char *why) {
+  if (g_ls.hold_ms) {
+    LOGI("low battery: shutdown hold ended (%s; %d%% %s ac=%d)", why, c->capacity, status_name(c->status), c->ac);
+    trace("lowshut:cancel");
+  }
+  g_ls.hold_ms = 0;
+  g_ls.conf_n = 0;
+}
+
+/* After combine(), before publish() (which carries the decision as capacity level critical, when it can). */
+static void lowshut_eval(const struct psy *ps, int n, const struct combo *c, long long t) {
+  if (c->nbat && c->capacity >= 0) {
+    if (c->capacity <= CL_LOW_PCT) g_ls.low = 1;
+    else if (c->capacity >= CL_LOW_CLEAR_PCT) g_ls.low = 0;
+  }
+  if (g_ls.off || g_readonly) return;
+  if (!g_ls.bc_ms && boot_completed()) g_ls.bc_ms = t > 0 ? t : 1;
+  if (g_ls.tripped) {                             /* decided: see that the shutdown happens */
+    char pc[PROP_VALUE_MAX], sr[PROP_VALUE_MAX];
+    prop_get("sys.powerctl", pc);
+    if (pc[0]) return;                            /* init has a request (ours or Android's) */
+    if (!g_ls.tries) {                            /* capacity_level path: Android's BatteryService was told */
+      prop_get("sys.shutdown.requested", sr);     /* ShutdownThread sets it when it starts */
+      if (t - g_ls.req_ms < (sr[0] ? 4 : 1) * (long long)LS_FALLBACK_MS) return;
+      LOGW("low battery: no shutdown %lld s after capacity level critical%s: sys.powerctl=shutdown,battery",
+           (t - g_ls.req_ms) / 1000, sr[0] ? " (Android's shutdown started, not finished)" : "");
+      ls_request(t, c);
+    } else if (g_ls.tries < LS_TRIES && t - g_ls.req_ms >= LS_RETRY_MS) {
+      ls_request(t, c);
+    }
+    return;
+  }
+  /* (w11 final, W11-S2 / W11-S3) events that end a hold and a started confirmation; that pass is not a reading */
+  long long su = g_susp_clock();
+  int resumed = g_ls.resume_ev || (g_ls.susp_init && su - g_ls.susp_ms >= LS_RESUME_MS);
+  g_ls.susp_ms = su;
+  g_ls.susp_init = 1;
+  int chg_ev = g_ls.chg_ev;
+  g_ls.resume_ev = g_ls.chg_ev = 0;
+  char set[sizeof g_ls.packs];
+  ls_pack_set(ps, n, set, sizeof set);
+  int set_changed = g_ls.set_init && strcmp(set, g_ls.packs);
+  snprintf(g_ls.packs, sizeof g_ls.packs, "%s", set);
+  g_ls.set_init = 1;
+  const char *ev = resumed ? "resumed from suspend" : chg_ev ? "charger event" : set_changed ? "packs changed" : NULL;
+  if (ev) {
+    ls_reset(c, ev);
+    return;
+  }
+  const char *bad = ls_unclean(ps, n, c);
+  if (bad || c->capacity >= LS_CLEAR_PCT) {
+    if (g_ls.hold_ms) ls_reset(c, bad && strcmp(bad, "charger connected") && strcmp(bad, "no pack") ? bad : ls_end_why(c));
+    g_ls.conf_n = 0;
+    if (bad && strcmp(bad, "charger connected") && c->nbat && c->capacity >= 0 && c->capacity <= LS_PCT &&
+        strcmp(g_ls.why, bad)) {                  /* a safety block (not the charger): logged once per reason */
+      LOGW("low battery: %d%% but no shutdown hold: %s", c->capacity, bad);
+      trace("lowshut:blocked");
+      snprintf(g_ls.why, sizeof g_ls.why, "%s", bad);
+    }
+    return;
+  }
+  char pc[PROP_VALUE_MAX];
+  prop_get("sys.powerctl", pc);
+  if (pc[0]) return;                              /* a shutdown or reboot is under way (a restart after a decision) */
+  g_ls.why[0] = 0;
+  if (!g_ls.hold_ms) {
+    if (c->capacity > LS_PCT) {                   /* LS_PCT < level < LS_CLEAR_PCT: keeps a hold, starts none */
+      g_ls.conf_n = 0;
+      return;
+    }
+    if (g_ls.conf_n && abs(c->capacity - g_ls.conf_cap) > LS_CONF_DIFF) g_ls.conf_n = 0;   /* not consistent */
+    if (!g_ls.conf_n) {                           /* the first clean reading at <= LS_PCT */
+      g_ls.conf_n = 1;
+      g_ls.conf_cap = c->capacity;
+      g_ls.conf_ms = t;
+      trace("lowshut:read1");
+      return;
+    }
+    if (t - g_ls.conf_ms < LS_CONF_MS) return;    /* the same refresh: not a second reading yet */
+    g_ls.conf_n = 2;
+    g_ls.hold_ms = t;
+    LOGW("low battery: %d%% on battery: a clean shutdown in %d s unless a charger is connected", c->capacity,
+         LS_HOLD_MS / 1000);
+    trace("lowshut:arm");
+    return;
+  }
+  if (c->capacity > LS_PCT || t - g_ls.hold_ms < LS_HOLD_MS) return;
+  if (!g_ls.bc_ms || t - g_ls.bc_ms < LS_BOOT_MS) {
+    if (!g_ls.gate_logged) {
+      g_ls.gate_logged = 1;
+      LOGW("low battery: %d%% on battery, but not %d s past sys.boot_completed yet: the shutdown waits", c->capacity,
+           LS_BOOT_MS / 1000);
+      trace("lowshut:gate");
+    }
+    return;
+  }
+  const char *rr = ls_charger_reread();           /* (w11 final, W11-S3) the charger read again right before */
+  if (rr) {
+    ls_reset(c, rr);
+    return;
+  }
+  g_ls.tripped = 1;
+  g_ls.req_ms = t;
+  int via_level = g_tp.ok && g_tp.level;
+  LOGW("low battery: %d%% discharging ac=0 for %lld s, %lld s after boot_completed: requesting a clean shutdown (%s)",
+       c->capacity, (t - g_ls.hold_ms) / 1000, (t - g_ls.bc_ms) / 1000,
+       via_level ? "capacity level critical for Android's BatteryService, sys.powerctl=shutdown,battery if it has not "
+                   "started in 30 s" : "sys.powerctl=shutdown,battery");
+  trace("lowshut:trip");
+  if (!via_level) ls_request(t, c);
+}
+
 /* What test_battery / test_ac / test_usb carry for combination c (NULL = parameter left alone). */
 struct tpv { const char *v[TP_N]; char buf[TP_N][24]; };
 static void tp_values(const struct combo *c, struct tpv *o) {
@@ -696,6 +1028,7 @@ static void tp_values(const struct combo *c, struct tpv *o) {
   TPS(TP_COUNTER, "-1");                          /* unused by the HAL (it reads charge_now); <= 0 is neutral */
   if (g_tp.full) TPS(TP_FULL, "100");             /* (legacy test_power: 100 already, not a parameter) */
   TPS(TP_AC, c->ac ? "on" : "off");
+  if (g_tp.level) TPS(TP_LEVEL, cl_names[ls_class(c)]);   /* (wave 11) critical only after the guard's decision */
   if (!c->nbat) { TPS(TP_PRESENT, "false"); return; }
   TPS(TP_TECH, c->tech);
   TPN(TP_VOLTAGE, c->v_uv / 1000 * 1000);         /* test_power hands it out raw as voltage_now: uV */
@@ -711,9 +1044,10 @@ static void tp_values(const struct combo *c, struct tpv *o) {
  * values would enter the HAL's 5-sample average and give a ~0 s estimate for 5 more reads), then charge_full and the
  * level, the rest, present, ac last (the HAL never sees present=true with stale numbers); without a pack,
  * present=false first. */
-static const int TP_ORDER_BAT[] = {TP_CURRENT, TP_FULL, TP_CAPACITY, TP_COUNTER, TP_FULL_DESIGN, TP_TECH, TP_HEALTH,
-                                   TP_TEMP, TP_USB, TP_VOLTAGE, TP_STATUS, TP_PRESENT, TP_AC};
-static const int TP_ORDER_NONE[] = {TP_PRESENT, TP_CURRENT, TP_FULL, TP_COUNTER, TP_HEALTH, TP_TEMP, TP_USB, TP_AC};
+static const int TP_ORDER_BAT[] = {TP_CURRENT, TP_FULL, TP_CAPACITY, TP_LEVEL, TP_COUNTER, TP_FULL_DESIGN, TP_TECH,
+                                   TP_HEALTH, TP_TEMP, TP_USB, TP_VOLTAGE, TP_STATUS, TP_PRESENT, TP_AC};
+static const int TP_ORDER_NONE[] = {TP_PRESENT, TP_LEVEL, TP_CURRENT, TP_FULL, TP_COUNTER, TP_HEALTH, TP_TEMP, TP_USB,
+                                    TP_AC};
 
 static void publish(const struct combo *c) {
   if (!g_tp.ok || g_readonly) return;
@@ -806,6 +1140,7 @@ static void battery_update(int force_log) {
     scope_param(0);
   }
   combine(ps, n, &c);
+  lowshut_eval(ps, n, &c, now_ms());              /* (wave 11) before publish(): it carries a decision as critical */
   publish(&c);
   char d[256];
   describe(ps, n, &c, d, sizeof d);
@@ -2392,6 +2727,8 @@ static int dgpu_releasing(void) { return g_dtx.ec == EC_CONFIRMED || g_dtx.latch
 static int g_bootdisk;                            /* a mounted base-side drive was seen by the last tick (latch lock) */
 static int dtx_ready(void) { return g_dtx_on && g_dtx.fd >= 0; }
 static int base_attached(void) { return dtx_ready() && g_dtx.base == SDTX_BASE_ATTACHED; }
+/* (wave 11 final) the low-battery guard may leave BAT2 out only when the EC says the base is detached */
+static int ls_base_detached(void) { return dtx_ready() && g_dtx.base == SDTX_BASE_DETACHED; }
 
 static const char *base_name(int v) {
   switch (v) {
@@ -2457,6 +2794,7 @@ static void resume_check(void) {
   if (read_text(rpath(p, sizeof p, "/sys/power/suspend_stats/success"), v, sizeof v) <= 0) return;
   if (g_susp[0] && strcmp(v, g_susp)) {
     LOGI("system resumed (suspend_stats/success %s -> %s)", g_susp, v);
+    g_ls.resume_ev = 1;                           /* (w11 final, W11-S3) a hold never runs across a suspend */
     pend_clear("system resumed");                 /* (R-12) a pending detach never fires long after the user acted */
     inventory();
     if (g_inv.bound_any && !g_shutdown) latch_set(1, 1, "after resume");
@@ -4615,6 +4953,11 @@ enum { R_ROOT, R_SHELL, R_UI, R_CSVC, R_CCLIENT, R_OTHER };
 static const char *const role_names[] = {"root", "shell", "ui", "compute-svc", "compute-client", "other"};
 #define MAXCL 8
 #define MAXWATCH 4
+/* (wave 11 security-review SR-4) the socket is 0666 and every app can connect: app peers without a role (an app uid,
+ * uid % 100000 >= 10000, that is not GbGpu and not a compute client) can only say hello, so at most this many of them
+ * are connected at once; otherwise any app could hold all MAXCL slots and lock GbGpu, gb_bootlog's status read and
+ * gb_dgpu_report out (EBUSY). System uids below 10000 are not counted. */
+#define MAXAPPOTHER 2
 #define CL_OUT 8192
 struct client {
   int fd, uid, pid, role, watch, compute, closing, dead;
@@ -4649,6 +4992,15 @@ static int sys_peer(int fd, int *uid, int *pid) {
   if (g_root[0]) {                                /* host test builds only (-r): the socket test chooses a role */
     const char *u = getenv("GB_POWER_TEST_UID");
     if (u && *u) *uid = atoi(u);
+    /* (wave 11 security-review SR-4) GB_POWER_TEST_UIDS=<uid>,<uid>,...: one uid per accepted connection, in order
+     * (the last one repeats), so one daemon sees several roles */
+    static int k;
+    const char *l = getenv("GB_POWER_TEST_UIDS");
+    if (l && *l) {
+      for (int i = 0; i < k && strchr(l, ','); i++) l = strchr(l, ',') + 1;
+      *uid = atoi(l);
+      k++;
+    }
   }
 #endif
   return 0;
@@ -5311,6 +5663,7 @@ static void cl_read(struct client *c) {
   }
 }
 
+static int app_other(int uid, int role) { return role == R_OTHER && uid >= 0 && uid % 100000 >= 10000; }   /* SR-4 */
 static struct client *cl_add(int fd, int uid, int pid) {
   struct client *c = &g_cl[g_ncl++];
   memset(c, 0, sizeof *c);
@@ -5341,6 +5694,21 @@ static void cl_accept(void) {
     }
     int uid = -1, pid = 0;
     if (peer_cred(fd, &uid, &pid)) { close(fd); continue; }
+    if (app_other(uid, peer_role(uid, pid))) {    /* (SR-4) an app without a role: at most MAXAPPOTHER at once */
+      int n = 0;
+      for (int i = 0; i < g_ncl; i++) n += !g_cl[i].dead && app_other(g_cl[i].uid, g_cl[i].role);
+      if (n >= MAXAPPOTHER) {
+        static const char m[] = "{\"v\":1,\"ok\":false,\"cmd\":\"\",\"err\":\"EBUSY\",\"msg\":\"too many connections\"}\n";
+        static long long last_log = -1000000;
+        if (send(fd, m, sizeof m - 1, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {}
+        close(fd);
+        if (now_ms() - last_log >= 10000) {       /* at most one line per 10 s (a flood must not fill the kernel log) */
+          last_log = now_ms();
+          LOGW("control: connection of uid %d refused (%d app connections without a role open)", uid, n);
+        }
+        continue;
+      }
+    }
     cl_add(fd, uid, pid);
   }
 }
@@ -5416,7 +5784,8 @@ static int ctl_open(const char *test_path) {
 }
 
 /* ------------------------------------------------------------------------------------------------ uevents */
-struct uev { const char *action, *devpath, *subsystem, *devname, *psy_name, *pci_id, *pci_class; };
+struct uev { const char *action, *devpath, *subsystem, *devname, *psy_name, *pci_id, *pci_class;
+             const char *psy_type; };                       /* (w11 final) POWER_SUPPLY_TYPE */
 
 static void uev_parse(char *buf, int len, struct uev *u) {
   memset(u, 0, sizeof *u);
@@ -5428,6 +5797,7 @@ static void uev_parse(char *buf, int len, struct uev *u) {
     else if (!strncmp(s, "SUBSYSTEM=", 10)) u->subsystem = s + 10;
     else if (!strncmp(s, "DEVNAME=", 8)) u->devname = s + 8;
     else if (!strncmp(s, "POWER_SUPPLY_NAME=", 18)) u->psy_name = s + 18;
+    else if (!strncmp(s, "POWER_SUPPLY_TYPE=", 18)) u->psy_type = s + 18;   /* (w11 final) */
     else if (!strncmp(s, "PCI_ID=", 7)) u->pci_id = s + 7;
     else if (!strncmp(s, "PCI_CLASS=", 10)) u->pci_class = s + 10;
     i += l + 1;
@@ -5437,12 +5807,25 @@ static void uev_parse(char *buf, int len, struct uev *u) {
 static long long g_bat_due = 0, g_profile_due = 0, g_tp_due = 0, g_last_bat, g_start;
 static int g_profile_done;
 
+/* (wave 11 final) a power_supply uevent of a charger: its POWER_SUPPLY_TYPE is not Battery, or (no type in the event)
+ * the supply's type file says so; a pack's own events (BAT1/BAT2 level changes) are not charger events */
+static int ls_is_charger(const struct uev *u) {
+  if (!u->psy_name || !u->psy_name[0]) return 0;
+  if (u->psy_type) return strcmp(u->psy_type, "Battery") != 0;
+  char p[PATH_MAX], ty[32];
+  if (strchr(u->psy_name, '/') || read_text(rpath(p, sizeof p, "/sys/class/power_supply/%s/type", u->psy_name), ty,
+                                             sizeof ty) <= 0)
+    return 0;
+  return strncmp(ty, "Battery", 7) != 0;
+}
+
 static void uev_handle(const struct uev *u) {
   if (!u->subsystem || !u->action) return;
   long long t = now_ms();
   if (!strcmp(u->subsystem, "power_supply")) {
     if (u->psy_name && !strncmp(u->psy_name, "test_", 5)) return;   /* our own writes */
     if (g_bat_due < 0 || g_bat_due > t + 300) g_bat_due = t + 300;    /* coalesce bursts */
+    if (ls_is_charger(u)) g_ls.chg_ev = 1;      /* (w11 final, W11-S3) a plug / unplug ends a low-battery hold */
   } else if (!strcmp(u->subsystem, "pci") && u->pci_id && !strncasecmp(u->pci_id, "10DE:", 5)) {
     if (!strcmp(u->action, "remove")) {
       const char *b = u->devpath ? strrchr(u->devpath, '/') : NULL;
@@ -5715,6 +6098,7 @@ static void read_cmdline(void) {
   for (char *t = strtok(c, " \t"); t; t = strtok(NULL, " \t")) {   /* repeated keys: last one wins */
     if (!strcmp(t, "gb.dgpu=keep")) { g_dgpu_on = 0; LOGI("gb.dgpu=keep: dGPU left alone"); }
     if (!strcmp(t, "gb.power.hide=0")) g_hide = 0;
+    if (!strcmp(t, "gb.power.lowshut=0")) g_ls.off = 1;   /* (wave 11) the low-battery guard's kill switch */
     if (!strncmp(t, "gb.boot=", 8)) snprintf(g_boot, sizeof g_boot, "%s", t + 8);
     if (!strncmp(t, "gb.nouveau=", 11)) { snprintf(nv, sizeof nv, "%s", t + 11); have_nv = 1; }
     if (!strncmp(t, "module_blacklist=", 17)) {   /* every occurrence counts (fail safe, as gb_nouveau.sh) */
@@ -5816,6 +6200,10 @@ int main(int argc, char **argv) {
   gfx_state_reset();                              /* (the static initial values; unit tests call it per fake boot) */
   read_cmdline();
   LOGI("starting (hide=%d dtx=%d dgpu=%d inhibit=%d)", g_hide, g_dtx_on, g_dgpu_on, g_inhibit_on);
+  if (g_ls.off) LOGI("low-battery guard: off (gb.power.lowshut=0)");
+  else LOGI("low-battery guard: on (a clean shutdown at <= %d%% on battery for %d s after 2 consistent readings, "
+            "every pack and the charger read fresh, not before %d s after sys.boot_completed)", LS_PCT,
+            LS_HOLD_MS / 1000, LS_BOOT_MS / 1000);
   if (g_keep_cli)
     LOGI("-K '%s': %s", g_keep_drv, g_keep_drv[0] ? "VGA functions bound to it stay bound except at detach"
                                                   : "every dGPU driver is unbound (test mode)");

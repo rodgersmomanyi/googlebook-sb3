@@ -30,6 +30,25 @@
 #   gb_hw.sh diag            after boot_completed: one hardware summary to the kernel log (ends up in gb_bootlog),
 #                            including the buttons binding, the posture (device_state, built-in input enabled), the
 #                            Surface Aggregator and its clients, the sensor hub and the rear focus motor.
+#   gb_hw.sh power           (wave 11 power-drain) boot_completed, own oneshot service: one measurement window (default
+#                            60 s, 5 s samples) at each uptime of power.at (default 330,780,1800,3600 s; the first two
+#                            end before gb_bootlog's t420 and t900 snapshots): RAPL package/core/uncore/psys power, the
+#                            batteries' net power, CPU busy and the top processes, package C-states (MSR), cpuidle
+#                            residency, GPU RC6, interrupts and wakeup sources, the dGPU's active time; once per boot
+#                            the static power configuration (cpuidle driver, EPP, RAPL limits, ASPM, runtime PM per PCI
+#                            and USB device, i915 parameters). 'gb_hw: power:' kmsg lines, also appended to
+#                            /data/vendor/gb/report/power-<boot>.txt: gb_bootlog prints the newest one, so a boot's late
+#                            windows reach the next boot's first snapshots. Read-only (sysfs, procfs, MSR reads; debugfs
+#                            only with power.debugfs=1). power.measure=0 turns it off.
+#   gb_hw.sh power-now       one window now (setprop vendor.gb.power.now 1).
+#   gb_hw.sh pwrpolicy       opt-in (pwr.policy=1), own oneshot service polling every 20 s: per power source the CPU
+#                            energy-performance preference (epp.bat, default balance_power | epp.ac, default
+#                            balance_performance, lapis powertool's boot value), a battery PL1 cap (rapl.bat_pl1_uw,
+#                            none by default) and a battery platform profile (profile.bat, none by default; never while
+#                            persist.vendor.gb.perf_profile is set). Exits at once when pwr.policy is not 1.
+#   gb_hw.sh pmtune          opt-in (pm.tune=1), once 60 s after boot_completed: the NMI watchdog off and runtime PM
+#                            'auto' for PCI USB, audio and multimedia functions that have a driver (never the dGPU, the
+#                            display, Wi-Fi, MEI, ISH, the LPSS serial/I2C controllers, bridges or driverless functions).
 #
 # Properties:
 #   persist.vendor.gb.rapl.mode   fw (default) = restore the Surface firmware limits | lapis = leave lapis's values |
@@ -42,12 +61,23 @@
 #                                 base=" | "FAILED ..." | "absent" (at most 91 characters)
 #   vendor.gb.ish                 written by ish: "already accel=N" | "rebound reset=.. accel=N ms=.." | "FAILED ..." |
 #                                 "absent"
+#   (wave 11) power.measure, power.at, power.win, power.debugfs, pwr.policy, epp.bat, epp.ac, rapl.bat_pl1_uw,
+#   profile.bat, pm.tune      read as vendor.gb.<name> (one boot: gb\gb.cfg GB_PROP_n with gb.overlay=1, or setprop)
+#                                 or else persist.vendor.gb.<name> (every boot). power.at: comma-separated uptimes in s
+#                                 (>= 60, ascending, at most 8); power.win: window s (10-600); power.debugfs=1: mount
+#                                 debugfs read-only during the windows (i915 PSR/FBC/DMC, PMC SLP_S0/LTR); epp.*: default,
+#                                 performance, balance_performance, balance_power, power or 0-255; rapl.bat_pl1_uw: 5-65 W
+#                                 in uW, applied only below the mode's PL1
+#   vendor.gb.power.last          written by power: the last window's summary (at most 91 characters)
+#   vendor.gb.power.now           1 = measure one window now (gb_hw_power_now); set back to 0 when done
+#   vendor.gb.pwr.state           written by pwrpolicy: "<ac|bat> epp=<value> pl1=<uW> profile=<name>" | "off"
 #   vendor.gb.vcm                 written by vcm: "loaded|bound|already|rebound rpm=.. sensor=.. waited_ms=.." |
 #                                 "FAILED ..." | "absent"
 #
 # Test hooks: GB_HW_ROOT prefixes /sys, /dev and /proc (host tests with a fake tree); GB_HW_LOG=- logs to stdout;
 # GB_HW_MSR (rapl-snapshot); GB_HW_BTN_WAIT, GB_HW_BTN_KO (buttons); GB_HW_SAM_WAIT, GB_HW_SAM_CLIENT_WAIT (sam);
-# GB_HW_ISH_WAIT (ish); GB_HW_VCM_WAIT, GB_HW_VCM_KO (vcm).
+# GB_HW_ISH_WAIT (ish); GB_HW_VCM_WAIT, GB_HW_VCM_KO (vcm); GB_HW_MSRDIR (power: one 8-byte file per MSR
+# index), GB_HW_PWR_POLL, GB_HW_PWR_LOOPS (pwrpolicy).
 # mksh arithmetic is 32-bit signed: all MSR math is done on single bytes and stays far below 2^31.
 
 R=${GB_HW_ROOT:-}
@@ -142,11 +172,22 @@ rapl_restore() {
 	if [ "$pl1" -lt 5000000 ] || [ "$pl1" -gt 65000000 ] || [ "$pl2" -lt "$pl1" ] || [ "$pl2" -gt 120000000 ]; then
 		log "rapl: values out of range pl1=$pl1 pl2=$pl2 (mode $mode), not applied"; return 1
 	fi
+	# (wave 11 power-drain) opt-in battery cap: pwr.policy=1, on battery and rapl.bat_pl1_uw (5-65 W) below the
+	# mode's PL1 -> PL1 = the cap, PL2 unchanged (still >= PL1). On AC or without the policy: the mode's values.
+	cap=
+	if [ "$(gbp pwr.policy)" = 1 ] && [ "$(pwr_src)" = bat ]; then
+		pw_cap=$(gbp rapl.bat_pl1_uw)
+		case "$pw_cap" in
+		''|*[!0-9]*) ;;
+		*) [ ${#pw_cap} -le 8 ] && [ "$pw_cap" -ge 5000000 ] && [ "$pw_cap" -lt "$pl1" ] &&
+			{ pl1=$pw_cap; cap=" (battery cap)"; } ;;
+		esac
+	fi
 	before="$(cat "$z/constraint_0_power_limit_uw" 2>/dev/null)/$(cat "$z/constraint_1_power_limit_uw" 2>/dev/null)"
 	[ "$(cat "$z/constraint_0_name" 2>/dev/null)" = long_term ] && echo "$pl1" > "$z/constraint_0_power_limit_uw"
 	[ "$(cat "$z/constraint_1_name" 2>/dev/null)" = short_term ] && echo "$pl2" > "$z/constraint_1_power_limit_uw"
 	after="$(cat "$z/constraint_0_power_limit_uw" 2>/dev/null)/$(cat "$z/constraint_1_power_limit_uw" 2>/dev/null)"
-	log "rapl: mode=$mode PL1/PL2 uW $before -> $after"
+	log "rapl: mode=$mode PL1/PL2 uW $before -> $after$cap"
 }
 
 # ---------------------------------------------------------------------------------------------------- backlight
@@ -683,6 +724,520 @@ diag() {
 		while read -r l; do log "diag: k: $l"; done
 }
 
+# ---------------------------------------------------------------------------------------------------- power
+# (wave 11 power-drain, C:\GB-build\native\w11prep\power-drain\RESULT.md) The second native boot drew 13-30 W from the
+# batteries during its first 4 minutes (gb_power and healthd lines) while 5-6.5 of the 8 CPUs were busy (/proc/uptime):
+# what the laptop draws once it is idle was never measured. 'power' measures it late in the boot; 'pwrpolicy' and
+# 'pmtune' are opt-in fixes (nothing changes unless their property is 1).
+PWR_DIR=$R/data/vendor/gb/report
+PW_MSRS="TSC:16 APERF:232 MPERF:231 PC2:1549 PC3:1016 PC6:1017 PC7:1018 PC8:1584 PC9:1585 PC10:1586 PERF_LIMIT:1615 PKG_THERM:433"
+
+gbp() {             # vendor.gb.$1 (one boot: gb.cfg GB_PROP_n) or else persist.vendor.gb.$1 (every boot)
+	pw_v=$(prop "vendor.gb.$1"); [ -n "$pw_v" ] || pw_v=$(prop "persist.vendor.gb.$1"); echo "$pw_v"
+}
+pwr_src() {         # ac | bat | none: the real Mains/USB supplies (ADP1) decide; gb_power's test_* mirrors only without one
+	pw_ra=; pw_rb=; pw_ta=; pw_tb=
+	for pw_s in "$R"/sys/class/power_supply/*; do
+		case "$(cat "$pw_s/type" 2>/dev/null)" in Mains|USB*|Wireless) ;; *) continue ;; esac
+		pw_o=$(cat "$pw_s/online" 2>/dev/null)
+		case "${pw_s##*/}" in
+		test_*) if [ "$pw_o" = 1 ]; then pw_ta=1; else pw_tb=1; fi ;;
+		*) if [ "$pw_o" = 1 ]; then pw_ra=1; else pw_rb=1; fi ;;
+		esac
+	done
+	if [ -n "$pw_ra$pw_rb" ]; then if [ -n "$pw_ra" ]; then echo ac; else echo bat; fi
+	elif [ -n "$pw_ta$pw_tb" ]; then if [ -n "$pw_ta" ]; then echo ac; else echo bat; fi
+	else echo none; fi
+}
+pwl() {             # one report line: kmsg and this boot's report file
+	log "power: $*"
+	[ -n "${PW_REP:-}" ] && echo "gb_hw: power: $*" >> "$PW_REP" 2>/dev/null
+}
+pwr_rep() {         # PW_REP = this boot's report power-<n>.txt (n = boot sequence of power.seq); keeps the newest 4
+	mkdir -p "$PWR_DIR" 2>/dev/null
+	pw_n=$(cat "$STATE/power.id" 2>/dev/null)
+	case "$pw_n" in
+	''|*[!0-9]*)
+		pw_n=$(cat "$PWR_DIR/power.seq" 2>/dev/null)
+		case "$pw_n" in ''|*[!0-9]*) pw_n=0 ;; esac
+		[ ${#pw_n} -gt 6 ] && pw_n=0
+		pw_n=$((pw_n + 1))
+		echo "$pw_n" > "$PWR_DIR/power.seq" 2>/dev/null; echo "$pw_n" > "$STATE/power.id"
+		for pw_f in "$PWR_DIR"/power-*.txt; do      # by number (mtimes can tie): keep n-3 .. n
+			pw_x=${pw_f##*/power-}; pw_x=${pw_x%.txt}
+			case "$pw_x" in ''|*[!0-9]*) continue ;; esac
+			[ ${#pw_x} -le 6 ] && [ "$pw_x" -le $((pw_n - 4)) ] && rm -f "$pw_f"
+		done
+		echo "== gb_hw power report, boot sequence $pw_n, kernel $(uname -r 2>/dev/null) (gb_hw.sh power)" > "$PWR_DIR/power-$pw_n.txt" 2>/dev/null
+		;;
+	esac
+	PW_REP=$PWR_DIR/power-$pw_n.txt
+}
+pwr_cnt() {         # " <count>x<value>" for each distinct value of the files given
+	cat "$@" 2>/dev/null | sort | uniq -c | awk '{ printf " %sx%s", $1, $2 }'
+}
+pwr_msrb() {        # the 8 bytes of cpu0 MSR $1 (decimal index) as decimal numbers, or nothing
+	if [ -n "${GB_HW_MSRDIR:-}" ]; then od -An -tu1 -v -N8 "$GB_HW_MSRDIR/$1" 2>/dev/null; return 0; fi
+	pw_md=$R/dev/cpu/0/msr; [ -c "$pw_md" ] || pw_md=$STATE/msr0
+	[ -c "$pw_md" ] && msr_bytes "$pw_md" "$1"
+}
+pwr_msr() {         # $1 = 0|1: TSC, APERF/MPERF, the package C-state residency counters and the limit reasons (cpu0)
+	pw_tag=$1
+	for pw_m in $PW_MSRS; do
+		pw_b=$(pwr_msrb "${pw_m#*:}")
+		set -- $pw_b
+		[ $# -eq 8 ] && echo "M$pw_tag ${pw_m%%:*} $pw_b" >> "$PW_RAW"
+	done
+}
+pwr_raw() {         # $1 = A (window start) | S (sample) | B (window end): uptime, RAPL energy, batteries, source, freqs
+	{
+		echo "$1 up $(cut -d' ' -f1 "$R/proc/uptime" 2>/dev/null)"
+		[ "$1" = S ] || grep -E '^(cpu[0-9]* |ctxt |processes |intr )' "$R/proc/stat" 2>/dev/null | cut -c1-200 | sed "s/^/$1 stat /"
+		for pw_z in "$R"/sys/class/powercap/intel-rapl:*; do
+			[ -f "$pw_z/energy_uj" ] &&
+				echo "$1 rapl ${pw_z##*/} $(cat "$pw_z/name" 2>/dev/null) $(cat "$pw_z/energy_uj" 2>/dev/null) $(cat "$pw_z/max_energy_range_uj" 2>/dev/null)"
+		done
+		for pw_b in "$R"/sys/class/power_supply/*; do
+			case "${pw_b##*/}" in test_*) continue ;; esac
+			[ "$(cat "$pw_b/type" 2>/dev/null)" = Battery ] || continue
+			pw_st=$(cat "$pw_b/status" 2>/dev/null | tr ' ' _)
+			pw_l=
+			for pw_x in power_now current_now voltage_now energy_now; do
+				pw_y=$(cat "$pw_b/$pw_x" 2>/dev/null); pw_l="$pw_l ${pw_y:--}"
+			done
+			echo "$1 bat ${pw_b##*/} ${pw_st:--}$pw_l"
+		done
+		echo "$1 src $(pwr_src)"
+		grep -H . "$R"/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq 2>/dev/null | sed "s/^/$1 freq /"
+	} >> "$PW_RAW"
+}
+pwr_heavy() {       # $1 = 0|1: process times, interrupts, wakeup sources, cpuidle, GPU RC6, dGPU, suspends, LPIT/PMC/DMC
+	{
+		cat "$R"/proc/[0-9]*/stat 2>/dev/null | sed "s/^/P$1 /"
+		sed "s/^/I$1 /" "$R/proc/interrupts" 2>/dev/null
+		grep -H . "$R"/sys/class/wakeup/wakeup*/name "$R"/sys/class/wakeup/wakeup*/event_count \
+			"$R"/sys/class/wakeup/wakeup*/active_time_ms 2>/dev/null | sed "s/^/W$1 /"
+		grep -H . "$R"/sys/devices/system/cpu/cpu[0-9]*/cpuidle/state*/name \
+			"$R"/sys/devices/system/cpu/cpu[0-9]*/cpuidle/state*/time \
+			"$R"/sys/devices/system/cpu/cpu[0-9]*/cpuidle/state*/usage 2>/dev/null | sed "s/^/C$1 /"
+		grep -H . "$R"/sys/class/drm/card[0-9]/gt/gt0/rc6_residency_ms "$R"/sys/class/drm/card[0-9]/power/rc6_residency_ms \
+			"$R"/sys/class/drm/card[0-9]/gt/gt0/rps_act_freq_mhz "$R"/sys/class/drm/card[0-9]/gt_act_freq_mhz 2>/dev/null |
+			sed "s/^/G$1 /"
+		for pw_d in "$R"/sys/bus/pci/devices/*; do
+			[ "$(cat "$pw_d/vendor" 2>/dev/null)" = 0x10de ] &&
+				echo "D$1 ${pw_d##*/} $(cat "$pw_d/power_state" 2>/dev/null) $(cat "$pw_d/power/runtime_status" 2>/dev/null) $(cat "$pw_d/power/runtime_active_time" 2>/dev/null)"
+		done
+		echo "X$1 susp $(cat "$R/sys/power/suspend_stats/success" 2>/dev/null)"
+		pw_c=$R/sys/devices/system/cpu/cpuidle
+		echo "X$1 lpi $(cat "$pw_c/low_power_idle_cpu_residency_us" 2>/dev/null) $(cat "$pw_c/low_power_idle_system_residency_us" 2>/dev/null)"
+		grep -H . "$R"/sys/kernel/debug/pmc_core/slp_s0_residency_usec 2>/dev/null | sed "s/^/X$1 dbg /"
+		grep -h -E 'DC[0-9] -> DC[0-9] count' "$R"/sys/kernel/debug/dri/[0-9]*/i915_dmc_info 2>/dev/null | sed "s/^/X$1 dmc /"
+	} >> "$PW_RAW"
+}
+pwr_dbg() {         # $1 = on|off: with power.debugfs=1, debugfs is mounted read-only for the window (unmounted after)
+	[ -n "$R" ] && return 0
+	if [ "$1" = on ]; then
+		[ "$(gbp power.debugfs)" = 1 ] || return 0
+		grep -q ' /sys/kernel/debug debugfs ' /proc/mounts && return 0
+		mount -t debugfs -o ro,nosuid,nodev,noexec debugfs /sys/kernel/debug 2>/dev/null && PW_DBGM=1
+	elif [ "${PW_DBGM:-}" = 1 ]; then
+		umount /sys/kernel/debug 2>/dev/null; PW_DBGM=
+	fi
+}
+pwr_cfg() {         # once per boot (the first window): the static power configuration
+	pw_c=$R/sys/devices/system/cpu; pw_m=$R/sys/module
+	pwl "cfg cpuidle driver=$(cat "$pw_c/cpuidle/current_driver" 2>/dev/null) governor=$(cat "$pw_c/cpuidle/current_governor" 2>/dev/null || cat "$pw_c/cpuidle/current_governor_ro" 2>/dev/null)"
+	for pw_s in "$pw_c"/cpu0/cpuidle/state*; do
+		[ -d "$pw_s" ] &&
+			pwl "cfg cpuidle cpu0 ${pw_s##*/} $(cat "$pw_s/name" 2>/dev/null) '$(cat "$pw_s/desc" 2>/dev/null)' latency=$(cat "$pw_s/latency" 2>/dev/null)us residency=$(cat "$pw_s/residency" 2>/dev/null)us disable=$(cat "$pw_s/disable" 2>/dev/null)"
+	done
+	pw_p=$pw_c/intel_pstate
+	pwl "cfg cpufreq pstate=$(cat "$pw_p/status" 2>/dev/null) no_turbo=$(cat "$pw_p/no_turbo" 2>/dev/null) hwp_dynamic_boost=$(cat "$pw_p/hwp_dynamic_boost" 2>/dev/null) perf_pct=$(cat "$pw_p/min_perf_pct" 2>/dev/null)-$(cat "$pw_p/max_perf_pct" 2>/dev/null) min/max_khz=$(cat "$pw_c/cpu0/cpufreq/scaling_min_freq" 2>/dev/null)/$(cat "$pw_c/cpu0/cpufreq/scaling_max_freq" 2>/dev/null) governor:$(pwr_cnt "$pw_c"/cpu[0-9]*/cpufreq/scaling_governor) epp:$(pwr_cnt "$pw_c"/cpu[0-9]*/cpufreq/energy_performance_preference) epb:$(pwr_cnt "$pw_c"/cpu[0-9]*/power/energy_perf_bias)"
+	set -- $(pwr_msrb 1908)
+	[ $# -eq 8 ] && pwl "cfg msr cpu0 HWP_REQUEST min=$1 max=$2 desired=$3 epp=$4"
+	set -- $(pwr_msrb 1905)
+	[ $# -eq 8 ] && pwl "cfg msr cpu0 HWP_CAPABILITIES highest=$1 guaranteed=$2 efficient=$3 lowest=$4"
+	set -- $(pwr_msrb 432)
+	[ $# -eq 8 ] && pwl "cfg msr cpu0 ENERGY_PERF_BIAS=$(($1 & 15))"
+	for pw_z in "$R"/sys/class/powercap/intel-rapl*; do
+		[ -f "$pw_z/name" ] || continue
+		pw_l=
+		for pw_x in 0 1 2; do
+			[ -f "$pw_z/constraint_${pw_x}_name" ] &&
+				pw_l="$pw_l $(cat "$pw_z/constraint_${pw_x}_name" 2>/dev/null)=$(cat "$pw_z/constraint_${pw_x}_power_limit_uw" 2>/dev/null)uW/$(cat "$pw_z/constraint_${pw_x}_time_window_us" 2>/dev/null)us"
+		done
+		pwl "cfg rapl ${pw_z##*/} $(cat "$pw_z/name" 2>/dev/null) enabled=$(cat "$pw_z/enabled" 2>/dev/null)$pw_l"
+	done
+	pwl "cfg platform_profile=$(cat "$R"/sys/firmware/acpi/platform_profile 2>/dev/null) aspm_policy='$(cat "$pw_m/pcie_aspm/parameters/policy" 2>/dev/null)' nmi_watchdog=$(cat "$R"/proc/sys/kernel/nmi_watchdog 2>/dev/null) dirty_writeback_cs=$(cat "$R"/proc/sys/vm/dirty_writeback_centisecs 2>/dev/null) usbcore_autosuspend=$(cat "$pw_m/usbcore/parameters/autosuspend" 2>/dev/null) nvme_ps_max_latency_us=$(cat "$pw_m/nvme_core/parameters/default_ps_max_latency_us" 2>/dev/null) iwlmvm_power_scheme=$(cat "$pw_m/iwlmvm/parameters/power_scheme" 2>/dev/null) iwlwifi_power_save=$(cat "$pw_m/iwlwifi/parameters/power_save" 2>/dev/null)"
+	pw_l=
+	for pw_x in enable_psr enable_psr2_sel_fetch enable_fbc enable_dc enable_dpcd_backlight disable_power_well enable_guc; do
+		pw_l="$pw_l $pw_x=$(cat "$pw_m/i915/parameters/$pw_x" 2>/dev/null)"
+	done
+	pwl "cfg i915$pw_l"
+	for pw_b in "$R"/sys/class/backlight/*; do
+		[ -f "$pw_b/brightness" ] &&
+			pwl "cfg backlight ${pw_b##*/} $(cat "$pw_b/brightness" 2>/dev/null)/$(cat "$pw_b/max_brightness" 2>/dev/null) actual=$(cat "$pw_b/actual_brightness" 2>/dev/null) bl_power=$(cat "$pw_b/bl_power" 2>/dev/null)"
+	done
+	pw_l=
+	for pw_x in "$R"/sys/class/drm/card[0-9]-*; do
+		[ -f "$pw_x/status" ] && pw_l="$pw_l ${pw_x##*/}=$(cat "$pw_x/status" 2>/dev/null),$(cat "$pw_x/dpms" 2>/dev/null),$(cat "$pw_x/enabled" 2>/dev/null)"
+	done
+	pwl "cfg drm connectors (status,dpms,enabled):${pw_l:- none}"
+	for pw_d in "$R"/sys/bus/pci/devices/*; do
+		[ -f "$pw_d/vendor" ] || continue
+		pw_l=$(readlink "$pw_d/driver" 2>/dev/null); pw_a=
+		for pw_x in clkpm l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
+			[ -f "$pw_d/link/$pw_x" ] && pw_a="$pw_a $pw_x=$(cat "$pw_d/link/$pw_x" 2>/dev/null)"
+		done
+		pwl "cfg pci ${pw_d##*/} $(cut -c3- "$pw_d/vendor" 2>/dev/null):$(cut -c3- "$pw_d/device" 2>/dev/null) class=$(cat "$pw_d/class" 2>/dev/null) driver=${pw_l##*/} control=$(cat "$pw_d/power/control" 2>/dev/null) runtime=$(cat "$pw_d/power/runtime_status" 2>/dev/null) state=$(cat "$pw_d/power_state" 2>/dev/null) d3cold_allowed=$(cat "$pw_d/d3cold_allowed" 2>/dev/null)${pw_a:+ link:$pw_a}"
+	done
+	for pw_d in "$R"/sys/bus/usb/devices/*; do
+		[ -f "$pw_d/idVendor" ] || continue
+		pw_l=
+		for pw_x in "$pw_d"/*:*/driver; do [ -e "$pw_x" ] && pw_l="$pw_l $(readlink "$pw_x" | sed 's,.*/,,')"; done
+		pwl "cfg usb ${pw_d##*/} $(cat "$pw_d/idVendor" 2>/dev/null):$(cat "$pw_d/idProduct" 2>/dev/null) class=$(cat "$pw_d/bDeviceClass" 2>/dev/null) speed=$(cat "$pw_d/speed" 2>/dev/null) removable=$(cat "$pw_d/removable" 2>/dev/null) control=$(cat "$pw_d/power/control" 2>/dev/null) runtime=$(cat "$pw_d/power/runtime_status" 2>/dev/null) autosuspend_ms=$(cat "$pw_d/power/autosuspend_delay_ms" 2>/dev/null) drivers:${pw_l:- none}"
+	done
+	pw_x=; for pw_y in "$R"/sys/kernel/debug/dri/[0-9]*/i915_edp_psr_status; do [ -f "$pw_y" ] && { pw_x=$pw_y; break; }; done
+	if [ -n "$pw_x" ]; then
+		head -n 8 "$pw_x" 2>/dev/null | while IFS= read -r pw_y; do pwl "cfg psr: $pw_y"; done
+		head -n 3 "${pw_x%/*}/i915_fbc_status" 2>/dev/null | while IFS= read -r pw_y; do pwl "cfg fbc: $pw_y"; done
+		grep -v -E 'RAW: 0x0[[:space:]]' "$R"/sys/kernel/debug/pmc_core/ltr_show 2>/dev/null | head -n 30 |
+			while IFS= read -r pw_y; do pwl "cfg pmc ltr: $pw_y"; done
+		grep -i -E 'not.?gated|state: *on|: *on$' "$R"/sys/kernel/debug/pmc_core/pch_ip_power_gating_status 2>/dev/null |
+			head -n 30 | while IFS= read -r pw_y; do pwl "cfg pmc pg: $pw_y"; done
+	else
+		pwl "cfg debugfs: not mounted (power.debugfs=1 mounts it read-only for the windows: PSR, FBC, DMC DC5/DC6, PMC SLP_S0 and LTR)"
+	fi
+}
+# The report of one window from the raw data (one-true-awk, mksh's 32-bit arithmetic is never used for the counters).
+PW_AWK='
+function after(s, c,   p) { p = index(s, c); return p ? substr(s, p + 1) : "" }
+function before(s, c,   p) { p = index(s, c); return p ? substr(s, 1, p - 1) : s }
+function base(p,   n, a) { n = split(p, a, "/"); return a[n] }
+function parent(p,   n, a, i, r) { n = split(p, a, "/"); r = a[1]; for (i = 2; i < n; i++) r = r "/" a[i]; return r }
+function msrv(s,   a, n, i, r) { n = split(s, a, " "); r = 0; for (i = n; i >= 1; i--) r = r * 256 + a[i]; return r }
+function w(e) { return (dt > 0) ? sprintf("%.2f", e / 1e6 / dt) : "n/a" }
+function pc(a, b) { return (b > 0) ? sprintf("%.1f%%", 100 * a / b) : "n/a" }
+function bit(x, b) { return int(x / 2 ^ b) % 2 }
+$1 == "A" || $1 == "S" || $1 == "B" {
+	t = $1
+	if ($2 == "up") { ns++; if (t == "A") ua = $3 + 0; if (t == "B") ub = $3 + 0; next }
+	if ($2 == "stat") {
+		if ($3 == "cpu") {
+			tt = 0; for (i = 4; i <= 11 && i <= NF; i++) tt += $i
+			if (t == "A") { st0 = tt; id0 = $7; io0 = $8 } else { st1 = tt; id1 = $7; io1 = $8 }
+		} else if ($3 ~ /^cpu[0-9]/) { if (t == "A") ncpu++ }
+		else if ($3 == "ctxt") { if (t == "A") cx0 = $4; else cx1 = $4 }
+		else if ($3 == "processes") { if (t == "A") pr0 = $4; else pr1 = $4 }
+		else if ($3 == "intr") { if (t == "A") in0 = $4; else in1 = $4 }
+		next
+	}
+	if ($2 == "rapl") { if (t == "A") { ra[$3] = $5; rnm[$3] = $4; rmx[$3] = $6; rz[++nz] = $3 } else if (t == "B") rb[$3] = $5; next }
+	if ($2 == "bat") {
+		p = ($5 != "-") ? $5 / 1e6 : (($6 != "-" && $7 != "-") ? $6 / 1e6 * $7 / 1e6 : 0)
+		g = ($4 == "Discharging") ? -1 : (($4 == "Charging") ? 1 : 0)
+		bn[ns] += g * p; bs[ns] = 1
+		if (!($3 in bk)) { bk[$3] = 1; bl[++nb] = $3 }
+		bst[$3] = $4; bpw[$3] = g * p
+		if (t == "A") be0[$3] = $8
+		if (t == "B") be1[$3] = $8
+		next
+	}
+	if ($2 == "src") { if (!index("," srcs ",", "," $3 ",")) srcs = srcs (srcs == "" ? "" : ",") $3; next }
+	if ($2 == "freq") { fv = after($3, ":"); if (fv != "") { fsum += fv; fn++ } ; next }
+	next
+}
+$1 == "P0" || $1 == "P1" {
+	s = substr($0, 4); pid = before(s, " "); pos = 0; r = s
+	while ((j = index(r, ") ")) > 0) { pos += j; r = substr(r, j + 1) }
+	if (pos == 0) next
+	q = index(s, "("); comm = substr(s, q + 1, pos - q - 1)
+	split(substr(s, pos + 2), f, " ")
+	key = pid ":" f[20]
+	if ($1 == "P0") c0[key] = f[12] + f[13]; else { c1[key] = f[12] + f[13]; cm[key] = comm; cp[key] = pid }
+	next
+}
+$1 == "I0" || $1 == "I1" {
+	if ($2 == "CPU0") next
+	lab = $2; tot = 0
+	for (i = 3; i <= NF && $i ~ /^[0-9]+$/; i++) tot += $i
+	nm = ""; for (; i <= NF; i++) nm = nm (nm == "" ? "" : " ") $i
+	if ($1 == "I0") i0[lab] = tot; else { i1[lab] = tot; inm[lab] = nm }
+	next
+}
+$1 == "W0" || $1 == "W1" || $1 == "C0" || $1 == "C1" || $1 == "G0" || $1 == "G1" {
+	s = substr($0, 4); pth = before(s, ":"); val = after(s, ":"); a = base(pth); d = parent(pth)
+	if ($1 == "W0" || $1 == "W1") {
+		if (a == "name") wn[d] = val
+		else if (a == "event_count") { if ($1 == "W0") we0[d] = val; else we1[d] = val }
+		else if (a == "active_time_ms") { if ($1 == "W0") wa0[d] = val; else wa1[d] = val }
+	} else if ($1 == "C0" || $1 == "C1") {
+		sd = base(d); cd = base(parent(parent(d)))
+		if (a == "name") cn[sd] = val
+		else if (a == "time") { if ($1 == "C0") ct0[sd] += val; else { ct1[sd] += val; ccpu[cd] = 1 } }
+		else if (a == "usage") { if ($1 == "C0") cu0[sd] += val; else cu1[sd] += val }
+	} else {
+		if (a == "rc6_residency_ms") { if (!($1 in gdone)) { gdone[$1] = 1; if ($1 == "G0") g0 = val; else g1 = val } }
+		else if (a ~ /act_freq_mhz$/ && $1 == "G1" && gf == "") gf = val
+	}
+	next
+}
+$1 == "D0" { da0[$2] = $5; next }
+$1 == "D1" { da1[$2] = $5; dst[$2] = $3 " " $4; dl[++nd] = $2; next }
+$1 == "X0" || $1 == "X1" {
+	if ($2 == "susp") { if ($1 == "X0") su0 = $3; else su1 = $3 }
+	else if ($2 == "lpi") { if ($1 == "X0") { lc0 = $3; ls0 = $4 } else { lc1 = $3; ls1 = $4 } }
+	else if ($2 == "dbg") { val = after($3, ":"); if ($1 == "X0") sl0 = val; else sl1 = val }
+	else if ($2 == "dmc") { key = $3 $5; if ($1 == "X0") dm0[key] = $NF; else { dm1[key] = $NF; if (!(key in dmk)) { dmk[key] = 1; dml[++ndm] = key } } }
+	next
+}
+$1 == "M0" || $1 == "M1" { s = $3; for (i = 4; i <= NF; i++) s = s " " $i; if ($1 == "M0") m0[$2] = msrv(s); else m1[$2] = msrv(s); next }
+END {
+	dt = ub - ua
+	if (dt <= 0) { printf "w%d no time passed (uptime %s -> %s)\n", k, ua, ub; exit }
+	dtot = st1 - st0; busy = dtot - (id1 - id0) - (io1 - io0); nc = (ncpu > 0) ? ncpu : 1
+	cpus = (dtot > 0) ? nc * busy / dtot : 0
+	sus = (su0 != "" && su1 != "" && su1 != su0) ? "YES (the numbers mix sleep and run)" : "no"
+	printf "w%d %ds up=%d-%d src=%s suspended=%s busy=%s (%.2f of %d cpus) iowait=%s ctx/s=%d forks=%d irq/s=%d\n", k, dt + 0.5, ua, ub, (srcs == "" ? "-" : srcs), sus, pc(busy, dtot), cpus, nc, pc(io1 - io0, dtot), (cx1 - cx0) / dt, pr1 - pr0, (in1 - in0) / dt
+	l = ""; lb = ""; pk = "n/a"; ps = "n/a"
+	for (i = 1; i <= nz; i++) {
+		z = rz[i]; if (!(z in rb)) continue
+		e = rb[z] - ra[z]; if (e < 0 && rmx[z] > 0) e += rmx[z]
+		nm = rnm[z]; if (nm == "package-0") { nm = "pkg"; pk = w(e) } else if (nm == "psys") ps = w(e)
+		l = l " " nm "=" w(e) "W"
+		if (ub > 0 && (nm == "pkg" || nm == "psys")) lb = lb " " nm "=" sprintf("%.2f", rb[z] / 1e6 / ub) "W"
+	}
+	printf "w%d rapl%s | counter/uptime (since reset, no wrap assumed):%s\n", k, (l == "" ? " none" : l), (lb == "" ? " n/a" : lb)
+	n = 0; sm = 0
+	for (i = 1; i <= ns; i++) if (i in bs) { n++; sm += bn[i]; if (n == 1 || bn[i] < mn) mn = bn[i]; if (n == 1 || bn[i] > mx) mx = bn[i] }
+	if (n) {
+		ed = 0; ec = 0
+		for (i = 1; i <= nb; i++) { b = bl[i]; if ((b in be0) && (b in be1) && be0[b] != "-" && be1[b] != "-") { ed += be1[b] - be0[b]; ec++ } }
+		per = ""; for (i = 1; i <= nb; i++) { b = bl[i]; per = per " " b "=" bst[b] ":" sprintf("%.2f", bpw[b]) "W" }
+		printf "w%d battery net=%.2fW (mean of %d samples, min %.2f max %.2f) energy_now=%s |%s\n", k, sm / n, n, mn, mx, (ec ? sprintf("%.2fW", ed / 1e6 * 3600 / dt) : "n/a"), per
+	} else printf "w%d battery none\n", k
+	tsc = (("TSC" in m0) && ("TSC" in m1)) ? m1["TSC"] - m0["TSC"] : 0
+	l = " n/a (no MSR)"; c0l = ""; tl = ""; pc10 = "n/a"
+	if (tsc > 0) {
+		l = ""; split("PC2 PC3 PC6 PC7 PC8 PC9 PC10", pcs, " ")
+		for (i = 1; i <= 7; i++) { x = pcs[i]; if ((x in m0) && (x in m1)) l = l " " tolower(x) "=" pc(m1[x] - m0[x], tsc) }
+		if (("PC10" in m0) && ("PC10" in m1)) pc10 = pc(m1["PC10"] - m0["PC10"], tsc)
+		tl = sprintf(" tsc=%dMHz", tsc / dt / 1e6)
+		if (("MPERF" in m0) && ("MPERF" in m1) && ("APERF" in m0) && ("APERF" in m1)) {
+			mp = m1["MPERF"] - m0["MPERF"]; ap = m1["APERF"] - m0["APERF"]
+			c0l = " | cpu0 c0=" pc(mp, tsc) (mp > 0 ? sprintf(" busy-freq=%dMHz", tsc / dt / 1e6 * ap / mp) : "")
+		}
+	}
+	fl = fn ? sprintf(" | scaling_cur_freq mean=%dMHz", fsum / fn / 1000) : ""
+	lp = (lc0 != "" && lc1 != "") ? sprintf(" | lpit cpu=+%dus sys=+%dus", lc1 - lc0, ls1 - ls0) : ""
+	sl = (sl0 != "" && sl1 != "") ? sprintf(" | slp_s0=+%dus", sl1 - sl0) : ""
+	dm = ""; for (i = 1; i <= ndm; i++) { x = dml[i]; if (x in dm0) dm = dm " " tolower(substr(x, 4)) "=+" (dm1[x] - dm0[x]) }
+	printf "w%d pkg-cstate%s%s%s%s%s%s%s\n", k, l, tl, c0l, fl, lp, sl, (dm == "" ? "" : " | dmc" dm)
+	nci = 0; for (x in ccpu) nci++
+	l = ""
+	for (i = 0; i < 16; i++) {
+		x = "state" i; if (!(x in ct1)) continue
+		l = l " " ((x in cn) ? cn[x] : x) "=" pc(ct1[x] - ct0[x], dt * 1e6 * (nci ? nci : 1)) "(" sprintf("%d", (cu1[x] - cu0[x]) / dt) "/s)"
+	}
+	printf "w%d cpuidle (%d cpus)%s\n", k, nci, (l == "" ? " none" : l)
+	l = (g0 != "" && g1 != "") ? " rc6=" pc(g1 - g0, dt * 1000) : " rc6=n/a"
+	if (gf != "") l = l " act=" gf "MHz"
+	for (i = 1; i <= nd; i++) { x = dl[i]; l = l " | dGPU " x " " dst[x] ((x in da0) ? " active+=" (da1[x] - da0[x]) "ms" : "") }
+	printf "w%d gpu%s\n", k, l
+	tot = 0
+	for (x in c1) { d = c1[x] - ((x in c0) ? c0[x] : 0); if (d > 0) { dd[x] = d; tot += d } }
+	l = ""
+	for (j = 1; j <= 8; j++) {
+		best = ""; bv = 0
+		for (x in dd) if (!(x in used) && dd[x] > bv) { bv = dd[x]; best = x }
+		if (best == "") break
+		used[best] = 1; l = l " " cm[best] "[" cp[best] "]=" sprintf("%.1f%%", bv / dt)
+	}
+	printf "w%d top (%% of one cpu)%s | all %.1f%%, cpu busy %.1f%%, not in a process alive at the end %.1f%%\n", k, (l == "" ? " none" : l), tot / dt, cpus * 100, cpus * 100 - tot / dt
+	for (x in i1) { d = i1[x] - ((x in i0) ? i0[x] : 0); if (d > 0) idl[x] = d }
+	l = ""
+	for (j = 1; j <= 8; j++) {
+		best = ""; bv = 0
+		for (x in idl) if (!(x in iu) && idl[x] > bv) { bv = idl[x]; best = x }
+		if (best == "") break
+		iu[best] = 1; nm = best; sub(/:$/, "", nm)
+		if (nm ~ /^[0-9]+$/) { n2 = split(inm[best], aa, " "); if (n2) nm = nm ":" aa[n2] }
+		l = l " " nm "=" sprintf("%.1f", bv / dt)
+	}
+	printf "w%d irq/s%s\n", k, (l == "" ? " none" : l)
+	for (x in we1) {
+		de = we1[x] - ((x in we0) ? we0[x] : 0); da = wa1[x] - ((x in wa0) ? wa0[x] : 0)
+		if (de > 0 || da > 0) wd[x] = da * 1000 + de
+	}
+	l = ""
+	for (j = 1; j <= 6; j++) {
+		best = ""; bv = 0
+		for (x in wd) if (!(x in wu) && wd[x] > bv) { bv = wd[x]; best = x }
+		if (best == "") break
+		wu[best] = 1
+		l = l " " ((best in wn) ? wn[best] : base(best)) "=+" (we1[best] - we0[best]) "ev/+" (wa1[best] - wa0[best]) "ms"
+	}
+	printf "w%d wakeup%s\n", k, (l == "" ? " none" : l)
+	if ("PERF_LIMIT" in m1) {
+		x = m1["PERF_LIMIT"]; nw = ""; lg = ""
+		split("0:prochot 1:thermal 4:residency 5:ratl 6:vr-therm 7:vr-tdc 8:other 10:pl1 11:pl2 12:max-turbo 13:turbo-attn", rbits, " ")
+		for (i = 1; i <= 11; i++) { b = before(rbits[i], ":") + 0; nm = after(rbits[i], ":"); if (bit(x, b)) nw = nw " " nm; if (bit(x, b + 16)) lg = lg " " nm }
+		y = ("PKG_THERM" in m1) ? m1["PKG_THERM"] : -1
+		printf "w%d limits core_perf_limit_reasons=0x%x now:%s log:%s%s\n", k, x, (nw == "" ? " none" : nw), (lg == "" ? " none" : lg), ((y >= 0) ? sprintf(" | package therm: %d C below TjMax, power-limit now=%d log=%d, thermal now=%d log=%d", int(y / 65536) % 128, bit(y, 10), bit(y, 11), bit(y, 0), bit(y, 1)) : "")
+	}
+	printf "SUMMARY w%d %s pkg=%sW psys=%sW bat=%sW busy=%s pc10=%s\n", k, (srcs == "" ? "-" : srcs), pk, ps, (n ? sprintf("%.1f", sm / n) : "n/a"), pc(busy, dtot), pc10
+}'
+pwr_window() {      # one measurement window of $pw_win s (5 s samples)
+	mkdir -p "$STATE" 2>/dev/null
+	PW_RAW=$STATE/power.raw.$$; : > "$PW_RAW"   # per process: power-now may run during a scheduled window
+	pw_k=$(cat "$STATE/power.k" 2>/dev/null); case "$pw_k" in ''|*[!0-9]*) pw_k=0 ;; esac
+	pw_k=$((pw_k + 1)); echo "$pw_k" > "$STATE/power.k"
+	pwr_rep
+	pwr_dbg on
+	[ "$pw_k" = 1 ] && pwr_cfg
+	pwr_heavy 0; pwr_msr 0; pwr_raw A
+	pw_i=1; pw_ns=$((pw_win / 5))
+	while :; do
+		sleep 5
+		[ $pw_i -ge $pw_ns ] && break
+		pwr_raw S; pw_i=$((pw_i + 1))
+	done
+	pwr_raw B; pwr_msr 1; pwr_heavy 1
+	pwr_dbg off
+	awk -v k="$pw_k" "$PW_AWK" "$PW_RAW" > "$STATE/power.out.$$" 2>&1
+	while IFS= read -r pw_l; do
+		case "$pw_l" in
+		SUMMARY\ *) pw_l=${pw_l#SUMMARY }; setprop vendor.gb.power.last "$(echo "$pw_l" | cut -c1-91)" 2>/dev/null; pwl "$pw_l" ;;
+		*) pwl "$pw_l" ;;
+		esac
+	done < "$STATE/power.out.$$"
+	rm -f "$PW_RAW" "$STATE/power.out.$$"
+}
+power() {           # $1 = run (the scheduled windows) | now (one window)
+	if [ "$(gbp power.measure)" = 0 ]; then log "power: off (power.measure=0)"; return 0; fi
+	pw_win=$(gbp power.win); case "$pw_win" in ''|*[!0-9]*) pw_win=60 ;; esac
+	[ ${#pw_win} -gt 3 ] && pw_win=600
+	[ "$pw_win" -lt 10 ] && pw_win=10
+	[ "$pw_win" -gt 600 ] && pw_win=600
+	if [ "$1" = now ]; then pwr_window; setprop vendor.gb.power.now 0 2>/dev/null; return 0; fi
+	pw_at=$(gbp power.at); case "$pw_at" in ''|*[!0-9,]*) pw_at=330,780,1800,3600 ;; esac
+	pw_cnt=0; pw_prev=0
+	for pw_t in $(echo "$pw_at" | tr , ' '); do
+		[ ${#pw_t} -le 5 ] || continue
+		[ "$pw_t" -ge 60 ] && [ "$pw_t" -gt "$pw_prev" ] || continue
+		[ $pw_cnt -ge 8 ] && break
+		pw_cnt=$((pw_cnt + 1)); pw_prev=$pw_t
+		pw_up=$(cut -d. -f1 "$R/proc/uptime" 2>/dev/null); case "$pw_up" in ''|*[!0-9]*) pw_up=0 ;; esac
+		[ "$pw_up" -lt "$pw_t" ] && sleep $((pw_t - pw_up))
+		[ "$(gbp power.measure)" = 0 ] && break
+		pwr_window
+	done
+	log "power: done, $pw_cnt window(s) of $pw_win s, report $PW_REP"
+}
+
+# ---------------------------------------------------------------------------------------------------- pwrpolicy
+pwr_epp_ok() {      # 0 if $1 is an EPP intel_pstate takes: one of its names or 0-255
+	case "$1" in
+	default|performance|balance_performance|balance_power|power) return 0 ;;
+	''|*[!0-9]*) return 1 ;;
+	esac
+	[ ${#1} -le 3 ] && [ "$1" -le 255 ]
+}
+pwr_epp_set() {     # $1 = the EPP for every CPU; prints "ok=N failed=M"
+	pw_ok=0; pw_bad=0
+	for pw_e in "$R"/sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
+		[ -f "$pw_e" ] || continue
+		if echo "$1" > "$pw_e" 2>/dev/null; then pw_ok=$((pw_ok + 1)); else pw_bad=$((pw_bad + 1)); fi
+	done
+	echo "ok=$pw_ok failed=$pw_bad"
+}
+pwr_profile() {     # $1 = bat|ac: profile.bat on battery (the AC profile is saved first and put back on AC)
+	pw_f=$R/sys/firmware/acpi/platform_profile
+	[ -f "$pw_f" ] || { echo -; return 0; }
+	pw_pb=$(gbp profile.bat)
+	if [ -z "$pw_pb" ] || [ -n "$(prop persist.vendor.gb.perf_profile)" ]; then cat "$pw_f" 2>/dev/null; return 0; fi
+	case " $(cat "$R/sys/firmware/acpi/platform_profile_choices" 2>/dev/null) " in
+	*" $pw_pb "*) ;;
+	*) echo "$(cat "$pw_f" 2>/dev/null) (profile.bat '$pw_pb' is not offered)"; return 0 ;;
+	esac
+	if [ "$1" = bat ]; then
+		[ -f "$STATE/pwr_profile_ac" ] || cat "$pw_f" > "$STATE/pwr_profile_ac" 2>/dev/null
+		echo "$pw_pb" > "$pw_f" 2>/dev/null
+	elif [ -f "$STATE/pwr_profile_ac" ]; then
+		cat "$STATE/pwr_profile_ac" > "$pw_f" 2>/dev/null; rm -f "$STATE/pwr_profile_ac"
+	fi
+	cat "$pw_f" 2>/dev/null
+}
+pwr_pl1() {         # the package-0 PL1 now (uW), or -
+	for pw_z in "$R"/sys/class/powercap/intel-rapl:*; do
+		[ "$(cat "$pw_z/name" 2>/dev/null)" = package-0 ] && { cat "$pw_z/constraint_0_power_limit_uw" 2>/dev/null; return 0; }
+	done
+	echo -
+}
+pwrpolicy() {       # $1 = poll interval s, $2 = loops (0 = until pwr.policy is no longer 1)
+	pw_last=; pw_n=0; pw_drift=0; pw_exp=
+	mkdir -p "$STATE" 2>/dev/null
+	while :; do
+		if [ "$(gbp pwr.policy)" != 1 ]; then
+			if [ -n "$pw_last" ]; then
+				pw_r=$(pwr_epp_set balance_performance); rapl_restore; pw_pf=$(pwr_profile ac)
+				log "pwrpolicy: turned off: epp=balance_performance ($pw_r), PL1 $(pwr_pl1) uW, profile $pw_pf"
+				setprop vendor.gb.pwr.state off 2>/dev/null
+			else
+				log "pwrpolicy: off (pwr.policy is not 1), nothing changed"
+			fi
+			return 0
+		fi
+		pw_src=$(pwr_src); [ "$pw_src" = none ] && pw_src=ac
+		if [ "$pw_src" = bat ]; then pw_w=$(gbp epp.bat); pw_dw=balance_power; else pw_w=$(gbp epp.ac); pw_dw=balance_performance; fi
+		[ -n "$pw_w" ] || pw_w=$pw_dw
+		if ! pwr_epp_ok "$pw_w"; then
+			[ "$pw_src" != "$pw_last" ] && log "pwrpolicy: epp '$pw_w' refused (default|performance|balance_performance|balance_power|power|0-255), $pw_dw instead"
+			pw_w=$pw_dw
+		fi
+		pw_cur=$(cat "$R"/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)
+		if [ "$pw_src" != "$pw_last" ]; then
+			pw_r=$(pwr_epp_set "$pw_w"); rapl_restore; pw_pf=$(pwr_profile "$pw_src")
+			log "pwrpolicy: source=$pw_src epp=$pw_w ($pw_r) pl1_uw=$(pwr_pl1) profile=$pw_pf"
+			setprop vendor.gb.pwr.state "$(echo "$pw_src epp=$pw_w pl1=$(pwr_pl1) profile=$pw_pf" | cut -c1-91)" 2>/dev/null
+			pw_last=$pw_src
+			# the reference for the drift check is what intel_pstate READS BACK after our write: one of its four names, or
+			# the number for any other value ('default' reads back as the value it resolved to)
+			pw_exp=$(cat "$R"/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)
+		elif [ -n "$pw_exp" ] && [ "$pw_cur" != "$pw_exp" ]; then
+			# another writer (lapis powertool) changed it: put ours back
+			pw_r=$(pwr_epp_set "$pw_w"); pw_drift=$((pw_drift + 1))
+			[ $pw_drift -le 3 ] && log "pwrpolicy: epp was '$pw_cur', $pw_w again ($pw_r)"
+		fi
+		pw_n=$((pw_n + 1))
+		[ "$2" -gt 0 ] && [ $pw_n -ge "$2" ] && return 0
+		sleep "$1"
+	done
+}
+
+# ---------------------------------------------------------------------------------------------------- pmtune
+pmtune() {          # opt-in (pm.tune=1): NMI watchdog off; runtime PM 'auto' for PCI USB/audio/multimedia with a driver
+	if [ "$(gbp pm.tune)" != 1 ]; then log "pmtune: off (pm.tune is not 1), nothing changed"; return 0; fi
+	[ -n "$R" ] || sleep 60
+	pw_f=$R/proc/sys/kernel/nmi_watchdog
+	if [ -f "$pw_f" ]; then
+		pw_o=$(cat "$pw_f" 2>/dev/null); echo 0 > "$pw_f" 2>/dev/null
+		log "pmtune: nmi_watchdog $pw_o -> $(cat "$pw_f" 2>/dev/null)"
+	fi
+	pw_n=0
+	for pw_d in "$R"/sys/bus/pci/devices/*; do
+		[ -e "$pw_d/driver" ] && [ -f "$pw_d/power/control" ] || continue
+		[ "$(cat "$pw_d/vendor" 2>/dev/null)" = 0x10de ] && continue      # the dGPU is gb_power's
+		pw_cl=$(cat "$pw_d/class" 2>/dev/null)
+		case "$pw_cl" in 0x0c03*|0x0403*|0x0480*) ;; *) continue ;; esac  # USB, audio, multimedia (IPU) only
+		[ "$(cat "$pw_d/power/control" 2>/dev/null)" = on ] || continue
+		pw_l=$(readlink "$pw_d/driver" 2>/dev/null)
+		if echo auto > "$pw_d/power/control" 2>/dev/null; then pw_n=$((pw_n + 1)); pw_r="on -> auto"; else pw_r="on, refused"; fi
+		log "pmtune: ${pw_d##*/} class $pw_cl driver ${pw_l##*/}: runtime PM $pw_r"
+	done
+	log "pmtune: done, $pw_n PCI function(s) set to runtime PM auto"
+}
+
 case "$1" in
 rapl-snapshot) rapl_snapshot ;;
 boot) rapl_restore; backlight_perms ;;
@@ -704,6 +1259,16 @@ diag)
 	[ -n "$R" ] || sleep 45
 	rapl_restore
 	diag ;;
-*) echo "usage: $0 rapl-snapshot|boot|buttons|posture|sam|ish|vcm|diag"; exit 2 ;;
+power) power run ;;
+power-now) power now ;;
+pwrpolicy)
+	pq=${GB_HW_PWR_POLL:-20}; case "$pq" in ''|*[!0-9]*) pq=20;; esac; [ ${#pq} -gt 3 ] && pq=300
+	[ "$pq" -lt 5 ] && pq=5; [ "$pq" -gt 300 ] && pq=300
+	pn=${GB_HW_PWR_LOOPS:-0}; case "$pn" in ''|*[!0-9]*) pn=0;; esac; [ ${#pn} -gt 6 ] && pn=0
+	[ -n "$R" ] || sleep 5
+	pwrpolicy "$pq" "$pn" ;;
+pmtune) pmtune ;;
+*) echo "usage: $0 rapl-snapshot|boot|buttons|posture|sam|ish|vcm|diag"
+	echo "       $0 power|power-now|pwrpolicy|pmtune (wave 11 power-drain)"; exit 2 ;;
 esac
 exit 0

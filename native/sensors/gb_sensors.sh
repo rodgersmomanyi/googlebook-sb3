@@ -2,7 +2,11 @@
 # Googlebook SB3 native: sensors helper (staged as /odm/gb_sensors.sh, run by gb.rc services).
 #   wait  - exec_start'ed at early-boot, before class hal starts the sensors multi-HAL: the lapis IIO
 #           sub-HAL scans /sys/bus/iio/devices only once, so wait (bounded) until the ISH accelerometer
-#           (cros-ec-accel) and the APDS-9960 light device (cros-ec-light) have registered.
+#           (cros-ec-accel) and the APDS-9960 light device (cros-ec-light) have registered. (w11 boot-time) Bounded
+#           by time (GB_SENSORS_WAIT_MS, default 8000, by /proc/uptime), without a fork per PCI or IIO device; for
+#           the accelerometer alone it stops once gb_hw ish has given up on it (vendor.gb.ish) and waits past the
+#           bound while gb_hw ish is still at work only when GB_SENSORS_WAIT_MAX_MS asks for it (w11 final, IA11-3:
+#           its default is the bound itself, so init is held at most 8 s, as before wave 11).
 #   diag  - after boot_completed: IIO + sensorservice state to the kernel log (gb_bootlog copies dmesg),
 #           and, only when GbSb3SettingsOverlay is not enabled, enable auto-rotate once (first native boot only)
 #           for the CURRENT user (with the overlay: no write, rotinit set), which at boot_completed is the
@@ -13,11 +17,32 @@
 #   rotation - (readiness A-L3) after boot_completed and at every DTX device-mode change (vendor.gb.dtx.mode, set by
 #           gb_power): one read-only 'GB_SENSORS: rotation:' line (rot_report) per change, at most 3 per start.
 # Test hooks: GB_SENSORS_LOG=- logs to stdout instead of /dev/kmsg; GB_SENSORS_SETTLE = seconds to let Android apply a
-# posture change before 'rotation' reads it (default 3).
+# posture change before 'rotation' reads it (default 3). (w11 boot-time, 'wait' only) GB_SENSORS_ROOT prefixes /sys and
+# /proc (host tests with a fake tree); GB_SENSORS_WAIT_MS = the wait's bound in ms (default 8000, at most 60000);
+# GB_SENSORS_WAIT_MAX_MS = its hard limit while gb_hw ish is at work (default: GB_SENSORS_WAIT_MS, i.e. no extension;
+# at most 60000).
 [ "${GB_SENSORS_LOG:-}" = - ] || exec >/dev/kmsg 2>&1
 mode=$1
 
-iio_names() { for n in /sys/bus/iio/devices/iio:device*/name; do [ -f "$n" ] && cat "$n"; done; }
+# (w11 boot-time) helpers of 'wait', which runs while init is blocked (exec_start): shell builtins only, no fork per
+# file (the old PCI scan forked two cats per PCI function: ~0.25 s of init's time in every native boot). They replace
+# iio_names, whose only callers were in 'wait'.
+SR=${GB_SENSORS_ROOT:-}
+iio_have() {        # sets h=" name1 name2 ... " of the IIO devices (builtin read)
+	h=" "
+	for n in "$SR"/sys/bus/iio/devices/iio:device*/name; do
+		[ -f "$n" ] || continue
+		x=; { IFS= read -r x; } 2>/dev/null < "$n"; h="$h$x "
+	done
+}
+now_ms() {          # sets ms = uptime in ms from /proc/uptime ("123.45 ..."); empty if it cannot be read
+	u=; { read -r u _; } 2>/dev/null < "$SR/proc/uptime"; ms=
+	case "$u" in [0-9]*.[0-9][0-9]*) ;; *) return 0;; esac
+	s=${u%%.*}; f=${u#*.}; f=${f%"${f#??}"}
+	case "$s$f" in *[!0-9]*) return 0;; esac
+	s=${s#"${s%%[!0]*}"}; f=${f#"${f%%[!0]*}"}     # no leading zeros: "08" is not octal
+	ms=$(( ${s:-0} * 1000 + ${f:-0} * 10 ))
+}
 
 # (readiness A-L3) Rotation-locked in laptop posture, auto-rotate in tablet posture: lapis 276 does this itself.
 # WindowManager's DisplayRotation.LaptopController (flag enable_auto_rotate_on_slate_state, compiled in as true) fixes
@@ -86,22 +111,62 @@ rot_report() {      # $1 = what triggered it. Reads only.
 
 case "$mode" in
 wait)
+	# (w11 boot-time) The bound is time: 80 polls of 'sleep 0.1' plus their forks took 10.6 s when the accelerometer
+	# never came (first native boot, boot 3: "waited 8000 ms" after 10.645 s of exec_start), now GB_SENSORS_WAIT_MS by
+	# /proc/uptime (a poll count only if it cannot be read). gb_hw ish (started just before, hw.json sorts first) resets
+	# an ISH whose coldboot probe failed. While only the accelerometer is missing: once vendor.gb.ish says it will not
+	# come (absent, FAILED..., or accel=0), stop at once; past the bound, wait on only while gb_hw ish is still at work
+	# (init.svc.gb_hw_ish running, no verdict yet), at most GB_SENSORS_WAIT_MAX_MS: its reset + re-probe can take longer
+	# than the bound (a re-probe that fails waits ~10 s for the ISH firmware, as the coldboot probe of boot 3 did), and
+	# the sensors HAL scans only once. (w11 final, IA11-3) That limit defaults to the bound itself: no extension unless a
+	# test or a debug boot sets GB_SENSORS_WAIT_MAX_MS, so init waits at most 8 s here, as before wave 11 (a hardware
+	# boot may show that a longer wait for a failing ISH reset is worth it). The 'waited' line keeps its format (hwtest
+	# analyze_gblog.py parses it);
+	# an early stop or an extension is a line of its own.
+	wm=${GB_SENSORS_WAIT_MS:-8000}; case "$wm" in ''|*[!0-9]*) wm=8000;; esac; [ ${#wm} -gt 5 ] && wm=60000
+	[ "$wm" -gt 60000 ] && wm=60000
+	wx=${GB_SENSORS_WAIT_MAX_MS:-$wm}; case "$wx" in ''|*[!0-9]*) wx=$wm;; esac; [ ${#wx} -gt 5 ] && wx=60000
+	[ "$wx" -gt 60000 ] && wx=60000; [ "$wx" -lt "$wm" ] && wx=$wm
 	want=
-	for d in /sys/bus/pci/devices/*; do
-		[ "$(cat $d/vendor 2>/dev/null):$(cat $d/device 2>/dev/null)" = "0x8086:0x34fc" ] && want="cros-ec-accel"
+	for d in "$SR"/sys/bus/pci/devices/*; do
+		v=; dv=; { IFS= read -r v; } 2>/dev/null < "$d/vendor"; { IFS= read -r dv; } 2>/dev/null < "$d/device"
+		[ "$v:$dv" = "0x8086:0x34fc" ] && want="cros-ec-accel"
 	done
-	[ -d /sys/bus/acpi/devices/MSHW0184:00 ] && want="$want cros-ec-light"
+	[ -d "$SR"/sys/bus/acpi/devices/MSHW0184:00 ] && want="$want cros-ec-light"
 	if [ -z "$want" ]; then echo "GB_SENSORS: no ISH (8086:34fc) / MSHW0184, not waiting"; exit 0; fi
-	i=0; miss=$want
-	while [ $i -lt 80 ]; do
-		have=" $(iio_names | tr '\n' ' ') "
+	now_ms; t0=$ms; k=0; gave=; ext=; fin=; gi=; miss=$want
+	kcap=$((wx / 50 + 20))     # polls: ends the wait even if /proc/uptime stood still (init must never hang here)
+	while :; do
+		iio_have
 		miss=
-		for w in $want; do case "$have" in *" $w "*) ;; *) miss="$miss $w";; esac; done
+		for w in $want; do case "$h" in *" $w "*) ;; *) miss="$miss $w";; esac; done
 		[ -z "$miss" ] && break
+		now_ms; if [ -n "$t0" ] && [ -n "$ms" ]; then el=$((ms - t0)); else el=$((k * 100)); fi
+		if [ "$miss" = " cros-ec-accel" ]; then
+			if [ $((k % 5)) -eq 0 ] || [ "$el" -ge "$wm" ]; then
+				gi=$(getprop vendor.gb.ish 2>/dev/null)
+				case "$gi" in absent|FAILED*|*accel=0*) gave=$gi; break;; esac
+			fi
+			if [ "$el" -ge "$wm" ]; then
+				[ "$el" -ge "$wx" ] && break
+				[ -n "$fin" ] && break
+				if [ -z "$gi" ] && [ "$(getprop init.svc.gb_hw_ish 2>/dev/null)" = running ]; then
+					ext=1
+				else
+					fin=1   # gb_hw ish ended or has a verdict (set before it exits): one more scan and property read
+				fi
+			fi
+		elif [ "$el" -ge "$wm" ]; then
+			break
+		fi
+		[ $k -ge $kcap ] && break
 		sleep 0.1
-		i=$((i + 1))
+		k=$((k + 1))
 	done
-	echo "GB_SENSORS: waited $((i * 100)) ms for:$want; iio:$(iio_names | tr '\n' ' ') missing:${miss:- none}"
+	now_ms; if [ -n "$t0" ] && [ -n "$ms" ]; then el=$((ms - t0)); else el=$((k * 100)); fi
+	echo "GB_SENSORS: waited $el ms for:$want; iio:${h# } missing:${miss:- none}"
+	[ -n "$gave" ] && echo "GB_SENSORS: wait: gb_hw ish gave up on the accelerometer (vendor.gb.ish=$gave), not waiting for it"
+	[ -n "$ext" ] && echo "GB_SENSORS: wait: past the $wm ms bound while gb_hw ish was at work (vendor.gb.ish=${gi:-unset}; at most $wx ms)"
 	;;
 diag)
 	for d in /sys/bus/iio/devices/iio:device*; do

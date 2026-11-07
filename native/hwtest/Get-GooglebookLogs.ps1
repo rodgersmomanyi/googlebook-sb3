@@ -76,6 +76,7 @@ param(
 $script:GbVersion = '1.1.1'
 $script:GbScriptPath = $PSCommandPath
 $script:GbQuiet = $false
+$script:GbAclNote = 'not set'          # (wave 11 security-review SR-3) the private folder's access, for COPY-INFO.txt
 
 # ---------------------------------------------------------------------------------------------------------------
 # Win32 helpers (read-only disk/volume queries, read-only file access, mount points for the fallback)
@@ -1566,9 +1567,77 @@ function New-GbOutputFolder([string]$Root, [string]$Stamp) {
     for ($i = 1; $i -le 99; $i++) {
         $name = if ($i -eq 1) { $Stamp } else { "$Stamp-$i" }
         $p = Join-Path $Root $name
-        if (-not (Test-Path -LiteralPath $p)) { [void][IO.Directory]::CreateDirectory($p); return $p }
+        if (-not (Test-Path -LiteralPath $p)) {
+            [void][IO.Directory]::CreateDirectory($p)
+            # (SR-3 review) CreateDirectory also succeeds on a folder another account created meanwhile (the parent may
+            # let every account create folders, as C:\ does); its owner could change any access list, so never use it.
+            # (SR-3 review-w10) Nor a junction or other reparse point made in that moment: Get-Acl / Set-Acl would follow
+            # it to a folder that already exists.
+            if ((([IO.File]::GetAttributes($p)) -band [IO.FileAttributes]::ReparsePoint) -or -not (Test-GbOwnFolder $p)) {
+                Write-GbMsg ("Warning: {0} was created by another account; it is not used." -f $p) 'Yellow'
+                continue
+            }
+            $script:GbAclNote = Set-GbPrivateAcl $p       # (SR-3) before any file is copied into it
+            # (SR-3 review-w10) until that list was set, every account could add an entry to the new folder (a junction
+            # the copy would write through, a file it owns and can read back); after it, none can. So a folder that is
+            # not empty now is not used either.
+            if (@(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop).Count) {
+                Write-GbMsg ("Warning: {0} was changed by another account before it was protected; it is not used." -f $p) 'Yellow'
+                continue
+            }
+            return $p
+        }
     }
     throw "cannot create a new folder under $Root"
+}
+
+# (wave 11 security-review SR-3 review) $true when the folder's owner is this user, Administrators (an elevated run)
+# or SYSTEM. Only NTFS/ReFS keep owners: on any other volume (FAT/exFAT, a network path) or an unreadable owner: $true
+# (Set-GbPrivateAcl then says NOT PROTECTED where it cannot set the list).
+function Test-GbOwnFolder([string]$Path) {
+    try {
+        $fs = (New-Object IO.DriveInfo([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path)))).DriveFormat
+        if (@('NTFS', 'ReFS') -notcontains $fs) { return $true }
+        $o = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner([Security.Principal.SecurityIdentifier])
+        if ($null -eq $o) { return $true }
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        return (@($me, 'S-1-5-32-544', 'S-1-5-18') -contains $o.Value)
+    } catch { return $true }
+}
+
+# (wave 11 security-review SR-3) The <timestamp> folder holds the unredacted logs and redaction-map.csv (placeholder ->
+# original value). A folder created outside the user profile (for example the -OutputRoot C:\Googlebook-logs this script
+# suggests for OneDrive users) inherits the parent's access list, on C:\ "Users: read" and "Authenticated Users:
+# modify", so every account on the PC could read and change it. The folder gets its own protected list instead: full
+# control for this user, SYSTEM and Administrators only, inherited by everything below it; nothing is inherited from the
+# parent. Returns the note for COPY-INFO.txt; never throws (a volume without access lists, e.g. FAT/exFAT, cannot be
+# protected: a yellow warning says so and the copy goes on).
+function Set-GbPrivateAcl([string]$Path) {
+    try {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $sids = @($me, (New-Object Security.Principal.SecurityIdentifier('S-1-5-18')),
+                  (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $inh = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        foreach ($sid in $sids) {
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid,
+                [Security.AccessControl.FileSystemRights]::FullControl, $inh,
+                [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)))
+        }
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        $now = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $want = @($sids | ForEach-Object { $_.Value })
+        $other = @($now.Access | Where-Object {
+            $ace = $_
+            $s = try { $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { "$($ace.IdentityReference)" }
+            $want -notcontains $s })
+        if (-not $now.AreAccessRulesProtected -or $other.Count) { throw "the access list still has $($other.Count) other entries" }
+        return 'owner-only (this user, SYSTEM, Administrators; not inherited from the parent folder)'
+    } catch {
+        Write-GbMsg ("Warning: could not restrict access to {0} ({1}). Other accounts on this PC may be able to read the private copy and redaction-map.csv; keep -OutputRoot inside your user profile." -f $Path, $_.Exception.Message) 'Yellow'
+        return "NOT PROTECTED ($($_.Exception.Message))"
+    }
 }
 
 # -SourcePath: a gblog folder, or a folder / volume root that contains gblog.
@@ -1966,6 +2035,7 @@ function Invoke-GbMain {
         $sums = @($copy.Files | ForEach-Object { $_.Sha256 + '  gblog/' + $_.Rel.Replace('\', '/') })
         [IO.File]::WriteAllLines((Join-Path $outDir 'SHA256SUMS.txt'), [string[]]$sums, [Text.Encoding]::ASCII)
         $info.Add("files: $(@($copy.Files).Count), $($copy.TotalBytes) bytes; SHA-256 of every copy matches the bytes read (SHA256SUMS.txt)")
+        $info.Add("private folder access: $script:GbAclNote")
         if (@($copy.Bad).Count) {
             [IO.File]::WriteAllLines((Join-Path $outDir 'COPY-INFO.txt'), [string[]]($info.ToArray() + @('COPY ERRORS:') + $copy.Bad), [Text.Encoding]::ASCII)
             Write-GbMsg "The copy could not be verified: $($copy.Bad -join '; ')" 'Red'

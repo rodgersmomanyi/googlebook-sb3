@@ -119,6 +119,7 @@ static void reset_daemon(void) {                  /* per-boot daemon state back 
   g_start = T - 200000;
   g_iommu_dmafq = g_iommu_done = 0;
   g_term = 0;
+  memset(&g_ls, 0, sizeof g_ls);                  /* (wave 11) the low-battery guard of a fresh daemon */
   memset(&g_esp_rel, 0, sizeof g_esp_rel);        /* wave 2b: a deferred ESP lock release, the steal race hook */
   g_esp_hook = NULL;
 }
@@ -614,6 +615,555 @@ static void test_battery_w10(void) {
       if (dlt > worst) worst = dlt;
     }
   CHECK(off == 0 && worst <= 1.0, "W10-BAT-7 HAL level within 1 of the composite (%d off, worst %.3f)", off, worst);
+}
+
+/* ---- (wave 11, w11prep battery-lowshut) W11-LS: the low-battery guard ---- */
+static char g_lstrace[8192];
+static void ls_trace(const char *what) {
+  if (strncmp(what, "lowshut:", 8) && strncmp(what, "setprop:sys.powerctl=", 21) &&
+      strncmp(what, "tp:battery_capacity_level=", 26))
+    return;
+  size_t l = strlen(g_lstrace);
+  if (l + strlen(what) + 2 < sizeof g_lstrace) snprintf(g_lstrace + l, sizeof g_lstrace - l, "%s ", what);
+}
+/* both packs at pct10/10 %, BAT2 with status st (BAT1 follows), ADP1 online or not */
+static void ls_packs(int pct10, const char *st, int adp) {
+  char b[2048];
+  fake_psy("BAT1", bat(b, "BAT1", st, 14900000LL * pct10 / 1000, 14900000, 3000000, 7400000, 7500000,
+                       "POWER_SUPPLY_SCOPE=Device\n"), "Battery\n", "surface_battery");
+  fake_psy("BAT2", bat(b, "BAT2", st, 45190000LL * pct10 / 1000, 45190000, 9000000, 10400000, 11360000,
+                       "POWER_SUPPLY_SCOPE=Device\n"), "Battery\n", "surface_battery");
+  fake_psy("ADP1", adp ? ADP_ON : ADP_OFF, "Mains\n", "surface_charger");
+}
+static void ls_setup(const char *name, int level_param) {
+  set_root(name);
+  fake_tp(1);
+  if (level_param) put(TP "battery_capacity_level", "normal\n");
+  g_lstrace[0] = 0;
+  g_trace = ls_trace;
+  tp_probe();
+}
+static void ls_step(long long ms) { T += ms; battery_update(0); }   /* one bridge pass after ms */
+/* (w11 final) the suspended time gb_power sees (CLOCK_BOOTTIME - CLOCK_MONOTONIC) */
+static long long g_fake_susp;
+static long long fake_susp(void) { return g_fake_susp; }
+/* (w11 final) 1-s passes until the hold starts (the second clean reading); returns the passes taken, -1 if none in 30 */
+static int ls_until_arm(void) {
+  int a0 = w10_count(g_lstrace, "lowshut:arm");
+  for (int k = 1; k <= 30; k++) { ls_step(1000); if (w10_count(g_lstrace, "lowshut:arm") > a0) return k; }
+  return -1;
+}
+/* (w11 final) the DTX's base state as the guard sees it (dtx_ready() && g_dtx.base) */
+static int g_ls_dtxfd = -1;
+static void ls_base(int detached) {
+  if (g_ls_dtxfd < 0) g_ls_dtxfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  g_dtx_on = 1;
+  g_dtx.fd = g_ls_dtxfd;
+  g_dtx.base = detached ? SDTX_BASE_DETACHED : SDTX_BASE_ATTACHED;
+}
+static void ls_base_unknown(void) { g_dtx.fd = -1; g_dtx.base = SDTX_BASE_ATTACHED; }
+static const char *ls_pc(void) { static char v[PROP_VALUE_MAX]; prop_get("sys.powerctl", v); return v; }
+static void ls_fail(const char *name) {           /* (w11 final) the supply's uevent read fails (an empty file) */
+  char p[PATH_MAX];
+  snprintf(p, sizeof p, "/sys/class/power_supply/%s/uevent", name);
+  put(p, "");
+}
+static void test_lowshut(void) {
+  /* W11-LS-1 k16 (no capacity_level parameter): 2 % on battery after boot_completed -> armed at once, the request
+   * exactly 60 s later (not earlier), sys.powerctl=shutdown,battery once, logged once; nothing more afterwards */
+  ls_setup("tree_ls1", 0);
+  CHECK(!g_tp.level, "W11-LS-1 k16 test_power has no capacity_level parameter");
+  prop_set("sys.boot_completed", "1");
+  ls_packs(20, "Discharging", 0);
+  T += 100000;
+  battery_update(0);                               /* boot_completed seen now: the gate opens 60 s from here */
+  CHECK(w10_count(g_lstrace, "lowshut:read1") == 1 && !strstr(g_lstrace, "lowshut:arm") && !g_ls.hold_ms,
+        "W11-LS-1 (w11 final) one clean reading at 2 %%: no hold yet: %s", g_lstrace);
+  for (int k = 0; k < 4; k++) ls_step(1000);
+  CHECK(!g_ls.hold_ms, "W11-LS-1 (w11 final) 4 s later: still no hold (the 2 readings must be >= 5 s apart)");
+  ls_step(1000);
+  long long t0 = T;
+  CHECK(w10_count(g_lstrace, "lowshut:arm") == 1 && !ls_pc()[0],
+        "W11-LS-1 armed at the second reading (5 s after the first), nothing requested: %s", g_lstrace);
+  for (int k = 0; k < 59; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !g_ls.tripped, "W11-LS-1 no request 59 s into the hold: %s", g_lstrace);
+  ls_step(1000);
+  CHECK(T - t0 == 60000 && !strcmp(ls_pc(), "shutdown,battery") && g_ls.tripped && g_ls.tries == 1,
+        "W11-LS-1 requested at 60 s: '%s' tries %d", ls_pc(), g_ls.tries);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(w10_count(g_lstrace, "lowshut:trip") == 1 && w10_count(g_lstrace, "setprop:sys.powerctl=") == 1 &&
+        w10_count(g_lstrace, "lowshut:arm") == 1 && w10_count(g_lstrace, "lowshut:cancel") == 0,
+        "W11-LS-1 one decision, one request, one log line in 5 min: %s", g_lstrace);
+  CHECK(!strcmp(get(TP "battery_capacity"), "2") && !strcmp(get(TP "battery_status"), "discharging") &&
+        !exists(TP "battery_capacity_level"), "W11-LS-1 the bridge still publishes (2 %%), no capacity_level file");
+
+  /* W11-LS-2 the periodic pass alone (no uevent) decides: run_due's 20 s backstop, within 60..80 s of the hold */
+  ls_setup("tree_ls2", 0);
+  prop_set("sys.boot_completed", "1");
+  ls_packs(30, "Discharging", 0);
+  T += 100000;
+  g_last_bat = T - 30000;
+  run_due(T);                                      /* the backstop pass: the first reading */
+  t0 = T;
+  long long tdec = -1;
+  for (int k = 0; k < 240 && tdec < 0; k++) { T += 500; run_due(T); if (ls_pc()[0]) tdec = T; }
+  CHECK(tdec > 0 && tdec - t0 >= 65000 && tdec - t0 <= 100000,
+        "W11-LS-2 decided %lld ms after the first pass (w11 final: the second reading at the next 20 s pass, then 60 s)",
+        tdec - t0);
+  T += 11000;
+  run_due(T);                                      /* status_tick: powerctl_check sees our request */
+  CHECK(g_shutdown == 1, "W11-LS-2 the daemon's own shutdown handling ran (g_shutdown %d)", g_shutdown);
+
+  /* W11-LS-3 the boot gate: a hold from before boot_completed waits until 60 s after it; no boot_completed: never */
+  ls_setup("tree_ls3", 0);
+  ls_packs(10, "Discharging", 0);
+  T += 30000;
+  battery_update(0);
+  t0 = T;
+  for (int k = 0; k < 50; k++) ls_step(1000);
+  prop_set("sys.boot_completed", "1");
+  ls_step(1000);                                   /* boot_completed seen at t0 + 51 s */
+  long long tbc = T;
+  for (int k = 0; k < 20; k++) ls_step(1000);       /* hold 71 s, gate 20 s */
+  CHECK(!ls_pc()[0] && w10_count(g_lstrace, "lowshut:gate") == 1, "W11-LS-3 gated, logged once: %s", g_lstrace);
+  for (int k = 0; k < 39; k++) ls_step(1000);
+  CHECK(!ls_pc()[0], "W11-LS-3 59 s after boot_completed: still nothing");
+  ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery") && T - tbc == 60000 && w10_count(g_lstrace, "lowshut:gate") == 1,
+        "W11-LS-3 requested 60 s after boot_completed ('%s', %lld ms)", ls_pc(), T - tbc);
+  ls_setup("tree_ls3b", 0);
+  ls_packs(10, "Discharging", 0);
+  for (int k = 0; k < 600; k++) ls_step(1000);     /* 10 min at 1 %, sys.boot_completed never 1 */
+  CHECK(!ls_pc()[0] && !g_ls.tripped, "W11-LS-3 never before boot_completed");
+
+  /* W11-LS-4 never with a charger: 1 % charging / not charging for 10 min; a plug-in ends a hold, an unplug starts a
+   * new one (60 s from the unplug) */
+  ls_setup("tree_ls4", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(10, "Charging", 1);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  ls_packs(10, "Not charging", 1);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:"), "W11-LS-4 nothing on the charger: %s", g_lstrace);
+  ls_packs(10, "Discharging", 0);
+  ls_step(1000);
+  for (int k = 0; k < 30; k++) ls_step(1000);
+  ls_packs(10, "Not charging", 1);                 /* plugged in 31 s into the hold */
+  ls_step(1000);
+  CHECK(w10_count(g_lstrace, "lowshut:cancel") == 1 && !g_ls.hold_ms, "W11-LS-4 plug-in ends the hold: %s", g_lstrace);
+  for (int k = 0; k < 120; k++) ls_step(1000);
+  ls_packs(10, "Discharging", 0);
+  ls_step(1000);
+  t0 = T;
+  for (int k = 0; k < 64; k++) ls_step(1000);
+  CHECK(!ls_pc()[0], "W11-LS-4 64 s after the unplug: nothing (w11 final: the hold starts at the second reading)");
+  ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery") && T - t0 == 65000 && w10_count(g_lstrace, "lowshut:arm") == 2,
+        "W11-LS-4 requested 65 s after the unplug (5 s to the second reading + 60 s): %s", g_lstrace);
+  /* the charger appears after the decision: the request stands (it is final), nothing is undone or repeated */
+  ls_packs(10, "Charging", 1);
+  for (int k = 0; k < 60; k++) ls_step(1000);
+  CHECK(w10_count(g_lstrace, "setprop:sys.powerctl=") == 1, "W11-LS-4 decision final: %s", g_lstrace);
+
+  /* W11-LS-5 hysteresis 3/5: 4 % keeps a running hold but decides nothing; 3 % then decides; 5 % ends a hold;
+   * 4 % starts none */
+  ls_setup("tree_ls5", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(30, "Discharging", 0);
+  ls_step(1000);
+  CHECK(ls_until_arm() == 5, "W11-LS-5 (w11 final) armed after 2 readings at 3 %% (5 s)");
+  t0 = T;
+  for (int k = 0; k < 30; k++) { ls_packs(k % 2 ? 40 : 30, "Discharging", 0); ls_step(1000); }
+  ls_packs(40, "Discharging", 0);
+  for (int k = 0; k < 40; k++) ls_step(1000);       /* 71 s held, but at 4 % */
+  CHECK(!ls_pc()[0] && g_ls.hold_ms == t0 && w10_count(g_lstrace, "lowshut:cancel") == 0,
+        "W11-LS-5 3/4 %% jitter keeps the hold, no decision at 4 %%: %s", g_lstrace);
+  ls_packs(30, "Discharging", 0);
+  ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery"), "W11-LS-5 decided back at 3 %%");
+  ls_setup("tree_ls5b", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(30, "Discharging", 0);
+  ls_step(1000);
+  ls_until_arm();
+  ls_packs(50, "Discharging", 0);
+  ls_step(1000);
+  ls_packs(40, "Discharging", 0);
+  for (int k = 0; k < 120; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && w10_count(g_lstrace, "lowshut:cancel") == 1 && w10_count(g_lstrace, "lowshut:arm") == 1,
+        "W11-LS-5 5 %% ends the hold, 4 %% starts none: %s", g_lstrace);
+  /* (w11 final) 3/4 % jitter BEFORE a hold never starts one: the 2 readings at <= 3 % must be consecutive */
+  ls_setup("tree_ls5c", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  for (int k = 0; k < 120; k++) { ls_packs(k % 2 ? 40 : 30, "Discharging", 0); ls_step(1000); }
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:arm"), "W11-LS-5c 3/4 %% jitter: no hold: %s", g_lstrace);
+
+  /* W11-LS-6 an incomplete sum (BAT2 present without usable data) never decides; the clipboard alone (base
+   * detached: BAT2 gone) does */
+  ls_setup("tree_ls6", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(10, "Discharging", 0);
+  fake_psy("BAT2", "POWER_SUPPLY_NAME=BAT2\nPOWER_SUPPLY_TYPE=Battery\nPOWER_SUPPLY_STATUS=Discharging\n"
+                   "POWER_SUPPLY_PRESENT=1\nPOWER_SUPPLY_SCOPE=Device\n", "Battery\n", "surface_battery");
+  for (int k = 0; k < 200; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:arm"), "W11-LS-6 incomplete sum: nothing: %s", g_lstrace);
+  char cmd[PATH_MAX + 32];
+  snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/power_supply/BAT2'", g_root);
+  if (system(cmd)) {}
+  for (int k = 0; k < 200; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:arm") && w10_count(g_lstrace, "lowshut:blocked") == 2,
+        "W11-LS-6 (w11 final, W11-S2) BAT2 gone while the base is not known detached: nothing, one line per reason "
+        "(no usable data, then BAT2 missing): %s", g_lstrace);
+  ls_base(0);                                      /* the EC says attached: still nothing */
+  for (int k = 0; k < 120; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:arm"), "W11-LS-6 (w11 final) base attached, BAT2 gone: nothing");
+  ls_base(1);                                      /* detached: the clipboard alone is the battery */
+  CHECK(ls_until_arm() == 6, "W11-LS-6 (w11 final) base detached: armed at the second reading (6th pass): %s",
+        g_lstrace);
+  for (int k = 0; k < 60; k++) ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery"), "W11-LS-6 the clipboard alone at 1 %% decides (base detached): %s",
+        g_lstrace);
+  ls_base_unknown();
+
+  /* W11-LS-7 kill switch gb.power.lowshut=0 */
+  ls_setup("tree_ls7", 0);
+  put("/proc/cmdline", "BOOT_IMAGE=/kernel gb.hw=native gb.power.lowshut=0\n");
+  read_cmdline();
+  CHECK(g_ls.off == 1, "W11-LS-7 kill switch parsed");
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(0, "Discharging", 0);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:"), "W11-LS-7 off: nothing: %s", g_lstrace);
+
+  /* W11-LS-8 a later kernel's battery_capacity_level parameter: the class follows the level (low <= 10, normal again
+   * >= 12, full); critical only at the decision (never before, never on the charger); sys.powerctl only when Android
+   * has not started its shutdown 30 s later (120 s when sys.shutdown.requested shows it started) */
+  ls_setup("tree_ls8", 1);
+  CHECK(g_tp.level == 1, "W11-LS-8 capacity_level parameter found");
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  const struct { int pct10; const char *st; int adp; const char *want; } cls[] = {
+    {500, "Discharging", 0, "normal"}, {115, "Discharging", 0, "normal"}, {100, "Discharging", 0, "low"},
+    {110, "Discharging", 0, "low"}, {115, "Charging", 1, "low"}, {120, "Charging", 1, "normal"},
+    {1000, "Full", 1, "full"}, {999, "Discharging", 0, "normal"}, {20, "Charging", 1, "low"},
+    {20, "Not charging", 1, "low"}};
+  for (unsigned i = 0; i < sizeof cls / sizeof *cls; i++) {
+    ls_packs(cls[i].pct10, cls[i].st, cls[i].adp);
+    ls_step(1000);
+    CHECK(!strcmp(get(TP "battery_capacity_level"), cls[i].want), "W11-LS-8 class at %d.%d %% %s: %s (want %s)",
+          cls[i].pct10 / 10, cls[i].pct10 % 10, cls[i].st, get(TP "battery_capacity_level"), cls[i].want);
+  }
+  for (int k = 0; k < 120; k++) ls_step(1000);     /* 2 min at 2 % on the charger */
+  CHECK(!strstr(g_lstrace, "=critical") && !ls_pc()[0], "W11-LS-8 no critical on the charger: %s", g_lstrace);
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  t0 = T;
+  for (int k = 0; k < 64; k++) ls_step(1000);
+  CHECK(!strstr(g_lstrace, "=critical"), "W11-LS-8 no critical inside the hold");
+  ls_step(1000);
+  CHECK(!strcmp(get(TP "battery_capacity_level"), "critical") && !ls_pc()[0] && g_ls.tripped,
+        "W11-LS-8 decision = critical, no sys.powerctl yet ('%s')", ls_pc());
+  for (int k = 0; k < 29; k++) ls_step(1000);
+  CHECK(!ls_pc()[0], "W11-LS-8 29 s after critical: still Android's turn");
+  ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery") && T - t0 == 95000, "W11-LS-8 fallback 30 s after critical (%lld ms)",
+        T - t0);
+  ls_setup("tree_ls8b", 1);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  for (int k = 0; k < 65; k++) ls_step(1000);
+  CHECK(g_ls.tripped && !ls_pc()[0], "W11-LS-8b decided via critical");
+  prop_set("sys.shutdown.requested", "0battery");  /* ShutdownThread started */
+  for (int k = 0; k < 60; k++) ls_step(1000);
+  CHECK(!ls_pc()[0], "W11-LS-8b Android's shutdown under way: no sys.powerctl at 60 s");
+  for (int k = 0; k < 60; k++) ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery"), "W11-LS-8b ... but at 120 s ('%s')", ls_pc());
+  ls_setup("tree_ls8c", 1);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  for (int k = 0; k < 65; k++) ls_step(1000);
+  CHECK(g_ls.tripped, "W11-LS-8c decided via critical first");
+  prop_set("sys.powerctl", "shutdown,battery");    /* Android's ShutdownThread got there itself */
+  for (int k = 0; k < 200; k++) ls_step(1000);
+  CHECK(w10_count(g_lstrace, "lowshut:powerctl") == 0, "W11-LS-8c Android shut down: gb_power adds nothing: %s",
+        g_lstrace);
+
+  /* W11-LS-9 sys.powerctl not taken (read-back empty): asked again every 30 s, 3 times in all */
+  ls_setup("tree_ls9", 0);
+  prop_set("sys.boot_completed", "1");
+  for (int i = 0; i < 128; i++)                    /* the host property store full: sys.powerctl cannot be stored */
+    if (!g_props[i].k[0]) snprintf(g_props[i].k, sizeof g_props[i].k, "test.fill.%d", i);
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(g_ls.tries == 3 && w10_count(g_lstrace, "lowshut:powerctl") == 3 && w10_count(g_lstrace, "lowshut:trip") == 1,
+        "W11-LS-9 three requests, one decision: tries %d %s", g_ls.tries, g_lstrace);
+
+  /* W11-LS-10 "gb_power -o" never decides or writes, prints the class only with the parameter */
+  ls_setup("tree_ls10", 1);
+  prop_set("sys.boot_completed", "1");
+  ls_packs(20, "Discharging", 0);
+  char root[PATH_MAX];
+  snprintf(root, sizeof root, "%s", g_root);
+  char *argv[] = {"gb_power", "-o", "-r", root, NULL};
+  for (int k = 0; k < 3; k++) {
+    optind = 1;
+    T += 70000;
+    CHECK(gb_power_main(4, argv) == 0, "W11-LS-10 -o rc");
+  }
+  CHECK(!ls_pc()[0] && !g_ls.tripped && !g_ls.hold_ms && !strcmp(get(TP "battery_capacity_level"), "normal"),
+        "W11-LS-10 -o: no decision, nothing written: %s", g_lstrace);
+
+  /* W11-LS-11 a shutdown or reboot already under way (sys.powerctl set, e.g. gb_power restarted after its decision,
+   * or an OTA reboot): the guard neither arms nor asks */
+  ls_setup("tree_ls11", 0);
+  prop_set("sys.boot_completed", "1");
+  prop_set("sys.powerctl", "reboot,ota");
+  T += 100000;
+  ls_packs(10, "Discharging", 0);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "reboot,ota") && !strstr(g_lstrace, "lowshut:") && !g_ls.tripped,
+        "W11-LS-11 nothing added to a running shutdown: %s", g_lstrace);
+
+  /* ---- (wave 11 final, LEAD_W11 b) W11-LS-12..21: the safety audit's W11-S2 / W11-S3, the two-readings rule ---- */
+  char b[2048];
+  /* W11-LS-12 (W11-S2, audit A2) the real drain order: BAT1 (clipboard) Full, BAT2 (base) at 1 %; BAT1 misreads
+   * PRESENT=0 -> the sum would be BAT2 alone at 1 %: never a hold while the base is not known detached */
+  ls_setup("tree_ls12", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(10, "Discharging", 0);
+  fake_psy("BAT1", "POWER_SUPPLY_NAME=BAT1\nPOWER_SUPPLY_TYPE=Battery\nPOWER_SUPPLY_PRESENT=0\nPOWER_SUPPLY_SCOPE=Device\n",
+           "Battery\n", "surface_battery");
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:arm") && w10_count(g_lstrace, "lowshut:blocked") == 1,
+        "W11-LS-12 BAT1 absent, BAT2 at 1 %%: no hold in 5 min, one line: %s", g_lstrace);
+  ls_base(0);
+  for (int k = 0; k < 120; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:arm"), "W11-LS-12 ... the same with the base known attached");
+  ls_base_unknown();
+
+  /* W11-LS-13 (W11-S2, audit A3) BAT1's reads fail: cached for 60 s (no hold on cached values), then dropped (BAT1
+   * missing): never a hold; a running hold ends at the first failed read */
+  ls_setup("tree_ls13", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(10, "Discharging", 0);
+  ls_step(1000);
+  CHECK(ls_until_arm() == 5, "W11-LS-13 armed (2 readings)");
+  ls_fail("BAT1");
+  ls_step(1000);
+  CHECK(!g_ls.hold_ms && w10_count(g_lstrace, "lowshut:cancel") == 1, "W11-LS-13 BAT1's failed read ends the hold: %s",
+        g_lstrace);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && w10_count(g_lstrace, "lowshut:arm") == 1, "W11-LS-13 BAT1 failing for 5 min: no new hold: %s",
+        g_lstrace);
+
+  /* W11-LS-14 (W11-S2) a change of the present packs ends a hold; the base detached during a hold (the DTX says so,
+   * BAT2 unregistered): the clipboard alone starts again from 2 readings and decides (audit A8, correct); the base
+   * re-attached during that hold ends it (A9) */
+  ls_setup("tree_ls14", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  ls_until_arm();
+  for (int k = 0; k < 30; k++) ls_step(1000);
+  ls_base(1);
+  snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/power_supply/BAT2'", g_root);
+  if (system(cmd)) {}
+  ls_step(1000);
+  CHECK(!g_ls.hold_ms && strstr(g_lstrace, "lowshut:cancel"), "W11-LS-14 detach: packs changed, hold ended: %s",
+        g_lstrace);
+  int ka = ls_until_arm();
+  CHECK(ka == 6, "W11-LS-14 the clipboard alone: a new hold after 2 readings (%d passes)", ka);
+  for (int k = 0; k < 30; k++) ls_step(1000);
+  ls_base(0);
+  fake_psy("BAT2", bat(b, "BAT2", "Discharging", 45190000LL * 20 / 1000, 45190000, 9000000, 10400000, 11360000,
+                       "POWER_SUPPLY_SCOPE=Device\n"), "Battery\n", "surface_battery");
+  ls_step(1000);
+  CHECK(!g_ls.hold_ms && w10_count(g_lstrace, "lowshut:cancel") == 2, "W11-LS-14 re-attach ends the hold: %s",
+        g_lstrace);
+  ls_base(1);
+  snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/power_supply/BAT2'", g_root);
+  if (system(cmd)) {}
+  ls_step(1000);
+  ls_until_arm();
+  for (int k = 0; k < 60; k++) ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery") && w10_count(g_lstrace, "lowshut:trip") == 1,
+        "W11-LS-14 detached for good: the clipboard alone at 2 %% decides: %s", g_lstrace);
+  ls_base_unknown();
+
+  /* W11-LS-15 (W11-S3, audit A6) a hold at 2 %; plugged in (the packs read Charging) but ADP1's read fails from that
+   * moment: its cached ONLINE=0 never counts -> the hold ends at once, no shutdown while plugged in */
+  ls_setup("tree_ls15", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  ls_until_arm();
+  for (int k = 0; k < 30; k++) ls_step(1000);
+  ls_packs(20, "Charging", 0);
+  ls_fail("ADP1");
+  ls_step(1000);
+  CHECK(!g_ls.hold_ms && w10_count(g_lstrace, "lowshut:cancel") == 1, "W11-LS-15 ADP1 unreadable: hold ended: %s",
+        g_lstrace);
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && w10_count(g_lstrace, "lowshut:arm") == 1, "W11-LS-15 no shutdown while ADP1 is unreadable: %s",
+        g_lstrace);
+
+  /* W11-LS-16 (W11-S3) a charger uevent (a plug and unplug between two passes: ADP1 reads offline again) ends a hold
+   * and a started confirmation; the hold starts again from 2 new readings */
+  ls_setup("tree_ls16", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  ls_until_arm();
+  for (int k = 0; k < 40; k++) ls_step(1000);
+  struct uev uc = {.action = "change", .subsystem = "power_supply", .psy_name = "ADP1", .psy_type = "Mains"};
+  uev_handle(&uc);
+  ls_step(1000);
+  CHECK(!g_ls.hold_ms && w10_count(g_lstrace, "lowshut:cancel") == 1, "W11-LS-16 the charger uevent ended the hold: %s",
+        g_lstrace);
+  struct uev ub = {.action = "change", .subsystem = "power_supply", .psy_name = "BAT2"};   /* no type: the type file */
+  ls_step(1000);
+  ls_step(1000);
+  uev_handle(&ub);
+  CHECK(!g_ls.chg_ev, "W11-LS-16 a pack's own uevent is not a charger event");
+  struct uev un = {.action = "change", .subsystem = "power_supply", .psy_name = "ADP1"};    /* no type: the type file */
+  uev_handle(&un);
+  CHECK(g_ls.chg_ev == 1, "W11-LS-16 ADP1's uevent without a TYPE field: a charger event (type file Mains)");
+  ls_step(1000);
+  int k16 = ls_until_arm();
+  CHECK(k16 == 6, "W11-LS-16 re-armed from 2 new readings (%d passes)", k16);
+  for (int k = 0; k < 60; k++) ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery"), "W11-LS-16 then decides 60 s later");
+
+  /* W11-LS-17 (W11-S3) a resume from suspend ends a hold (CLOCK_BOOTTIME gained on CLOCK_MONOTONIC; and
+   * suspend_stats/success changed); a cached value ages with the suspended time */
+  ls_setup("tree_ls17", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  ls_until_arm();
+  for (int k = 0; k < 40; k++) ls_step(1000);
+  g_fake_susp += 600000;                           /* 10 min asleep */
+  ls_step(1000);
+  CHECK(!g_ls.hold_ms && w10_count(g_lstrace, "lowshut:cancel") == 1, "W11-LS-17 resume ended the hold: %s", g_lstrace);
+  ls_until_arm();
+  for (int k = 0; k < 20; k++) ls_step(1000);
+  put("/sys/power/suspend_stats/success", "3\n");
+  resume_check();
+  put("/sys/power/suspend_stats/success", "4\n");
+  resume_check();                                  /* "system resumed (3 -> 4)" */
+  ls_step(1000);
+  CHECK(!g_ls.hold_ms && w10_count(g_lstrace, "lowshut:cancel") == 2, "W11-LS-17 suspend_stats resume ended it too: %s",
+        g_lstrace);
+  {
+    struct psy ps[MAXPSY];
+    ls_step(1000);                                 /* fresh values cached now */
+    ls_fail("BAT1");
+    int n1 = psy_scan(ps, MAXPSY), c1 = 0;
+    for (int i = 0; i < n1; i++) if (!strcmp(ps[i].name, "BAT1") && ps[i].cached) c1 = 1;
+    g_fake_susp += 61000;                          /* the same failed read after 61 s asleep: no cached value any more */
+    int n2 = psy_scan(ps, MAXPSY), c2 = 0;
+    for (int i = 0; i < n2; i++) if (!strcmp(ps[i].name, "BAT1")) c2 = 1;
+    CHECK(c1 && !c2, "W11-LS-17 a failed read: cached (marked) at once, gone after 61 s suspended (%d %d)", c1, c2);
+  }
+
+  /* W11-LS-18 (W11-S3) the charger read again right before the decision: test_ac online (another writer) -> no
+   * shutdown, the hold ends; ls_charger_reread() on fake trees */
+  ls_setup("tree_ls18", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(20, "Discharging", 0);
+  ls_step(1000);
+  ls_until_arm();
+  for (int k = 0; k < 59; k++) ls_step(1000);
+  put(TP "ac_online", "on\n");
+  ls_step(1000);
+  CHECK(!ls_pc()[0] && !g_ls.tripped && !g_ls.hold_ms && w10_count(g_lstrace, "lowshut:cancel") == 1,
+        "W11-LS-18 test_ac online at the re-read: no request, hold ended: %s", g_lstrace);
+  put(TP "ac_online", "off\n");
+  CHECK(ls_charger_reread() == NULL, "W11-LS-18 reread: ADP1 offline + test_ac off -> on battery");
+  fake_psy("ADP1", ADP_ON, "Mains\n", "surface_charger");
+  CHECK(ls_charger_reread() && strstr(ls_charger_reread(), "online"), "W11-LS-18 reread: ADP1 online");
+  ls_fail("ADP1");
+  CHECK(ls_charger_reread() && strstr(ls_charger_reread(), "unreadable"), "W11-LS-18 reread: ADP1 unreadable");
+  fake_psy("ADP1", "POWER_SUPPLY_NAME=ADP1\nPOWER_SUPPLY_TYPE=Mains\n", "Mains\n", "surface_charger");
+  CHECK(ls_charger_reread() && strstr(ls_charger_reread(), "no online state"), "W11-LS-18 reread: no ONLINE field");
+  snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/power_supply/ADP1'", g_root);
+  if (system(cmd)) {}
+  CHECK(ls_charger_reread() && strstr(ls_charger_reread(), "no charger supply"), "W11-LS-18 reread: no charger supply");
+  fake_psy("ADP1", ADP_OFF, "Mains\n", "surface_charger");
+  snprintf(cmd, sizeof cmd, "rm -f '%s" TP "ac_online'", g_root);
+  if (system(cmd)) {}
+  CHECK(ls_charger_reread() && strstr(ls_charger_reread(), "test_ac"), "W11-LS-18 reread: test_ac unreadable");
+  ls_fail("BAT2");
+  put(TP "ac_online", "off\n");
+  CHECK(ls_charger_reread() == NULL, "W11-LS-18 reread: a pack's failed read is not a charger's");
+
+  /* W11-LS-19 the two-readings rule: one 0 %% reading between normal ones, two inconsistent readings (3 then 0 %%),
+   * two readings < 5 s apart: no hold; a jump inside the confirmation restarts it */
+  ls_setup("tree_ls19", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  for (int r = 0; r < 20; r++) {
+    ls_packs(400, "Discharging", 0); ls_step(20000);
+    ls_packs(0, "Discharging", 0); ls_step(20000);  /* one glitch reading every 40 s */
+  }
+  CHECK(!strstr(g_lstrace, "lowshut:arm") && !ls_pc()[0], "W11-LS-19 single 0 %% readings: no hold: %s", g_lstrace);
+  ls_packs(30, "Discharging", 0); ls_step(20000);
+  ls_packs(0, "Discharging", 0); ls_step(20000);   /* 3 % then 0 %: not consistent: 0 % is a new first reading */
+  CHECK(!g_ls.hold_ms && g_ls.conf_n == 1 && g_ls.conf_cap == 0, "W11-LS-19 3 -> 0 %%: confirmation restarted");
+  ls_packs(400, "Discharging", 0); ls_step(20000);
+  ls_packs(20, "Discharging", 0); ls_step(1000);
+  for (int k = 0; k < 4; k++) ls_step(1000);
+  CHECK(!g_ls.hold_ms, "W11-LS-19 2 %% for 4 s (readings < 5 s apart): no hold");
+  ls_step(1000);
+  CHECK(g_ls.hold_ms > 0, "W11-LS-19 the reading 5 s after the first starts it");
+
+  /* W11-LS-20 no charger supply registered at all (no ADP1): never a hold */
+  ls_setup("tree_ls20", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(10, "Discharging", 0);
+  snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/power_supply/ADP1'", g_root);
+  if (system(cmd)) {}
+  for (int k = 0; k < 300; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && !strstr(g_lstrace, "lowshut:arm") && w10_count(g_lstrace, "lowshut:blocked") == 1,
+        "W11-LS-20 no charger supply: no hold, one line: %s", g_lstrace);
+
+  /* W11-LS-21 (audit A12/A13, the ~0 %% glitch) both packs read 0 %% for 64 s (1-s passes) then 40 %% again: no
+   * shutdown (the wave-11 candidate's rule tripped after 60 s); 0 %% for 70 s does decide (I-W11-1: inherent) */
+  ls_setup("tree_ls21", 0);
+  prop_set("sys.boot_completed", "1");
+  T += 100000;
+  ls_packs(400, "Discharging", 0);
+  ls_step(1000);
+  ls_packs(0, "Discharging", 0);
+  for (int k = 0; k < 64; k++) ls_step(1000);
+  ls_packs(400, "Discharging", 0);
+  for (int k = 0; k < 60; k++) ls_step(1000);
+  CHECK(!ls_pc()[0] && w10_count(g_lstrace, "lowshut:cancel") == 1, "W11-LS-21 a 64 s 0 %% glitch: no shutdown: %s",
+        g_lstrace);
+  ls_packs(0, "Discharging", 0);
+  for (int k = 0; k < 70; k++) ls_step(1000);
+  CHECK(!strcmp(ls_pc(), "shutdown,battery"), "W11-LS-21 0 %% for 70 s: decided (a reading wrong for > 65 s)");
+  g_trace = NULL;
 }
 
 /* ---- uevent netlink message parsing ---- */
@@ -2704,12 +3254,14 @@ int main(int argc, char **argv) {
   snprintf(W, sizeof W, "%s", argv[1]);
   mkdirs(W);
   g_clock = fake_now;
+  g_susp_clock = fake_susp;                       /* (w11 final) no suspend unless a test says so */
   setvbuf(stdout, NULL, _IOLBF, 0);
   signal(SIGPIPE, SIG_IGN);
   test_parse();
   test_combine();
   test_publish();
   test_battery_w10();
+  test_lowshut();
   test_uevent();
   test_dgpu_passes();
   test_dtx();

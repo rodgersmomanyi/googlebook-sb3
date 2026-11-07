@@ -64,6 +64,9 @@ TOP = [
     ("nouveau_log", lambda s: s == "== gb_nouveau.log (tail)"),
     ("dmesg", lambda s: s == "== dmesg"),
     ("logcat", lambda s: s == "== logcat"),
+    # (wave 10, w10prep bootlog-diag) once per boot, right after the window of the first snapshot written: that
+    # snapshot's logcat lines before its 6000-line window (no avc lines); its lines join the logcat corpus
+    ("logcat_early", lambda s: s.startswith("== logcat-early")),
     ("sf", lambda s: s == "== dumpsys SurfaceFlinger"),
     ("dumpsys_input", lambda s: s == "== dumpsys input"),
 ]
@@ -100,6 +103,29 @@ SUMMARY_KEYS = ("serial 8250:", "serial errors:", "serial surface_serial_hub bou
                 "ota gate:",
                 # (wave 9 hw-native1) the Surface Aggregator after gb_hw's re-bind, the Integrated Sensor Hub
                 "sam: MSHW0084", "ish: ")
+# (wave 10, w10prep bootlog-diag, BACKLOG 14.5 VM1-VEX128-site / W5-early-logcat) GB_BOOTLOG_SH's two diagnostics: the
+# summary block '-- vnni init records' (every comm=init gb_vnni record that gb_bootlog's polls saw since its start; the
+# '-- gb_vnni' block lists only the kernel's 16 most recent records, which ML-KEM's runs fill long before t40) and the
+# '== logcat-early' section (its first line: the counts). Logs written before wave 10 have neither.
+VI_HDR = "vnni init records"
+VI_FIRST_RE = re.compile(r"^first poll at (\S+) s: (emulated \d+ vex128 (\d+) vex256 (\d+) .*)$")
+VI_REC_RE = re.compile(r"^init rip=([0-9a-f]+) count=(\d+) seen=(\S+)-(\S+) s polls=(\d+) lives=(\d+)$")
+VI_END_RE = re.compile(r"^init records: (\d+) kept \(at most (\d+)\); reads of rips not kept: (\d+); polls (\d+)$")
+LCE_RE = re.compile(r"^logcat-early: dumped at (\S+) s; (\d+) of the (\d+) lines before the window kept \((\d+) avc "
+                    r"lines left out\); cut at (\d+) bytes: (yes|no)$")
+# (wave 10, VM1-VEX128-site) init's 14 VEX AVX-VNNI instructions: /system/bin/init of lapis CL3B.260622.276.R4 (sha256
+# 9c6d33419ac64c79..., 2,983,272 B; vnni-perf evidence\scan.json), vaddr -> function; every one is vpdpwssd on xmm
+# (VEX.128, word). Their page offsets all differ and a process's load base is page aligned, so the low 12 bits of a
+# comm=init rip name the instruction and rip - vaddr is the load base of that process's init image.
+INIT_VNNI_BUILD = "CL3B.260622.276.R4"
+INIT_VNNI_SITES = {0x74F94: "SubcontextReply_ExpandArgsReply::ByteSizeLong",
+                   0x74F9D: "SubcontextReply_ExpandArgsReply::ByteSizeLong",
+                   **{v: "adler32_simd_" for v in (0x214E5B, 0x214E6E, 0x214ED5, 0x214EE8, 0x214EFA, 0x214F12, 0x214F2E,
+                                                   0x214F46, 0x214F62, 0x214F7A)},
+                   0x28F024: "chromeos_update_engine::DynamicPartitionGroup::ByteSizeLong",
+                   0x28F02D: "chromeos_update_engine::DynamicPartitionGroup::ByteSizeLong"}
+INIT_VNNI_BY_PAGE = {v & 0xFFF: v for v in INIT_VNNI_SITES}
+assert len(INIT_VNNI_BY_PAGE) == len(INIT_VNNI_SITES) == 14
 # (wave 5, native-readiness A-L1) -517 = -EPROBE_DEFER: a probe deferred and retried later, never an error by itself
 # (on the SB3 surface_hotplug's first probe, before lapis's pinctrl-icelake, logs "failed to set up IRQ 0: -517")
 DEFERRED_RE = re.compile(r"-517(?!\d)|EPROBE_DEFER")
@@ -207,6 +233,44 @@ class Snap:
 
     def ev(self, ln, text):
         return Ev(self.name, ln, text)
+
+    def logcat_early(self):
+        """(wave 10) This snapshot's '== logcat-early' section: {"ev": header Ev, "info": counts dict or None,
+        "lines": number of threadtime lines}, or None (no such section)."""
+        if "logcat_early" not in self.hdr:
+            return None
+        ln, h = self.hdr["logcat_early"]
+        body = self.lines("logcat_early")
+        info = None
+        m = LCE_RE.match(body[0][1]) if body else None
+        if m:
+            info = {"dumped_at": m.group(1), "kept": int(m.group(2)), "before": int(m.group(3)), "avc": int(m.group(4)),
+                    "max_bytes": int(m.group(5)), "cut": m.group(6) == "yes"}
+        return {"ev": Ev(self.name, ln, h), "info": info, "lines": sum(1 for _l, x in body if LOGCAT_RE.match(x))}
+
+    def vnni_init(self):
+        """(wave 10) This snapshot's '-- vnni init records' block: {"first": the first poll or None, "records": [...],
+        "end": the closing line or None, "ev": [Ev]}, or None (a log before wave 10)."""
+        blk = self.sblock(VI_HDR)
+        if blk is None:
+            return None
+        out = {"first": None, "records": [], "end": None, "ev": blk}
+        for e in blk:
+            m = VI_FIRST_RE.match(e.text)
+            if m:
+                out["first"] = {"uptime": m.group(1), "counter": m.group(2), "vex128": int(m.group(3)),
+                                "vex256": int(m.group(4))}
+                continue
+            m = VI_REC_RE.match(e.text)
+            if m:
+                out["records"].append({"rip": m.group(1), "count": int(m.group(2)), "first": m.group(3),
+                                       "last": m.group(4), "polls": int(m.group(5)), "lives": int(m.group(6))})
+                continue
+            m = VI_END_RE.match(e.text)
+            if m:
+                out["end"] = {"kept": int(m.group(1)), "max": int(m.group(2)), "not_kept": int(m.group(3)),
+                              "polls": int(m.group(4))}
+        return out
 
     # -- summary helpers (wave 3 "== summary" block)
     def sline(self, prefix):
@@ -379,6 +443,23 @@ class Boot:
             if e:
                 return e
         return None
+
+    def logcat_early(self):
+        """(wave 10) (snapshot, its logcat_early() dict) of the first snapshot with a '== logcat-early' section (the
+        script writes it once per boot), or (None, None)."""
+        for sn in self.snaps:
+            x = sn.logcat_early()
+            if x:
+                return sn, x
+        return None, None
+
+    def vnni_init(self):
+        """(wave 10) (snapshot, its vnni_init() dict) of the newest snapshot with the block, or (None, None)."""
+        for sn in reversed(self.summary_snaps()):
+            x = sn.vnni_init()
+            if x is not None:
+                return sn, x
+        return None, None
 
 
 # ------------------------------------------------------------------------------------------- structured views
@@ -679,6 +760,7 @@ class Analysis:
             if c >= 3:
                 procs.setdefault(f"{svc} (init service, {c} abnormal exits)", []).extend(loop_ev[svc])
         self.crash_procs = procs
+        self.dump_bursts = _dump_bursts(b)
         self.tombstones = b.lc(r"Tombstone written to: (\S+)")
         self.kernel_issues = b.dm(r"(Kernel panic - not syncing|kernel BUG at|BUG: (?:unable|kernel|scheduling|"
                                   r"sleeping|soft lockup|KASAN|KFENCE|Bad page|workqueue|spinlock)|Oops: |"
@@ -2397,6 +2479,7 @@ def c_vnni(a, it):
                 adler += 1
     if comms:
         it.note("recent emulation sites by comm: " + ", ".join(f"{c} ({n})" for c, n in comms.most_common(5)))
+    _vnni_init_notes(a, it)
     if adler:
         it.note(f"{adler} recent RIP(s) at adler32_simd_ page offsets (0x067, 0x145-0x1ea): stock libz still "
                 "emulating? (see libz_bind)")
@@ -2405,6 +2488,83 @@ def c_vnni(a, it):
     if irqon != em:
         return it.set(FAIL, f"irqon {irqon} != emulated {em} (k15 contract: every emulation runs IRQs-on)")
     it.set(PASS, f"emulated {em:,}, irqon {irqon:,} (equal)")
+
+
+def _init_site_names(a, it, recs, where):
+    """(wave 10, BACKLOG 14.5 VM1-VEX128-site) Name each comm=init rip by init's instruction table (INIT_VNNI_SITES,
+    only when the booted system build is INIT_VNNI_BUILD) and group the rips by load base (rip - vaddr: one base per
+    process image of /system/bin/init). recs: [(rip hex, count)]. Notes only, no status change."""
+    if not recs:
+        return
+    fp = a.b.prop("ro.system.build.fingerprint")[0] or a.b.prop("ro.build.fingerprint")[0]
+    bid = _build_id(fp) if fp else None
+    if bid != INIT_VNNI_BUILD:
+        it.note(f"init site names not applied: the booted system build is {bid or 'unknown'}, the site table is "
+                f"{INIT_VNNI_BUILD}'s /system/bin/init")
+        return
+    named, other, bases = [], [], {}
+    for rip, n in recs:
+        r = int(rip, 16)
+        v = INIT_VNNI_BY_PAGE.get(r & 0xFFF)
+        if v is None:
+            other.append(f"{rip} ({n})")
+            continue
+        named.append(f"{rip} = init+{v:#x} {INIT_VNNI_SITES[v]} ({n})")
+        b = bases.setdefault(r - v, [0, 0])
+        b[0] += 1
+        b[1] += n
+    if named:
+        it.note(f"init sites {where} ({INIT_VNNI_BUILD} /system/bin/init; every one a VEX.128 vpdpwssd): "
+                + ", ".join(named[:8]) + (f" ... {len(named) - 8} more" if len(named) > 8 else ""))
+        it.note(f"{len(bases)} process image(s) of /system/bin/init (load base = rip - site): " + ", ".join(
+            f"{b:#x}: {k} site(s), {n:,} emulation(s)" for b, (k, n) in list(bases.items())[:6]))
+    if other:
+        it.note(f"{len(other)} init rip(s) {where} at a page offset of none of init's {len(INIT_VNNI_SITES)} VNNI "
+                f"instructions ({INIT_VNNI_BUILD}; another binary named init?): " + ", ".join(other[:6]))
+
+
+def _vnni_init_notes(a, it):
+    """(wave 10, BACKLOG 14.5 VM1-VEX128-site) Notes (and evidence) from the newest '-- vnni init records' block:
+    every comm=init site gb_bootlog's polls saw, with its page offset, count and (lapis 276.R4) instruction. A log
+    without the block: the comm=init records of the earliest '-- gb_vnni' block that still lists some are named the
+    same way. No status change."""
+    sn, vi = a.b.vnni_init()
+    if vi is None:
+        it.note("no '-- vnni init records' block (a log written before wave 10): init's emulation sites are known only "
+                "while they are among the kernel's 16 most recent records")
+        for sn2, blk in _vnni_blocks(a):
+            old = [(e, m) for e in blk for m in [re.match(r"^comm=init rip=([0-9a-f]+) count=(\d+)$", e.text)] if m]
+            if old:
+                _init_site_names(a, it, [(m.group(1), int(m.group(2))) for _e, m in old],
+                                 f"in {sn2.name}'s -- gb_vnni block")
+                it.add([e for e, _m in old][:4])
+                break
+        return
+    if vi["first"] is None:
+        it.note(f"vnni init records ({sn.name}): gb_bootlog's polls read no counter")
+        it.add(vi["ev"][:2])
+        return
+    recs = vi["records"]
+    tot = sum(r["count"] for r in recs)
+    it.note(f"init's emulation sites ({sn.name}: every comm=init record gb_bootlog's polls saw from "
+            f"{vi['first']['uptime']} s{', ' + str(vi['end']['polls']) + ' polls' if vi['end'] else ''}): "
+            f"{len(recs)} rip(s), {tot:,} emulation(s); the counter at the first poll: VEX.128 "
+            f"{vi['first']['vex128']:,}, VEX.256 {vi['first']['vex256']:,}")
+    if recs:
+        it.note("init rips (page offset: count, lives): " + ", ".join(
+            f"{r['rip']} (0x{int(r['rip'], 16) & 0xFFF:03x}: {r['count']}{', ' + str(r['lives']) + ' lives' if r['lives'] > 1 else ''})"
+            for r in recs[:12]) + (f" ... {len(recs) - 12} more" if len(recs) > 12 else ""))
+        _init_site_names(a, it, [(r["rip"], r["count"]) for r in recs], f"in {sn.name}'s -- vnni init records")
+    once = [r for r in recs if r["count"] == 1]
+    if once:
+        it.note(f"{len(once)} init site(s) emulated once: " + ", ".join(r["rip"] for r in once[:6]))
+    again = [r for r in recs if r["lives"] > 1]
+    if again:
+        it.note(f"{len(again)} init record(s) were evicted and made again (lives > 1): their counts are lower bounds")
+    if vi["end"] and vi["end"]["not_kept"]:
+        it.note(f"{vi['end']['not_kept']} read(s) of further init rips were not kept (at most {vi['end']['max']} "
+                "rips are kept)")
+    it.add(vi["ev"][:1] + [e for e in vi["ev"] if VI_REC_RE.match(e.text)][:4])
 
 
 @check("libz_bind", "VNNI libz patch: fingerprint-gated libz.so binds fired", "wave 5; vnni-perf INTEGRATION.md",
@@ -2496,7 +2656,23 @@ def c_apgetty(a, it):
     it.set(PASS, f"desktop.apgetty.enable={en or '(unset)'} init.svc.apgetty={svc or '(unset)'}")
 
 
-@check("slotsync", "No held system update (gb_slotsync HOLD)", "checklist 24; OTA.md", "SW")
+# (wave 11, w11prep ota-hw3; third hardware test 2026-11-06) A Google A/B system update (GmsCore's "System update"
+# screen -> update_engine, Virtual A/B) written into the other slot during this boot. Once update_engine has applied
+# it, gb_slotsync makes that slot the systemd-boot default within 60 s (same KMI), so the next start runs a build this
+# image was not made for (OTA gate: unvalidated; after its first boot_completed the snapshot merge removes the way
+# back). The first boot of the wave-10 stick logged one being applied and this item said "no HOLD line". Sources: the
+# kernel log (gb_slotsync's own lines) and logcat (update_engine; the snapshots keep only a tail of it, so a log that
+# shows none of these lines does not prove that no update ran).
+UE_APPLY_RE = (r"update_engine: \[INFO:[^\]]*\] (?:Starting to apply update payload operations"
+               r"|PreparePartitionsForUpdate done|Successfully created all snapshots for target slot _[ab])")
+UE_TARGET_RE = (r"update_engine: \[INFO:[^\]]*\] (?:Successfully created all snapshots for target slot _([ab])"
+                r"|Opening /dev/block/by-name/[a-z_]+_([ab]) partition)")
+UE_DONE_RE = r"update_engine: \[INFO:[^\]]*\] Update successfully applied, waiting to reboot"
+SS_APPLIED_RE = r"gb_slotsync: update applied, slot ([ab]) active"
+SS_SWITCH_RE = r"gb_slotsync: slot ([ab]): kernel check passed \(.*\): switching the default"
+
+
+@check("slotsync", "No held or pending system update (gb_slotsync HOLD, update_engine)", "checklist 24; OTA.md", "SW")
 def c_slotsync(a, it):
     hold = a.b.dm(r"gb_slotsync: HOLD slot ")
     line = None
@@ -2507,8 +2683,31 @@ def c_slotsync(a, it):
     it.add(hold[:2]).add([line] if line else [])
     if hold or (line and line.text.split("HOLD:", 1)[1].strip()):
         return it.set(FAIL, "gb_slotsync holds a system update (kernel interface mismatch, OTA.md)")
+    # (wave 11, ota-hw3) an update applied, completed or followed by gb_slotsync during this boot
+    sw, app = a.b.dm(SS_SWITCH_RE), a.b.dm(SS_APPLIED_RE)
+    done, apply_, tgt = a.b.lc(UE_DONE_RE), a.b.lc(UE_APPLY_RE), a.b.lc(UE_TARGET_RE)
+    cur, ce = a.b.prop("ro.boot.slot_suffix")
+    cur = (cur or "").lstrip("_")
+    slot = next((m.group(1) for _e, m in sw + app), None) or next(
+        (m.group(1) or m.group(2) for _e, m in tgt if (m.group(1) or m.group(2)) != cur), None) or "?"
+    it.add(sw[:1]).add(app[:1]).add(done[:1]).add(apply_[:1]).add(apply_[-1:]).add(tgt[:1])
+    it.add([ce] if ce and (sw or app or done or apply_) else [])
+    stay = f"; to stay on this build, pick '(slot {cur.upper()})' in the boot menu at the next start" if cur else ""
+    if sw:
+        return it.set(FAIL, f"a system update completed into slot {slot.upper()} during this boot and gb_slotsync made "
+                            f"it the boot default: the next start runs that build, which this image was not made for "
+                            f"(OTA gate: unvalidated; OTA.md){stay}")
+    if done or app:
+        return it.set(FAIL, f"a system update completed into slot {slot.upper()} during this boot (update_engine: "
+                            f"waiting to reboot): with the same kernel interface gb_slotsync makes it the boot default "
+                            f"within 60 s, and the next start runs another build (OTA.md){stay}")
+    if apply_:
+        return it.set(FAIL, f"a Google system update was being installed into slot {slot.upper()} (update_engine) in "
+                            f"this boot's log: once it completes, gb_slotsync makes slot {slot.upper()} the boot "
+                            f"default and the next start runs another build, which this image was not made for "
+                            f"(OTA.md){stay}")
     if line or a.b.klog_from_zero:
-        return it.set(PASS, "no HOLD line")
+        return it.set(PASS, "no HOLD line, no system update applied in the logged window")
     it.set(UNKNOWN, "no summary line and the kernel log is wrapped")
 
 
@@ -2637,6 +2836,71 @@ def c_firmware(a, it):
 HW_DEPENDENT_PROC = re.compile(r"surfaceflinger|allocator|composer|camera|dras|audio|bootanim|minigbm|"
                                r"gpu|nvk|iptsd|sensors", re.I)
 
+# (wave 11, w11prep anr-battery-hw3) debuggerd's stack dumps as the kernel log shows them. For every native process it
+# dumps (a crash, or a backtrace request) bionic's debuggerd handler starts crash_dump64 and a copy of the process
+# named after the dumping thread; both end as children of init, which logs 'init: Untracked process (pid: P name:
+# (crash_dump64) ...' and, a few pids later, '... name: (<thread name>) ...'. ActivityManager's ANR trace collection
+# (and system_server's watchdog) dumps a fixed list of native services one after another (Watchdog's
+# NATIVE_STACKS_OF_INTEREST: servicemanager, vold, netd, statsd, audioserver, surfaceflinger, cameraserver, the media
+# servers, ...); a native crash dumps one process. The kernel log covers the whole boot, each 6000-line logcat window
+# only seconds of it: the third native boot (wave 10 USB, 2026-11-06) had no 'ANR in' line in any window, but two such
+# bursts (639-643 s: 3 services, 851-859 s: 9 services) while the owner saw two "isn't responding" dialogs.
+UNTRACKED_RE = (r"init: Untracked process \(pid: (\d+) name: \(([^)]*)\) ppid: \d+ pgrp: (\d+) state: \w+\) "
+                r"(?!did not have)")
+DUMP_GAP_S = 20.0           # crash_dump64 reaps closer than this belong to one burst
+DUMP_BURST_MIN = 2          # distinct processes dumped in one burst: an ANR's (or the watchdog's) trace collection
+THREAD_PID_RE = re.compile(r"^(?:Hw)?[Bb]inder:(\d+)_\w+$")
+
+
+def _dump_bursts(b):
+    """[(t_first, t_last, [dumped process names], [Ev])] of debuggerd dumps (crash_dump64 reaped by init; its processes
+    of one process group are one dump), grouped into bursts DUMP_GAP_S apart; '?' = the dumped copy is not in the log;
+    a copy named after a binder thread ('binder:732_2') is named by init's service of that pid ('vold')."""
+    rows = []
+    for e, m in b.dm(UNTRACKED_RE):
+        t = KTS_RE.match(e.text)
+        if t:
+            rows.append((float(t.group(1)), int(m.group(1)), m.group(2), int(m.group(3)), e))
+    if not any(r[2] == "crash_dump64" for r in rows):
+        return []
+    svc = {}
+    for _e, m in b.dm(r"init: \.\.\. started service '([^']+)' has pid (\d+)"):
+        svc[m.group(2)] = m.group(1)
+    rows.sort(key=lambda r: (r[0], r[1]))
+    groups = []                                   # one dump: crash_dump64 processes of one process group, 2 s apart
+    for r in rows:
+        if r[2] != "crash_dump64":
+            continue
+        g = next((g for g in groups if g["pgrp"] == r[3] and abs(r[0] - g["t"]) <= 2.0), None)
+        if g:
+            g["pids"].append(r[1])
+            g["evs"].append(r[4])
+        else:
+            groups.append({"t": r[0], "pgrp": r[3], "pids": [r[1]], "evs": [r[4]]})
+    used, dumps = set(), []
+    for g in groups:
+        lo, hi = min(g["pids"]), max(g["pids"])
+        copy = next((r for r in rows if r[2] != "crash_dump64" and lo < r[1] <= hi + 4 and abs(r[0] - g["t"]) <= 2.0
+                     and r[1] not in used), None)
+        what = "?"
+        evs = g["evs"][:1]
+        if copy:
+            used.add(copy[1])
+            evs.append(copy[4])
+            what = copy[2]
+            tp = THREAD_PID_RE.match(what)
+            if tp and tp.group(1) in svc:
+                what = svc[tp.group(1)]
+        dumps.append((g["t"], what, evs))
+    out = []
+    for t, what, evs in dumps:
+        if out and t - out[-1][1] <= DUMP_GAP_S:
+            b0 = out[-1]
+            out[-1] = (b0[0], t, b0[2] + [what], b0[3] + evs)
+        else:
+            out.append((t, t, [what], list(evs)))
+    return out
+
 
 @check("crashes", "Crashes: tombstones, fatal signals, crash loops, kernel oops/WARN", "all rows", "SW")
 def c_crashes(a, it):
@@ -2659,11 +2923,34 @@ def c_crashes(a, it):
         it.note("crashing: " + ", ".join(f"{p} ({len(evs)} lines)" for p, evs in procs.items()))
     if a.tombstones:
         it.note(f"{len(a.tombstones)} tombstone(s) written")
+    # (wave 11, w11prep anr-battery-hw3) debuggerd's stack dumps from the kernel log (see UNTRACKED_RE)
+    bursts = getattr(a, "dump_bursts", None) or []
+    anr_like = [x for x in bursts if len(set(x[2]) - {"?"}) >= DUMP_BURST_MIN]
+    for t0, t1, names, _evs in bursts:
+        named = [n for n in names if n != "?"]
+        if len(set(named)) < DUMP_BURST_MIN:
+            kind = ("a native crash or a backtrace request" if len(names) == 1
+                    else "native crashes or backtrace requests")
+        elif len(set(named)) == len(named):
+            kind = "the native services an ANR's (or system_server's watchdog's) trace collection dumps"
+        else:                                     # (review) a crash loop chained in, or two collections in a row
+            kind = "native crashes or back-to-back trace collections (a process dumped more than once)"
+        cnt = Counter(names)                      # (review) a crash loop is 'surfaceflinger x37', not 37 names
+        shown = ", ".join(n + (f" x{cnt[n]}" if cnt[n] > 1 else "") for n in dict.fromkeys(names))
+        it.note(f"debuggerd stack dump at {t0:.0f}" + (f"-{t1:.0f}" if t1 - t0 >= 1.0 else "") +
+                f" s of {len(names)} process(es) ({shown}): {kind}")
+    for _t0, _t1, _n, evs in anr_like[:2]:
+        it.add(evs[:2])
     if a.kernel_issues:
         return it.set(FAIL, f"{len(a.kernel_issues)} kernel oops/BUG/WARNING line(s)")
     if not procs and not a.tombstones:
         if not a.b.logcat:
             return it.set(UNKNOWN, "no logcat in the snapshots")
+        if anr_like:
+            return it.set(UNKNOWN, f"no crash line in the logs, but {len(anr_like)} debuggerd stack dump burst(s) of "
+                                   "system services (at " + ", ".join(f"{x[0]:.0f} s" for x in anr_like) +
+                                   "): the trace collection of an ANR (or of system_server's watchdog) whose "
+                                   "'ANR in' line is outside the logcat windows")
         return it.set(PASS, "no tombstone, fatal signal, crash loop or kernel warning")
     if not a.judge_hw:
         other = [p for p in procs if not HW_DEPENDENT_PROC.search(p)]
@@ -2861,6 +3148,125 @@ def _hal_flaps(seq):
     return [(ch[i], ch[i + 1]) for i in range(len(ch) - 1) if ch[i + 1] - ch[i] < HAL_FLAP_S]
 
 
+# (wave 11, w11prep battery-lowshut) gb_power's low-battery guard (gb_power.c section A, lowshut_eval()): at a combined
+# level <= 3 % on battery (no charger, discharging, every pack read) held 60 s, and not before 60 s after
+# sys.boot_completed, it requests sys.powerctl=shutdown,battery once (with a test_power battery_capacity_level
+# parameter: capacity level critical first, Android's BatteryService shuts down). Its lines:
+#   "gb_power: low-battery guard: on (...)" / "... off (gb.power.lowshut=0)"      at the daemon's start
+#   "gb_power: low battery: N% on battery: a clean shutdown in 60 s unless a charger is connected"   a hold starts
+#   "gb_power: low battery: shutdown hold ended (<why>; N% <status> ac=A)"        a hold ends
+#   "gb_power: low battery: N% on battery, but not 60 s past sys.boot_completed yet: the shutdown waits"
+#   "gb_power: low battery: N% discharging ac=0 for H s, B s after boot_completed: requesting a clean shutdown (...)"
+#   init: "init: Received sys.powerctl='shutdown,battery' from pid: P (/vendor/bin/gb_power)"
+# A decision near the end of a boot is usually after its last snapshot: the NEXT boot's copy of this boot's live kernel
+# log (next_boot_tail, as in the suspend item) and its sys.boot.reason.last (shutdown,battery) show it.
+LS_ON_RE = re.compile(r"gb_power: low-battery guard: (on|off)\b")
+LS_ARM_RE = re.compile(r"gb_power: low battery: (\d+)% on battery: a clean shutdown in (\d+) s")
+LS_END_RE = re.compile(r"gb_power: low battery: shutdown hold ended \(([^;)]*)")
+LS_GATE_RE = re.compile(r"gb_power: low battery: (\d+)% on battery, but not (\d+) s past sys\.boot_completed")
+LS_TRIP_RE = re.compile(r"gb_power: low battery: (\d+)% discharging ac=(\d) for (\d+) s, (-?\d+) s after "
+                        r"boot_completed: requesting a clean shutdown \((.*)\)$")
+LS_INIT_RE = re.compile(r"init: Received sys\.powerctl='shutdown,battery' from pid: \d+(?: \(([^)]*)\))?")
+LS_PCT, LS_CLEAR_PCT, LS_HOLD_S, LS_BOOT_S = 3, 5, 60.0, 60.0
+LS_MISS_S = 120.0         # on battery at <= 3 % this long past the earliest decision time without one: the guard failed
+
+
+def _lowshut_prev(a, it):
+    """(wave 11) A note when the previous boot ended with a low-battery shutdown (bootstat's sys.boot.reason.last)."""
+    last_reason, _e = a.b.prop("sys.boot.reason.last")
+    if last_reason == "shutdown,battery":
+        it.note("the PREVIOUS boot ended with a low-battery shutdown (sys.boot.reason.last = shutdown,battery)")
+
+
+def _lowshut(a, it, gbp, problems):
+    """Item battery_hal part 5: judges the guard's decisions (and a missing one) against gb_power's own battery lines
+    of this boot; notes the holds, init's acceptance and the previous boot's low-battery shutdown."""
+    tail = list(getattr(a.b, "next_tail", None) or [])
+    own = {e.text for e in a.b.dmesg}
+    ts_own = [float(m.group(1)) for e in a.b.dmesg for m in [KTS_RE.match(e.text)] if m]
+    newest = max(ts_own, default=None)
+    late = []
+    if tail and len([e for e in tail if e.text in own]) >= 20 and newest is not None:
+        late = [e for e in tail if float(KTS_RE.match(e.text).group(1)) > newest]
+
+    def find(rx):
+        out = [(e, m, _hal_kts(e)) for e, m in a.b.dm(rx.pattern)]
+        out += [(e, m, _hal_kts(e)) for e in late for m in [rx.search(e.text)] if m]
+        return sorted((x for x in out if x[2] is not None), key=lambda x: x[2])
+    on, arms, ends, gates, trips, inits = (find(rx) for rx in (LS_ON_RE, LS_ARM_RE, LS_END_RE, LS_GATE_RE, LS_TRIP_RE,
+                                                               LS_INIT_RE))
+    if not (on or arms or trips):
+        if gbp and min((int(m.group(1)) for _e, m, _t in gbp if m.group(1) is not None), default=100) <= LS_PCT:
+            it.note("no low-battery guard line from gb_power (an image before wave 11): no shutdown at a real 0 %")
+        return
+    guard_on = bool(on) and on[-1][1].group(1) == "on"
+    if on and not guard_on:
+        it.note("the low-battery guard is off (gb.power.lowshut=0 on the kernel command line)")
+    done, _e, tbc = _completed(a)
+    end = max([t for _e, _m, t in gbp] + ([newest] if newest is not None else []) +
+              [float(KTS_RE.match(e.text).group(1)) for e in late], default=None)
+    lgbp = [(e, m, _hal_kts(e)) for e in late for m in [HAL_GBP_RE.search(e.text)] if m]   # after the last snapshot
+    gbp = sorted(list(gbp) + [x for x in lgbp if x[2] is not None], key=lambda g: g[2])
+    packs = [(t, int(m.group(1)), m.group(2), int(m.group(3))) for _e, m, t in gbp if m.group(1) is not None]
+
+    def in_force(t):
+        cur = None
+        for tg, p, s, ac in packs:
+            if tg > t + 0.05:
+                break
+            cur = (p, s, ac)
+        return cur
+    for e, m, t in trips:
+        it.add([e])
+        pct, ac, held, after = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        cur = in_force(t)
+        bad = []
+        if pct > LS_PCT or ac != 0:
+            bad.append(f"at {pct} % ac={ac}")
+        if cur is not None and (cur[1] != "discharging" or cur[2] != 0 or cur[0] > LS_PCT):
+            bad.append(f"while gb_power's battery line said {cur[0]} % {cur[1]} ac={cur[2]}")
+        if held < LS_HOLD_S:
+            bad.append(f"after only {held} s at <= {LS_PCT} %")
+        if after < LS_BOOT_S or (tbc is not None and t < tbc + LS_BOOT_S - 1.0):
+            bad.append(f"{t - tbc:.0f} s after boot_completed" if tbc is not None else f"{after} s after boot_completed")
+        if bad:
+            problems.append(f"the low-battery guard requested a shutdown at {t:.1f} s " + ", ".join(bad) +
+                            f" (allowed only at <= {LS_PCT} % on battery for {LS_HOLD_S:.0f} s, from "
+                            f"{LS_BOOT_S:.0f} s after boot_completed)")
+    if len(trips) > 1:
+        problems.append(f"{len(trips)} low-battery shutdown decisions in one boot (one at most)")
+    if trips:
+        acc = [x for x in inits if x[2] >= trips[0][2] - 0.5]
+        it.note(f"low-battery guard: shutdown requested at {trips[0][2]:.1f} s ({trips[0][1].group(5)})"
+                + (f"; init took sys.powerctl=shutdown,battery at {acc[0][2]:.1f} s"
+                   + (f" from {acc[0][1].group(1)}" if acc[0][1].group(1) else "") if acc else
+                   "; init's 'Received sys.powerctl' line is not in these logs"))
+    if arms or ends or gates:
+        why = Counter(m.group(1) for _e, m, _t in ends)
+        it.note(f"low-battery guard: {len(arms)} hold(s) started, {len(ends)} ended"
+                + (f" ({', '.join(f'{k} x{v}' for k, v in sorted(why.items()))})" if why else "")
+                + ("; one wait for 60 s after boot_completed" if gates else ""))
+    # a missing decision: on battery at <= LS_PCT (a hold kept below LS_CLEAR_PCT) past the earliest decision time
+    if guard_on and not trips and tbc is not None and end is not None:
+        hold = None
+        for i, (t, p, s, ac) in enumerate(packs):
+            nxt = packs[i + 1][0] if i + 1 < len(packs) else end
+            on_bat = s == "discharging" and ac == 0
+            if not on_bat or p >= LS_CLEAR_PCT:
+                hold = None
+                continue
+            if hold is None and p <= LS_PCT:
+                hold = t
+            if hold is not None and p <= LS_PCT:
+                due = max(hold + LS_HOLD_S, tbc + LS_BOOT_S, t)
+                if nxt - due > LS_MISS_S:
+                    it.add([gbp[[g[2] for g in gbp].index(t)][0]])
+                    problems.append(f"on battery at {p} % from {hold:.0f} s to {nxt:.0f} s with the low-battery guard "
+                                    f"on and no shutdown request (due from {due:.0f} s; an unreadable pack also stops "
+                                    "it: see item batteries)")
+                    break
+
+
 @check("battery_hal", "Battery level and charger state as the health HAL shows them (wave 10)",
        "row 42; w10prep battery-userspace", "HW")
 def c_battery_hal(a, it):
@@ -2872,6 +3278,7 @@ def c_battery_hal(a, it):
     packs = [(t, int(m.group(1)), m.group(2), int(m.group(3))) for e, m, t in gbp if m.group(1) is not None]
     if not a.judge_hw:
         return a.not_here(it, "gb_power reports no battery here" if not packs else "")
+    _lowshut_prev(a, it)                          # (wave 11) a previous low-battery shutdown, with or without a pack
     if not packs:
         it.add([e for e, _m, _t in gbp[-1:]])
         return it.set(UNKNOWN, "no 'gb_power: battery N%' line: no pack was combined (see item batteries)")
@@ -2968,6 +3375,8 @@ def c_battery_hal(a, it):
     if eta:
         it.add(eta[:1])
         problems.append(f"{len(eta)} time-to-full value(s) under 60 s while not Full")
+    # 5. (wave 11) the low-battery guard: a decision only at <= 3 % on battery after boot_completed + 60 s, once
+    _lowshut(a, it, gbp, problems)
     it.note(f"gb_power composite values {allv}; AC changes: gb_power {gch}, healthd chg= {kch} after the first pack"
             + ("; Battery Debug lines paired with the healthd kmsg lines (Level judged against the composite of "
                "that moment)" if off is not None else "; no Battery Debug / healthd pairing (Level compared with every "
@@ -3042,6 +3451,7 @@ def render_md(a, src_label, other_boots):
                  + (" (boot messages present)" if b.klog_from_zero else " (wrapped: early boot lines lost)") + " |")
     else:
         L.append("| Kernel log | none |")
+    L.append(f"| Early logcat | {_cell(early_label(b))} |")
     base = a.base[0] or "unknown"
     L.append(f"| Keyboard base (DTX) | {_cell(base)} |")
     if other_boots:
@@ -3090,9 +3500,34 @@ def render_md(a, src_label, other_boots):
     return "\n".join(L)
 
 
+def early_label(b):
+    """(wave 10) One line on the boot's '== logcat-early' section for the TRIAGE header."""
+    sn, x = b.logcat_early()
+    if sn is None:
+        return ("none: a log written before wave 10 (or no snapshot of this boot written with it): logcat lines before "
+                "the first snapshot's 6000-line window are not in this log")
+    i = x["info"]
+    if i is None:
+        return f"{sn.name}: {x['lines']} line(s) (no counts line)"
+    return (f"{sn.name}: {x['lines']} line(s) from before its 6000-line window ({i['kept']} of {i['before']} kept, "
+            f"{i['avc']} avc lines left out{', CUT at ' + str(i['max_bytes']) + ' bytes' if i['cut'] else ''}; "
+            "merged into the logcat evidence)")
+
+
+def diag_json(b):
+    """(wave 10) The 'logcat_early' and 'vnni_init' objects of the JSON (None for a log before wave 10)."""
+    sn, x = b.logcat_early()
+    le = None if sn is None else {"file": sn.name, "line": x["ev"].ln, "lines": x["lines"], "counts": x["info"]}
+    sn, vi = b.vnni_init()
+    vj = None if sn is None else {"file": sn.name, "first_poll": vi["first"], "records": vi["records"],
+                                  "end": vi["end"]}
+    return {"logcat_early": le, "vnni_init": vj}
+
+
 def to_json(a, src_label):
     return {
         "tool": "analyze_gblog.py", "version": VERSION, "source": src_label, "boot": a.b.n, "env": a.env,
+        **diag_json(a.b),
         "dmi": redact(a.dmi), "snapshots": [s.name for s in a.b.snaps], "audio": [x.name for x in a.b.audio],
         "base": a.base[0], "counts": dict(Counter(i.status for i in a.items)),
         "items": [{"id": i.id, "title": i.title, "ref": i.ref, "kind": i.kind, "status": i.status,

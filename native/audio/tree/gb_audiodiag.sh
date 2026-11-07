@@ -104,6 +104,10 @@ copy_out() {   # 0 = every file of $O copied to the ESP's gblog/ (B = the boot n
   if ! mount -t vfat -o rw,flush,nosuid,nodev,noexec "$D" "$M" 2>/dev/null; then
     unlock; echo "gb_audiodiag: cannot mount $D, files kept in $O" >> "$K"; return 1
   fi
+  if [ -e "$M/gblog/OFF" ] || [ -e "$M/gblog/OFF.txt" ]; then   # (wave 11 security-review SR-2) the owner's opt-out
+    echo "gb_audiodiag: gblog/OFF exists: nothing copied, files kept in $O" >> "$K"   # (as gb_bootlog: gblog_off)
+    sync; umount "$M"; unlock; return 1
+  fi
   r=1
   B=$(tr -d '\r' < "$M/gblog/bootcount" 2>/dev/null); case $B in ''|*[!0-9]*) B=0;; esac   # a CRLF edit keeps B
   # free KiB = the third field from the end of df's last line; no number = fail closed (nothing copied)

@@ -56,6 +56,33 @@ hash; unit 1081 checks / 0 failures, also under ASan/UBSan; socket 146/146; rc l
 `aa08dc2a...` rebuilds the wave-9 `163e6f83...` byte for byte); the wave-9 binary is kept as `bin\gb_power.pre-w10`
 and in `C:\GB-x86\archive\pre-w10\`.
 
+**Wave 11 (w11prep battery-lowshut, BACKLOG W10-BAT-LOWSHUT):** the **low-battery guard** (section A,
+`lowshut_eval()`). With percent units the status bar shows the real level, but nothing shut Android down at a real
+0 %: k16's `test_power` hard-wires `capacity_level` to `Normal` (no parameter), AOSP's BatteryService then shuts down
+only at capacity level `CRITICAL`, and the desktop HAL never shuts down itself, so the EC's cut-off ended the boot
+uncleanly. gb_power now requests `sys.powerctl=shutdown,battery` once at <= 3 % on battery for 60 s, not before 60 s
+after `sys.boot_completed` (table below). Details, the HAL and BatteryService derivation and the evidence:
+`C:\GB-build\native\w11prep\battery-lowshut\RESULT.md`.
+
+**Wave 11 final step (LEAD_W11 b, the safety audit's W11-S2 / W11-S3; a shutdown that should not happen is worse
+than none):** the guard acts only on CLEAN readings: every present pack and every charger supply read fresh (a value
+the 60 s read-failure cache supplies never counts; the cache's age includes suspended time), at least one charger
+supply (ADP1) present and offline, `BAT1` (the clipboard's pack) present with data and, unless the DTX reports the
+base detached, `BAT2` (the base's pack) too. A hold starts only at the second of **2 consecutive consistent clean
+readings at <= 3 %** (>= 5 s apart, within 1 point: the ~0 %-for-a-minute EC glitch); a change of the present packs,
+a charger uevent (a plug or unplug) or a resume from suspend (CLOCK_BOOTTIME gains on CLOCK_MONOTONIC, or
+`suspend_stats/success` changes) ends a hold and a started confirmation. Right before the decision (and before every
+later `sys.powerctl` request) ADP1 / every charger supply and `test_ac`'s state (test_power's `ac_online`) are read
+again: online or unreadable -> no shutdown, the hold ends ("... withdrawn" for a later request). New log lines:
+`gb_power: low battery: N% but no shutdown hold: <reason>` (a safety block, once per reason) and `... shutdown request
+withdrawn (<reason>)`; the start line reads `low-battery guard: on (a clean shutdown at <= 3% on battery for 60 s after
+2 consistent readings, every pack and the charger read fresh, not before 60 s after sys.boot_completed)`. Binary
+`bin\gb_power` `e138b26c...` (source `2832a101...`, test `c550de5c...`; NDK static build on the builder by the wave-11
+final step, `D:\gb-w11fix\logs\25_gbpower_buildsh.console.log`: unit 1173 checks / 0 failures, also under
+ASan/UBSan with no reports; socket 157/157; rc lint clean); the wave-11 candidate-1 binary `153cd91d...` (image
+`08b44460`, source `dc04ee16...`) is kept as `bin\gb_power.w11-08b44460`, the wave-10 `29c86218...` as
+`bin\gb_power.pre-w11`; pre-images `C:\GB-x86\archive\pre-w11-final\`.
+
 `gb_power` is the Surface Book 3 power daemon for Googlebook OS native images (`gb.hw=native`). It is a static
 bionic binary started by init at `early-init` and runs as root in `u:r:shell:s0`. It implements plan Phase 3
 (gb_power hot-plug hardening, deliverables 1-8), the server side of the Phase 7 control socket, plan P1 item 7
@@ -70,6 +97,7 @@ notes: `C:\GB-build\native\dgpu\integration\gb-power.md` (section 7 is v1.2).
 | Area | Behaviour |
 |---|---|
 | A. Battery (wave 10: percent units) | Sums BAT1 + BAT2 into `test_power`'s `test_battery` (capacity = charge_now = level, charge_full 100, current 0, design scaled for the state of health), mirrors ADP1, hides BATn from the health HAL. The only writer of `test_power`. |
+| A. Low-battery guard (wave 11, w11prep battery-lowshut) | Nothing else in lapis shuts down on an empty battery (k16's `test_power` reads capacity level `Normal` always; AOSP's BatteryService shuts down only at `CRITICAL`). At a combined level <= 3 % on battery (no charger online, discharging, every present pack read) for 60 s, and not before 60 s after `sys.boot_completed=1`: once per boot `sys.powerctl=shutdown,battery` (init's clean shutdown: services stopped, `/data` unmounted; the next boot's `sys.boot.reason.last` is `shutdown,battery`). Hysteresis: 4 % keeps a running hold, 5 % or a charger ends it. Nothing is added while `sys.powerctl` is already set. (wave 11 final) Only clean readings count (fresh pack and charger reads, ADP1 present and offline, BAT1 read, BAT2 read unless the base is detached); 2 consecutive consistent readings at <= 3 % start a hold; a pack-set change, a charger uevent or a resume ends it; ADP1 and `test_ac` are read again right before the request. With a `battery_capacity_level` parameter (a later kernel) `test_battery` also carries the class (`full` / `low` <= 10 %, normal again >= 12 % / `normal`; `critical` only at the decision, so Android's own shutdown runs; `sys.powerctl` follows if it has not started within 30 s, 120 s once `sys.shutdown.requested` is set). Kill switch: `gb.power.lowshut=0` on the kernel command line. Log lines `gb_power: low-battery guard: on/off` (start) and `gb_power: low battery: ...` (hold, end, wait, decision); analyser item 42 judges them. |
 | B. Detach, quick path (unchanged) | No driver on any NVIDIA function and nouveau not used this boot: `HB`, then `CONFIRM`. |
 | B. Detach, slow path | `/dev/gb_dgpu/detaching` set, load-window check (a live `gb_nouveau` ESP lock owner, or v1.2 gb_power's own rebind watch, refuses with N15), boot-disk guard, **(v1.2) app graphics forced to Intel (`vendor.gb.gfx_active=intel`) before anything else**, LATCH_LOCK, N07, `ctl.stop` of `gb_dgpu_test`, `gb_nvk_probe`, (v1.2) `gb_gfx_selftest` and `gb_gpu_compute`, nouveau DRM nodes `chmod 000` (also nodes that appear later), wait for the services, the load window and the `/sys/module/nouveau/refcnt` gate (30 s; **v1.2: refused after 5 s when every holder is a closable app process**), worker job 1 unbinds, main-loop re-check, worker job 2 PCI-removes every 10de function (the child re-checks the gate before each write), last checks, N12, `CONFIRM`. A refusal because of holders increments `detach_ref` (v1.2) and posts N08 unless GbGpu declared `ui-caps notify`. |
 | B. Latch lifecycle | `LATCH_LOCK` while any driver is bound to any 10de function or a base drive is mounted, re-issued after every resume and every `BASE_CONNECTION`; `LATCH_UNLOCK` when driverless, at start only if driverless, at shutdown, on SIGTERM only if driverless or shutting down. |
@@ -157,12 +185,40 @@ the real uid 1000 as role `other`, answers `get-mode` with `EPERM`, and `strings
 | `-v` | `--dtx-monitor` (unchanged in v1.2)
 
 `-o` (wave 10) prints one combined-battery pass and the values the daemon publishes, and writes nothing (no
-`test_power` parameter, no BATn hiding).
+`test_power` parameter, no BATn hiding). (wave 11) It never runs the low-battery guard.
+
+Kernel command line (read at start): `gb.dgpu=keep`, `gb.power.hide=0`, `gb.boot=`, `gb.nouveau=`, `module_blacklist=`
+and (wave 11) `gb.power.lowshut=0` (the low-battery guard off).
 
 `-K` changes which driver gb_power leaves bound on the VGA function (default `nouveau`; `-K ''` unbinds every
 driver, tests only). Non-VGA functions are always kept driverless (except with `-G`/`gb.dgpu=keep`).
 
 ## Test map
+
+### Wave 11 low-battery guard (`test/test_gb_power.c`, `test_lowshut`)
+
+| Id | What is checked |
+|---|---|
+| W11-LS-1, -2 | k16 (no capacity_level parameter): armed at once, `sys.powerctl=shutdown,battery` exactly 60 s later (not 59 s), once, one log line in 5 min; the 20 s backstop pass alone decides within 60-80 s; the daemon's own shutdown handling (`powerctl_check`) follows. |
+| W11-LS-3 | The boot gate: a hold from before `sys.boot_completed` decides exactly 60 s after it, the wait logged once; never without `sys.boot_completed`. |
+| W11-LS-4 | Never on the charger (1 % charging / not charging, 10 min); a plug-in ends a hold, an unplug starts a new one; a decision is final. |
+| W11-LS-5 | Hysteresis 3/5 %: 3/4 % jitter keeps the hold, no decision at 4 %; 5 % ends it, 4 % starts none. |
+| W11-LS-6, -7 | An incomplete sum (a present pack without data) never decides, the clipboard alone does; `gb.power.lowshut=0`. |
+| W11-LS-8 | With `battery_capacity_level`: the class (low <= 10, normal >= 12, full), `critical` only at the decision, never on the charger; `sys.powerctl` 30 s later (120 s with `sys.shutdown.requested`), nothing when Android set `sys.powerctl` itself. |
+| W11-LS-9, -10, -11 | `sys.powerctl` not taken: asked 3 times 30 s apart; `-o` never decides or writes; nothing added while `sys.powerctl` is set. |
+| (wave 11 final) W11-LS-1..8 | follow the 2-readings rule (the hold at the second clean reading 5 s after the first; 3/4 % jitter before a hold starts none); W11-LS-6: the clipboard alone decides only when the DTX says the base is detached. |
+| W11-LS-12, -13 | (W11-S2) BAT1 absent / its reads failing while BAT2 is at 1 %: never a hold (one log line); a failed read ends a running hold. |
+| W11-LS-14 | (W11-S2) a pack-set change ends a hold; base detached: the clipboard alone starts again from 2 readings and decides; re-attached: the hold ends. |
+| W11-LS-15, -16, -17 | (W11-S3) ADP1 unreadable at a plug-in ends the hold (no shutdown while plugged in); a charger uevent ends a hold (a pack's uevent does not); a resume (the suspend clock, `suspend_stats/success`) ends a hold; a cached value ages with suspended time. |
+| W11-LS-18 | (W11-S3) the re-read right before the decision: `test_ac` online -> no request, the hold ends; `ls_charger_reread()` on fake trees (online, unreadable, no ONLINE, no charger, `test_ac` unreadable, a pack's failed read is not a charger's). |
+| W11-LS-19, -20, -21 | the 2-readings rule (single 0 % readings, 3 -> 0 % inconsistent, < 5 s apart); no charger supply at all: never; a 64 s 0 % glitch does not decide (the candidate-1 rule did after 60 s), 70 s does. |
+
+The scenario harness `C:\GB-build\native\w11prep\battery-lowshut\tests\run_harness.py` (the wave-10 one plus the guard:
+an oracle of the rule, the HAL's capacity-level latch and a BatteryService model; 21 mutants) runs on the builder.
+(wave 11 final) Its hardened copy `C:\GB-build\native\w11prep\battery-lowshut\work\final-w11\tests\` (oracle
+`hal_model.guard_rule()`, 312 runs incl. the safety audit's A1-A13, 30 mutants incl. MLF1-MLF8 / MLF11; its control
+`harness_control_w11c1.py` on the candidate-1 guard; `unit_mutants.py`: U1-U13 against these unit tests) is the
+registered one (`w11.battery-lowshut.harness`, `.harness-control-w11c1`, `.unit-mutants`).
 
 ### v1.2 (TASKS_1B 2.2)
 
@@ -216,6 +272,13 @@ driver, tests only). Non-VGA functions are always kept driverless (except with `
 | GP-25..32 | `test_load_window`, `test_gate_split`, `test_release_window`, `test_off_rebind`, `test_bootdisk_latch`, `test_misc`, `test_socket_cmds` | v1.1 additions; (v1.2) GP-30 rewritten for `reconcile_off()`, GP-32 for the retired gfxdriver gate and the 26.2 effects. |
 
 ## Hardware-only checks (nothing here ran on the real SB3)
+
+Wave 11 (low-battery guard): one supervised run down to 3 % on battery after a full start (the charger at hand):
+`gb_power: low battery: N% on battery: ...` at 3 %, the decision 60 s later, init's `Received
+sys.powerctl='shutdown,battery'`, a clean power-off before the EC's cut-off; the next start's `sys.boot.reason.last`
+= `shutdown,battery` and analyser item 42 PASS. Whether the packs' combined 3 % leaves enough time for the clean
+shutdown, and at which level the EC sets the packs' own critical flag (surface_battery's capacity level), are
+hardware facts.
 
 Wave 1 (GP-HW, plan Phase 3): driverless detach/attach timing; the EC timeout with `--dtx-monitor`; bound and idle
 detach, rescan and rebind; an `nvk_probe` holder refused; gb_power killed mid-decision; detach while suspended;

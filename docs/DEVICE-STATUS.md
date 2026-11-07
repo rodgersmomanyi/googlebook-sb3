@@ -16,8 +16,11 @@ base, touchpad, batteries, charger and detach did not. **The second native boot,
 `e0825ee1…`; results per item in
 [Second real-hardware results](#second-real-hardware-results-2026-11-01-the-wave-9-usb-image)), confirmed the wave 9
 fix: the keyboard base, touchpad, both batteries, the charger and the detach device appeared, and the keyboard, the
-touchpad and sound worked; Android's battery level read 0 % (wave 10 fixes it in the image to test next,
-`3b6330d9…`). Every row below that the tables do not mark otherwise is still untested on hardware. The VMware VM
+touchpad and sound worked; Android's battery level read 0 % (wave 10 fixed it). **The third native boot, on
+2026-11-06** (the wave 10 image `3b6330d9…`; results per item in
+[Third real-hardware results](#third-real-hardware-results-2026-11-06-the-wave-10-usb-image)), confirmed the battery fix; both cameras showed a
+black preview, and a Google system update was being installed into slot A. The image to test next is the final
+wave 11 image `e43a463b…`, on a freshly written stick (checklist 30-35). Every row below that the tables do not mark otherwise is still untested on hardware. The VMware VM
 cannot see this hardware; a VMware boot of the native tree (`GB_NATIVE_TEST=1`, see [NATIVE.md](NATIVE.md)) only
 proves that the modules load and the services start. "Ready" means the driver is built (or ships with lapis), the firmware is staged and the configuration exists.
 It still needs a native boot to confirm. Per-subsystem detail: [DRIVERS.md](DRIVERS.md).
@@ -35,6 +38,52 @@ Status key:
 
 Tags: **[V]** verified against the ACPI tables, the source or the inventory. **[I]** inferred.
 
+## Third real-hardware results (2026-11-06, the wave 10 USB image)
+
+The third native boot: the owner wrote the wave 10 USB image (`3b6330d9…`, kernel build #16) to a fresh stick and
+started it once (the first start of that stick, the normal `(slot B)` entry) on the Surface Book 3 13.5" with the
+keyboard base attached, for about 15 minutes. The boot-log analyser of wave 10 on that start: **41 PASS, 0 FAIL,
+1 UNKNOWN** of 42 items (suspend); the wave 11 analyser on the same logs: 39 PASS, 1 FAIL, 2 UNKNOWN (its new
+`slotsync` rule FAILs on the Google update being installed, as designed, and its `crashes` item reads the two
+crash-dump bursts of the "not responding" dialogs as UNKNOWN). Android reached `boot_completed` after 88.7 s. By hand
+the owner saw a real battery level (74 % -> 62 % in about 17 minutes of a busy first start, never 0 %), a **black
+preview on both cameras** in the Camera app, Settings showing "Installing system update" (34.25 MB), "not responding"
+dialogs of Settings and the Play Store (36 app updates were pending) and the Terminal app's "Unrecoverable error"
+once, after which Debian started. Personal values from those logs are not reproduced here. The last column says what
+wave 11 changed.
+
+| # | Item (row; checklist) | Third boot (wave 10 image) | Wave 11 |
+|---|---|---|---|
+| 1-2 | Kernel build #16, kernel command line | PASS | - |
+| 3 | `gbinit` module loading | PASS: 61 modules, none failed | - |
+| 4-6 | 8250 serial, Surface Aggregator, SAM registry (rows 12, 18, 42; 19) | PASS: the first probe failed as expected; `gb_hw_sam` bound it again (`bound binds=1 waited_ms=0 kbd=1 tp=1 bat=11 adp=1 dtx=1 base=attached`); 9 client devices | - |
+| 7-8 | Base keyboard and touchpad (rows 18, 19) | PASS | - |
+| 9 | Batteries BAT1/BAT2 and charger ADP1 (row 42) | PASS: both packs and the charger present; the level was right (item 42) | the low-battery shutdown at 3 % (checklist 30, 33): not yet seen on the laptop, keep above about 10 % |
+| 10-12 | Detach device, buttons, posture | PASS: DTX ready with the base attached; two `gpio-keys`; `OPEN` | - |
+| 13 | CPU power limits (row 1; 3) | PASS: the firmware's limits kept | an opt-in power policy, off by default; a power measurement at every start (checklist 34) |
+| 14 | Suspend and resume (row 46; 11) | UNKNOWN: no lid close or sleep in the logged time | - (checklist 11) |
+| 15-17 | Intel GPU, panel, backlight, touchscreen and pen | PASS | - |
+| 18-19 | Wi-Fi and Bluetooth (rows 37, 38) | PASS: firmware loaded, both started (the Google update downloaded over Wi-Fi) | - |
+| 20-21 | Sound card, DRAS (row 39) | PASS | - |
+| 22-23 | Sensors, rotation per posture (rows 27-28) | PASS: every sensor; `ok: laptop posture, rotation locked` | the sensor-hub wait is bounded at 8 s |
+| 24 | Cameras (row 29; 9) | PASS in the analyser: the IPU4P bound and its firmware authenticated, `Connected 3 cameras`, `ov5693` and `ov8865` probed, the rear focus motor loaded without the `-121` error (the wave 10 fix works), the camera provider running with 0 HAL load failures. **But the Camera app showed a black preview on the front and the rear camera**; the logs of that start hold no camera session, so the cause is not known | the opt-in camera self-test (checklist 32) |
+| 25-28 | dGPU D3cold, nouveau, the dGPU report, graphics state (row 17) | PASS: D3cold seen, nouveau bound and clean, the report written and collected, Intel active | - |
+| 29-34 | Gatekeeper, zram, the VNNI counter, the libz binds, fs-verity, the serial console off | PASS | - |
+| 35 | No held or pending update (wave 11: also a Google update being installed) | PASS on the wave 10 rule; the wave 11 `slotsync` rule FAILs by design: a Google A/B update (a 34.25 MB delta, all eleven A/B images) was being installed into slot A when the logs end. Its own start was not tried | Google updates are followed automatically; to stay on the tested build choose `(slot B)` ([OTA.md](OTA.md#google-updates-on-the-usb-stick-and-on-native-installs-wave-11)); checklist 35 |
+| 36 | OTA gate | PASS: `validated` (the running build is the one the image was made for); `gb_slotsync` had nothing to follow yet; the firmware updater was stubbed | - |
+| 37-38 | The bring-up config unused, no missing firmware | PASS | - |
+| 39 | Crashes | PASS on the wave 10 rule; the wave 11 rule: UNKNOWN: no crash line, but two stack-dump bursts of system services (at 639 s and 851 s): the trace collection of the "not responding" dialogs, while the stick could not keep up with the first start's writes (USB storage, write cache off), not a fault of the image | the analyser reads such bursts |
+| 40 | SELinux: no enforced denial | PASS | - |
+| 41 | Boot completed | PASS: after 88.7 s (the first start of a freshly written stick) | - |
+| 42 | Battery level (the health HAL) | PASS: the HAL's level equalled `gb_power`'s combined level in all 165 battery updates of that start; no `battery none` with a pack; no charger flapping | - |
+
+Not in the log, still to test by hand on the wave 11 image (the order of the final test is checklist 30-35): a
+picture from both cameras (or the self-test's verdict), a lid close (suspend), a start with the clipboard detached
+(posture `TABLET`) and a detach and reattach, the charger plugged and unplugged by hand (one animation each, within
+about 2 s), the Fn, media, volume and brightness keys, touchpad gestures, USB-C, the SD card, the dock, pen pairing,
+an NVIDIA app and the `[NVIDIA test]` entry, and for every start whether it was a cold start or a restart. Do not
+start the wave 10 stick of this test again: it holds the Google update in slot A; write the wave 11 image to a stick.
+
 ## Second real-hardware results (2026-11-01, the wave 9 USB image)
 
 The second native boot: the owner wrote the wave 9 USB image (`e0825ee1…`, kernel build #16) to the stick with Rufus
@@ -48,8 +97,8 @@ and saw Wi-Fi and Bluetooth on. One new bug: the battery icon read 0 % with the 
 plugged in, and after unplugging the "charger connected" animation kept flickering (item 9). Personal values from
 those logs (serial numbers, network and account names) are not reproduced here. The first-boot column repeats the
 verdicts of [First real-hardware results](#first-real-hardware-results-2026-10-31-the-wave-8-usb-image); the last
-column says what wave 10 changed. **The image to test next is the wave 10 USB image
-`3b6330d9…`** (flash it with Rufus in DD mode, or write it with option 1 of the wave 10 installer ISO).
+column says what wave 10 changed. The wave 10 USB image `3b6330d9…` was tested next:
+[Third real-hardware results](#third-real-hardware-results-2026-11-06-the-wave-10-usb-image).
 
 | # | Item (row; checklist) | First boot (wave 8 image) | Second boot (wave 9 image) | Wave 10 |
 |---|---|---|---|---|
@@ -356,7 +405,8 @@ worked; [Second real-hardware results](#second-real-hardware-results-2026-11-01-
     outside that boot's log window; the analyser 17 PASS, 0 FAIL, 24 UNKNOWN). The installer ISO is not rebuilt
     yet (it still carries the wave 8 system), and the long-running VM stays on the wave 8 boot partition until
     the host has disk space for its check boot. The SAM and sensor-hub fixes need the laptop: item 29.
-* **Wave 10, 2026-11-05/06 (the second native boot's fixes; the wave 10 image has not run on the hardware yet):**
+* **Wave 10, 2026-11-05/06 (the second native boot's fixes; the wave 10 image ran on the laptop on 2026-11-06, the
+  third native boot):**
   * The second native boot
     ([Second real-hardware results](#second-real-hardware-results-2026-11-01-the-wave-9-usb-image)): the wave 9
     Surface Aggregator re-bind works (row 12). The keyboard base, touchpad, both batteries, the charger and the detach
@@ -370,6 +420,58 @@ worked; [Second real-hardware results](#second-real-hardware-results-2026-11-01-
   * Notices that are no longer true are not shown (see "Notifications reach the person" under wave 6).
   * Tested in VMware: VM-1 on the wave 10 USB image (the analyser 17 PASS, 0 FAIL, 25 UNKNOWN; every wave 2-10 check VMware can show, among them the desktop health HAL's level equal to the combined battery's), a rehearsal of the VM build on a throwaway VM (a fresh first boot, forced and validated update boots: the planted stale notices dropped, this start's notice shown once after the sign-in), `verify_image.py` on the USB image, the export and the VM build, the host suites and every post area test. The installer ISO is current again: `e0bb15d5…` installs the wave 10
     system with both options (T0, T1a/T1b (option 1 wrote a disk byte-identical to the wave 10 USB image), the dual-boot groups G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-11-06 (12 test ids, 378 checks, 0 failed; the same counts as the wave 8 ISO's)). The long-running VM now runs the wave 10 VM build (written 2026-11-06 after a verified backup of its boot partition; its lock-screen PIN path is unchanged; its check boot passed without a sign-in).
+* **Wave 11, 2026-11-06/07 (the final wave: the third native boot's findings and the last prepared items; the wave
+  11 image has not run on the hardware yet). No further feature waves follow, only small, targeted fixes for real
+  hardware findings:**
+  * The third native boot ([Third real-hardware results](#third-real-hardware-results-2026-11-06-the-wave-10-usb-image)): the
+    wave 10 battery fix works (row 42); both cameras showed a black preview (row 29); a Google A/B update was being
+    installed into slot A; Settings and the Play Store showed "not responding" while the stick could not keep up
+    with the first start's writes (not a fault of the image).
+  * Row 42 (low battery): `gb_power` asks init for a clean shutdown (`sys.powerctl=shutdown,battery`) at 3 % or less
+    on battery: only on clean readings (every pack and the charger read fresh, `BAT1`, and `BAT2` unless the base is
+    detached), after 2 consistent readings at least 5 s apart and a 60-s hold, never before 60 s after
+    `sys.boot_completed`; a charger, a change of the packs or a resume ends the hold, and the charger is read again
+    right before the request. Kill switch `gb.power.lowshut=0`. Not yet seen working on the laptop: **do not run the
+    battery below about 10 %; plug in** (checklist 30, 33).
+  * Row 29 (cameras): an opt-in self-test, `/odm/bin/gb_camtest.sh` (service `gb_camtest`, disabled; it starts only
+    at `sys.boot_completed=1` with `vendor.gb.camtest=1`, which nothing in the image sets): it lists the cameras with
+    libcamera, captures 3 s from each (no picture is stored) and logs frame counts, mean brightness and a verdict
+    (`gb_camtest: cam<i>: verdict ...`, `vendor.gb.camtest_result`), and at about 6 min 40 s a filtered copy of the
+    camera service's state (its client and event lines: which apps opened a camera, and when). Checklist 32. Its
+    result separates the kernel's capture path (no frames: a kernel change, not in this release) from Android's camera
+    path (frames, but a black preview).
+  * Google updates (OTA): followed automatically (the owner's decision, 2026-11-06; `gb_slotsync` unchanged): once an
+    update has completed, the next start runs the new, untested build; `(slot B)` in the boot menu stays on the
+    tested build only before the new build's first completed start; `native/hwtest/check_stick_ota.py` reads a
+    stick's slot state read-only from Windows; the analyser's item 35 `slotsync` reports an update being installed,
+    completed or followed ([OTA.md](OTA.md#google-updates-on-the-usb-stick-and-on-native-installs-wave-11)).
+  * Boot log (BACKLOG W5-early-logcat, VM1-VEX128-site): the first snapshot keeps its own logcat lines from before
+    the 6000-line window (`== logcat-early`, once per boot, no `avc:` lines, at most 1 MiB), so early lines such as
+    the key store's early-boot result are no longer lost; the summary lists every emulation site of `init` (`-- vnni
+    init records`): the log writer reads the `#UD` counter every second until the first snapshot and every 5 s after,
+    before the kernel's list of 16 recent sites drops them. The hwtest analyser reads both (an `Early logcat` row in
+    TRIAGE.md, notes on the `vnni` item that name init's instruction and its process images, two new JSON objects).
+  * Privacy (security review SR-2, SR-3, SR-4): the log files are scrubbed on the device before they reach the stick
+    (e-mail addresses, MAC and Bluetooth addresses, serial numbers, Wi-Fi network names and global IPv6 addresses
+    become placeholders; a file whose scrub fails is not written); an empty `gblog\OFF` stops all log writing; the
+    collector makes each new log folder readable only by your Windows account; `gb_power`'s control socket accepts at
+    most 2 connections from apps without a role, so no app can fill it.
+  * Power draw (power-drain): the battery drain on the second native boot was measured only during the first 4
+    minutes after flashing: 13-30 W while 5-6.5 of 8 CPUs were busy (boot dexopt, sign-in). The idle draw is
+    unmeasured. Images from wave 11 log `gb_hw: power:` windows at 330/780/1800/3600 s (off with
+    `persist.vendor.gb.power.measure=0`). Since wave 10 the health HAL reports battery current 0 by design (the level
+    fix), so battery power comes from gb_dgpu_report's 30 samples (`== power` in the dgpu report) and, from wave 11
+    on, from `gb_hw: power:`. The optional power policy and tuning stay off (`pwr.policy=1`, `pm.tune=1` on request).
+    Checklist 34.
+  * The start waits at most 8 s for the sensor hub (`gb_sensors.sh`, without the 60 forked commands of its old
+    wait loop); a read-only self-test `/vendor/bin/gb_hwcheck.sh` (checklist 31). Not in this release: the TPM
+    placeholder that would have saved init's 10 s wait (lapis's `gscd` aborted on it in VMware).
+  * Tested in VMware: VM-1 on the final USB image `e43a463b…` (the analyser 17 PASS, 0 FAIL, 25 UNKNOWN; every wave
+    2-11 check VMware can show; the camera self-test off by default, and once forced on in a throwaway copy it ran
+    once, found no camera and ended cleanly; VMware never reports Android as fully started, so that copy's start
+    condition left that part out), `verify_image.py` on the USB image, the export and the VM build, the host suites
+    and every area test. The installer ISO `4f4164a6…` installs the wave 11 system with both options (T0, T1a/T1b,
+    G1-G4 and T8 passed on 2026-11-07: 12 test ids, 378 checks, 0 failed). The long-running VM's build is unchanged.
 
 ## 1. Platform, CPU, firmware interfaces
 
@@ -462,6 +564,7 @@ worked; [Second real-hardware results](#second-real-hardware-results-2026-11-01-
 | `kernel/src/hid-surface.c`, `kernel/src/Makefile` | – | Source and out-of-tree compile test (build logs not included) |
 | `tree/gb_hw.sh` → `/odm/gb_hw.sh` | native tree | RAPL firmware-limit snapshot/restore, backlight permissions, `MSHW0040` power/volume button binding (`buttons`), opt-in posture override (`posture`), boot hardware + posture + S0ix residency summary to kmsg (`diag`) |
 | `gb_hw.rc` | native gb.rc (as `rc_text` of `hw.json`) | Starts `gb_hw.sh` at early-init (`rapl-snapshot`), `on boot` (`boot`, `buttons`), and `boot_completed` (`diag`, plus `posture` when `vendor.gb.posture` or `persist.vendor.gb.posture` is set) |
+| `gb_hw.sh power` / `power-now` / `pwrpolicy` / `pmtune` | native gb.rc, `start` at boot_completed | (wave 11) `power`: four read-only 60-s windows at 330/780/1800/3600 s (`gb_hw: power:` lines, `/data/vendor/gb/report/power-<N>.txt`; off with `persist.vendor.gb.power.measure=0`); `power-now`: one window now (`vendor.gb.power.now=1`); `pwrpolicy`: opt-in (`pwr.policy=1`), EPP and an optional PL1 cap / platform profile per power source; `pmtune`: opt-in (`pm.tune=1`), NMI watchdog off and runtime PM auto for PCI USB/audio/IPU |
 | `tree/usr/idc/Microsoft_Surface_045E_09AE_Keyboard.idc`, `..._09AF_Touchpad.idc` → `vup/usr/idc/` | native tree | Built-in keyboard and touchpad configuration |
 | `tree/usr/keylayout/Vendor_045e_Product_0921.kl`, `Surface_Slim_Pen_2_Keyboard.kl` → `vup/usr/keylayout/` | native tree | Surface Pen top button |
 | `tree/etc/excluded-input-devices.xml` → `vup/etc/` | native tree | Hides the SAM touchpad/keyboard vendor-collection inputs (BTN_MISC "gamepads"). Keeps lapis's entry; recheck against the booted vendor build |
@@ -566,10 +669,42 @@ worked; [Second real-hardware results](#second-real-hardware-results-2026-11-01-
     Android or from Windows). Start once with the clipboard detached: the posture must be `TABLET`.
 30. (Wave 10, row 42) Battery: the status-bar level equals Windows' level within 1 %, plugged in and unplugged;
     plugging in and unplugging shows the charger symbol and animation once, within about 2 s (no flicker); the
-    analyser's `battery_hal` item PASS. **Do not run the battery below about 10 %** on Googlebook until a later
-    wave: Android does not yet shut down by itself at a real 0 % (the combined battery always reports a normal
-    level band; only the battery's own cut-off would stop the laptop). Keep one start running for 15 minutes
-    (at least 7) so the 7- and 15-minute log files and the dGPU report are written.
+    analyser's `battery_hal` item PASS (confirmed on the third native boot). **Do not run the battery below about
+    10 %** on Googlebook; plug in. (Wave 11) New in the wave 11 image: Googlebook tries to shut down cleanly on its
+    own when the battery is at 3 % or less without a charger (about one minute after two consistent readings at 3 %
+    or less, never in the first minute after Android has finished starting; plugging in during that minute cancels
+    it). This has not been seen working on the laptop yet, so keep the charger in below about 10 %. Keep one start
+    running for 15 minutes (at least 7) so the 7- and 15-minute log files and the dGPU report are written.
+31. (Wave 11) The image carries a read-only self-test, `/vendor/bin/gb_hwcheck.sh` (`-h` lists its items; its
+    `battery` and `ac` items check item 30 from inside Android). It needs a shell on the laptop; lapis is a user
+    build and this laptop exposes no USB device controller, so the only route is Wireless debugging (Settings >
+    System > Developer options), which is still to be confirmed on the native install. Until then the gblog
+    collector stays the way to test the hardware.
+32. (Wave 11, row 29) Camera self-test, on a **second** start after writing the stick (the first start's app
+    updates shrink the log windows): switch Wi-Fi off before shutting down the first start; create `gb\gb.cfg` with
+    `# gb.cfg v1` and `GB_PROP_1=vendor.gb.camtest=1` and start once with `gb.overlay=1` (FLASHING.md section 8,
+    example 4); do not open the Camera app in the first 3 minutes (the privacy LED lights about 30 s after the lock
+    screen, once per camera: note it); between 3 min 30 s and 6 min 30 s after power-on open the Camera app, rear and
+    front, switching about every 20 s; keep Android running to 16 minutes, then rename `gb\gb.cfg`. The kernel log
+    then has `gb_camtest: cam<i>: verdict ...` and `vendor.gb.camtest_result`: frames that are fine point at
+    Android's camera path, dark or empty frames at exposure or the capture path, no frames at the kernel's IPU4P
+    capture path (a kernel change, not in this release). A result that stays `running` means a capture that hung:
+    restart. On another start, the Camera app alone (rear and front, switching every 20 s) at 2 min 30 s - 4 min
+    15 s and 6 min 30 s - 8 min 15 s after power-on puts a camera session into the 3- and 7-minute log files.
+33. (Wave 11, row 42) Low-battery shutdown (once, supervised, the last test, charger at hand, screen on): run down to
+    3 % unplugged; Googlebook powers off cleanly about a minute later (`gb_power: low battery: 3% on battery: ...`,
+    then `requesting a clean shutdown`); the next start's logs show `shutdown,battery` (`sys.boot.reason.last`) and
+    the analyser's item 42 PASS. A line `low battery: N% but no shutdown hold: <reason>` is a safety block (a pack or
+    the charger not read): keep the logs. Off for one boot: ` gb.power.lowshut=0` at the boot menu.
+34. (Wave 11) Power draw: on a later start, on battery (charged to 50 % or more, base attached, the brightness as on
+    Windows), sign in and leave it idle with the screen on for 16 minutes; the start's `gb_hw: power:` windows at
+    330 and 780 s go into the 7- and 15-minute log files (an optional 61-minute idle gives the 30- and 60-minute
+    windows in the next start's first file).
+35. (Wave 11) Google updates: if Settings shows "Installing system update", the next start runs the new Google build
+    once the update has completed. To stay on the tested build, choose the boot-menu entry that ends `(slot B)` at
+    that start (before the new build has finished a start); from Windows, `native/hwtest/check_stick_ota.py --disk N`
+    (an administrator prompt; N from `Get-Disk`) shows which slot and build the stick starts next, read-only. The
+    analyser's item 35 `slotsync` reports it.
 
 ## Readiness audit (wave 5): what the image proves and what needs the laptop
 

@@ -169,6 +169,16 @@ suite() {     # suite LABEL: every case once, PATH already set
   [ $rc = 0 ] && [ "$(kept)" = 1 ] && grep -q 'cannot mount' "$GBT/kmsg" && [ ! -e "$GBT/gb_esp.lock" ]
   ok $? "$1 A5b mount failure: files kept, kmsg line, lock released"
 
+  # (wave 11 security-review SR-2) A18: gblog/OFF or gblog/OFF.txt on the ESP: nothing copied, files kept, one kmsg
+  # line, unmounted and unlocked
+  for o in OFF OFF.txt; do
+    newcase "a18-$o"; : > "$GBT/esp/gblog/$o"
+    adiag; rc=$?
+    [ $rc = 0 ] && [ "$(copied)" = 0 ] && [ "$(kept)" = 1 ] && [ "$(grep -c 'gblog/OFF exists' "$GBT/kmsg")" = 1 ] &&
+      grep -q '^UMOUNT' "$GBT/events" && [ ! -e "$GBT/gb_esp.lock" ] && ! grep -q '^COPY .*/esp/gblog/' "$GBT/events"
+    ok $? "$1 A18 gblog/$o: nothing copied to the ESP, files kept, kmsg line, unmounted and unlocked"
+  done
+
   # A1b: a stale lock (dead pid) is stolen once
   newcase a1b; mkdir "$GBT/gb_esp.lock"; sh -c 'exit 0' & dp=$!; wait "$dp"; echo "$dp gb_bootlog 3" > "$GBT/gb_esp.lock/owner"
   adiag; rc=$?

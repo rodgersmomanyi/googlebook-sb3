@@ -111,7 +111,7 @@ def node_mode(path):
 
 
 class Server:
-    def __init__(self, binary, work, uid, props, root="root", dtx=False, tag=""):
+    def __init__(self, binary, work, uid, props, root="root", dtx=False, tag="", uids=None):
         self.root = os.path.join(work, root)
         self.sock = os.path.join(work, "gb_power%s.sock" % tag)
         self.props = os.path.join(work, "props-%d%s" % (uid, tag))
@@ -121,6 +121,8 @@ class Server:
         env = {"PATH": "/usr/bin:/bin", "GB_POWER_TEST_UID": str(uid), "GB_POWER_PROPS_DIR": self.props}
         if dtx:
             env["GB_POWER_TEST_DTX"] = "1"
+        if uids:                                 # (wave 11 SR-4) one uid per accepted connection, in order
+            env["GB_POWER_TEST_UIDS"] = ",".join(str(u) for u in uids)
         if os.path.exists(self.sock):
             os.unlink(self.sock)
         self.logf = open(os.path.join(work, "server-%d%s.log" % (uid, tag)), "w", encoding="ascii")
@@ -391,6 +393,47 @@ def main():
           "VMware model: no settings message queued (%d files)" % len(notes))
     s.close()
     check(srv.stop() == 0, "VMware-model server exit 0")
+
+    # ---- (wave 11 security-review SR-4) app peers without a role hold at most 2 of the 8 slots
+    # accept order: other, other (user 10), other (refused), ui, system uid 1000 (other, not an app: not counted),
+    # other (isolated uid)
+    srv = Server(binary, work, 10500, {"vendor.gb.nouveau.booted": "1", "vendor.gb.nouveau.mode": "default"},
+                 tag="-sr4", uids=[10500, 1010500, 10777, 10123, 1000, 99012])
+    o1 = conn(srv.sock)
+    got = req(o1, "hello\n")
+    check(got is not None and '"role":"other"' in got, "SR-4 1st app without a role: served (%r)" % got)
+    o2 = conn(srv.sock)
+    got = req(o2, "hello\n")
+    check(got is not None and '"role":"other"' in got and '"uid":1010500' in got,
+          "SR-4 2nd app without a role (another user): served (%r)" % got)
+    o3 = conn(srv.sock)
+    got = readline(o3)
+    check(got == '{"v":1,"ok":false,"cmd":"","err":"EBUSY","msg":"too many connections"}',
+          "SR-4 3rd app without a role: EBUSY (%r)" % got)
+    check(closed_by_server(o3), "SR-4 3rd app without a role: closed")
+    o3.close()
+    u = conn(srv.sock)
+    got = req(u, "hello\n")
+    check(got is not None and '"role":"ui"' in got, "SR-4 GbGpu still served while 2 role-less apps are connected (%r)" % got)
+    got = req(u, "get-mode\n")
+    check(got is not None and '"ok":true' in got, "SR-4 GbGpu get-mode answered (%r)" % got)
+    sysu = conn(srv.sock)
+    got = req(sysu, "hello\n")
+    check(got is not None and '"role":"other"' in got and '"uid":1000,' in got,
+          "SR-4 a system uid (1000) is not counted as an app (%r)" % got)
+    o1.close()
+    time.sleep(0.3)
+    req(u, "hello\n")                           # a poll round: the daemon sweeps the closed client
+    o4 = conn(srv.sock)
+    got = req(o4, "hello\n")
+    check(got is not None and '"role":"other"' in got and '"uid":99012' in got,
+          "SR-4 a slot freed by a closed app is usable again (isolated uid 99012) (%r)" % got)
+    for x in (o2, u, sysu, o4):
+        x.close()
+    check(srv.stop() == 0, "SR-4 server exit 0")
+    log = read(os.path.join(work, "server-10500-sr4.log")) or ""
+    check(log.count("app connections without a role open") == 1, "SR-4 one refusal log line (%d)" %
+          log.count("app connections without a role open"))
 
     print("\n%d checks, %d failures" % (CHECKS[0], len(FAILS)))
     return 1 if FAILS else 0

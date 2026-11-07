@@ -175,6 +175,37 @@ unvalidated boots and showed the louder notice at the third, again in user 10's 
 token was validated and left the record unchanged. Design, classification of all 136 additions and tests:
 [native/ota-gating/DESIGN.md](../native/ota-gating/DESIGN.md).
 
+## Google updates on the USB stick and on native installs (wave 11)
+
+* The first native boot of a freshly flashed wave-10 stick (2026-11-06) installed a Google system update from about
+  12 minutes after the start (a few minutes after Settings > System update had been opened): Settings showed
+  "Installing system update... Update size: 34.25 MB ... Downloading and installing update". It is an ordinary A/B
+  update: `update_engine` writes it into the other slot (slot A on a stick made from a slot-B system) as Virtual A/B
+  snapshots while the running slot stays untouched.
+* **Native Googlebook follows Google updates automatically** (the owner's decision, 2026-11-06; `gb_slotsync` is
+  unchanged since wave 9, wave 11 documents the choice): once the update has completed, `gb_slotsync` makes that slot
+  the boot default within a minute (same kernel interface), and the **next start runs the new build**, which the
+  image was not made or tested for ("System update not validated"). Nothing asks first, and nothing falls back to the
+  old slot by itself. Restarting is enough; you do not have to tap "Restart now".
+* **To stay on the build you tested:** at the next start press the Down or Up arrow key while the boot menu shows
+  (4 s on the stick), choose the entry that ends `(slot B)` (not `[NVIDIA test]`) and press Enter. That choice stays
+  the default. Android then treats the update as rolled back and may download and install it again later. After
+  this, do not choose `(slot A)` on that stick: its update was cancelled and the entry may no longer start (if it
+  does not, hold the power button, start again: the default is `(slot B)`). Re-flashing the stick removes it.
+* Going back is possible only before the new build has reached the lock screen once: from its first completed start
+  on, Android merges the update into the space of the old slot, and the old slot no longer starts.
+* On native disks the ESP **cannot be re-validated from the host** after such an update: the USB image and the export
+  are made from the VM's `lapis.bin`, and `install_dualboot.ps1 -UpdateEspOnly` refuses a slot that was updated on the
+  device. The way back to a validated build is a fresh flash or install (it erases Android's data).
+* To see the state of a stick from Windows before starting it (read only, administrator prompt):
+  `python -I native/hwtest/check_stick_ota.py --disk <N>` (N from `Get-Disk`; never the internal disk). It reports
+  the slot the next start runs, that slot's build and whether it is the build the image was made for (exit 0: yes,
+  1: another build). It reads only the partition table, the boot partition's loader files and `gb/inject.gz`'s
+  validated build, and the two `init_boot` partitions' build fingerprint; never `gblog\` or `/data`.
+* The boot-log analyser's item `slotsync` (wave 11) reports an update that was being installed, completed or followed
+  during the logged boot.
+* No Google update is offered while the stick has no network.
+
 ## Host-side rebuilds follow the slot
 
 `build_esp.py` and `build_usb.py` never assume slot A: `extract_slot.boot_slot()` reads the same vbmeta GPT
@@ -206,7 +237,9 @@ complete and no firmware is touched.
 * The ESP needs room for two initrds: 192 MiB in the VM, 512 MiB on USB/internal images.
 * Observed in the VM, once: CL3B.260622.271 -> .276 installed by OTA, and the VM then booted .276 from slot B. This
   was confirmed afterwards from the slot state and the build number; the reboot into the new slot was not watched
-  step by step. Untested on hardware.
+  step by step. On hardware (2026-11-06) an update was offered and installed into slot A on the first start of a
+  wave-10 stick; the start into it was not done (see
+  [Google updates on the USB stick and on native installs](#google-updates-on-the-usb-stick-and-on-native-installs-wave-11)).
 * Wave 8, on a throwaway VMware VM: with the GPT set as an update into slot A leaves it and the update recorded as
   completed in that boot, `gb_slotsync` logged the kernel check, built `initrd-a.img`, wrote `gb-a.conf` and
   `default gb-a.conf`, and the next power-on started slot A (13 of 13 kernel starts). That VM's slot A held an older

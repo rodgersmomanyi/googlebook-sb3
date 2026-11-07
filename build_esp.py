@@ -2527,6 +2527,17 @@ GB_MODULES_SH = (b"#!/system/bin/sh\n"
 # their order and prefixes (hwtest\analyze_gblog.py keys on them).
 # (Wave 6, OTA gate follow-up F2) One more summary line after the gb_slotsync line: "ota gate: ..." from gbinit's
 # /odm/etc/gb/ota_state (w6prep\ota-followups; hwtest\analyze_gblog.py item ota_gate).
+# (Wave 10, w10prep\bootlog-diag, BACKLOG 14.5 W5-early-logcat + VM1-VEX128-site) Two diagnostics, both read-only and
+# bounded, no new SELinux access (logcat -d, sysfs reads, toybox applets and files in /dev, as before; wc is the one
+# applet the script did not run before, its counts go through tr -cd 0-9 as the OTA gate notifier's do):
+#   * the first snapshot keeps, once per boot, the lines of its own logcat dump before the 6000-line window (no avc
+#     lines, at most 1 MiB of whole lines; /dev/gb_bootlog.txt.lc0) and every snapshot prints them as "== logcat-early"
+#     right after its "== logcat" window until one of them is on the ESP: lines such as keystore2's earlyBootEnded
+#     result are no longer lost to the window (wave-9 VM-1 W5-09c). Old readers see one longer logcat section.
+#   * the kernel keeps 16 gb_vnni (comm, rip) records and the ML-KEM runs evict init's long before the first snapshot,
+#     so vpoll reads the counter every 1 s from gb_bootlog's start (post-fs-data) until the first snapshot, then every
+#     5 s, and keeps every comm=init record (at most 32 rips; /dev/gb_bootlog.txt.vi). The summary prints them as
+#     "-- vnni init records" after the i915 lines; the "-- gb_vnni" block itself is unchanged (<= 17 lines).
 GB_BOOTLOG_SH = rb"""#!/system/bin/sh
 # gb_bootlog (native): kernel + Android logs to <boot partition>\gblog\boot<N>-t<T>.txt at T = 40, 90, 180, 420, 900 s.
 # Each snapshot is collected in /dev first; the ESP is locked (INTERFACES 5.4 r3) and mounted rw,flush only for the
@@ -2536,11 +2547,16 @@ GB_BOOTLOG_SH = rb"""#!/system/bin/sh
 # or when df gives no number (fail closed).
 # The dgpu section reads cached sysfs attributes and node metadata only (PLAN invariant 12) and sends only the
 # read-only socket commands hello, status and get-mode. GB_BOOTLOG_* overrides exist for the test harness only.
+# (Wave 10) The first snapshot written also holds the boot's early logcat lines (== logcat-early); the summary lists
+# every comm=init gb_vnni record seen since gb_bootlog started (-- vnni init records).
 P=EFI-SYSTEM
 # shellcheck disable=SC2013  # /proc/cmdline is one line of blank-separated tokens: words are wanted
 for a in $(cat /proc/cmdline); do case $a in gb.logpart=*) P=${a#gb.logpart=};; esac; done
 D=/dev/block/by-name/$P; M=${GB_BOOTLOG_MNT:-/mnt/gb_esp}; L=${GB_BOOTLOG_LOCK:-/dev/gb_esp.lock}
 T=${GB_BOOTLOG_TMP:-/dev/gb_bootlog.txt}; G=/data/vendor/gb; N=; OWN=; KEEP=8; FLOOR_KB=131072
+# (wave 10) U: the uptime file (GB_BOOTLOG_UPTIME: test harness only); LC0: the early logcat copy (empty = not made,
+# kept = made and in /dev, done = on the ESP), LC0I: its counts line, LC0_MAX: its size bound; VI_MAX: init records kept
+U=${GB_BOOTLOG_UPTIME:-/proc/uptime}; LC0=; LC0I=; LC0_MAX=1048576; VI_MAX=32
 mkdir -p "$M"
 #@@functions-begin
 busy() {    # 0 = a steal is in progress: a $L.stale.<pid> directory of another live pid (INTERFACES 5.4 r3)
@@ -2619,6 +2635,60 @@ prune() {   # once per boot, right after N is known
   done
 }
 rdf() { v=-; [ -r "$1" ] && v=$(head -c 600 "$1"); echo "$v"; }
+# (wave 11 security-review SR-2) a snapshot leaves the device on an unencrypted FAT partition (a USB stick is read by
+# any computer it is plugged into) and stays there for 8 boots, so the identifiers that no triage item needs are
+# removed on the device before the copy: e-mail addresses (logcat: the accounts), input-device Uniq= values
+# (Bluetooth addresses, serial numbers), power-supply serial numbers (the uevent dump and any dmesg line), the
+# values of getprop names holding "serial", and (review rev2: the rules hwtest\analyze_gblog.py applies to what it
+# prints, plus the shapes the second native boot showed) MAC/Bluetooth addresses, serial-number and SSID key=value
+# forms, Passpoint ANQP network names, global IPv6 addresses and deviceName values. The summary never prints them.
+# (review-w10 R3) also an SSID value in single quotes as a whole (wpa_supplicant: SSID='a b c') and the SSID of a
+# WifiConfiguration key "<SSID>"<security type> (WPA_PSK, wpa3-sae, ...): both are in the owner's first native boot.
+# scrub_file fails closed (no scrubbed copy: the snapshot is not written). The Windows collector's redaction (hwtest\Get-GooglebookLogs.ps1) still runs on top.
+scrub() {
+  sed -E -e 's/[A-Za-z0-9._%+-]+@[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z]+/<email>/g' \
+    -e 's/^(U: Uniq=).+$/\1<uniq>/' -e 's/(POWER_SUPPLY_SERIAL_NUMBER=)[^ ]+/\1<serial>/g' \
+    -e 's/^(\[[A-Za-z0-9_.]*[Ss][Ee][Rr][Ii][Aa][Ll][A-Za-z0-9_.]*\]: \[).+(\])$/\1<serial>\2/' \
+    -e 's/[0-9A-Fa-f][0-9A-Fa-f](:[0-9A-Fa-f][0-9A-Fa-f]){5}/<mac>/g' \
+    -e 's/([Ss][Ee][Rr][Ii][Aa][Ll][_-]?([Nn][Oo]|[Nn][Uu][Mm][Bb][Ee][Rr])\]?[ ]*[=:][ ]*\[?)[^][<, ;][^], ;]*/\1<serial>/g' \
+    -e 's/([Ss][Ss][Ii][Dd][ ]*[=:][ ]*)("[^"]*"|'\''[^'\'']*'\''|[^<", ;][^, ;]*)/\1<ssid>/g' \
+    -e 's/(^|[^=A-Za-z0-9])"[^"=]*"(NONE|WEP|WPA_PSK|WPA_EAP|SAE|OWE|SUITE_B_192|WAPI_PSK|WAPI_CERT|wpa[0-9]?-[a-z]+)/\1"<ssid>"\2/g' \
+    -e 's/(PasspointManager: )[^:]*(: <mac>)/\1<ssid>\2/' -e 's/(<mac>:<)[^>]*>/\1ssid>/g' \
+    -e 's/(^|[^0-9A-Fa-f:])[23][0-9A-Fa-f]{3}:[0-9A-Fa-f]{1,4}:([0-9A-Fa-f]{0,4}:){1,5}[0-9A-Fa-f]{1,4}/\1<ip6>/g' \
+    -e 's/(deviceName: ).+$/\1<name>/'
+}
+# (review-w10 R3-3) a network name also shows up as free text (the Wi-Fi dialog's window title, 'wifiEntry <name>',
+# 'network: "<name>"', a URL-encoded configKey). The names that the keyed forms show (SSID="x", SSID='x', "x"<security
+# type>; 4..32 bytes) in this or an earlier snapshot of this boot are kept in SS (a shell variable: memory only, at most
+# 16; null / none / <unknown ssid> never) and replaced as plain text (awk index(), not a regular expression) after scrub().
+SS=
+ssid_learn() {  # $1 = a raw snapshot: add the network names of its keyed forms to SS
+  ssn=$({ grep -o -E '[Ss][Ss][Ii][Dd][ ]*[=:][ ]*"[^"]{4,32}"' "$1"
+          grep -o -E '[Ss][Ss][Ii][Dd][ ]*[=:][ ]*'\''[^'\'']{4,32}'\''' "$1"
+          grep -o -E '(^|[^=A-Za-z0-9])"[^"=]{4,32}"(NONE|WEP|WPA_PSK|WPA_EAP|SAE|OWE|SUITE_B_192|WAPI_PSK|WAPI_CERT|wpa[0-9]?-[a-z]+)' "$1"
+        } 2>/dev/null | sed -E -e 's/^[Ss][Ss][Ii][Dd][ ]*[=:][ ]*//' -e 's/^[^"'\'']?["'\'']//' -e 's/["'\''][A-Za-z0-9_-]*$//')
+  SS=$(printf '%s\n%s\n' "$SS" "$ssn" | sed -e '/^$/d' -e '/^null$/d' -e '/^NULL$/d' -e '/^none$/d' -e '/^NONE$/d' \
+       -e '/^<unknown ssid>$/d' | sort -u | head -n 16)
+}
+ssid_drop() {   # stdin -> stdout: every name in SS -> <ssid>
+  SS=$SS awk 'BEGIN { n = split(ENVIRON["SS"], v, "\n") }
+    { for (i = 1; i <= n; i++) if (length(v[i]) >= 4 && index($0, v[i])) {
+        s = $0; o = ""
+        while ((p = index(s, v[i])) > 0) { o = o substr(s, 1, p - 1) "<ssid>"; s = substr(s, p + length(v[i])) }
+        $0 = o s
+      }
+      print }'
+}
+scrub_file() {  # $1 = a snapshot in /dev, replaced by its scrubbed copy; 1 = the scrub failed (then nothing is copied)
+  rm -f "$1.s" "$1.u"
+  ssid_learn "$1"
+  if scrub < "$1" > "$1.u" 2>/dev/null && ssid_drop < "$1.u" > "$1.s" 2>/dev/null && [ -s "$1.s" ] && mv -f "$1.s" "$1"; then
+    rm -f "$1.u"; return 0
+  fi
+  rm -f "$1.s" "$1.u"; return 1
+}
+# (wave 11 SR-2) the owner's opt-out: a file named OFF (or OFF.txt) in the gblog folder stops every write
+gblog_off() { [ -e "$1/gblog/OFF" ] || [ -e "$1/gblog/OFF.txt" ]; }
 # (wave 5) summary helpers. nmatch: grep -c that prints 0 for a missing file too. kts: the kernel timestamps of a dmesg
 # dump. probe: can bionic load and link a binary (C-1, C-2: one library that cannot link stops a HAL)? It runs the
 # binary's version/usage option, which prints and exits before doing anything else (wpa_supplicant -v, hostapd -v,
@@ -2641,6 +2711,83 @@ otagate() {
   [ -f "$r/odm/etc/gb/ota_state" ] || { echo 'no state file (an image without the OTA gate)'; return 0; }
   if [ -d "$r/odm/vnni" ]; then ov=present; else ov=absent; fi
   echo "state=$(ostate state) token=$(ostate token) prop=$(getprop ro.vendor.gb.ota_gate) vnni=$ov notifier=$(getprop init.svc.gb_otagate) booted=$(ostate booted) validated=$(ostate validated)"
+}
+# (wave 10, BACKLOG 14.5 VM1-VEX128-site) every comm=init record of the #UD emulator counter. The kernel keeps 16
+# (comm, rip) records, most recently used first, and the summary prints them all; the ML-KEM runs ('main', 12 sites
+# each) evict init's records long before the first snapshot. vpoll reads the counter once (one sysfs read) and merges
+# its comm=init records into $T.vi: '# <polls> <rips not kept> <first poll s> <first poll's counter line>', then one
+# line per rip in the order first seen: '<rip> <count of earlier lives> <count> <first s> <last s> <polls seen> <lives>
+# <last poll seen>'. A record missing at the previous poll, or whose count went down, was evicted and made again (the
+# kernel restarts its count at 0): a new life; one evicted and made again between two polls is not seen, so the count
+# is a lower bound. At most VI_MAX rips (more: counted only). A read without the counter line changes nothing. The new
+# state goes through a shell variable into $T.vi (no temporary file, no rename: the same file operations as before).
+vpoll() {
+  vs=${GB_BOOTLOG_ROOT:-}/sys/kernel/gb_vnni/summary
+  [ -r "$vs" ] || return 0
+  vu=$(cut -d. -f1 "$U" 2>/dev/null)
+  if vst=$(timeout 5 cat "$vs" 2>/dev/null | awk -v f="$T.vi" -v u="${vu:-?}" -v max="$VI_MAX" '
+    BEGIN { np = 0; nd = 0; n = 0; hd = ""
+      while ((getline l < f) > 0) {
+        split(l, a, " ")
+        if (a[1] == "#") { np = a[2]; nd = a[3]; hd = l; sub(/^# [0-9]+ [0-9]+ /, "", hd); continue }
+        n++; r[n] = a[1]; i[a[1]] = n; b[a[1]] = a[2]; c[a[1]] = a[3]; f1[a[1]] = a[4]; f2[a[1]] = a[5]
+        s[a[1]] = a[6]; v[a[1]] = a[7]; p[a[1]] = a[8]
+      }
+      close(f) }
+    NR == 1 && /^emulated [0-9]+ / { ok = 1; if (np == 0) hd = u " " $0; next }
+    ok && /^comm=init rip=[0-9a-f]+ count=[0-9]+$/ {
+      k = substr($2, 5); x = substr($3, 7) + 0
+      if (k in h) next
+      h[k] = 1
+      if (!(k in i)) {
+        if (n >= max) { nd++; next }
+        n++; r[n] = k; i[k] = n; b[k] = 0; c[k] = x; f1[k] = u; s[k] = 0; v[k] = 1
+      } else if (p[k] != np || x < c[k]) { b[k] += c[k]; c[k] = x; v[k]++ }
+      else c[k] = x
+      f2[k] = u; s[k]++; p[k] = np + 1
+    }
+    END { if (!ok) exit 1
+      print "# " (np + 1) " " nd " " hd
+      for (j = 1; j <= n; j++) { k = r[j]; print k, b[k], c[k], f1[k], f2[k], s[k], v[k], p[k] } }' 2>/dev/null)
+  then printf '%s\n' "$vst" > "$T.vi"; fi
+}
+vinit() {   # the lines of the summary's '-- vnni init records' block, from $T.vi
+  if [ ! -s "$T.vi" ]; then echo 'first poll: none (no counter read from /sys/kernel/gb_vnni/summary)'; return 0; fi
+  awk -v max="$VI_MAX" 'NR == 1 { np = $2; nd = $3; hd = $0; sub(/^# [0-9]+ [0-9]+ /, "", hd); u = hd; sub(/ .*/, "", u)
+      sub(/^[^ ]* /, "", hd); printf "first poll at %s s: %s\n", u, hd; next }
+    { n++; printf "init rip=%s count=%d seen=%s-%s s polls=%d lives=%d\n", $1, $2 + $3, $4, $5, $6, $7 }
+    END { printf "init records: %d kept (at most %d); reads of rips not kept: %d; polls %d\n", n, max, nd, np }' "$T.vi"
+}
+# (wave 10, BACKLOG 14.5 W5-early-logcat) '== logcat' is the last 6000 lines of the dump, so a boot that logs a lot
+# before the first snapshot loses its early lines there (wave-9 VM-1: keystore2's earlyBootEnded result). The first
+# snapshot keeps, once, the lines of its own dump before that window: without avc lines (the permissive flood, as the
+# kernel-log copy), at most LC0_MAX bytes of whole lines from the start ($T.lc0: lk = the newline-ended lines within
+# the first LC0_MAX bytes, then exactly those lines are written, so no partial line and no rewrite; wc's counts go
+# through tr -cd 0-9, a wc may pad them). Every snapshot prints them as '== logcat-early' right after its window until
+# one of them is on the ESP (the main loop then removes the copy).
+logcats() {
+  echo '== logcat'
+  if [ -n "$LC0" ]; then logcat -d -b all -v threadtime | tail -n 6000
+  else
+    LC0=kept
+    logcat -d -b all -v threadtime > "$T.lt"
+    tail -n 6000 "$T.lt"
+    ln=$(wc -l < "$T.lt" 2>/dev/null | tr -cd 0-9); ln=$((${ln:-0} - 6000)); la=0; lk=0; lc=no
+    if [ "$ln" -gt 0 ]; then
+      la=$(head -n "$ln" "$T.lt" | grep -c -F 'avc:')
+      lk=$(head -n "$ln" "$T.lt" | grep -v -F 'avc:' | head -c "$LC0_MAX" | wc -l | tr -cd 0-9); lk=${lk:-0}
+      head -n "$ln" "$T.lt" | grep -v -F 'avc:' | head -n "$lk" > "$T.lc0"
+      [ "$lk" -lt $((ln - la)) ] && lc=yes
+    else
+      ln=0; : > "$T.lc0"
+    fi
+    rm -f "$T.lt"
+    LC0I="logcat-early: dumped at $(cut -d. -f1 "$U") s; $lk of the $ln lines before the window kept ($la avc lines left out); cut at $LC0_MAX bytes: $lc"
+  fi
+  if [ "$LC0" = kept ]; then
+    echo '== logcat-early (once per boot: the lines of the first snapshot dump before its 6000-line window, without avc lines)'
+    echo "$LC0I"; cat "$T.lc0" 2>/dev/null
+  fi
 }
 # (wave 3, item 8) one-screen triage, tied to the DEVICE-STATUS checklist. Read-only and bounded: dmesg and logcat -d
 # (dump and exit, never a streaming logcat: [W3R-14]) once each into /dev, then fixed greps. It prints no serial
@@ -2744,6 +2891,9 @@ summary() {
   echo "i915 modules.load: $(grep -E '^#?i915\.ko' "$r/odm/lib/modules/modules.load" 2>/dev/null); gbinit: $(grep -F i915.ko "$r/odm/gbinit_modules.log" 2>/dev/null | tr '\n' ' ')"
   # (wave 5, B-3) panel self refresh / pipe underruns (flicker, ghost images): GB_MODOPTS_i915=enable_psr=0 enable_fbc=0
   echo "i915 PSR/underrun lines: $(grep -c -E 'i915 .*(FIFO underrun|Selective fetch area calculation failed|PSR.*(error|fail))' "$K")"
+  # (wave 10, VM1-VEX128-site) every comm=init gb_vnni record since gb_bootlog started (vpoll): the sites of init's
+  # emulations, which the 16-record list above has lost by now; a block of its own, after the i915 lines
+  vpoll; echo '-- vnni init records (every comm=init record of /sys/kernel/gb_vnni/summary seen since gb_bootlog started)'; vinit
   # item 18: HWUI on a one-queue-per-family Vulkan backend (literal of WAVE3 2.4; gbOS86 hook.sh:489-492)
   echo "HWUI Vulkan queueCount abort lines: $(grep -c -F 'queueFamilyProperties.queueCount < kRequestedQueueCount' "$T.lc")"
   # item 13: gb_slotsync HOLD (WAVE3 2.6)
@@ -2821,7 +2971,8 @@ snapshot() {
   dmesg | grep -iE 'nouveau|gsp|pciehp|_OSC|sdtx|surface_hotplug|acpiphp|firmware|gb_nouveau|gb_power|gb_notify|gb_slotsync|gb_audiodiag|runtime PM through ACPI _PR3|no longer present on the bus|runtime suspend failed|failed to evict VRAM|Do not have permissions to set'
   logcat -d -s gb_notify gb_gpu_ui_setup gb_gpu_compute gb_gfxdriver GbGpu 2>/dev/null | tail -n 60
   getenforce
-  for k in dgpu load bind test selftest; do
+  # (wave 11 power-drain) power: gb_hw.sh power's report (this boot's windows, the last boot's before the first one)
+  for k in dgpu load bind test selftest power; do
     # shellcheck disable=SC2012  # newest of the fixed report names <prefix>-<N>.txt (INTERFACES 5.1)
     f=$(ls -t $G/report/$k-*.txt 2>/dev/null | head -n 1); [ -n "$f" ] && { echo "== $f"; cat "$f"; }
   done
@@ -2829,20 +2980,28 @@ snapshot() {
   echo '== dmesg-live.prev (tail)'; tail -c 262144 $G/report/dmesg-live.prev.txt 2>/dev/null
   echo '== gb_nouveau.log (tail)'; tail -c 32768 $G/report/gb_nouveau.log.1 2>/dev/null; tail -c 65536 $G/report/gb_nouveau.log 2>/dev/null
   echo '== dmesg'; dmesg
-  echo '== logcat'; logcat -d -b all -v threadtime | tail -n 6000
+  logcats
   echo '== dumpsys SurfaceFlinger'; timeout 20 dumpsys SurfaceFlinger | head -n 120
   echo '== dumpsys input'; timeout 20 dumpsys input | head -n 200
 }
 #@@functions-end
 for t in 40 90 180 420 900; do
-  while [ "$(cut -d. -f1 /proc/uptime)" -lt $t ]; do sleep 5; done
+  # (wave 10) the uptime check stays every 5 s; vpoll runs every 1 s until the first snapshot, then every 5 s
+  while [ "$(cut -d. -f1 "$U")" -lt $t ]; do
+    if [ $t = 40 ]; then q=0; while [ $q -lt 5 ]; do vpoll; sleep 1; q=$((q+1)); done; else vpoll; sleep 5; fi
+  done
   [ $t = 40 ] && setprop vendor.gb.dgpu_report 1
   snapshot > "$T" 2>&1
+  scrub_file "$T" || { echo "gb_bootlog: the privacy scrub failed, t=$t not written" > /dev/kmsg; rm -f "$T"; continue; }
   lock || { rm -f "$T"; continue; }
   if ! mount -t vfat -o rw,flush,nosuid,nodev,noexec "$D" "$M"; then
     unlock; rm -f "$T"; echo "gb_bootlog: cannot mount $D, t=$t skipped" > /dev/kmsg; continue
   fi
   mkdir -p "$M/gblog"
+  if gblog_off "$M"; then
+    echo "gb_bootlog: gblog/OFF exists: nothing written this boot" > /dev/kmsg
+    sync; umount "$M"; unlock; rm -f "$T"; break
+  fi
   if [ -z "$N" ]; then
     c=$(tr -d '\r' < "$M/gblog/bootcount" 2>/dev/null); case $c in ''|*[!0-9]*) c=0;; esac   # a CRLF edit keeps N
     N=$((c+1)); echo $N > "$M/gblog/bootcount"; prune
@@ -2855,12 +3014,13 @@ for t in 40 90 180 420 900; do
     echo "gb_bootlog: cannot read the ESP free space, t=$t not written" > /dev/kmsg
   elif [ "$fr" -lt $FLOOR_KB ]; then
     echo "gb_bootlog: ESP free ${fr} KiB below the 128 MiB floor, t=$t not written" > /dev/kmsg
-  else
-    cp "$T" "$M/gblog/boot$N-t$t.txt"
+  elif cp "$T" "$M/gblog/boot$N-t$t.txt" && [ "$LC0" = kept ]; then
+    LC0='done'; rm -f "$T.lc0"      # (wave 10) the early logcat copy is on the ESP: once per boot ('done' quoted: SC1010)
   fi
   sync; umount "$M"; unlock; rm -f "$T"
 done
 rm -f "$T.dm0"      # (wave 5) the first snapshot's kernel-log copy (summary)
+rm -f "$T.lc0" "$T.lt" "$T.vi"      # (wave 10) the early logcat copy if never written, a dump left by a kill, vpoll's state
 """
 assert b"\r" not in GB_BOOTLOG_SH
 

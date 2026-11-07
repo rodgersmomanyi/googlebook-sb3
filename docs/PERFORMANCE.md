@@ -117,7 +117,8 @@ on the exact lapis build the copy was made from.
   * `readlink /proc/{1,self,$(pidof zygote64)}/ns/mnt` and `grep libz /proc/{1,$(pidof zygote64)}/mountinfo` show the
     two binds in both namespaces (`ro` in `init`'s namespace, `rw` allowed in the default namespace);
   * the first line of `/sys/kernel/gb_vnni/summary` (`emulated N ...`) is the emulation count since boot. The
-    boot-log summary on a native stick shows it as `-- gb_vnni`.
+    boot-log summary on a native stick shows it as `-- gb_vnni`. Native images from wave 11 on also list init's
+    emulation sites in the boot log's `-- vnni init records` block.
 
 ## Measured effect (wave 5)
 
@@ -165,6 +166,20 @@ boot-time dexopt total and the emulation counts.
 138.7 million in the same window before the update. The native image in a VMware smoke test (no Surface hardware, the
 boot never completes there): 16 emulations (`init`'s own) in every snapshot up to 900 s, against up to 128,080 in the
 wave 3 smoke test.
+
+## Power policy (wave 11, off by default)
+
+Native images from wave 11 on carry an optional power policy, **off by default** (nothing in the image sets
+`pwr.policy` or `pm.tune`). `pwr.policy=1` sets the CPU's energy-performance preference per power source (default
+`balance_power` on battery, `balance_performance` on the charger, lapis's own boot value) and can cap the package's
+long-term power limit PL1 on battery (`rapl.bat_pl1_uw`, 5-65 W) or choose a platform profile; it costs
+responsiveness and peak speed on battery. `pm.tune=1` turns the NMI watchdog off and runtime power management on for
+the PCI USB, audio and camera (IPU) functions; it can add a short delay when those wake. Both are one-boot
+`gb\gb.cfg` switches ([FLASHING.md](FLASHING.md#8-bring-up-configuration-gbgbcfg), example 5) or `persist.vendor.gb.*`
+properties. Every native start also measures its own power draw (four read-only one-minute windows at about 5.5,
+13, 30 and 60 minutes; `gb_hw: power:` in the boot logs; off with `persist.vendor.gb.power.measure=0`). The idle draw
+on the laptop has not been measured yet: the 13-30 W of the second native boot came from the first start's app
+compilation, not from idle.
 
 ## What is not covered
 

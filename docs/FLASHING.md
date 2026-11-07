@@ -135,6 +135,16 @@ sound driver mode, Wi-Fi, Bluetooth, the cameras, programs that cannot start (`l
 panel self-refresh errors. They also keep a copy of the boot's first kernel messages (without SELinux `avc:` lines),
 so the later snapshots still show them (`kernel log:` line). Section 7 maps symptoms to those lines.
 
+Images from wave 11 on also keep the boot's early Android log: the first snapshot written holds a section
+`== logcat-early` right after its `== logcat` part, with the log lines from before that part's last 6000 lines
+(without SELinux `avc:` lines, at most 1 MiB). The summary gains a block `-- vnni init records`: every place where
+Android's `init` needed the processor emulation since the log writer started (instruction addresses and counts only;
+the analyser names the instruction). They also measure the power draw at every start: four read-only one-minute
+windows at about 5.5, 13, 30 and 60 minutes after Android has started (`gb_hw: power:` lines and
+`== /data/vendor/gb/report/power-<N>.txt` in the snapshots); a start's 30- and 60-minute windows show up in the next
+start's 40-second file. Measure the power only on the second start after writing the stick (let the first start run
+15 minutes on the charger): the first start is busy installing and compiling apps.
+
 ### First-boot checklist
 
 After the first boot (wait for the 15-minute snapshot), open the newest `gblog\boot1-t*.txt` on the stick from
@@ -171,6 +181,13 @@ Then try the hardware itself (section 3), and go through the per-device "Hardwar
 properties, SSIDs, Bluetooth device names, Google account e-mail addresses). Search the files for them and redact
 before you post them anywhere, and do the same with the `dgpu-*` and `audio-*` reports. The issue template
 ([.github/ISSUE_TEMPLATE/native-boot-report.md](../.github/ISSUE_TEMPLATE/native-boot-report.md)) repeats this.
+(Wave 11) Images from wave 11 on scrub the log files on the device before they are written to the stick: e-mail
+addresses, MAC and Bluetooth addresses, serial numbers, Wi-Fi network names and global IPv6 addresses become
+placeholders such as `<email>` or `<serial>` (a file whose scrub fails is not written). Still look through a log
+before you post it. An empty file `gblog\OFF` on the stick's FAT32 partition stops all log writing (delete it to get
+logs back; for a hardware test the logs are what is needed). The log collector `Get-GooglebookLogs.ps1` makes each
+new log folder readable only by your Windows account. The camera self-test (section 8, example 4) also copies the
+camera service's client and event lines (which apps opened a camera, and when) into the logs.
 
 ## 5. Safety built into the image
 
@@ -186,6 +203,10 @@ These are design measures; like everything native, they have not been checked on
 * The NVIDIA driver is never part of the boot itself. It starts only after Android is up, a kernel panic on such a
   boot reboots after 30 s, and the next boot falls back to Intel. Do not delete or edit `gb\dgpu-*.erofs` on the
   stick's boot partition: it holds the NVIDIA firmware and driver files.
+* (Wave 11) Google's own system updates are not blocked: they install into the other slot, and the next start runs
+  them without asking ([OTA.md](OTA.md#google-updates-on-the-usb-stick-and-on-native-installs-wave-11): how to stay on `(slot B)`).
+* (Wave 11) At 3 % battery or less without a charger, Googlebook tries to shut down cleanly (not yet seen working on
+  the laptop: keep the charger in below about 10 %; ` gb.power.lowshut=0` turns it off for one boot).
 
 ## 6. Dual boot (install next to Windows)
 
@@ -220,10 +241,13 @@ skips `gbinit`, the image's own start-up step: if your text is at the start, pre
 | Quick flicks on the touchpad do not move the pointer | `inputs (Surface Aggregator HID, bus 0019):` lists the touchpad | The touchpad IDC sets `gestureProp.Change_Timeout = 0.02` (Android's default holds motion for 200 ms after touchdown). Report it if flicks still fail. |
 | The boot hangs or misbehaves after you changed `gb\gb.cfg` | `-- ESP bring-up (/odm/gbinit_bringup.log)` | Boot the normal entry (it never carries `gb.overlay=1`), or rename `gb\gb.cfg` from Windows. A format error refuses the whole file (nothing in it is applied); a single refused setting (unknown key, denied property, module not in `modules.load`, overlay path not allowed) is skipped with its own log line and the rest is applied. |
 | Notification "System update held: Kernel mismatch" | `gb_slotsync HOLD:` | The update's kernel interface (KMI) differs from our kernel's, so its vendor modules would not load: the default stays on the old slot ([OTA.md](OTA.md#kernel-check-before-the-switch)). |
+| Settings shows "Installing system update" / "Downloading and installing update" (wave 10 images on) | the analyser item `slotsync`: "a Google system update was being installed into slot A" | A Google update. When it completes, the next start runs the new build: choose "(slot B)" in the boot menu to stay on the tested one ([OTA.md](OTA.md#google-updates-on-the-usb-stick-and-on-native-installs-wave-11)). |
 | Notification "System update not validated" (wave 5 images) | `gb_otagate: UNVALIDATED build: ...` in `== dmesg`; `[ro.vendor.gb.ota_gate]: [unvalidated]` in `== getprop`; from wave 6 also `ota gate: state=unvalidated ...` in the summary; from wave 7, from the third boot of the same build, the notice says "System update still not validated" and `dmesg` has `gb_otagate: boot count: N unvalidated boot(s) of this build pair` | Android was updated to a build this image was not made for. The image then skips its build-specific libz patch and keeps everything else; most things are expected to work, but nothing was tested on that build. Rebuild the boot partition for the new build on the host, or pick the previous slot's `(slot X)` entry in the boot menu (only while the new build has not reached the lock screen: since wave 8 the pick stays the default, and going back after a sign-in is a downgrade over `/data` that can refuse your PIN). Boot options for one boot: ` gb.otagate=0` (gate off), ` gb.otagate=force` (test the "not validated" path on the validated build) ([OTA.md](OTA.md#the-ota-gate-wave-5)). |
 | Wi-Fi or Bluetooth missing | `-- firmware load failures (dmesg)` (`Direct firmware load for ... failed`); from wave 5 on also `wifi:` and `bluetooth:` | Note the file name in your report; [INPUTS.md](INPUTS.md#firmware-native-only) lists what is staged and from where. `wifi: ... link: wpa_supplicant FAILED: CANNOT LINK EXECUTABLE ...` means the Wi-Fi supplicant of this image cannot start, so Wi-Fi cannot scan or connect even though the card works (`wlan0` present, firmware loaded): report it with the `gblog\` folder. |
 | A feature never starts; a service keeps restarting (wave 5 images) | `linker:` and the `-- linker failures (most frequent first)` lines below it | `CANNOT LINK EXECUTABLE "<program>"` means Android cannot load that program: one of its libraries is missing or does not match. Report the line. `dlopen failed` lines from optional plugins can be normal; the summary leaves out lines from `/data` (app names). |
 | Camera app shows no cameras, or `vendor.camera-provider-2-7-legacy-wrapper` keeps restarting | `camera:` line in `== summary` (`HAL load failures:` must be `0`), `CANNOT LINK lines:` (`0`), and `intel-ipu6` firmware lines in dmesg | Images built before wave 5 had misaligned `PT_LOAD` headers in the staged camera ELFs (`dlopen failed: cannot find "n34_0_Box_C"`), fixed in wave 5 (`V12b`). On hardware, verify that `intel/ipu/ipu4p_fw.bin` was staged when building the image ([INPUTS.md](INPUTS.md#firmware-native-only)). If the IPU4P kernel driver itself hangs or errors during bring-up, add `GB_SKIPMOD=intel_ipu6_isys,intel_ipu6` to `gb\gb.cfg` and boot once with ` gb.overlay=1`. |
+| Camera app shows a black preview (the third native boot, front and rear) | the analyser's `cameras` item (it covers the probe only); after a self-test start `gb_camtest:` lines in `== dmesg` and `[vendor.gb.camtest_result]` in `== getprop` | Run the opt-in camera self-test once, on a second start after writing the stick ([section 8](#8-bring-up-configuration-gbgbcfg), example 4; [DEVICE-STATUS.md](DEVICE-STATUS.md) checklist 32), and send the logs: its verdict says whether frames reach the software (then the fault is in Android's camera path), come dark or empty, or never come (the kernel's capture path). |
+| Googlebook switched itself off at a low battery (wave 11 images) | the next start's `[sys.boot.reason.last]` is `shutdown,battery`; `gb_power: low battery:` lines in the earlier start's last log file | The low-battery shutdown: at 3 % or less on battery, after two consistent readings and a one-minute hold. A `no shutdown hold: <reason>` line means it held back on purpose (a battery or the charger could not be read). Turn it off for one boot with ` gb.power.lowshut=0`. |
 | HWUI aborts (apps crash on start) | `HWUI Vulkan queueCount abort lines:` above 0 | HWUI landed on a Vulkan device with one queue per family. Report it with the `gblog\` folder; the supported workaround is Settings > System > Graphics > **Intel only** ([NVIDIA.md](NVIDIA.md#status-and-what-to-test-first)). |
 
 Typing `<module>.<parameter>=` on the kernel command line (for example `i915.enable_psr=0`) does nothing for our own
@@ -357,4 +381,28 @@ GB_PROP_1=vendor.gb.posture=open
 
 Allowed values are `open`, `tablet`, `docked`, `closed` and `reset` (`off` or `none` does nothing). While an override is
 active, closing the lid does not put the device into `CLOSED`; use the power button to sleep.
+
+Example 4, the camera self-test (wave 11 images; [DEVICE-STATUS.md](DEVICE-STATUS.md) checklist 32), on a second
+start after writing the stick:
+
+```
+# gb.cfg v1
+GB_PROP_1=vendor.gb.camtest=1
+```
+
+About 30 s after Android has started it captures 3 s from each camera (the privacy LED lights briefly for each) and
+logs frame counts and mean brightness, never a picture; at about 6 min 40 s it also logs the camera service's client
+and event lines (which apps opened a camera, and when). Rename `gb\gb.cfg` afterwards (for example to `gb.cfg.off`).
+The app sandbox of this image is permissive (a known limit), so an app could start the self-test too; it still stores
+no picture.
+
+Example 5, the power measurement and the opt-in power settings (wave 11 images), one boot each, one key per line:
+`GB_PROP_1=vendor.gb.power.measure=0` (no measurement), `GB_PROP_1=vendor.gb.pwr.policy=1` (the CPU's energy
+preference per power source), `GB_PROP_2=vendor.gb.rapl.bat_pl1_uw=15000000` (with `pwr.policy=1`: a PL1 cap on
+battery), `GB_PROP_1=vendor.gb.pm.tune=1` (the NMI watchdog off, runtime power management for PCI USB, audio and
+the camera unit), `GB_PROP_1=vendor.gb.power.debugfs=1` (extra read-only debugfs readings in the windows). A
+`setprop vendor.gb.pwr.policy 1` or `vendor.gb.pm.tune 1` after Android has started does nothing (both start once at
+boot_completed; only `persist.vendor.gb.pwr.policy=1` has a trigger of its own); the measurement properties are read
+when each window starts, and `setprop vendor.gb.power.now 1` measures one window at once.
+`persist.vendor.gb.power.measure=0` turns the measurement off for good.
 

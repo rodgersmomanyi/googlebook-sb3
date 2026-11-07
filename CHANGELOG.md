@@ -3,8 +3,67 @@
 What each wave changed, newest first. Details per device: [docs/DEVICE-STATUS.md](docs/DEVICE-STATUS.md) ("Changes
 since the audit"). The first native boot on the Surface Book 3 happened on 2026-10-31 (the wave 8 image; results
 per item in DEVICE-STATUS, "First real-hardware results"), the second on 2026-11-01 (the wave 9 image; "Second
-real-hardware results"); every other result below is from VMware VMs, QEMU, the Linux build machine or disk-image
-files.
+real-hardware results"), the third on 2026-11-06 (the wave 10 image; "Third real-hardware results"); every other
+result below is from VMware VMs, QEMU, the Linux build machine or disk-image files. **Wave 11 is the final wave**:
+after it only small, targeted fixes for real hardware findings follow, no further feature waves.
+
+## Wave 11 (2026-11-06/07, the final wave): the third native boot, a low-battery shutdown, a camera self-test, Google updates followed
+
+* **The third native boot** (the wave 10 image `3b6330d9…` on a freshly written stick, one start on the Surface Book
+  3 13.5" with the keyboard base attached, 2026-11-06; analyser 41 PASS, 0 FAIL, 1 UNKNOWN): **the battery fix
+  works**: Android's level equalled the combined battery's in all 165 updates of that start (74 % -> 62 % in about 17
+  minutes of a busy first start, never 0 %). The keyboard base, touchpad, Wi-Fi, Bluetooth, the sensors, the
+  NVIDIA power saving and the dGPU report worked as on the second boot; the rear focus motor loaded without its
+  error (the wave 10 fix); `boot_completed` after 88.7 s. **The cameras failed**: both showed a black preview in the
+  Camera app although the IPU4P firmware authenticated, three cameras were connected, both sensors probed and the
+  camera provider ran (the logs hold no camera session, so the cause is not known). **A Google system update** (a
+  34.25 MB A/B delta) was being installed into slot A; the OTA gate stayed `validated`, `gb_slotsync` had nothing to
+  follow yet, and the firmware updater was stubbed. Settings and the Play Store showed "not responding" during that
+  first start: the stick could not keep up with the writes of a first start (36 app updates, app compilation), not
+  a fault of the image; the Terminal app's "Unrecoverable error" once, after which Debian started. Suspend was not
+  tried. Per item: [DEVICE-STATUS.md](docs/DEVICE-STATUS.md#third-real-hardware-results-2026-11-06-the-wave-10-usb-image).
+* **Google system updates are followed automatically** (the owner's decision, 2026-11-06; the behaviour is
+  `gb_slotsync`'s, unchanged since wave 9): once an update into the other slot has completed, `gb_slotsync` makes
+  that slot the default within a minute and the next start runs the new Google build, which no image here was made or
+  tested for. To stay on the tested build, choose the boot-menu entry that ends `(slot B)` at that next start; this
+  works only before the new build's first completed start. `native/hwtest/check_stick_ota.py` (new, read-only, from
+  Windows) shows which slot and build a stick starts next; the analyser's `slotsync` item reports an update that was
+  being installed, completed or followed ([OTA.md](docs/OTA.md#google-updates-on-the-usb-stick-and-on-native-installs-wave-11)).
+* **Low-battery shutdown** (`gb_power`, native image): at 3 % or less on battery, after two consistent clean
+  readings (every pack and the charger read fresh) and a one-minute hold, never in the first minute after Android
+  has started, `gb_power` asks init for a clean shutdown (`sys.powerctl=shutdown,battery`); a charger, a change of
+  the packs or a resume ends the hold, and any doubt means no shutdown. Kill switch `gb.power.lowshut=0` on the
+  kernel command line. Tested on the build machine (the gb_power unit tests, 1,173 checks, also under the address and
+  undefined-behaviour sanitisers; a battery harness, 312 runs without a violation, 30 of 30 guard mutants caught) and
+  in VMware (it starts once and stays idle without batteries). **Not yet seen working on the laptop: keep the
+  battery above about 10 %; plug in.**
+* **Camera self-test** (`gb_camtest`, native image, off by default): with `GB_PROP_1=vendor.gb.camtest=1` in
+  `gb\gb.cfg` and `gb.overlay=1` for one start, about 30 s after Android has started it captures 3 s from each
+  camera (the privacy LED lights briefly) and logs frame counts and mean brightness, never a picture; at about 6 min
+  40 s it also logs the camera service's client and event lines (which apps opened a camera, and when). Its result
+  (frames, dark, empty, none) tells whether the black preview is in the kernel's capture path or in Android's camera
+  path. Tested on the build machine (66 checks, 12 of 12 guard mutants) and in VMware (it found no camera there and
+  ended cleanly). A kernel-side cause would need a kernel change, which this release does not make.
+* **Power measurement at every start** (`gb_hw.sh power`): four read-only one-minute windows at about 5.5, 13, 30 and
+  60 minutes after Android has started (`gb_hw: power:` lines, `power-<N>.txt` reports in the logs; off with
+  `persist.vendor.gb.power.measure=0`). An optional power policy (energy preference per power source, a PL1 cap on
+  battery) and runtime power tuning stay **off** unless asked for (`pwr.policy=1`, `pm.tune=1`).
+* **Boot logs**: the first snapshot keeps Android's early log (`== logcat-early`) and the summary lists every
+  emulation site of `init` (`-- vnni init records`); before anything is written to the stick, e-mail addresses, MAC
+  and Bluetooth addresses, serial numbers, Wi-Fi network names and global IPv6 addresses are replaced by placeholders;
+  an empty `gblog\OFF` stops all log writing; the log collector makes each new private log folder readable only by
+  your Windows account.
+* **Smaller items**: a read-only hardware self-test over Wireless debugging (`adb shell sh /vendor/bin/gb_hwcheck.sh`);
+  the start waits at most 8 s for the sensor hub; `gb_power`'s control socket accepts at most 2 connections from apps
+  without a role, so no app can fill it; the analyser reads the crash-dump bursts of "not responding" dialogs. Not
+  in this release: the TPM placeholder that would have saved 10 s at boot (lapis's `gscd` aborted on it in VMware).
+* Tested in VMware: VM-1 on the final USB image `e43a463b…` (the analyser 17 PASS, 0 FAIL, 25 UNKNOWN; every wave
+  2-11 check VMware can show; the camera self-test off by default, and once forced on in a throwaway copy it ran once,
+  found no camera and ended cleanly), `verify_image.py` on the USB image, the dual-boot export and the VM build, the
+  host suites (TB-3 231 of 231 with its image tests) and every area test. **The installer ISO** `4f4164a6…` installs
+  the wave 11 system with both options (option 1 writes `e43a463b…` byte for byte): T0, T1a/T1b, the dual-boot groups
+  G1-G4 (T3 with its refusal cases, T4, T4b, T9) and T8 passed on 2026-11-07 (12 test ids, 378 checks, 0 failed).
+  The long-running VM's build is unchanged (wave 11 changes only the native image).
 
 ## Wave 10 (2026-11-05/06): the second native boot, the battery level, an installer ISO for the current system
 

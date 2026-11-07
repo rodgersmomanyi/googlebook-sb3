@@ -340,6 +340,8 @@ before use (6.5).
 | `selftest/running` (v1.2) | file | 0600 root:root | `gb_dgpu_report.sh selftest` | gb_power | Crash marker `boot=<boot_id> t=<epoch_s>`: created + `sync` before the first probe, removed + `sync` after the verdict. 25.3. |
 | `selftest/result` (v1.2) | file | 0644 root:root | `gb_dgpu_report.sh selftest`; gb_power (only the `interrupted`, `crash` and `hang` verdicts) | gb_power | The self-test record (truth), 25.4. Written as `.tmp` (O_EXCL/noclobber), `sync`, rename. |
 | `report/selftest-<N>.txt` (v1.2) | file | 0640 root:shell | `gb_dgpu_report.sh selftest` | gb_bootlog, user | Full probe output, identity and timing. Retention as `report/` (20 per prefix). |
+| `report/power-<N>.txt` (wave 11) | file | root:root, mode from the service's umask (gb_hw.sh does no chmod) | `gb_hw.sh power` | gb_bootlog (root; its snapshots carry it to the ESP) | The power measurement of boot N (N = `report/power.seq`): four read-only 60-s windows at 330 / 780 / 1800 / 3600 s; the newest 4 are kept (gb_hw.sh prunes by number, not by the 20-per-prefix rule). Off with `persist.vendor.gb.power.measure=0` (every boot) or `vendor.gb.power.measure=0` (one boot, `gb\gb.cfg`). |
+| `report/power.seq` (wave 11) | file | root:root | `gb_hw.sh power` | `gb_hw.sh power` | The boot counter N of `report/power-<N>.txt`. |
 | `models/` | dir | 0775 root:shell | user (`adb push`) | gb_gpu_compute | GGUF models `<id>.gguf`. |
 | `compute/` | dir | 0700 nobody:graphics | gb_gpu_compute | | Private run dir: internal sockets, `cache/` (Mesa shader cache). |
 | `ui/` | dir | 0700 shell:shell | init (`gb_gpu_ui.rc`) | | gb_gpu_ui_setup.sh's private directory (shell cannot create files in `/data/vendor/gb` itself). |
@@ -975,7 +977,12 @@ In `once`/`test` boots the tile shows the state but taps return `effect:"next-bo
 * Reply: exactly one line per request: a JSON object (RFC 8259, UTF-8, no floats, no NaN), at most 4096 bytes
   including `\n`. Non-ASCII or control bytes from `/proc` (e.g. `comm`) are replaced by `?`.
 * Requests on one connection are answered in order. Max 8 simultaneous connections (the 9th gets an `EBUSY` reply and
-  is closed); max 4 `watch` connections. Idle connections (no request for 30 s) are closed, except `watch`
+  is closed); max 4 `watch` connections. (wave 11, SR-4) Of these, at most 2 may be **role-less app peers** at once
+  (role `other` with an app uid, `uid % 100000 >= 10000`: any installed app that is neither GbGpu nor a compute
+  client); a third gets the same `EBUSY` `too many connections` line and is closed, and gb_power logs at most one
+  refusal line per 10 s. root, shell, ui (GbGpu), compute-svc and compute-client peers and system uids below 10000
+  are never counted, so the graphics UI, gb_bootlog's read-only `hello/status/get-mode` block and gb_dgpu_report
+  always get a slot. Idle connections (no request for 30 s) are closed, except `watch`
   connections and the compute service's connection once it has sent `compute-state` (its power hold lives exactly as
   long as that connection, 9.3/D14; v1.1). Per-client output buffer 8 KiB; overflow closes the client.
 
@@ -1225,6 +1232,46 @@ coalescing and the message are unchanged.
 Existing `-p -o -r -H -D -G -I -K -v` unchanged. New: `-S <path>` (test socket path, only with `-r`),
 `--dtx-monitor` (read-only: enables events on its own fd, prints each event with a CLOCK_MONOTONIC timestamp, never
 sends confirm/cancel/heartbeat/lock; for the EC-timeout measurement while the daemon is stopped).
+
+### 10.9 (Wave 11, w11prep battery-lowshut) Low-battery guard
+
+(Section A of `gb_power.c`, `lowshut_eval()`; the power README's "Wave 11" paragraphs and table row A are the
+reference; this is the interface.)
+
+* Input: the combined battery of section A (`combine()`): level P (floor(E_now*100/E_full + 0.05)), status, ac (any
+  non-battery supply online: ADP1, a USB/Wireless charger). The combined status is discharging exactly when ac is 0,
+  so the charger check is ac alone (ADP1's online = the EC's platform power source, `surface_charger`).
+* Clean readings only (wave 11 final step, W11-S2 / W11-S3): every present pack and every charger supply read fresh
+  (a value from the 60-s read-failure cache never counts; the cache's age includes suspended time), ADP1 present and
+  offline, `BAT1` present with data and, unless the DTX reports the base detached, `BAT2` too. Otherwise no hold:
+  `gb_power: low battery: N% but no shutdown hold: <reason>` (once per reason).
+* Hold: starts at the second of 2 consecutive consistent clean readings at P <= 3 (>= 5 s apart, within 1 point),
+  status discharging, ac 0; it continues while P < 5 and the readings stay clean; P >= 5, a charger, a change of the
+  present packs, a charger uevent or a resume from suspend ends it (logged).
+* Decision: the hold >= 60 s, `sys.boot_completed=1` seen by this process >= 60 s ago, `sys.powerctl` empty; ADP1,
+  every charger supply and test_power's `ac_online` read again right before it (online or unreadable: no shutdown,
+  the hold ends). Once per process. Kill switch: `gb.power.lowshut=0` on the kernel command line (logged at start).
+* Action: test_power without `battery_capacity_level` (k16): `sys.powerctl=shutdown,battery` (read back; not taken:
+  asked again 30 s later, 3 times in all, each time after the same re-read; a re-read that finds a charger withdraws
+  it: `... shutdown request withdrawn (<reason>)`). With the parameter (a later kernel): `battery_capacity_level=
+  critical` at the decision (Android's BatteryService requests ACTION_REQUEST_SHUTDOWN, reason battery), and
+  `sys.powerctl=shutdown,battery` only if neither `sys.powerctl` nor `sys.shutdown.requested` is set 30 s later (120 s
+  once `sys.shutdown.requested` is set). Before the decision the class is full (status full or P 100), low (P <= 10,
+  normal again at P >= 12) or normal; never critical. Nothing is added while `sys.powerctl` is set.
+* gb_power's own `sys.powerctl` handling (10.2: latch UNLOCK, R-1 shutdown markers) runs for its own request as for
+  any other shutdown. `gb_power -o` never runs the guard. The guard does not run while the laptop is suspended.
+* kmsg lines (analyser item 42 keys on them; keep them stable): `gb_power: low-battery guard: on (a clean shutdown at
+  <= 3% on battery for 60 s after 2 consistent readings, every pack and the charger read fresh, not before 60 s after
+  sys.boot_completed)`, `gb_power: low-battery guard: off (gb.power.lowshut=0)`, `gb_power: low battery: <P>% on
+  battery: a clean shutdown in 60 s unless a charger is connected`, `gb_power: low battery: shutdown hold ended
+  (<why>; ...)`, `gb_power: low battery: <P>% on battery, but not 60 s past sys.boot_completed yet: the shutdown
+  waits`, `gb_power: low battery: <P>% discharging ac=0 for <H> s, <B> s after boot_completed: requesting a clean
+  shutdown (<how>)`, `gb_power: low battery: N% but no shutdown hold: <reason>`, `gb_power: low battery: shutdown
+  request withdrawn (<reason>)`, `gb_power: low battery: sys.powerctl=shutdown,battery not taken (reads '<v>';
+  request <k> of 3)`.
+* The test_power parameter for a later kernel (BACKLOG K17 row): `battery_capacity_level`, 0644, values
+  `unknown|critical|low|normal|high|full` (lowercase, as `battery_status`), mapped to POWER_SUPPLY_CAPACITY_LEVEL_*
+  for `POWER_SUPPLY_PROP_CAPACITY_LEVEL` (today hard-wired NORMAL, k16 test_power.c 106-107); default normal.
 
 ---
 

@@ -1,0 +1,14 @@
+{
+ "name": "hwcheck",
+ "comment": "w11 selftest-tool: the read-only hardware self-test gb_hwcheck.sh, run by hand from adb as the shell user (adb shell sh /vendor/bin/gb_hwcheck.sh). No init service: no rc_files, no rc_text, no build_prop.",
+ "files": [
+  {
+   "src": "${GB_BUILD}\\native\\hw-gap-audit\\tree\\gb_hwcheck.sh",
+   "dest": "vup/bin/gb_hwcheck.sh",
+   "mode": "0755"
+  }
+ ],
+ "rc_files": [],
+ "rc_text": "",
+ "build_prop": []
+}
